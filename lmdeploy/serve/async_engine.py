@@ -460,7 +460,6 @@ class AsyncEngine(LogitsMixin):
     def close(self):
         self.internal_thread.close()
         self.free_insts = None
-        self.instances.clear()
         self.engine.close()
 
     def __enter__(self):
