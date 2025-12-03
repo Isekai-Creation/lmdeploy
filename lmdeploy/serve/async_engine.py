@@ -11,7 +11,8 @@ from functools import partial
 from itertools import count
 from queue import Queue
 from threading import Thread
-from typing import Any, AsyncIterator, Dict, Iterator, List, Literal, Optional, Tuple, Union
+from typing import (Any, AsyncIterator, Dict, Iterator, List, Literal,
+                    Optional, Tuple, Union)
 
 import tqdm
 
@@ -22,14 +23,17 @@ from lmdeploy.messages import (GenerationConfig, PytorchEngineConfig, Response,
                                ResponseType, SpeculativeConfig,
                                TurbomindEngineConfig)
 from lmdeploy.metrics.metrics_processor import metrics_processor
-from lmdeploy.metrics.stats import IterationStats, RequestState, SpeculativeDecodingStats
-from lmdeploy.model import MODELS, BaseChatTemplate, ChatTemplateConfig, best_match_model
-from lmdeploy.pytorch.disagg.conn.protocol import (DistServeConnectionRequest,
-                                                   DistServeDropConnectionRequest,
-                                                   DistServeInitRequest)
+from lmdeploy.metrics.stats import (IterationStats, RequestState,
+                                    SpeculativeDecodingStats)
+from lmdeploy.model import (MODELS, BaseChatTemplate, ChatTemplateConfig,
+                            best_match_model)
+from lmdeploy.pytorch.disagg.conn.protocol import (
+    DistServeConnectionRequest, DistServeDropConnectionRequest,
+    DistServeInitRequest)
 from lmdeploy.serve.utils import LogitsMixin
 from lmdeploy.tokenizer import DetokenizeState
-from lmdeploy.utils import _get_and_verify_max_len, _stop_words, get_hf_gen_cfg, get_logger
+from lmdeploy.utils import (_get_and_verify_max_len, _stop_words,
+                            get_hf_gen_cfg, get_logger)
 
 logger = get_logger("lmdeploy")
 
@@ -454,7 +458,8 @@ class AsyncEngine(LogitsMixin):
         self.stat_loggers = []
 
         if getattr(self.backend_config, "enable_metrics", False):
-            from lmdeploy.metrics.loggers import (LoggingStatLogger, PrometheusStatLogger)
+            from lmdeploy.metrics.loggers import (LoggingStatLogger,
+                                                  PrometheusStatLogger)
 
             dp_rank = self.backend_config.dp_rank if self.backend_config.dp > 1 else 0
 
