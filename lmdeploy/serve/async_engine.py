@@ -11,29 +11,56 @@ from functools import partial
 from itertools import count
 from queue import Queue
 from threading import Thread
-from typing import (Any, AsyncIterator, Dict, Iterator, List, Literal,
-                    Optional, Tuple, Union)
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import tqdm
 
 from lmdeploy import Tokenizer
 from lmdeploy.archs import get_model_arch
 from lmdeploy.logger import RequestLogger
-from lmdeploy.messages import (GenerationConfig, PytorchEngineConfig, Response,
-                               ResponseType, SpeculativeConfig,
-                               TurbomindEngineConfig)
+from lmdeploy.messages import (
+    GenerationConfig,
+    PytorchEngineConfig,
+    Response,
+    ResponseType,
+    SpeculativeConfig,
+    TurbomindEngineConfig,
+)
 from lmdeploy.metrics.metrics_processor import metrics_processor
-from lmdeploy.metrics.stats import (IterationStats, RequestState,
-                                    SpeculativeDecodingStats)
-from lmdeploy.model import (MODELS, BaseChatTemplate, ChatTemplateConfig,
-                            best_match_model)
+from lmdeploy.metrics.stats import (
+    IterationStats,
+    RequestState,
+    SpeculativeDecodingStats,
+)
+from lmdeploy.model import (
+    MODELS,
+    BaseChatTemplate,
+    ChatTemplateConfig,
+    best_match_model,
+)
 from lmdeploy.pytorch.disagg.conn.protocol import (
-    DistServeConnectionRequest, DistServeDropConnectionRequest,
-    DistServeInitRequest)
+    DistServeConnectionRequest,
+    DistServeDropConnectionRequest,
+    DistServeInitRequest,
+)
 from lmdeploy.serve.utils import LogitsMixin
 from lmdeploy.tokenizer import DetokenizeState
-from lmdeploy.utils import (_get_and_verify_max_len, _stop_words,
-                            get_hf_gen_cfg, get_logger)
+from lmdeploy.utils import (
+    _get_and_verify_max_len,
+    _stop_words,
+    get_hf_gen_cfg,
+    get_logger,
+)
 
 logger = get_logger("lmdeploy")
 
@@ -165,7 +192,9 @@ class Session:
         history (List[Any, str]): chat history.
     """
 
-    def __init__(self, session_id: int, engine: Any, gen_config: GenerationConfig = None):
+    def __init__(
+        self, session_id: int, engine: Any, gen_config: GenerationConfig = None
+    ):
         self._id: int = session_id
         self._engine = engine
         self._step: int = 0
@@ -278,11 +307,13 @@ class _EventLoopThread:
             if task.cancelled():
                 continue
             if task.exception() is not None:
-                self.loop.call_exception_handler({
-                    "message": "unhandled exception during worker thread shutdown",
-                    "exception": task.exception(),
-                    "task": task,
-                })
+                self.loop.call_exception_handler(
+                    {
+                        "message": "unhandled exception during worker thread shutdown",
+                        "exception": task.exception(),
+                        "task": task,
+                    }
+                )
 
     def close(self):
         if self.closed:
@@ -327,7 +358,9 @@ class AsyncEngine(LogitsMixin):
         model_path: str,
         model_name: Optional[str] = None,
         backend: Literal["turbomind", "pytorch"] = "turbomind",
-        backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig]] = None,
+        backend_config: Optional[
+            Union[TurbomindEngineConfig, PytorchEngineConfig]
+        ] = None,
         chat_template_config: Optional[ChatTemplateConfig] = None,
         max_log_len: int = None,
         speculative_config: SpeculativeConfig = None,
@@ -336,12 +369,15 @@ class AsyncEngine(LogitsMixin):
         logger.info(f"input backend={backend}, backend_config={backend_config}")
         logger.info(f"input chat_template_config={chat_template_config}")
         logger.info(f"speculative_config={speculative_config}")
-        backend_config = backend_config or (TurbomindEngineConfig()
-                                            if backend == "turbomind" else PytorchEngineConfig())
+        backend_config = backend_config or (
+            TurbomindEngineConfig() if backend == "turbomind" else PytorchEngineConfig()
+        )
         self.model_name = model_name if model_name else model_path
         chat_template_name = best_match_model(model_path)
         if chat_template_config is None:
-            chat_template_config = ChatTemplateConfig(chat_template_name, model_path=model_path)
+            chat_template_config = ChatTemplateConfig(
+                chat_template_name, model_path=model_path
+            )
         elif chat_template_config.model_name is None:
             chat_template_config.model_name = chat_template_name
         self.chat_template = chat_template_config.chat_template
@@ -351,14 +387,20 @@ class AsyncEngine(LogitsMixin):
         self.tokenizer = Tokenizer(model_path)
         self.hf_gen_cfg = get_hf_gen_cfg(model_path)
         self.arch, cfg = get_model_arch(model_path)
-        self.session_len = (_get_and_verify_max_len(cfg, None)
-                            if backend_config.session_len is None else backend_config.session_len)
+        self.session_len = (
+            _get_and_verify_max_len(cfg, None)
+            if backend_config.session_len is None
+            else backend_config.session_len
+        )
         backend_config.session_len = self.session_len
-        if speculative_config is not None and backend == "turbomind":
-            logger.warning("speculative decoding is not supported by turbomind ")
         # build backend engine
         if backend == "turbomind":
-            self.engine = self._build_turbomind(model_path=model_path, backend_config=backend_config, **kwargs)
+            self.engine = self._build_turbomind(
+                model_path=model_path,
+                backend_config=backend_config,
+                speculative_config=speculative_config,
+                **kwargs,
+            )
             self.hf_tm_cfg = self.engine.config
         elif backend == "pytorch":
             self.engine = self._build_pytorch(
@@ -372,7 +414,9 @@ class AsyncEngine(LogitsMixin):
             raise ValueError(f"unsupported backend {backend}")
         self.backend_config = self.engine.engine_config
         self.is_sleeping = backend_config.empty_init
-        self.sleeping_tags: set[str] = (set() if not backend_config.empty_init else {"weights", "kv_cache"})
+        self.sleeping_tags: set[str] = (
+            set() if not backend_config.empty_init else {"weights", "kv_cache"}
+        )
         logger.info(f"updated backend_config={self.backend_config}")
 
         # parameters for member functions
@@ -384,13 +428,18 @@ class AsyncEngine(LogitsMixin):
         self.id2step = {}
         self.id2inst = {}
         self.free_insts: asyncio.Queue = None
-        self.instances = [self.engine.create_instance() for _ in range(self.instance_num)]
+        self.instances = [
+            self.engine.create_instance() for _ in range(self.instance_num)
+        ]
         self._session_id = count(0)
         self.request_logger = RequestLogger(max_log_len)
         self.internal_thread = _EventLoopThread(daemon=True)
         self.limiter: asyncio.Semaphore = None
-        self.num_spec_token = (0 if backend == "turbomind" or speculative_config is None else
-                               speculative_config.num_speculative_tokens)
+        self.num_spec_token = (
+            0
+            if backend == "turbomind" or speculative_config is None
+            else speculative_config.num_speculative_tokens
+        )
 
         # build stat loggers
         self._build_stat_loggers()
@@ -399,14 +448,15 @@ class AsyncEngine(LogitsMixin):
         self.harmony_parser = None
         if self.arch == "GptOssForCausalLM":
             try:
-                from lmdeploy.serve.openai.harmony_utils import \
-                    GptOssChatParser
+                from lmdeploy.serve.openai.harmony_utils import GptOssChatParser
 
                 self.harmony_parser = GptOssChatParser()
                 logger.info("GPT-OSS model detected, harmony parser initialized")
             except ImportError as e:
-                logger.warning(f"Failed to import GptOssChatParser: {e}. "
-                               "Harmony format parsing will be disabled.")
+                logger.warning(
+                    f"Failed to import GptOssChatParser: {e}. "
+                    "Harmony format parsing will be disabled."
+                )
 
     def close(self):
         self.internal_thread.close()
@@ -430,18 +480,29 @@ class AsyncEngine(LogitsMixin):
     def _build_turbomind(
         self,
         model_path: str,
-        backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig]] = None,
+        backend_config: Optional[
+            Union[TurbomindEngineConfig, PytorchEngineConfig]
+        ] = None,
+        speculative_config: Optional[SpeculativeConfig] = None,
         **kwargs,
     ):
         """Innter build method for turbomind backend."""
         from lmdeploy import turbomind as tm
 
-        return tm.TurboMind.from_pretrained(model_path, engine_config=backend_config, **kwargs)
+        # Pass speculative_config to backend_config
+        if speculative_config is not None and backend_config is not None:
+            backend_config.speculative_config = speculative_config
+
+        return tm.TurboMind.from_pretrained(
+            model_path, engine_config=backend_config, **kwargs
+        )
 
     def _build_pytorch(
         self,
         model_path: str,
-        backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig]] = None,
+        backend_config: Optional[
+            Union[TurbomindEngineConfig, PytorchEngineConfig]
+        ] = None,
         speculative_config: SpeculativeConfig = None,
         **kwargs,
     ):
@@ -458,12 +519,13 @@ class AsyncEngine(LogitsMixin):
         self.stat_loggers = []
 
         if getattr(self.backend_config, "enable_metrics", False):
-            from lmdeploy.metrics.loggers import (LoggingStatLogger,
-                                                  PrometheusStatLogger)
+            from lmdeploy.metrics.loggers import LoggingStatLogger, PrometheusStatLogger
 
             dp_rank = self.backend_config.dp_rank if self.backend_config.dp > 1 else 0
 
-            logger.info(f"enable metrics, with dp: {self.backend_config.dp} dp_rank: {dp_rank}")
+            logger.info(
+                f"enable metrics, with dp: {self.backend_config.dp} dp_rank: {dp_rank}"
+            )
             self.stat_loggers = [
                 LoggingStatLogger(dp_rank=dp_rank),
                 PrometheusStatLogger(
@@ -582,12 +644,16 @@ class AsyncEngine(LogitsMixin):
         """
         tags = tags or list(self.sleeping_tags)
         if any(tag not in self.sleeping_tags for tag in tags):
-            logger.warning(f"some tag in {tags} not in sleeping tags {self.sleeping_tags}")
+            logger.warning(
+                f"some tag in {tags} not in sleeping tags {self.sleeping_tags}"
+            )
             return
         self.engine.wakeup(tags)
         # for TM backend, sleep/wakeup will reset gateway, therefore we need to rebuild instance
         if self.backend == "turbomind" and "kv_cache" in tags:
-            self.instances = [self.engine.create_instance() for _ in range(self.instance_num)]
+            self.instances = [
+                self.engine.create_instance() for _ in range(self.instance_num)
+            ]
             self.free_insts = None
         self.sleeping_tags = self.sleeping_tags - set(tags)
         self.is_sleeping = bool(self.sleeping_tags)
@@ -597,12 +663,16 @@ class AsyncEngine(LogitsMixin):
             self.limiter = asyncio.Semaphore(self.instance_num)
         return self.limiter
 
-    async def _async_infer(self, requests: AsyncIterator[Dict], **kwargs) -> AsyncIterator[AsyncIterator[Response]]:
+    async def _async_infer(
+        self, requests: AsyncIterator[Dict], **kwargs
+    ) -> AsyncIterator[AsyncIterator[Response]]:
         async for req in requests:
             gen = self.generate(**req, **kwargs)
             yield gen
 
-    def _infer(self, requests: Iterator[Dict], multiplex: bool, pbar=None, loop=None) -> Iterator[Iterator[Response]]:
+    def _infer(
+        self, requests: Iterator[Dict], multiplex: bool, pbar=None, loop=None
+    ) -> Iterator[Iterator[Response]]:
 
         async def _sync_resp(g, que: Queue, idx: int, sem: asyncio.Semaphore):
             async for out in g:
@@ -635,8 +705,9 @@ class AsyncEngine(LogitsMixin):
 
         loop = loop or self.internal_thread.loop
         # submit the coroutine to async world
-        asyncio.run_coroutine_threadsafe(_infer(),
-                                         loop).add_done_callback(lambda f: None if f.cancelled() else f.result())
+        asyncio.run_coroutine_threadsafe(_infer(), loop).add_done_callback(
+            lambda f: None if f.cancelled() else f.result()
+        )
 
         return iter(que.get, None)
 
@@ -661,7 +732,9 @@ class AsyncEngine(LogitsMixin):
         gen_config = gen_config or GenerationConfig()
         if not isinstance(gen_config, List):
             gen_config = [gen_config] * len(prompts)
-        assert len(prompts) == len(gen_config), "input gen_confg length differs from the length of prompts"  # noqa
+        assert len(prompts) == len(
+            gen_config
+        ), "input gen_confg length differs from the length of prompts"  # noqa
 
         def requests():
             for prompt, gen_cfg in zip(prompts, gen_config):
@@ -710,13 +783,13 @@ class AsyncEngine(LogitsMixin):
         pbar = tqdm.tqdm(total=1 if is_single else len(prompts)) if use_tqdm else None
         try:
             for g in self.infer(
-                    prompts,
-                    gen_config,
-                    do_preprocess,
-                    adapter_name,
-                    stream_response=False,
-                    pbar=pbar,
-                    **kwargs,
+                prompts,
+                gen_config,
+                do_preprocess,
+                adapter_name,
+                stream_response=False,
+                pbar=pbar,
+                **kwargs,
             ):
                 res = None
                 for out in g:
@@ -895,7 +968,9 @@ class AsyncEngine(LogitsMixin):
         elif gen_config.random_seed is None and sequence_start:
             gen_config.random_seed = random.getrandbits(64)
         if gen_config.n > 1:
-            logger.warning(f"n({gen_config.n}) > 1 hasn't been supported yet. Fallback to 1")
+            logger.warning(
+                f"n({gen_config.n}) > 1 hasn't been supported yet. Fallback to 1"
+            )
             gen_config.n = 1
         if messages:
             prompt = messages
@@ -925,19 +1000,23 @@ class AsyncEngine(LogitsMixin):
                 gen_config=gen_config,
                 adapter_name=adapter_name,
             )
-            logger.info(f"session={session_id}, "
-                        f"history_tokens={self.id2step[session_id]}, "
-                        f"input_tokens={len(input_ids)}, "
-                        f"max_new_tokens={gen_config.max_new_tokens}, "
-                        f"seq_start={sequence_start}, seq_end={sequence_end}, "
-                        f"step={step}, prep={do_preprocess}")
+            logger.info(
+                f"session={session_id}, "
+                f"history_tokens={self.id2step[session_id]}, "
+                f"input_tokens={len(input_ids)}, "
+                f"max_new_tokens={gen_config.max_new_tokens}, "
+                f"seq_start={sequence_start}, seq_end={sequence_end}, "
+                f"step={step}, prep={do_preprocess}"
+            )
         else:
             # TODO(lvhan) VLM doesn't support input_ids as an argument.
             # Figure out a graceful way to handle the invalid input
             prompt_input = dict(input_ids=input_ids)
 
         if gen_config.max_new_tokens is None:
-            gen_config.max_new_tokens = max(0, self.session_len - self.id2step[session_id] - len(input_ids))
+            gen_config.max_new_tokens = max(
+                0, self.session_len - self.id2step[session_id] - len(input_ids)
+            )
             if gen_config.max_new_tokens == 0:
                 logger.error(f"run out of tokens. session={session_id}.")
                 yield GenOut(
@@ -951,10 +1030,14 @@ class AsyncEngine(LogitsMixin):
                 if sequence_end is True and sequence_start is False:
                     await self.end_session(session_id)
                 return
-        if self.backend_config.enable_prefix_caching and (gen_config.output_last_hidden_state == "all"
-                                                          or gen_config.output_logits == "all"):
-            errmsg = ("lmdeploy does not support outputting all token's logits or last_hidden_state "
-                      "when prefix caching is ON")
+        if self.backend_config.enable_prefix_caching and (
+            gen_config.output_last_hidden_state == "all"
+            or gen_config.output_logits == "all"
+        ):
+            errmsg = (
+                "lmdeploy does not support outputting all token's logits or last_hidden_state "
+                "when prefix caching is ON"
+            )
             yield GenOut(
                 response=errmsg,
                 history_token_len=self.id2step[session_id],
@@ -986,23 +1069,28 @@ class AsyncEngine(LogitsMixin):
             response = ""
             finish_reason = None
             async with self.safe_run(
-                    inst,
-                    session_id=session_id,
-                    **prompt_input,
-                    gen_config=gen_config,
-                    adapter_name=adapter_name,
-                    stream_output=stream_response,
-                    sequence_start=sequence_start,
-                    sequence_end=sequence_end,
-                    step=history_len,
+                inst,
+                session_id=session_id,
+                **prompt_input,
+                gen_config=gen_config,
+                adapter_name=adapter_name,
+                stream_output=stream_response,
+                sequence_start=sequence_start,
+                sequence_end=sequence_end,
+                step=history_len,
             ) as gen:
                 hit_stop_token = 0
                 req_state = RequestState(prompt_tokens=input_len)  # per-requst state
                 async for outputs in gen:
                     iteration_stats = IterationStats()  # per-iteration stats
-                    specdecode_stats = (SpeculativeDecodingStats(self.num_spec_token)
-                                        if self.num_spec_token > 0 else None)
-                    metrics_processor.queue_update((outputs, req_state, iteration_stats, specdecode_stats))
+                    specdecode_stats = (
+                        SpeculativeDecodingStats(self.num_spec_token)
+                        if self.num_spec_token > 0
+                        else None
+                    )
+                    metrics_processor.queue_update(
+                        (outputs, req_state, iteration_stats, specdecode_stats)
+                    )
                     # decode res
                     if is_error(outputs.status):
                         break
@@ -1015,7 +1103,7 @@ class AsyncEngine(LogitsMixin):
                     if output_len and outputs.token_ids[-1] in stop_ids:
                         hit_stop_token = 1
 
-                    token_ids += outputs.token_ids[:output_len - hit_stop_token]
+                    token_ids += outputs.token_ids[: output_len - hit_stop_token]
                     gen_len = len(token_ids) - input_len
 
                     ids_offset = state.ids_offset
@@ -1038,12 +1126,23 @@ class AsyncEngine(LogitsMixin):
                         cache_block_ids=outputs.cache_block_ids,
                     )
                     if outputs.logprobs is not None:
-                        out.logprobs = (outputs.logprobs[:-hit_stop_token] if hit_stop_token else outputs.logprobs)
+                        out.logprobs = (
+                            outputs.logprobs[:-hit_stop_token]
+                            if hit_stop_token
+                            else outputs.logprobs
+                        )
                     if outputs.last_hidden_state is not None:
-                        out.last_hidden_state = (outputs.last_hidden_state[:-hit_stop_token]
-                                                 if hit_stop_token else outputs.last_hidden_state)
+                        out.last_hidden_state = (
+                            outputs.last_hidden_state[:-hit_stop_token]
+                            if hit_stop_token
+                            else outputs.last_hidden_state
+                        )
                     if outputs.logits is not None:
-                        out.logits = (outputs.logits[:-hit_stop_token] if hit_stop_token else outputs.logits)
+                        out.logits = (
+                            outputs.logits[:-hit_stop_token]
+                            if hit_stop_token
+                            else outputs.logits
+                        )
 
                     # Parse harmony format for GPT-OSS models
                     if self.harmony_parser and parse_harmony and token_ids:
@@ -1052,10 +1151,15 @@ class AsyncEngine(LogitsMixin):
                             # Update output with parsed harmony content
                             out.response = parsed.content or ""
                             out.reasoning_content = parsed.reasoning_content
-                            out.tool_calls = ([tc.model_dump()
-                                               for tc in parsed.tool_calls] if parsed.tool_calls else None)
+                            out.tool_calls = (
+                                [tc.model_dump() for tc in parsed.tool_calls]
+                                if parsed.tool_calls
+                                else None
+                            )
                         except Exception as e:
-                            logger.warning(f"Failed to parse harmony format: {e}. Using raw output.")
+                            logger.warning(
+                                f"Failed to parse harmony format: {e}. Using raw output."
+                            )
 
                     yield out
                 # end of generator loop
@@ -1065,7 +1169,9 @@ class AsyncEngine(LogitsMixin):
                     if outputs.status == ResponseType.CANCEL:
                         finish_reason = "abort"
                     else:
-                        finish_reason = ("stop" if outputs.token_ids[-1] in stop_ids else "length")
+                        finish_reason = (
+                            "stop" if outputs.token_ids[-1] in stop_ids else "length"
+                        )
 
                     # utf-8 char at the end means it's a potential unfinished byte sequence
                     if not response.endswith("�"):
@@ -1077,24 +1183,39 @@ class AsyncEngine(LogitsMixin):
                         None,
                         None,
                     )
-                    if (gen_config.include_stop_str_in_output and finish_reason == "stop"):
+                    if (
+                        gen_config.include_stop_str_in_output
+                        and finish_reason == "stop"
+                    ):
                         # return the eos token id (MUST be in a list), eos string, eos token's logits and so on
                         token_ids = outputs.token_ids[-1:]
-                        response = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+                        response = self.tokenizer.decode(
+                            token_ids, skip_special_tokens=False
+                        )
                         logits = outputs.logits[-1:] if outputs.logits else None
-                        last_hidden_state = (outputs.last_hidden_state[-1:] if outputs.last_hidden_state else None)
+                        last_hidden_state = (
+                            outputs.last_hidden_state[-1:]
+                            if outputs.last_hidden_state
+                            else None
+                        )
                         logprobs = outputs.logprobs[-1:] if outputs.logprobs else None
                         gen_len += 1
 
                     # router replay
                     routed_experts = outputs.routed_experts
-                    if (routed_experts is not None and not isinstance(routed_experts, str)
-                            and (not gen_config.include_stop_str_in_output) and finish_reason == "stop"):
+                    if (
+                        routed_experts is not None
+                        and not isinstance(routed_experts, str)
+                        and (not gen_config.include_stop_str_in_output)
+                        and finish_reason == "stop"
+                    ):
                         routed_experts = routed_experts[:-1]
 
-                    logger.info(f"session {session_id} finished, reason "
-                                f'"{finish_reason}", input_tokens '
-                                f"{len(input_ids)}, output_tokens {gen_len}")
+                    logger.info(
+                        f"session {session_id} finished, reason "
+                        f'"{finish_reason}", input_tokens '
+                        f"{len(input_ids)}, output_tokens {gen_len}"
+                    )
                     yield GenOut(
                         response,
                         self.id2step[session_id],
@@ -1115,8 +1236,10 @@ class AsyncEngine(LogitsMixin):
                             output_len = gen_len
                         self.id2step[session_id] += input_len + output_len
                 else:
-                    logger.error(f"session {session_id} finished, {outputs.status}, "
-                                 'reason "error"')
+                    logger.error(
+                        f"session {session_id} finished, {outputs.status}, "
+                        'reason "error"'
+                    )
                     yield GenOut(
                         response=f"internal error happened, status code {outputs.status}",
                         history_token_len=self.id2step[session_id],

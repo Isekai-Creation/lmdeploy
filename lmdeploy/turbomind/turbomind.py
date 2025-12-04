@@ -913,16 +913,9 @@ class TurboMindInstance:
         )
 
         if use_speculation:
-            logger.debug(
+            logger.info(
                 f"[async_stream_infer] Using speculative decoding for session {session_id}"
             )
-            # TODO: Implement full speculative generation flow
-            # For now, log and fall back to standard generation
-            logger.warning(
-                "Speculative decoding enabled but full integration pending. "
-                "Using standard generation."
-            )
-            use_speculation = False  # Disable for now
         # ===== END SPECULATIVE DECODING INTEGRATION =====
 
         outputs, shared_state, metrics = self.model_inst.forward(
