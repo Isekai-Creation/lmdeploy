@@ -28,9 +28,11 @@ class SpeculativeDecodingManager:
             config: SpeculativeConfig instance
             target_model_comm: Target model communication object
         """
-        from lmdeploy.speculative_config import SpeculativeConfig
+        from lmdeploy.speculative_config import SpeculativeConfig as SpecConfigV1
+        from lmdeploy.messages import SpeculativeConfig as SpecConfigV2
 
-        if not isinstance(config, SpeculativeConfig):
+        # Accept SpeculativeConfig from either module (backward compatibility)
+        if not isinstance(config, (SpecConfigV1, SpecConfigV2)):
             raise TypeError(f"config must be SpeculativeConfig, got {type(config)}")
 
         self.config = config
