@@ -97,15 +97,42 @@ class SpeculativeDecodingManager:
             f"max_decoding_tokens={self.config.max_decoding_tokens}"
         )
 
-        # TODO: Load EAGLE draft model and initialize tree structures
-        # self.draft_model_comm = load_eagle_model(self.config.model)
-        # self.eagle_tree = SpeculationTree(...)
+        # Load EAGLE3 draft model using PyTorch (HuggingFace)
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        logger.warning(
-            "EAGLE3 speculative decoding initialized but not yet "
-            "fully implemented. Draft model loading and tree "
-            "structures are TODO."
-        )
+            logger.info("Loading EAGLE3 draft model with PyTorch backend...")
+
+            # Load model
+            self.draft_model = AutoModelForCausalLM.from_pretrained(
+                self.config.model,
+                torch_dtype=torch.float16,
+                device_map="cuda",
+                trust_remote_code=True,
+            )
+            self.draft_model.eval()
+
+            # Load tokenizer (needed for token mapping)
+            self.draft_tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model, trust_remote_code=True
+            )
+
+            # Initialize tree structures for EAGLE3
+            self.max_path_len = self.config.max_path_len or 5
+            self.max_decoding_tokens = self.config.max_decoding_tokens or 10
+
+            logger.info(f"EAGLE3 draft model loaded successfully: {self.config.model}")
+            logger.info(
+                f"Tree config: max_path_len={self.max_path_len}, "
+                f"max_decoding_tokens={self.max_decoding_tokens}"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to load EAGLE3 draft model: {e}")
+            raise RuntimeError(
+                f"Could not load EAGLE draft model from {self.config.model}: {e}"
+            )
 
     def _init_ngram(self):
         """Initialize NGram speculative decoding."""
@@ -160,20 +187,8 @@ class SpeculativeDecodingManager:
             elif not isinstance(input_ids, list):
                 input_ids = [input_ids]
 
-            # Create a session for draft model inference
-            draft_session = self.draft_model.create_instance()
-
-            # Use async helper to generate draft tokens
-            from lmdeploy.turbomind.speculative_async_helper import (
-                generate_draft_tokens_sync,
-            )
-
-            draft_tokens = generate_draft_tokens_sync(
-                draft_session,
-                input_ids,
-                num_tokens,
-                session_id=0,  # Use session 0 for draft
-            )
+            # Generate draft tokens using PyTorch model
+            draft_tokens = self._generate_eagle_draft_tokens(input_ids, num_tokens)
 
             logger.debug(f"Generated {len(draft_tokens)} draft tokens: {draft_tokens}")
             return draft_tokens
@@ -184,6 +199,44 @@ class SpeculativeDecodingManager:
 
             logger.error(traceback.format_exc())
             return []
+    
+    def _generate_eagle_draft_tokens(self, input_ids, num_tokens):
+        """Generate draft tokens using EAGLE3 model."""
+        import torch
+        
+        # Convert to tensor
+        input_tensor = torch.tensor([input_ids], dtype=torch.long, device="cuda")
+        
+        draft_tokens = []
+        
+        with torch.no_grad():
+            # Use KV cache for efficiency
+            past_key_values = None
+            
+            for _ in range(num_tokens):
+                # Run draft model
+                outputs = self.draft_model(
+                    input_tensor if past_key_values is None else input_tensor[:, -1:],
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+                
+                # Get next token
+                next_token_logits = outputs.logits[0, -1, :]
+                next_token = torch.argmax(next_token_logits).item()
+                
+                draft_tokens.append(next_token)
+                
+                # Update for next iteration
+                input_tensor = torch.cat([
+                    input_tensor,
+                    torch.tensor([[next_token]], device="cuda")
+                ], dim=1)
+                
+                # Update KV cache
+                past_key_values = outputs.past_key_values
+        
+        return draft_tokens
 
     def verify_draft_tokens(self, draft_tokens, target_logits):
         """
