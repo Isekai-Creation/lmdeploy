@@ -8,6 +8,7 @@ import torch
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
+from lmdeploy.speculative_config import SpeculativeConfig
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationRequest
 
 from .tokenizer import Tokenizer
@@ -130,7 +131,8 @@ class GenerationConfig:
         def special_word_token_ids(words):
             if words is not None:
                 assert isinstance(words, List) and all(
-                    isinstance(elem, str) for elem in words), f"stop_words must be a list of str but got {type(words)}"
+                    isinstance(elem, str) for elem in words
+                ), f"stop_words must be a list of str but got {type(words)}"
                 indexes = []
                 for word in words:
                     indexes += tokenizer.indexes_containing_token(word)
@@ -169,7 +171,9 @@ class GenerationConfig:
         assert self.top_p >= 0 and self.top_p <= 1  # [0, 1]
         assert self.top_k >= 0, "top_k can not be a negative integer"
         assert self.temperature >= 0 and self.temperature <= 2  # [0,2]
-        assert (0 <= self.min_p <= 1), f"min_p should be in range [0, 1], but found {self.min_p}"
+        assert (
+            0 <= self.min_p <= 1
+        ), f"min_p should be in range [0, 1], but found {self.min_p}"
 
 
 @pydantic_dataclass
@@ -266,6 +270,7 @@ class TurbomindEngineConfig:
     communicator: str = "nccl"
     hf_overrides: Optional[Dict[str, Any]] = None
     enable_metrics: bool = True
+    speculative_config: Optional[SpeculativeConfig] = None
 
     def __post_init__(self):
         """Check input validation."""
@@ -418,15 +423,17 @@ class PytorchEngineConfig:
             "maca",
             "camb",
         ], f"invalid device_type: {self.device_type}"
-        assert (self.block_size >= 16 and
-                (self.block_size &
-                 (self.block_size - 1)) == 0), f"block_size must be >= 16 and a power of 2, but got {self.block_size}"
+        assert (
+            self.block_size >= 16 and (self.block_size & (self.block_size - 1)) == 0
+        ), f"block_size must be >= 16 and a power of 2, but got {self.block_size}"
         if self.quant_policy > 0 and self.device_type not in ["cuda", "ascend"]:
             assert False, "kv cache quantization only works for CUDA and ASCEND."
         if self.device_type == "camb" and self.block_size != 16:
             self.block_size = 16
-            logger.warning("Currently, camb device requires block size to be 16, \
-                    setting block size to 16")
+            logger.warning(
+                "Currently, camb device requires block size to be 16, \
+                    setting block size to 16"
+            )
 
 
 class ResponseType(enum.Enum):
@@ -546,7 +553,9 @@ class EngineEvent:
     timestamp: float
 
     @classmethod
-    def new_event(cls, event_type: EventType, timestamp: Optional[float] = None) -> "EngineEvent":
+    def new_event(
+        cls, event_type: EventType, timestamp: Optional[float] = None
+    ) -> "EngineEvent":
         # Timestamps MUST use wall-clock time (time.time()) to maintain consistency
         # between csrc(std::chrono::system_clock) and python
         timestamp = time.time() if timestamp is None else timestamp
