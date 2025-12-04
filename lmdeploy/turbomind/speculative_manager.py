@@ -45,7 +45,8 @@ class SpeculativeDecodingManager:
         # Initialize based on method
         if config.method == "draft_target":
             self._init_draft_target()
-        elif config.method == "eagle":
+        elif config.method in ["eagle", "eagle3"]:
+            # eagle3 is the same as eagle for TurboMind
             self._init_eagle()
         elif config.method == "ngram":
             self._init_ngram()
