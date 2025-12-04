@@ -19,6 +19,39 @@ cd "${ROOT_DIR}"
 
 VENV_DIR="${VENV_DIR:-.venv_py311}"
 
+install_python_via_pyenv() {
+  echo "[build_py311_wheel] python3.11 not available via system packages, installing via pyenv..."
+
+  # Basic build deps for CPython (non-interactive)
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    sudo apt-get update -qq || true
+    sudo apt-get install -y -qq \
+      build-essential curl git \
+      libssl-dev zlib1g-dev libbz2-dev \
+      libreadline-dev libsqlite3-dev \
+      libffi-dev liblzma-dev || true
+  fi
+
+  # Install pyenv locally under $HOME if missing
+  if [[ ! -d "${HOME}/.pyenv" ]]; then
+    git clone --depth 1 https://github.com/pyenv/pyenv.git "${HOME}/.pyenv"
+  fi
+
+  export PYENV_ROOT="${HOME}/.pyenv"
+  export PATH="${PYENV_ROOT}/bin:${PATH}"
+
+  # shellcheck disable=SC1090
+  eval "$(pyenv init -)"
+
+  PY_VERSION="${PY_VERSION:-3.11.9}"
+  # -s: skip if already installed
+  PYENV_QUIET=1 pyenv install -s "${PY_VERSION}"
+
+  PYTHON_BIN="${PYENV_ROOT}/versions/${PY_VERSION}/bin/python"
+  export PYTHON_BIN
+}
+
 detect_or_install_python() {
   if [[ -n "${PYTHON_BIN:-}" ]]; then
     if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
@@ -34,19 +67,21 @@ detect_or_install_python() {
     return
   fi
 
-  # Try to install python3.11 via apt (non-interactive, quiet)
+  # Try to install python3.11 via apt (non-interactive, quiet); if that fails,
+  # fall back to a local pyenv build.
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
-    PYTHON_BIN="$(command -v python3.11)"
-    export PYTHON_BIN
-    return
+    if sudo apt-get update -qq && \
+       sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev; then
+      PYTHON_BIN="$(command -v python3.11)"
+      if [[ -n "${PYTHON_BIN}" ]]; then
+        export PYTHON_BIN
+        return
+      fi
+    fi
   fi
 
-  echo "ERROR: python3.11 not found and apt-get is unavailable." >&2
-  echo "Please install Python 3.11 and set PYTHON_BIN before running this script." >&2
-  exit 1
+  install_python_via_pyenv
 }
 
 echo "[build_py311_wheel] Using lmdeploy source at: ${ROOT_DIR}"
@@ -72,4 +107,3 @@ echo "[build_py311_wheel] Building lmdeploy wheel with TurboMind..."
 LMDEPLOY_TARGET_DEVICE=cuda "${VENV_PY}" -m build --wheel --quiet
 
 echo "[build_py311_wheel] Done. Wheels are in: ${ROOT_DIR}/dist"
-
