@@ -20,6 +20,9 @@ SUPPORTED_ARCHS = dict(
     # llama, llama2, alpaca, vicuna, codellama, ultracm, yi,
     # deepseek-coder, deepseek-llm
     LlamaForCausalLM='llama',
+    # llama-based Eagle3 draft model used for speculative decoding
+    # shares the same structural layout as standard LlamaForCausalLM
+    LlamaForCausalLMEagle3='llama',
     # Qwen 7B-72B, Qwen-VL-7B
     QWenLMHeadModel='qwen',
     # Qwen2
