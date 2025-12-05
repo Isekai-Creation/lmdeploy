@@ -89,57 +89,24 @@ class SpeculativeDecodingManager:
     def _init_eagle(self):
         """Initialize EAGLE / EAGLE3 speculative decoding.
 
-        Current implementation loads the draft model as a standard HuggingFace
-        `AutoModelForCausalLM` on CUDA. This keeps the integration simple and
-        avoids touching TurboMind internals. Once the Python-side path is
-        proven, the draft can be migrated to a TurboMind instance for better
-        performance.
+        Native C++ implementation handles draft model loading and generation.
+        This method is kept for compatibility and logging.
         """
         if not self.config.model:
             raise ValueError("EAGLE method requires 'model' to be specified")
 
-        logger.info(f"Loading EAGLE draft model from: {self.config.model}")
+        logger.info(f"Initializing native EAGLE speculative decoding")
+        logger.info(f"Draft model: {self.config.model}")
         logger.info(
             "EAGLE config: "
             f"max_path_len={self.config.max_path_len}, "
             f"max_decoding_tokens={self.config.max_decoding_tokens}"
         )
-
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
-            logger.info("Loading EAGLE draft model with PyTorch backend...")
-
-            # Draft model: small, fast causal LM with the same tokenizer
-            self.draft_model = AutoModelForCausalLM.from_pretrained(
-                self.config.model,
-                torch_dtype=torch.float16,
-                device_map="cuda",
-                trust_remote_code=True,
-            )
-            self.draft_model.eval()
-
-            # Tokenizer is kept for possible future extensions (tree builders etc.)
-            self.draft_tokenizer = AutoTokenizer.from_pretrained(
-                self.config.model, trust_remote_code=True
-            )
-
-            # Tree-related knobs used by CUDA kernels / future integration
-            self.max_path_len = self.config.max_path_len or 5
-            self.max_decoding_tokens = self.config.max_decoding_tokens or 10
-
-            logger.info("EAGLE draft model loaded successfully")
-            logger.info(
-                "Tree config: "
-                f"max_path_len={self.max_path_len}, "
-                f"max_decoding_tokens={self.max_decoding_tokens}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to load EAGLE draft model: {e}")
-            raise RuntimeError(
-                f"Could not load EAGLE draft model from {self.config.model}: {e}"
-            )
+        
+        # Native implementation handles everything in C++
+        # We don't load the model here.
+        self.draft_model = None
+        self.draft_tokenizer = None
 
     def _init_ngram(self):
         """Initialize NGram speculative decoding."""
