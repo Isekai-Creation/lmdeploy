@@ -87,24 +87,31 @@ class SpeculativeDecodingManager:
             )
 
     def _init_eagle(self):
-        """Initialize EAGLE3 speculative decoding."""
+        """Initialize EAGLE / EAGLE3 speculative decoding.
+
+        Current implementation loads the draft model as a standard HuggingFace
+        `AutoModelForCausalLM` on CUDA. This keeps the integration simple and
+        avoids touching TurboMind internals. Once the Python-side path is
+        proven, the draft can be migrated to a TurboMind instance for better
+        performance.
+        """
         if not self.config.model:
             raise ValueError("EAGLE method requires 'model' to be specified")
 
         logger.info(f"Loading EAGLE draft model from: {self.config.model}")
         logger.info(
-            f"EAGLE config: max_path_len={self.config.max_path_len}, "
+            "EAGLE config: "
+            f"max_path_len={self.config.max_path_len}, "
             f"max_decoding_tokens={self.config.max_decoding_tokens}"
         )
 
-        # Load EAGLE3 draft model using PyTorch (HuggingFace)
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
-            logger.info("Loading EAGLE3 draft model with PyTorch backend...")
+            logger.info("Loading EAGLE draft model with PyTorch backend...")
 
-            # Load model
+            # Draft model: small, fast causal LM with the same tokenizer
             self.draft_model = AutoModelForCausalLM.from_pretrained(
                 self.config.model,
                 torch_dtype=torch.float16,
@@ -113,23 +120,23 @@ class SpeculativeDecodingManager:
             )
             self.draft_model.eval()
 
-            # Load tokenizer (needed for token mapping)
+            # Tokenizer is kept for possible future extensions (tree builders etc.)
             self.draft_tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model, trust_remote_code=True
             )
 
-            # Initialize tree structures for EAGLE3
+            # Tree-related knobs used by CUDA kernels / future integration
             self.max_path_len = self.config.max_path_len or 5
             self.max_decoding_tokens = self.config.max_decoding_tokens or 10
 
-            logger.info(f"EAGLE3 draft model loaded successfully: {self.config.model}")
+            logger.info("EAGLE draft model loaded successfully")
             logger.info(
-                f"Tree config: max_path_len={self.max_path_len}, "
+                "Tree config: "
+                f"max_path_len={self.max_path_len}, "
                 f"max_decoding_tokens={self.max_decoding_tokens}"
             )
-
         except Exception as e:
-            logger.error(f"Failed to load EAGLE3 draft model: {e}")
+            logger.error(f"Failed to load EAGLE draft model: {e}")
             raise RuntimeError(
                 f"Could not load EAGLE draft model from {self.config.model}: {e}"
             )
@@ -181,25 +188,36 @@ class SpeculativeDecodingManager:
             return []
 
         try:
-            # Convert input_ids to list if needed
+            # Convert input_ids to a flat Python list for the HF model
             if hasattr(input_ids, "tolist"):
                 input_ids = input_ids.tolist()
             elif not isinstance(input_ids, list):
-                input_ids = [input_ids]
+                input_ids = [int(input_ids)]
 
-            # Generate draft tokens using PyTorch model
             draft_tokens = self._generate_eagle_draft_tokens(input_ids, num_tokens)
 
-            logger.debug(f"Generated {len(draft_tokens)} draft tokens: {draft_tokens}")
+            logger.debug(
+                "Generated %d draft tokens: %s", len(draft_tokens), draft_tokens
+            )
             return draft_tokens
-
         except Exception as e:
             logger.error(f"Draft token generation failed: {e}")
             import traceback
 
             logger.error(traceback.format_exc())
             return []
-    
+
+    def generate_draft_tokens_sync(self, input_ids, num_tokens=None, hidden_states=None):
+        """Synchronous draft token generation.
+
+        This helper mirrors the interface used in the high‑level design doc
+        (generate_draft_tokens_sync) while delegating to the existing
+        generate_draft_tokens implementation. The hidden_states argument is
+        reserved for future integration with TurboMind's captured activations.
+        """
+        _ = hidden_states  # currently unused, kept for API compatibility
+        return self.generate_draft_tokens(input_ids, num_tokens=num_tokens)
+
     def _generate_eagle_draft_tokens(self, input_ids, num_tokens):
         """Generate draft tokens using EAGLE3 model."""
         import torch
@@ -239,16 +257,23 @@ class SpeculativeDecodingManager:
         return draft_tokens
 
     def verify_draft_tokens(self, draft_tokens, target_logits):
-        """
-        Verify draft tokens against target model outputs.
+        """Verify draft tokens against target model outputs.
 
-        Args:
-            draft_tokens: Draft token IDs
-            target_logits: Target model logits
-
-        Returns:
-            Acceptance results
+        This thin wrapper exists for callers that work with the manager
+        directly. Internally it delegates to :class:`DraftTokenVerifier`
+        which implements both greedy and probabilistic acceptance.
         """
-        # TODO: Implement verification
-        logger.warning("Draft token verification not yet implemented")
-        return {"accepted": [], "num_accepted": 0}
+        if not draft_tokens:
+            return {"accepted_tokens": [], "num_accepted": 0, "acceptance_rate": 0.0}
+
+        try:
+            from lmdeploy.turbomind.draft_verifier import DraftTokenVerifier
+
+            verifier = DraftTokenVerifier()
+            return verifier.verify_tokens(draft_tokens, target_logits)
+        except Exception as e:
+            logger.error(f"Draft token verification failed: {e}")
+            import traceback
+
+            logger.debug(traceback.format_exc())
+            return {"accepted_tokens": [], "num_accepted": 0, "acceptance_rate": 0.0}

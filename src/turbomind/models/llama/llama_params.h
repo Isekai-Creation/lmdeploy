@@ -111,6 +111,15 @@ struct EngineParam {
     int mlp_tp_rank;
 
     std::vector<int> devices;
+    
+    // speculative decoding params
+    bool enable_speculative_decoding;
+    int spec_max_draft_path_len;
+    int spec_max_decoding_draft_tokens;
+    int spec_max_decoding_tokens;
+    int spec_max_non_leaf_nodes;
+    std::string spec_draft_model_path;
+    std::string spec_method;  // "eagle", "eagle3", "ngram", etc.
 };
 
 enum class LoraPolicy : int

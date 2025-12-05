@@ -29,6 +29,9 @@
 #include "src/turbomind/models/llama/context.h"
 #include "src/turbomind/models/llama/llama_params.h"
 #include "src/turbomind/models/llama/unified_decoder.h"
+#include "src/turbomind/models/llama/EagleModule.h"
+#include "src/turbomind/models/llama/EagleBuffers.h"
+#include "lmdeploy/turbomind/speculative_decoding_mode.h"
 
 namespace turbomind {
 
@@ -93,6 +96,14 @@ private:
                        Buffer sampled_nums,
                        int    step,
                        int    max_context_len);
+    
+    // EAGLE speculative decoding step
+    void eagleSpeculativeStep(Buffer_<int>     draft_tokens,
+                              int              num_draft_tokens,
+                              Buffer_<int>     accepted_tokens,
+                              Buffer_<int>     num_accepted,
+                              const Sequence** sequences,
+                              int              batch_size);
 
 private:
     friend class LlamaBatch;
@@ -129,6 +140,12 @@ private:
 
     std::unique_ptr<UnifiedDecoder>     unified_decoder_;
     std::unique_ptr<DynamicDecodeLayer> dynamic_decode_;
+    
+    // Speculative decoding (EAGLE)
+    SpeculativeDecodingMode spec_mode_{SpeculativeDecodingMode::None()};
+    std::unique_ptr<EagleModule> eagle_module_;
+    std::unique_ptr<EagleBuffers> eagle_buffers_;
+    const EngineParam engine_param_;
 };
 
 }  // namespace turbomind

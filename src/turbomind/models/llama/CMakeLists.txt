@@ -22,6 +22,9 @@ add_library(Llama STATIC
         llama_kernels.cu
         llama_utils.cu
         mla_utils.cu
+        EagleModule.cc
+        EagleBuffers.cc
+        LlamaV2_eagle.cc
 )
 set_property(TARGET Llama PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET Llama PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)
@@ -43,4 +46,5 @@ target_link_libraries(Llama PUBLIC CUDA::cudart
         memory_utils
         cuda_utils
         logger
+        eagle_kernels
         anomaly_handler)

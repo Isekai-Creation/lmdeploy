@@ -378,6 +378,33 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
     engine_param_.mlp_tp_rank   = 0;
 
     engine_param_.devices = engine_reader["devices"].as<std::vector<int>>();
+    
+    // Parse speculative decoding config if present
+    if (engine_reader["speculative_config"]) {
+        const auto spec_reader = engine_reader["speculative_config"];
+        engine_param_.enable_speculative_decoding = true;
+        engine_param_.spec_method = spec_reader["method"].as<std::string>("");
+        engine_param_.spec_max_draft_path_len = spec_reader["max_path_len"].as<int>(5);
+        engine_param_.spec_max_decoding_draft_tokens = spec_reader["num_speculative_tokens"].as<int>(5);
+        engine_param_.spec_max_decoding_tokens = spec_reader["max_decoding_tokens"].as<int>(10);
+        engine_param_.spec_max_non_leaf_nodes = spec_reader["max_non_leaves_per_layer"].as<int>(10);
+        engine_param_.spec_draft_model_path = spec_reader["model"].as<std::string>("");
+        
+        TM_LOG_INFO("[LlamaTritonModel] Speculative decoding enabled: method=%s, "
+                    "max_path_len=%d, num_speculative_tokens=%d, max_decoding_tokens=%d",
+                    engine_param_.spec_method.c_str(),
+                    engine_param_.spec_max_draft_path_len,
+                    engine_param_.spec_max_decoding_draft_tokens,
+                    engine_param_.spec_max_decoding_tokens);
+    } else {
+        engine_param_.enable_speculative_decoding = false;
+        engine_param_.spec_method = "";
+        engine_param_.spec_max_draft_path_len = 0;
+        engine_param_.spec_max_decoding_draft_tokens = 0;
+        engine_param_.spec_max_decoding_tokens = 0;
+        engine_param_.spec_max_non_leaf_nodes = 0;
+        engine_param_.spec_draft_model_path = "";
+    }
 
     {
         auto tp                             = engine_param_.attn_tp_size * engine_param_.attn_cp_size;

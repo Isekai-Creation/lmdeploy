@@ -104,10 +104,17 @@ def update_parallel_config(cfg: TurbomindEngineConfig):
         total = cfg.dp * cfg.tp
         if not cfg.device_num:
             count = torch.cuda.device_count()
+            if count == 0:
+                # NVML failed - fallback to 1 GPU if CUDA is available
+                if torch.cuda.is_available():
+                    logger.warning("NVML initialization failed, assuming 1 GPU")
+                    count = 1
+                else:
+                    raise RuntimeError("No CUDA devices detected. Ensure NVIDIA drivers are properly installed.")
             if total < count:
                 count = total
             cfg.device_num = count
-        assert total % cfg.device_num == 0
+        assert total % cfg.device_num == 0, f"total ({total}) must be divisible by device_num ({cfg.device_num})"
         overlap = total // cfg.device_num
         attn_dp_size = overlap
         mlp_tp_size = overlap
@@ -195,6 +202,34 @@ class TurboMind:
                     f"Speculative decoding enabled: method={self.speculative_manager.get_method()}, "
                     f"num_tokens={self.speculative_manager.get_num_speculative_tokens()}"
                 )
+                
+                # Create separate TurboMind instance for draft model (EAGLE)
+                spec_config = _engine_config.speculative_config
+                if spec_config.method in ['eagle', 'eagle3'] and spec_config.model:
+                    logger.info(f"Loading EAGLE draft model from: {spec_config.model}")
+                    
+                    # Create draft engine config (smaller batch size, no speculation)
+                    draft_engine_config = TurbomindEngineConfig(
+                        dtype=_engine_config.dtype,
+                        tp=_engine_config.tp,
+                        session_len=_engine_config.session_len,
+                        max_batch_size=min(_engine_config.max_batch_size or 32, 8),  # Smaller batch for draft
+                        cache_max_entry_count=0.3,  # Less cache for draft
+                        enable_prefix_caching=False,
+                        speculative_config=None  # No nested speculation
+                    )
+                    
+                    # Import here to avoid circular dependency
+                    from lmdeploy.turbomind.turbomind import TurboMind
+                    
+                    self.draft_tm = TurboMind(
+                        model_path=spec_config.model,
+                        engine_config=draft_engine_config
+                    )
+                    logger.info("Draft model loaded successfully")
+                else:
+                    self.draft_tm = None
+                    
             except Exception as e:
                 logger.warning(
                     f"Failed to initialize speculative decoding: {e}. "
@@ -905,106 +940,118 @@ class TurboMindInstance:
         signal_cb = partial(self.async_signal_cb, sem)
 
         # ===== SPECULATIVE DECODING INTEGRATION =====
-        # Check if speculative decoding is enabled
+        # At this stage the C++ TurboMind engine is still responsible for the
+        # actual token generation. The Python speculative path is used to
+        # generate draft tokens and compute acceptance statistics, without
+        # altering the target output yet. This keeps the integration safe
+        # while we validate behaviour.
         use_speculation = (
             hasattr(self.tm_model, "speculative_manager")
             and self.tm_model.speculative_manager is not None
-            and sequence_start  # Only use speculation at sequence start for now
+            and sequence_start  # only collect stats on the first chunk for now
         )
 
-        if use_speculation:
-            logger.info(
-                f"[async_stream_infer] Using speculative decoding for session {session_id}"
-            )
-
-            # Generate draft tokens
-            spec_manager = self.tm_model.speculative_manager
-            num_spec_tokens = spec_manager.get_num_speculative_tokens()
-
-            try:
-                # Get current input tokens
-                input_token_ids = inputs if isinstance(inputs, list) else [inputs]
-
-                # Step 1: Generate draft tokens
-                draft_tokens = spec_manager.generate_draft_tokens(
-                    input_token_ids, num_spec_tokens
-                )
-
-                if draft_tokens and len(draft_tokens) > 0:
-                    logger.debug(
-                        f"Generated {len(draft_tokens)} draft tokens for session {session_id}"
-                    )
-
-                    # Step 2: Run target model on input + draft tokens
-                    # Extend input with draft tokens
-                    extended_inputs = input_token_ids + draft_tokens
-
-                    # Run target model forward pass
-                    outputs, shared_state, metrics = self.model_inst.forward(
-                        extended_inputs,
-                        session,
-                        gen_cfg,
-                        stream_output,
-                        self.tm_model.engine_config.enable_metrics,
-                        signal_cb,
-                    )
-
-                    # Step 3: Verify draft tokens
-                    # Extract logits from outputs for verification
-                    # Note: This is a simplified version - full implementation would
-                    # extract logits for each draft position
-                    from lmdeploy.turbomind.draft_verifier import DraftTokenVerifier
-
-                    if not hasattr(self, "_draft_verifier"):
-                        self._draft_verifier = DraftTokenVerifier()
-
-                    # For now, accept all draft tokens (TODO: proper verification)
-                    # In practice, we'd extract logits and verify each token
-                    logger.debug(
-                        f"Speculative step complete: drafted {len(draft_tokens)} tokens"
-                    )
-
-                else:
-                    # No draft tokens, fall back to standard generation
-                    logger.debug("No draft tokens generated, using standard generation")
-                    outputs, shared_state, metrics = self.model_inst.forward(
-                        inputs,
-                        session,
-                        gen_cfg,
-                        stream_output,
-                        self.tm_model.engine_config.enable_metrics,
-                        signal_cb,
-                    )
-
-            except Exception as e:
-                logger.warning(
-                    f"Speculative decoding failed: {e}, falling back to standard generation"
-                )
-                import traceback
-
-                logger.debug(traceback.format_exc())
-
-                # Fall back to standard generation
-                outputs, shared_state, metrics = self.model_inst.forward(
-                    inputs,
-                    session,
-                    gen_cfg,
-                    stream_output,
-                    self.tm_model.engine_config.enable_metrics,
-                    signal_cb,
-                )
-        else:
-            # Standard generation (no speculation)
-            outputs, shared_state, metrics = self.model_inst.forward(
-                inputs,
-                session,
-                gen_cfg,
-                stream_output,
-                self.tm_model.engine_config.enable_metrics,
-                signal_cb,
-            )
+        # Run the normal TurboMind forward pass
+        outputs, shared_state, metrics = self.model_inst.forward(
+            inputs,
+            session,
+            gen_cfg,
+            stream_output,
+            self.tm_model.engine_config.enable_metrics,
+            signal_cb,
+        )
 
         outputs = _tm_dict_to_torch_dict(outputs)
+
+        # If speculative decoding is configured, run EAGLE draft model
+        # and pass draft tokens to C++ for verification
+        if use_speculation:
+            try:
+                spec_config = self.tm_model.engine_config.speculative_config
+                
+                # Check if EAGLE mode and draft model is loaded
+                if (spec_config and 
+                    spec_config.method in ['eagle', 'eagle3'] and 
+                    hasattr(self.tm_model, 'draft_tm') and 
+                    self.tm_model.draft_tm is not None):
+                    
+                    logger.debug("[EAGLE] Running draft model for speculation")
+                    
+                    # Generate draft tokens using draft model
+                    num_spec_tokens = spec_config.num_speculative_tokens
+                    
+                    # Create draft model instance if needed
+                    if not hasattr(self, '_draft_instance'):
+                        self._draft_instance = self.tm_model.draft_tm.create_instance()
+                    
+                    # Run draft model to generate speculative tokens
+                    # Use same input as target model
+                    draft_gen_config = _tm.GenerationConfig()
+                    draft_gen_config.max_new_tokens = num_spec_tokens
+                    draft_gen_config.temperature = 0.0  # Greedy for draft
+                    draft_gen_config.top_k = 1
+                    
+                    draft_session = _tm.SessionParam(
+                        id=session_id + 1000000,  # Offset to avoid collision
+                        step=0,
+                        start=True,
+                        end=False
+                    )
+                    
+                    # Generate draft tokens (simplified - full impl would be async)
+                    draft_outputs, _, _ = self._draft_instance.forward(
+                        inputs,
+                        draft_session,
+                        draft_gen_config,
+                        False,  # No streaming for draft
+                        False,  # No metrics
+                        lambda: None
+                    )
+                    
+                    draft_outputs = _tm_dict_to_torch_dict(draft_outputs)
+                    draft_token_ids = draft_outputs['output_ids'][input_len:input_len+num_spec_tokens]
+                    
+                    logger.debug(f"[EAGLE] Generated {len(draft_token_ids)} draft tokens")
+                    
+                    # TODO: Pass draft tokens to C++ EAGLE module via TensorMap
+                    # This would require extending the C++ API to accept draft tokens
+                    # For now, log the draft tokens
+                    logger.info(f"[EAGLE] Draft tokens: {draft_token_ids.tolist()}")
+                    
+                else:
+                    # Fallback to metrics-only wrapper for other methods
+                    from lmdeploy.turbomind.speculative_generation import (
+                        SpeculativeGenerationWrapper,
+                    )
+
+                    if not hasattr(self, "_spec_wrapper"):
+                        self._spec_wrapper = SpeculativeGenerationWrapper(
+                            self.tm_model, self.tm_model.speculative_manager
+                        )
+
+                    # input_ids is a numpy array when coming from AsyncEngine
+                    if hasattr(input_ids, "tolist"):
+                        base_input_ids = input_ids.tolist()
+                    else:
+                        base_input_ids = list(input_ids)
+
+                    # Newly generated tokens for this call start after the prompt
+                    # (input_len). We ignore any pre-existing step offset here;
+                    # for sequence_start this is always 0.
+                    output_ids_buf = outputs["output_ids"]
+                    target_output_ids = output_ids_buf[input_len:].tolist()
+
+                    self._spec_wrapper.generate_step_with_speculation(
+                        base_input_ids,
+                        session,
+                        target_output_ids=target_output_ids,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Speculative statistics collection failed for session %s: %s",
+                    session_id,
+                    e,
+                )
 
         extra_fs = self._get_extra_output_processors(
             outputs, gen_config, input_len, metrics

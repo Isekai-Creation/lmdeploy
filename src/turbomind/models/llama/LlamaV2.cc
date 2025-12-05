@@ -78,7 +78,8 @@ LlamaV2::LlamaV2(DataType                     dtype,
     weights_(std::move(weights)),
     stream_(ctx.stream),
     linear_(*ctx.linear),
-    debug_(isDebug())
+    debug_(isDebug()),
+    engine_param_(engine)
 {
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
@@ -91,6 +92,29 @@ LlamaV2::LlamaV2(DataType                     dtype,
     // using float to avoid data overflow
     dynamic_decode_ = std::make_unique<DynamicDecodeLayer>(
         kFloat32, max_batch_size, vocab_size_, vocab_size_padded_, stream_, &ctx.device_prop);
+    
+    // Initialize EAGLE speculative decoding if enabled
+    if (engine.enable_speculative_decoding && engine.spec_method == "eagle") {
+        TM_LOG_INFO("[LlamaV2] Initializing EAGLE speculative decoding: "
+                    "max_path_len=%d, num_spec_tokens=%d, max_decoding_tokens=%d",
+                    engine.spec_max_draft_path_len,
+                    engine.spec_max_decoding_draft_tokens,
+                    engine.spec_max_decoding_tokens);
+        
+        spec_mode_ = SpeculativeDecodingMode::Eagle();
+        
+        eagle_module_ = std::make_unique<EagleModule>(
+            engine.spec_max_draft_path_len,
+            engine.spec_max_decoding_draft_tokens,
+            engine.spec_max_decoding_tokens,
+            engine.spec_max_non_leaf_nodes
+        );
+        
+        eagle_buffers_ = std::make_unique<EagleBuffers>();
+        eagle_buffers_->allocate(max_batch_size, eagle_module_.get(), stream_);
+        
+        TM_LOG_INFO("[LlamaV2] EAGLE module initialized successfully");
+    }
 }
 
 void LlamaV2::updateEmbedding(char*            decoder_input,

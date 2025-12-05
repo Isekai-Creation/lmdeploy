@@ -82,3 +82,9 @@ work_dir*/
 
 !CMakeLists.txt
 proxy_config.yml
+
+# Build artifacts and environments
+offline_pkgs/
+venv_turbomind_build/
+build_turbomind/
+
