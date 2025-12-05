@@ -26,6 +26,7 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     // Allocate input buffers
     cudaMalloc(&inputs.draft_tokens, batch_size_ * max_decoding_tokens_ * sizeof(TokenIdType));
     cudaMalloc(&inputs.draft_lens, batch_size_ * sizeof(SizeType));
+    cudaMalloc(&inputs.target_tokens, batch_size_ * max_decoding_tokens_ * sizeof(TokenIdType));
     cudaMalloc(&inputs.draft_paths, batch_size_ * max_decoding_tokens_ * max_path_len_ * sizeof(SizeType));
     cudaMalloc(&inputs.packed_masks, batch_size_ * max_decoding_tokens_ * num_packed_masks_ * sizeof(SizeType));
     cudaMalloc(&inputs.leaf_mask, batch_size_ * max_decoding_tokens_ * sizeof(int8_t));
@@ -54,11 +55,14 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMalloc(&outputs.accepted_tokens, batch_size_ * max_path_len_ * sizeof(TokenIdType));
     cudaMalloc(&outputs.accepted_lens, batch_size_ * sizeof(SizeType));
     cudaMalloc(&outputs.best_path_ids, batch_size_ * sizeof(SizeType));
+    cudaMalloc(&outputs.accepted_lengths_cumsum, batch_size_ * sizeof(SizeType));
+    cudaMalloc(&outputs.accepted_path_offsets, batch_size_ * max_decoding_tokens_ * sizeof(SizeType));
     cudaMalloc(&outputs.acceptance_rate, batch_size_ * sizeof(float));
     
     // Initialize buffers to zero
     cudaMemsetAsync(inputs.draft_tokens, 0, batch_size_ * max_decoding_tokens_ * sizeof(TokenIdType), stream);
     cudaMemsetAsync(inputs.draft_lens, 0, batch_size_ * sizeof(SizeType), stream);
+    cudaMemsetAsync(inputs.target_tokens, 0, batch_size_ * max_decoding_tokens_ * sizeof(TokenIdType), stream);
     cudaMemsetAsync(inputs.draft_paths, -1, batch_size_ * max_decoding_tokens_ * max_path_len_ * sizeof(SizeType), stream);
     cudaMemsetAsync(outputs.accepted_lens, 0, batch_size_ * sizeof(SizeType), stream);
     
@@ -78,6 +82,7 @@ void EagleBuffers::free() {
     // Free input buffers
     cudaFree(inputs.draft_tokens);
     cudaFree(inputs.draft_lens);
+    cudaFree(inputs.target_tokens);
     cudaFree(inputs.draft_paths);
     cudaFree(inputs.packed_masks);
     cudaFree(inputs.leaf_mask);
@@ -100,6 +105,8 @@ void EagleBuffers::free() {
     cudaFree(outputs.accepted_tokens);
     cudaFree(outputs.accepted_lens);
     cudaFree(outputs.best_path_ids);
+    cudaFree(outputs.accepted_lengths_cumsum);
+    cudaFree(outputs.accepted_path_offsets);
     cudaFree(outputs.acceptance_rate);
     
     inputs.zero();

@@ -23,6 +23,14 @@ struct RequestMetrics {
     int64_t enque_time{};      // when a request is enqued
     int64_t scheduled_time{};  // when a request is scheduled for inference
 
+    // EAGLE speculative decoding metrics (TurboMind backend)
+    // Aggregated over the lifetime of a request.
+    int64_t eagle_total_draft_tokens{};      // total number of draft tokens proposed
+    int64_t eagle_total_accepted_tokens{};   // total number of draft tokens accepted
+    int64_t eagle_steps{};                   // number of speculative steps taken
+    int64_t eagle_total_rewound_tokens{};    // total number of tokens rewound from KV cache
+    int64_t eagle_rewind_steps{};            // number of steps where KV rewind was applied
+
     static int64_t timestamp()
     {
         // Get current timestamp in microseconds since Unix epoch
@@ -51,6 +59,11 @@ inline std::ostream& operator<<(std::ostream& os, const RequestMetrics& m)
     os << "RequestMetrics { ";
     os << "enque_time=" << m.enque_time;
     os << ", scheduled_time=" << m.scheduled_time;
+    os << ", eagle_total_draft_tokens=" << m.eagle_total_draft_tokens;
+    os << ", eagle_total_accepted_tokens=" << m.eagle_total_accepted_tokens;
+    os << ", eagle_steps=" << m.eagle_steps;
+     os << ", eagle_total_rewound_tokens=" << m.eagle_total_rewound_tokens;
+     os << ", eagle_rewind_steps=" << m.eagle_rewind_steps;
     os << " }";
     return os;
 }

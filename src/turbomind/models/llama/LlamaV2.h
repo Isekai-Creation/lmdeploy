@@ -54,6 +54,10 @@ public:
         return vocab_size_;
     }
 
+    bool isEagleEnabled() const noexcept
+    {
+        return spec_mode_.isEagle() && eagle_module_ && eagle_buffers_ && eagle_module_->isEnabled();
+    }
 private:
     void updateEmbedding(char*            decoder_input,
                          const int        bsz,
@@ -98,12 +102,32 @@ private:
                        int    max_context_len);
     
     // EAGLE speculative decoding step
+    // draft_tokens:  [batch_size] or flattened tree tokens (host)
+    // target_tokens: [batch_size] per-sequence target token IDs (host)
+    // accepted_tokens: host buffer for per-sequence accepted draft tokens
     void eagleSpeculativeStep(Buffer_<int>     draft_tokens,
+                              Buffer_<int>     target_tokens,
                               int              num_draft_tokens,
                               Buffer_<int>     accepted_tokens,
+                              Buffer_<int>     accepted_lens,
                               Buffer_<int>     num_accepted,
                               const Sequence** sequences,
                               int              batch_size);
+
+    // Run draft model (EagleNet) over the last-token hidden states to
+    // produce draft logits / hidden states for speculative decoding.
+    // This is a thin wrapper around EagleModule::forward so that
+    // LlamaBatch does not need to access EagleModule directly.
+    void eagleDraftForward(const Tensor& hidden_states,
+                           Tensor&       draft_logits,
+                           Tensor&       draft_hidden);
+
+    // Max engine tokens TurboMind should handle per decode step
+    // when running in EAGLE speculative mode.
+    int eagleMaxEngineTokensPerStep() const noexcept
+    {
+        return eagle_max_engine_tokens_per_step_;
+    }
 
 private:
     friend class LlamaBatch;
@@ -146,6 +170,7 @@ private:
     std::unique_ptr<EagleModule> eagle_module_;
     std::unique_ptr<EagleBuffers> eagle_buffers_;
     const EngineParam engine_param_;
+    int eagle_max_engine_tokens_per_step_{0};
 };
 
 }  // namespace turbomind

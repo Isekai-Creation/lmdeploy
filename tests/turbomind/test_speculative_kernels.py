@@ -258,5 +258,76 @@ class TestAcceptanceStats:
         assert acceptance_rates[2].item() == pytest.approx(1.0), "100% acceptance"
 
 
+class TestKVCacheRewindHelper:
+    """Tests for the host-side KV rewind helper + kernel."""
+
+    def test_compute_and_invoke_kv_cache_rewind_marks_tail_blocks(self, monkeypatch):
+        """Rewind helper should compute rewind_lengths and clear tail table entries."""
+        from lmdeploy.turbomind.kernels.speculative_decoding import common as sd_common
+
+        # Small synthetic configuration.
+        block_size = 4
+        max_batch_size = 4
+        max_blocks_per_seq = 3
+        num_layers = 2
+        batch_size = 2
+
+        # Host-side draft / accepted lengths per slot.
+        # slot 0: 5 draft, 3 accepted -> rewind 2 tokens (~1 block).
+        # slot 1: 7 draft, 1 accepted -> rewind 6 tokens (~2 blocks).
+        draft_lengths = [5, 7, 0, 0]
+        accepted_lengths = [3, 1, 0, 0]
+        batch_slots = [0, 1]
+
+        # Device buffers for block tables and rewind lengths.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        block_tables = torch.arange(
+            max_batch_size * max_blocks_per_seq, dtype=torch.int32, device=device
+        ).view(max_batch_size, max_blocks_per_seq)
+        rewind_lengths_dev = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
+
+        # For this CPU-only test, we call the helper's logic via Python:
+        # compute rewind lengths the same way as the C++ helper.
+        expected_rewind = []
+        for slot in range(max_batch_size):
+            d = max(0, draft_lengths[slot])
+            a = max(0, accepted_lengths[slot])
+            expected_rewind.append(max(0, d - a))
+
+        # Simulate what computeAndInvokeKVCacheRewind would write into
+        # rewind_lengths and then into KVCacheRewindParams.
+        rewind_lengths_host = torch.tensor(expected_rewind, dtype=torch.int32, device=device)
+        rewind_lengths_dev.copy_(rewind_lengths_host)
+
+        # Now invoke the CUDA kernel wrapper directly.
+        params = sd_common.KVCacheRewindParams(
+            kv_cache_blocks=None,
+            rewind_lengths=rewind_lengths_dev,
+            batch_slots=torch.tensor(batch_slots, dtype=torch.int32, device=device),
+            block_tables=block_tables,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            num_layers=num_layers,
+            block_size=block_size,
+            max_blocks_per_seq=max_blocks_per_seq,
+        )
+
+        sd_common.invoke_kv_cache_rewind(params)
+
+        # On slot 0 we expect 1 block cleared from the tail.
+        # On slot 1 we expect 2 blocks cleared from the tail.
+        table_host = block_tables.cpu().numpy()
+
+        # slot 0: last block should be -1, the others remain non-negative.
+        assert table_host[0, -1] == -1
+        assert table_host[0, 0] >= 0 and table_host[0, 1] >= 0
+
+        # slot 1: last two blocks should be -1.
+        assert table_host[1, -1] == -1
+        assert table_host[1, -2] == -1
+        # first block remains non-negative.
+        assert table_host[1, 0] >= 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -81,6 +81,7 @@ add_library(eagle_kernels STATIC
     ${EAGLE_KERNEL_DIR}/leaf_mask_kernels.cu
     ${EAGLE_KERNEL_DIR}/packed_mask_kernels.cu
     ${EAGLE_KERNEL_DIR}/common.cu
+    ${EAGLE_KERNEL_DIR}/kv_rewind_helper.cu
 )
 set_property(TARGET eagle_kernels PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET eagle_kernels PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

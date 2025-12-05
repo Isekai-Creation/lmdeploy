@@ -93,27 +93,70 @@ LlamaV2::LlamaV2(DataType                     dtype,
     dynamic_decode_ = std::make_unique<DynamicDecodeLayer>(
         kFloat32, max_batch_size, vocab_size_, vocab_size_padded_, stream_, &ctx.device_prop);
     
-    // Initialize EAGLE speculative decoding if enabled
+    // Compute an upper bound on how many tokens per step the engine
+    // should attempt when running in EAGLE speculative mode. This is
+    // analogous to TensorRT-LLM's "max decoding engine tokens".
+    if (engine.enable_speculative_decoding && (engine.spec_method == "eagle" || engine.spec_method == "eagle3")) {
+        const int max_engine_tokens = std::min(engine.spec_max_decoding_tokens, engine.max_forward_token_num);
+        eagle_max_engine_tokens_per_step_ = std::max(1, max_engine_tokens);
+        TM_LOG_INFO("[LlamaV2][EAGLE] max_engine_tokens_per_step=%d "
+                    "(spec_max_decoding_tokens=%d, max_forward_token_num=%d)",
+                    eagle_max_engine_tokens_per_step_,
+                    engine.spec_max_decoding_tokens,
+                    engine.max_forward_token_num);
+    }
+
+    // Initialize EAGLE speculative decoding if enabled.
+    //
+    // Safety principle: EAGLE is considered active for this engine only if the
+    // draft model path is provided and EagleModule::load succeeds. Otherwise
+    // we explicitly disable speculative mode so TurboMind falls back to
+    // baseline decoding with no partial EAGLE side effects or metrics.
     if (engine.enable_speculative_decoding && engine.spec_method == "eagle") {
         TM_LOG_INFO("[LlamaV2] Initializing EAGLE speculative decoding: "
                     "max_path_len=%d, num_spec_tokens=%d, max_decoding_tokens=%d",
                     engine.spec_max_draft_path_len,
                     engine.spec_max_decoding_draft_tokens,
                     engine.spec_max_decoding_tokens);
-        
+
         spec_mode_ = SpeculativeDecodingMode::Eagle();
-        
-        eagle_module_ = std::make_unique<EagleModule>(
-            engine.spec_max_draft_path_len,
-            engine.spec_max_decoding_draft_tokens,
-            engine.spec_max_decoding_tokens,
-            engine.spec_max_non_leaf_nodes
-        );
-        
-        eagle_buffers_ = std::make_unique<EagleBuffers>();
-        eagle_buffers_->allocate(max_batch_size, eagle_module_.get(), stream_);
-        
-        TM_LOG_INFO("[LlamaV2] EAGLE module initialized successfully");
+
+        eagle_module_ = std::make_unique<EagleModule>(engine.spec_max_draft_path_len,
+                                                      engine.spec_max_decoding_draft_tokens,
+                                                      engine.spec_max_decoding_tokens,
+                                                      engine.spec_max_non_leaf_nodes);
+
+        bool eagle_ok = false;
+
+        if (!engine.spec_draft_model_path.empty()) {
+            TM_LOG_INFO("[LlamaV2] Loading EAGLE draft model from %s", engine.spec_draft_model_path.c_str());
+            eagle_module_->load(engine.spec_draft_model_path, 0, stream_);
+            if (!eagle_module_->isEnabled()) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE] Draft model load failed; disabling EAGLE and falling back to baseline decoding");
+            }
+            else {
+                TM_LOG_INFO("[LlamaV2][EAGLE] Draft model loaded and validated");
+                eagle_ok = true;
+            }
+        }
+        else {
+            TM_LOG_WARNING(
+                "[LlamaV2][EAGLE] Speculative decoding requested but no draft model path provided; disabling EAGLE for "
+                "this engine");
+        }
+
+        if (eagle_ok) {
+            eagle_buffers_ = std::make_unique<EagleBuffers>();
+            eagle_buffers_->allocate(max_batch_size, eagle_module_.get(), stream_);
+            TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE module initialized successfully");
+        }
+        else {
+            spec_mode_ = SpeculativeDecodingMode::Disabled();
+            eagle_module_.reset();
+            eagle_buffers_.reset();
+            TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE disabled; falling back to baseline decoding for this engine");
+        }
     }
 }
 
@@ -387,6 +430,30 @@ void LlamaV2::dynamicDecode(Buffer token_ids,
     }
 
     dynamic_decode_->Forward(args);
+}
+
+void LlamaV2::eagleDraftForward(const Tensor& hidden_states,
+                                Tensor&       draft_logits,
+                                Tensor&       draft_hidden)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    if (!spec_mode_.isEagle() || !eagle_module_ || !eagle_buffers_) {
+        return;
+    }
+
+    // Current EagleModule::forward implementation consumes hidden_states and
+    // produces normalized hidden_states + logits via the draft LM head.
+    // Input ids are unused for the minimal draft network, so we pass a
+    // default tensor here.
+    Tensor dummy_input_ids;
+    eagle_module_->forward(
+        dummy_input_ids,   // input_ids (unused in current implementation)
+        hidden_states,     // last-token hidden states from target model
+        draft_logits,      // [batch, vocab_size_padded]
+        draft_hidden,      // [batch, hidden_units]
+        linear_,           // reuse LlamaLinear for LM head matmul
+        stream_);
 }
 
 }  // namespace turbomind

@@ -33,6 +33,7 @@ target_link_libraries(Llama PUBLIC CUDA::cudart
         core
         gemm2
         CUDA::cublas
+        yaml-cpp::yaml-cpp
         nvidia::cutlass::cutlass
         rms_norm
         DynamicDecodeLayer

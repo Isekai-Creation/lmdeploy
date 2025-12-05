@@ -48,7 +48,13 @@ nvcc --version || { echo "ERROR: nvcc not found in PATH"; exit 1; }
 if [[ -z "${TM_ARCH}" ]]; then
   if command -v nvidia-smi &>/dev/null; then
     # e.g. '8.0' -> '80', '8.9' -> '89', '9.0' -> '90'
-    CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d ' ' | tr -d '.')
+    # Tolerate failures from nvidia-smi (e.g. when NVML is not available)
+    # and ignore non-numeric output like "Failed to initialize NVML".
+    CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+      | head -n1 \
+      | grep -Eo '[0-9]+(\.[0-9]+)?' \
+      | head -n1 \
+      | tr -d ' ' | tr -d '.' || true)
     if [[ -n "${CAP}" ]]; then
       TM_ARCH="${CAP}"
     else
@@ -87,10 +93,11 @@ echo ">>> Installing Python build dependencies..."
 pip install -U 'cmake>=3.26' ninja build wheel
 
 # CUDA-specific requirements (includes torch, etc.)
-if [[ -f "requirements/requirements_cuda.txt" ]]; then
-  pip install -r requirements/requirements_cuda.txt
+# Use the consolidated CUDA requirements file at the repo root.
+if [[ -f "requirements_cuda.txt" ]]; then
+  pip install -r requirements_cuda.txt
 else
-  echo "WARN: requirements/requirements_cuda.txt not found; skipping."
+  echo "WARN: requirements_cuda.txt not found; skipping."
 fi
 
 ###############################################

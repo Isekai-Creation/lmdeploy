@@ -164,10 +164,10 @@ void invokePackAcceptedPaths(
 
 /**
  * @brief Kernel: Rewind KV cache for rejected tokens
- * 
- * Marks blocks as free without actual memory operations.
- * This is a placeholder - actual implementation depends on
- * TurboMind's KV cache manager internals.
+ *
+ * Marks tail KV blocks as free in a per‑sequence block table. The caller is
+ * responsible for mapping these logical blocks back to the engine’s actual
+ * cache manager (e.g. TurboMind’s SequenceManager / BlockManager).
  */
 __global__ void kvCacheRewindKernel(
     void** kv_cache_blocks,
@@ -183,20 +183,40 @@ __global__ void kvCacheRewindKernel(
     if (batch_idx >= batch_size) return;
     
     int slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
-    int rewind_len = rewind_lengths[slot];
+    int rewind_len = rewind_lengths ? rewind_lengths[slot] : 0;
     
     if (rewind_len <= 0) return;
     
-    // Calculate how many blocks to free
+    // Calculate how many whole blocks from the tail we should consider
+    // rewinding for this sequence.
     int blocks_to_free = (rewind_len + block_size - 1) / block_size;
-    
-    // Mark blocks as free in block table
-    // TODO: Integrate with TurboMind's actual KV cache manager
-    // This is a placeholder showing the concept
-    for (int layer = 0; layer < num_layers; ++layer) {
-        for (int block_idx = 0; block_idx < blocks_to_free; ++block_idx) {
-            // Mark block as available
-            // Actual implementation will call TurboMind's free_block()
+
+    if (!block_tables || blocks_to_free <= 0) {
+        return;
+    }
+
+    // `block_tables` is laid out as [max_batch_size, max_blocks_per_seq]
+    // where each row holds the logical block IDs for a given sequence. For
+    // now we simply mark the last `blocks_to_free` entries in the row as -1
+    // so higher‑level code can treat them as free / invalidated.
+    SizeType* table = const_cast<SizeType*>(block_tables);
+    SizeType* row   = table + static_cast<size_t>(slot) * max_blocks_per_seq;
+
+    for (int i = 0; i < blocks_to_free && i < max_blocks_per_seq; ++i) {
+        int idx = max_blocks_per_seq - 1 - i;
+        row[idx] = -1;
+    }
+
+    // Optionally clear the corresponding kv_cache_blocks pointers when
+    // provided. The layout of `kv_cache_blocks` is engine‑specific; we
+    // assume a simple [num_layers, max_blocks_per_seq] layout here.
+    if (kv_cache_blocks) {
+        for (int layer = 0; layer < num_layers; ++layer) {
+            void** layer_blocks = kv_cache_blocks + static_cast<size_t>(layer) * max_blocks_per_seq;
+            for (int i = 0; i < blocks_to_free && i < max_blocks_per_seq; ++i) {
+                int idx = max_blocks_per_seq - 1 - i;
+                layer_blocks[idx] = nullptr;
+            }
         }
     }
 }

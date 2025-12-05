@@ -97,7 +97,8 @@ class SpeculativeGenerationWrapper:
         # Step 2: If target outputs are available, build a synthetic logits
         # tensor so we can reuse DraftTokenVerifier's logic. For integration
         # inside TurboMindInstance.async_stream_infer we pass target_output_ids
-        # via kwargs; for unit tests we keep the original "accept first 2" stub.
+        # via kwargs. When no target outputs are provided we do not accept any
+        # draft tokens, to avoid unsound speculative behaviour in production.
         target_output_ids: Optional[List[int]] = kwargs.get("target_output_ids")
 
         if target_output_ids:
@@ -122,14 +123,10 @@ class SpeculativeGenerationWrapper:
                     draft_tokens[:effective_len], target_logits
                 )
         else:
-            # Backwards‑compatible stub behaviour used by existing tests:
-            # accept first 2 draft tokens purely for sanity‑checking.
-            accepted = draft_tokens[:2]
-            num_accepted = len(accepted)
             verification_result = {
-                "accepted_tokens": accepted,
-                "num_accepted": num_accepted,
-                "acceptance_rate": num_accepted / len(draft_tokens),
+                "accepted_tokens": [],
+                "num_accepted": 0,
+                "acceptance_rate": 0.0,
             }
 
         num_accepted = verification_result["num_accepted"]

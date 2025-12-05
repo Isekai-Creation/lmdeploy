@@ -26,6 +26,8 @@ struct EagleBuffers {
         // Draft tokens from previous iteration
         TokenIdType* draft_tokens;           // [batch_size, max_decoding_tokens]
         SizeType* draft_lens;                // [batch_size]
+        // Target tokens for device-side acceptance
+        TokenIdType* target_tokens;          // [batch_size, max_decoding_tokens]
         
         // Tree structure
         SizeType* draft_paths;               // [batch_size, max_decoding_tokens, max_path_len]
@@ -52,6 +54,7 @@ struct EagleBuffers {
         void zero() {
             draft_tokens = nullptr;
             draft_lens = nullptr;
+            target_tokens = nullptr;
             draft_paths = nullptr;
             packed_masks = nullptr;
             leaf_mask = nullptr;
@@ -82,6 +85,10 @@ struct EagleBuffers {
         TokenIdType* accepted_tokens;        // [batch_size, max_path_len]
         SizeType* accepted_lens;             // [batch_size]
         SizeType* best_path_ids;             // [batch_size]
+
+        // Packed acceptance metadata for downstream KV / decode updates
+        SizeType* accepted_lengths_cumsum;   // [batch_size]
+        SizeType* accepted_path_offsets;     // [batch_size, max_decoding_tokens]
         
         // Statistics
         float* acceptance_rate;              // [batch_size]
@@ -95,13 +102,15 @@ struct EagleBuffers {
             accepted_tokens = nullptr;
             accepted_lens = nullptr;
             best_path_ids = nullptr;
+            accepted_lengths_cumsum = nullptr;
+            accepted_path_offsets = nullptr;
             acceptance_rate = nullptr;
         }
     };
     
     Inputs inputs;
     Outputs outputs;
-    
+
     EagleBuffers() = default;
     ~EagleBuffers() { free(); }
     

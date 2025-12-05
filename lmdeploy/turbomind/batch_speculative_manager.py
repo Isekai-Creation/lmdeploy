@@ -41,30 +41,27 @@ class BatchSpeculativeManager(SpeculativeDecodingManager):
         session_ids: Optional[List[int]] = None,
     ) -> List[List[int]]:
         """
-        Generate draft tokens for entire batch in parallel.
+        Generate draft tokens for entire batch in parallel using the Python
+        draft model.
 
-        This is the key innovation: process all batch items together
-        instead of sequentially like TensorRT-LLM.
-
-        Args:
-            batch_input_ids: List of input token sequences
-            num_tokens: Number of draft tokens to generate per sequence
-            session_ids: Optional session IDs for each sequence
-
-        Returns:
-            List of draft token sequences, one per input
-
-        Example:
-            >>> manager = BatchSpeculativeManager(...)
-            >>> batch_inputs = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
-            >>> drafts = await manager.generate_batch_draft_tokens_async(
-            ...     batch_inputs, num_tokens=3
-            ... )
-            >>> # drafts = [[10, 11, 12], [13, 14, 15], [16, 17, 18]]
-            >>> # All generated in parallel!
+        Note:
+            For native EAGLE/EAGLE3, TurboMind's C++ backend owns the draft
+            model and speculative loop. In that case this method returns
+            empty drafts so that Python-side speculation is effectively
+            disabled and native TurboMind EAGLE remains the single source
+            of truth.
         """
         if num_tokens is None:
             num_tokens = self.config.num_speculative_tokens
+
+        # EAGLE/EAGLE3 are handled natively by TurboMind; do not attempt
+        # to run a separate Python draft model for these methods.
+        if self.config.method in ("eagle", "eagle3"):
+            logger.debug(
+                "EAGLE/EAGLE3 is handled natively in TurboMind; "
+                "skipping Python batch draft generation"
+            )
+            return [[] for _ in batch_input_ids]
 
         if not hasattr(self, "draft_model"):
             logger.warning("Draft model not loaded, returning empty drafts")
@@ -251,10 +248,25 @@ class OptimizedBatchSpeculativeManager(BatchSpeculativeManager):
                 batch_input_ids, num_tokens, session_ids
             )
 
-        # Use pre-allocated buffers for efficiency
-        # (Implementation would use self.draft_buffer and self.packed_mask_buffer)
-
-        # For now, delegate to parent
-        return await super().generate_batch_draft_tokens_async(
+        # Delegate to parent to generate the actual drafts
+        batch_draft_tokens = await super().generate_batch_draft_tokens_async(
             batch_input_ids, num_tokens, session_ids
         )
+
+        # Reuse pre-allocated device buffers to store the latest drafts.
+        # This avoids per-call tensor allocations and keeps a contiguous
+        # representation that future kernels (e.g., packed-mask builders)
+        # can consume directly.
+        with torch.no_grad():
+            self.draft_buffer.zero_()
+            max_tokens = self.draft_buffer.size(1)
+            for i, drafts in enumerate(batch_draft_tokens):
+                if i >= self.batch_size:
+                    break
+                if not drafts:
+                    continue
+                length = min(len(drafts), max_tokens)
+                self.draft_buffer[i, :length] = torch.as_tensor(
+                    drafts[:length], dtype=torch.int32, device=self.device
+                )
+        return batch_draft_tokens

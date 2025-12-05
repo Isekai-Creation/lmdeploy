@@ -2,7 +2,8 @@
 """Speculative decoding configuration for LMDeploy engines."""
 
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Dict
+import warnings
 
 
 @dataclass
@@ -115,3 +116,102 @@ class SpeculativeConfig:
                 self.max_non_leaves_per_layer = 10
             if self.capture_layers is None:
                 self.capture_layers = [-1]  # Last layer by default
+
+            # EAGLE-specific validation: all structural parameters must be
+            # positive and internally consistent so that TurboMind can safely
+            # size EagleModule / EagleBuffers.
+            if self.max_path_len <= 0:
+                raise ValueError(
+                    f"max_path_len must be > 0 for method '{self.method}', "
+                    f"got {self.max_path_len}"
+                )
+            if self.max_decoding_tokens <= 0:
+                raise ValueError(
+                    f"max_decoding_tokens must be > 0 for method '{self.method}', "
+                    f"got {self.max_decoding_tokens}"
+                )
+            if self.max_non_leaves_per_layer <= 0:
+                raise ValueError(
+                    f"max_non_leaves_per_layer must be > 0 for method '{self.method}', "
+                    f"got {self.max_non_leaves_per_layer}"
+                )
+
+            # max_path_len cannot exceed max_decoding_tokens and should be at
+            # least as large as num_speculative_tokens (otherwise the tree
+            # cannot represent the speculative step).
+            if self.max_path_len > self.max_decoding_tokens:
+                raise ValueError(
+                    "max_path_len must be <= max_decoding_tokens "
+                    f"for method '{self.method}', got "
+                    f"max_path_len={self.max_path_len}, "
+                    f"max_decoding_tokens={self.max_decoding_tokens}"
+                )
+            if self.max_path_len < self.num_speculative_tokens:
+                raise ValueError(
+                    "max_path_len must be >= num_speculative_tokens "
+                    f"for method '{self.method}', got "
+                    f"max_path_len={self.max_path_len}, "
+                    f"num_speculative_tokens={self.num_speculative_tokens}"
+                )
+
+    # ---- TurboMind alignment helpers -------------------------------------------------
+
+    def to_turbomind_spec_dict(self) -> Dict[str, object]:
+        """Return a dict matching TurboMind's expected speculative_config block.
+
+        This dict uses the same keys that the C++ Triton backend reads in
+        ``LlamaTritonModel.cc`` (``method``, ``model``, ``num_speculative_tokens``,
+        ``max_path_len``, ``max_decoding_tokens``, ``max_non_leaves_per_layer``),
+        so it can be used when constructing engine configs or sanity-checking
+        YAML-based configs for TurboMind.
+        """
+        d: Dict[str, object] = {
+            "method": self.method,
+        }
+        if self.model:
+            d["model"] = self.model
+        # Only include structural fields when they are explicitly set or have
+        # been defaulted in __post_init__.
+        d["num_speculative_tokens"] = self.num_speculative_tokens
+        if self.max_path_len is not None:
+            d["max_path_len"] = self.max_path_len
+        if self.max_decoding_tokens is not None:
+            d["max_decoding_tokens"] = self.max_decoding_tokens
+        if self.max_non_leaves_per_layer is not None:
+            d["max_non_leaves_per_layer"] = self.max_non_leaves_per_layer
+        return d
+
+
+def check_turbomind_spec_alignment(spec_cfg: SpeculativeConfig, engine_spec: Dict[str, object]) -> None:
+    """Emit a warning if SpeculativeConfig and engine-side spec differ.
+
+    Args:
+        spec_cfg: The high-level SpeculativeConfig used in Python.
+        engine_spec: A dict that reflects the speculative_config block seen
+            by TurboMind (for example, parsed from an engine YAML or built
+            by a higher-level config generator).
+
+    This helper compares the fields that matter for TurboMind EAGLE
+    integration (method, model, num_speculative_tokens, max_path_len,
+    max_decoding_tokens, max_non_leaves_per_layer). If any of them differ
+    between Python and ``engine_spec``, a UserWarning is emitted describing
+    the mismatch so offline users can diagnose configuration drift.
+    """
+    expected = spec_cfg.to_turbomind_spec_dict()
+    mismatches = {}
+    for key, expected_val in expected.items():
+        if key not in engine_spec:
+            mismatches[key] = ("<missing>", expected_val)
+        else:
+            current_val = engine_spec[key]
+            if current_val != expected_val:
+                mismatches[key] = (current_val, expected_val)
+
+    if mismatches:
+        details = ", ".join(
+            f"{k}: engine={cur!r}, expected={exp!r}" for k, (cur, exp) in mismatches.items()
+        )
+        warnings.warn(
+            f"Turbomind speculative_config mismatch detected: {details}",
+            UserWarning,
+        )

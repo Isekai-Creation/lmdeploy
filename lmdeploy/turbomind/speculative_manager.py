@@ -95,16 +95,18 @@ class SpeculativeDecodingManager:
         if not self.config.model:
             raise ValueError("EAGLE method requires 'model' to be specified")
 
-        logger.info(f"Initializing native EAGLE speculative decoding")
-        logger.info(f"Draft model: {self.config.model}")
+        logger.info("Initializing native EAGLE speculative decoding")
+        logger.info("EAGLE draft model (managed natively by TurboMind): %s", self.config.model)
         logger.info(
-            "EAGLE config: "
-            f"max_path_len={self.config.max_path_len}, "
-            f"max_decoding_tokens={self.config.max_decoding_tokens}"
+            "EAGLE config: max_path_len=%s, max_decoding_tokens=%s, num_speculative_tokens=%s",
+            getattr(self.config, "max_path_len", None),
+            getattr(self.config, "max_decoding_tokens", None),
+            getattr(self.config, "num_speculative_tokens", None),
         )
-        
-        # Native implementation handles everything in C++
-        # We don't load the model here.
+
+        # Native implementation handles everything in C++.
+        # Python must not create or own a separate draft model instance
+        # for EAGLE/EAGLE3; TurboMind is the single source of truth.
         self.draft_model = None
         self.draft_tokenizer = None
 
@@ -150,7 +152,18 @@ class SpeculativeDecodingManager:
         if num_tokens is None:
             num_tokens = self.config.num_speculative_tokens
 
-        if not hasattr(self, "draft_model"):
+        # For native EAGLE/EAGLE3, TurboMind's C++ backend owns the draft
+        # model and speculative loop. Python‑side draft generation is only
+        # used for `draft_target` / `ngram` methods.
+        if self.config.method in ("eagle", "eagle3"):
+            logger.debug(
+                "EAGLE/EAGLE3 is handled natively in TurboMind; "
+                "skipping Python draft generation"
+            )
+            return []
+
+        draft_model = getattr(self, "draft_model", None)
+        if draft_model is None:
             logger.warning("Draft model not loaded, cannot generate draft tokens")
             return []
 
@@ -188,7 +201,7 @@ class SpeculativeDecodingManager:
     def _generate_eagle_draft_tokens(self, input_ids, num_tokens):
         """Generate draft tokens using EAGLE3 model."""
         import torch
-        
+
         # Convert to tensor
         input_tensor = torch.tensor([input_ids], dtype=torch.long, device="cuda")
         

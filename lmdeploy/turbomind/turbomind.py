@@ -5,6 +5,7 @@ import base64
 import copy
 import json
 import math
+import os
 import os.path as osp
 import sys
 from collections.abc import Sequence
@@ -594,6 +595,40 @@ def _get_metrics(metrics):
                 token_timestamp=time.time(), engine_events=events
             )
             is_first = False
+
+        # Attach TurboMind EAGLE speculative decoding stats when available.
+        eagle_steps = getattr(metrics, "eagle_steps", 0)
+        if eagle_steps:
+            num_draft = getattr(metrics, "eagle_total_draft_tokens", 0)
+            num_accept = getattr(metrics, "eagle_total_accepted_tokens", 0)
+            avg_accepted_per_step = (
+                float(num_accept) / float(eagle_steps) if eagle_steps > 0 else 0.0
+            )
+            spec_info = {
+                "num_draft_tokens": int(num_draft),
+                "num_accepted_tokens": int(num_accept),
+                "avg_accepted_per_step": avg_accepted_per_step,
+            }
+            # KV rewind metrics (optional; default to zero until wired in C++).
+            total_rewound = getattr(metrics, "eagle_total_rewound_tokens", 0)
+            rewind_steps = getattr(metrics, "eagle_rewind_steps", 0)
+            if total_rewound or rewind_steps:
+                spec_info["num_rewound_tokens"] = int(total_rewound)
+                spec_info["rewind_steps"] = int(rewind_steps)
+            out.req_metrics.spec_info = spec_info
+
+            # Optional debug/trace logging for EAGLE metrics.
+            if os.getenv("LMDEPLOY_EAGLE_METRICS_DEBUG", "") not in ("", "0", "false", "False"):
+                logger.info(
+                    "[EAGLE][Metrics] steps=%d num_draft_tokens=%d num_accepted_tokens=%d "
+                    "avg_accepted_per_step=%.4f num_rewound_tokens=%d rewind_steps=%d",
+                    int(eagle_steps),
+                    int(num_draft),
+                    int(num_accept),
+                    float(avg_accepted_per_step),
+                    int(total_rewound),
+                    int(rewind_steps),
+                )
 
     return _func
 

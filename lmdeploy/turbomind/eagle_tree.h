@@ -9,6 +9,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <cassert>
 
 namespace turbomind {
 namespace eagle {
@@ -52,6 +53,28 @@ public:
      * @param num_tokens number of draft tokens
      */
     void buildTree(TokenIdType const* draft_tokens, SizeType num_tokens);
+
+    /**
+     * @brief Build tree from draft tokens following an explicit choices table.
+     *
+     * The choices table encodes children per node, where
+     *   choices[i] = {child_node_indices...}
+     * and node index 0 is reserved for the root. Tokens are assigned in
+     * sequence to the created nodes up to @p num_tokens, respecting
+     * @p max_depth_ and @p max_paths_.
+     *
+     * This is a C++ counterpart to the EAGLE choices loaded in
+     * EagleModule (e.g. from eagle_tree.yaml) and allows offline-tuned
+     * trees to be reflected in the host-side representation.
+     *
+     * @param draft_tokens [num_draft_tokens] array of token IDs
+     * @param num_tokens number of draft tokens
+     * @param choices per-node child indices (node 0 is the root)
+     */
+    void buildTreeWithChoices(
+        TokenIdType const* draft_tokens,
+        SizeType num_tokens,
+        std::vector<std::vector<SizeType>> const& choices);
     
     /**
      * @brief Extract all paths from root to leaves

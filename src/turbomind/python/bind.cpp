@@ -17,6 +17,8 @@
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/core/tensor.h"
 #include "src/turbomind/engine/model_request.h"
+#include "src/turbomind/models/llama/EagleModule.h"
+#include "src/turbomind/models/llama/LlamaLinear.h"
 #include "src/turbomind/python/dlpack.h"
 #include "src/turbomind/triton_backend/llama/LlamaTritonModel.h"
 #include "src/turbomind/utils/cuda_utils.h"
@@ -297,7 +299,12 @@ PYBIND11_MODULE(_turbomind, m)
     py::class_<ft::RequestMetrics, std::shared_ptr<ft::RequestMetrics>>(m, "RequestMetrics")
         .def(py::init())
         .def_readonly("enque_time", &ft::RequestMetrics::enque_time)
-        .def_readonly("scheduled_time", &ft::RequestMetrics::scheduled_time);
+        .def_readonly("scheduled_time", &ft::RequestMetrics::scheduled_time)
+        .def_readonly("eagle_total_draft_tokens", &ft::RequestMetrics::eagle_total_draft_tokens)
+        .def_readonly("eagle_total_accepted_tokens", &ft::RequestMetrics::eagle_total_accepted_tokens)
+        .def_readonly("eagle_steps", &ft::RequestMetrics::eagle_steps)
+        .def_readonly("eagle_total_rewound_tokens", &ft::RequestMetrics::eagle_total_rewound_tokens)
+        .def_readonly("eagle_rewind_steps", &ft::RequestMetrics::eagle_rewind_steps);
 
     py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m, "ScheduleMetrics")
         .def(py::init())
@@ -308,6 +315,203 @@ PYBIND11_MODULE(_turbomind, m)
         .def_readonly("active_blocks", &ft::ScheduleMetrics::active_blocks)
         .def_readonly("cached_blocks", &ft::ScheduleMetrics::cached_blocks)
         .def_readonly("free_blocks", &ft::ScheduleMetrics::free_blocks);
+
+    // Test-only harness for EagleModule::forward.
+    //
+    // This helper constructs an EagleModule from a given draft-model
+    // directory, runs forward twice for a small synthetic batch, and
+    // reports shapes plus whether the logits / hidden-state buffers
+    // were reused between calls (i.e. no per-step reallocations in
+    // the speculative decode hot path).
+    m.def(
+        "eagle_forward_smoke",
+        [](const std::string& model_dir, int batch_size) {
+            if (batch_size <= 0) {
+                throw std::invalid_argument("batch_size must be positive");
+            }
+
+            int device_id = 0;
+            ft::CudaDeviceGuard device_guard(device_id);
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            // Use small but non-trivial limits; the concrete shapes
+            // are driven by the draft model config in model_dir.
+            constexpr ft::EagleModule::SizeType kMaxDraftPathLen       = 16;
+            constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+            constexpr ft::EagleModule::SizeType kMaxDecodingTokens     = 16;
+            constexpr ft::EagleModule::SizeType kMaxNonLeafNodes       = 32;
+
+            ft::EagleModule module(
+                kMaxDraftPathLen,
+                kMaxDecodingDraftTokens,
+                kMaxDecodingTokens,
+                kMaxNonLeafNodes);
+
+            module.load(model_dir, device_id, stream);
+
+            auto const& weights = module.getWeights();
+            if (!weights.embed_tokens || !weights.lm_head) {
+                cudaStreamDestroy(stream);
+                throw std::runtime_error(
+                    "EagleModule weights not initialized; check draft model directory");
+            }
+
+            const int hidden_units = static_cast<int>(weights.embed_tokens.shape(1));
+            const int vocab_size   = static_cast<int>(weights.lm_head.shape(1));
+
+            // Allocate synthetic hidden states and input IDs on device.
+            Tensor hidden_states(
+                std::vector<ft::core::ssize_t>{batch_size, hidden_units},
+                ft::data_type_v<ft::half_t>,
+                ft::kDEVICE);
+            Tensor input_ids(
+                std::vector<ft::core::ssize_t>{batch_size},
+                ft::data_type_v<int32_t>,
+                ft::kDEVICE);
+
+            ft::check_cuda_error(
+                cudaMemsetAsync(hidden_states.raw_data(), 0, hidden_states.byte_size(), stream));
+            ft::check_cuda_error(
+                cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
+
+            ft::LlamaLinear linear(stream);
+
+            Tensor logits_1;
+            Tensor hidden_1;
+            module.forward(input_ids, hidden_states, logits_1, hidden_1, linear, stream);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+
+            void* logits_ptr_1 = logits_1.raw_data();
+            void* hidden_ptr_1 = hidden_1.raw_data();
+
+            Tensor logits_2;
+            Tensor hidden_2;
+            module.forward(input_ids, hidden_states, logits_2, hidden_2, linear, stream);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+
+            const bool reuse_logits = logits_ptr_1 == logits_2.raw_data();
+            const bool reuse_hidden = hidden_ptr_1 == hidden_2.raw_data();
+
+            auto logits_shape = logits_1.shape();
+            auto hidden_shape = hidden_1.shape();
+
+            return py::dict("logits_shape"_a = logits_shape,
+                            "hidden_shape"_a = hidden_shape,
+                            "reuse_logits_buffer"_a = reuse_logits,
+                            "reuse_hidden_buffer"_a = reuse_hidden,
+                            "vocab_size"_a = vocab_size,
+                            "hidden_units"_a = hidden_units);
+        },
+        "model_dir"_a,
+        "batch_size"_a = 2);
+
+    // Microbenchmark helper for EagleModule::forward.
+    //
+    // Runs a configurable number of forward passes for a synthetic batch
+    // and reports basic latency statistics. Intended for offline tuning
+    // and regression checks, not for production inference.
+    m.def(
+        "eagle_forward_bench",
+        [](const std::string& model_dir, int batch_size, int iters) {
+            if (batch_size <= 0) {
+                throw std::invalid_argument("batch_size must be positive");
+            }
+            if (iters <= 0) {
+                throw std::invalid_argument("iters must be positive");
+            }
+
+            int device_id = 0;
+            ft::CudaDeviceGuard device_guard(device_id);
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            constexpr ft::EagleModule::SizeType kMaxDraftPathLen       = 16;
+            constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+            constexpr ft::EagleModule::SizeType kMaxDecodingTokens     = 16;
+            constexpr ft::EagleModule::SizeType kMaxNonLeafNodes       = 32;
+
+            ft::EagleModule module(
+                kMaxDraftPathLen,
+                kMaxDecodingDraftTokens,
+                kMaxDecodingTokens,
+                kMaxNonLeafNodes);
+
+            module.load(model_dir, device_id, stream);
+
+            auto const& weights = module.getWeights();
+            if (!weights.embed_tokens || !weights.lm_head) {
+                cudaStreamDestroy(stream);
+                throw std::runtime_error(
+                    "EagleModule weights not initialized; check draft model directory");
+            }
+
+            const int hidden_units = static_cast<int>(weights.embed_tokens.shape(1));
+            const int vocab_size   = static_cast<int>(weights.lm_head.shape(1));
+
+            Tensor hidden_states(
+                std::vector<ft::core::ssize_t>{batch_size, hidden_units},
+                ft::data_type_v<ft::half_t>,
+                ft::kDEVICE);
+            Tensor input_ids(
+                std::vector<ft::core::ssize_t>{batch_size},
+                ft::data_type_v<int32_t>,
+                ft::kDEVICE);
+
+            ft::check_cuda_error(
+                cudaMemsetAsync(hidden_states.raw_data(), 0, hidden_states.byte_size(), stream));
+            ft::check_cuda_error(
+                cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
+
+            ft::LlamaLinear linear(stream);
+
+            Tensor logits;
+            Tensor hidden;
+
+            // Warmup one run.
+            module.forward(input_ids, hidden_states, logits, hidden, linear, stream);
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+
+            cudaEvent_t start, stop;
+            ft::check_cuda_error(cudaEventCreate(&start));
+            ft::check_cuda_error(cudaEventCreate(&stop));
+
+            ft::check_cuda_error(cudaEventRecord(start, stream));
+            for (int i = 0; i < iters; ++i) {
+                module.forward(input_ids, hidden_states, logits, hidden, linear, stream);
+            }
+            ft::check_cuda_error(cudaEventRecord(stop, stream));
+            ft::check_cuda_error(cudaEventSynchronize(stop));
+
+            float elapsed_ms = 0.0f;
+            ft::check_cuda_error(cudaEventElapsedTime(&elapsed_ms, start, stop));
+
+            ft::check_cuda_error(cudaEventDestroy(start));
+            ft::check_cuda_error(cudaEventDestroy(stop));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+
+            const double avg_ms_per_forward = static_cast<double>(elapsed_ms) / static_cast<double>(iters);
+            const double tokens_per_forward = static_cast<double>(batch_size);
+            const double tokens_per_second =
+                (avg_ms_per_forward > 0.0)
+                ? (tokens_per_forward * 1000.0 / avg_ms_per_forward)
+                : 0.0;
+
+            return py::dict("batch_size"_a = batch_size,
+                            "iters"_a = iters,
+                            "avg_ms_per_forward"_a = avg_ms_per_forward,
+                            "tokens_per_second"_a = tokens_per_second,
+                            "hidden_units"_a = hidden_units,
+                            "vocab_size"_a = vocab_size);
+        },
+        "model_dir"_a,
+        "batch_size"_a = 2,
+        "iters"_a = 50);
 
     py::class_<ft::SessionParam>(m, "SessionParam")
         .def(py::init([](uint64_t id, int step, bool start, bool end) {

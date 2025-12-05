@@ -278,3 +278,44 @@ class SpeculativeDecodingStats:
                 f'draft_acceptance_rate={draft_acceptance_rate:.2f}%, '
                 f'mean_acceptance_length={mean_acceptance_length:.2f}, '
                 f'per_position_acceptance_rate={rates_str})')
+
+
+@dataclass
+class EagleMetricsSummary:
+    """Aggregate view of EAGLE speculative decoding metrics.
+
+    This wraps :class:`SpeculativeDecodingStats` into a compact summary
+    suitable for logging or saving alongside benchmark results.
+    """
+
+    num_drafts: int
+    num_draft_tokens: int
+    num_accepted_tokens: int
+    draft_acceptance_rate: float
+    mean_acceptance_length: float
+
+    @classmethod
+    def from_stats(cls, stats: SpeculativeDecodingStats) -> "EagleMetricsSummary":
+        """Construct a summary from :class:`SpeculativeDecodingStats`."""
+        num_drafts = stats.num_drafts
+        num_draft_tokens = stats.num_draft_tokens
+        num_accepted_tokens = stats.num_accepted_tokens
+
+        if num_draft_tokens > 0:
+            draft_acceptance_rate = num_accepted_tokens / num_draft_tokens
+        else:
+            draft_acceptance_rate = float("nan")
+
+        if num_drafts > 0:
+            # Conventionally, mean acceptance length includes the bonus token.
+            mean_acceptance_length = 1.0 + (num_accepted_tokens / num_drafts)
+        else:
+            mean_acceptance_length = float("nan")
+
+        return cls(
+            num_drafts=num_drafts,
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            draft_acceptance_rate=draft_acceptance_rate,
+            mean_acceptance_length=mean_acceptance_length,
+        )
