@@ -296,13 +296,6 @@ struct ScopedGIL {
     PyGILState_STATE state;
 };
 
-// Lightweight wrapper for AtomicRequestState that exposes a
-// Python-friendly consume() API without binding the underlying
-// RequestState / AtomicRequestState C++ types.
-struct PyAtomicRequestState {
-    std::shared_ptr<ft::AtomicRequestState> impl;
-};
-
 }  // namespace
 
 PYBIND11_MODULE(_turbomind, m)
@@ -860,21 +853,6 @@ PYBIND11_MODULE(_turbomind, m)
         "batch_size"_a = 2,
         "iters"_a = 50);
 
-    py::class_<PyAtomicRequestState>(m, "AtomicRequestStateHandle")
-        .def("consume", [](PyAtomicRequestState& s) {
-            if (!s.impl) {
-                return py::object(py::none());
-            }
-            auto state = s.impl->exchange(nullptr);
-            if (!state) {
-                return py::object(py::none());
-            }
-            py::dict d;
-            d["status"] = state->status;
-            d["seq_len"] = state->seq_len;
-            return py::object(std::move(d));
-        });
-
     // data type
     {
         using namespace turbomind;
@@ -1133,11 +1111,6 @@ PYBIND11_MODULE(_turbomind, m)
                         std::cerr << e.what() << std::endl;
                     }
                 });
-                // Wrap AtomicRequestState into a lightweight handle so we
-                // don't bind the C++ type directly.
-                PyAtomicRequestState handle;
-                handle.impl = std::move(ret.state);
-
                 // Convert C++ RequestMetrics (if present) into a plain
                 // Python dict so that we do not expose the C++ type via
                 // pybind11 (avoids generic_type re-registration issues).
@@ -1154,7 +1127,30 @@ PYBIND11_MODULE(_turbomind, m)
                     d["eagle_rewind_steps"]          = m.eagle_rewind_steps;
                     py_metrics = std::move(d);
                 }
-                return std::make_tuple(std::move(ret.tensors), std::move(handle), std::move(py_metrics));
+                // Expose a callable to consume the shared state without
+                // binding the underlying AtomicRequestState / RequestState
+                // C++ types. The callable returns either:
+                //   - None, or
+                //   - a dict with keys: status, seq_len
+                py::object state_consumer = py::none();
+                if (ret.state) {
+                    auto state_ptr = ret.state;
+                    state_consumer = py::cpp_function(
+                        [state_ptr]() -> py::object {
+                            auto st = state_ptr->exchange(nullptr);
+                            if (!st) {
+                                return py::none();
+                            }
+                            py::dict d;
+                            d["status"] = st->status;
+                            d["seq_len"] = st->seq_len;
+                            return py::object(std::move(d));
+                        });
+                }
+
+                return std::make_tuple(std::move(ret.tensors),
+                                       std::move(state_consumer),
+                                       std::move(py_metrics));
             },
             py::call_guard<py::gil_scoped_release>(),
             "input_tensors"_a,

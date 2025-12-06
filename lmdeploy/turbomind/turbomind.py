@@ -989,7 +989,7 @@ class TurboMindInstance:
         try:
             while True:
                 await sem.acquire()
-                state = shared_state.consume()
+                state = shared_state() if callable(shared_state) else shared_state
 
                 if state is None:
                     continue
@@ -1044,7 +1044,7 @@ class TurboMindInstance:
 
             while not state or _status(state) == 0:
                 await sem.acquire()
-                state = shared_state.consume()
+                state = shared_state() if callable(shared_state) else shared_state
             logger.info(f"[async_stream_infer] session {session_id} done")
 
     def _get_error_output(self, status):
