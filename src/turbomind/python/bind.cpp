@@ -979,7 +979,7 @@ PYBIND11_MODULE(_turbomind, m)
                     try {
                         auto start_attr = session_obj.attr("start");
                         if (!start_attr.is_none()) {
-                            session.start = start_attr.cast<int>();
+                            session.start_flag = start_attr.cast<bool>();
                         }
                     }
                     catch (const py::error_already_set&) {
@@ -988,7 +988,7 @@ PYBIND11_MODULE(_turbomind, m)
                     try {
                         auto end_attr = session_obj.attr("end");
                         if (!end_attr.is_none()) {
-                            session.end = end_attr.cast<int>();
+                            session.end_flag = end_attr.cast<bool>();
                         }
                     }
                     catch (const py::error_already_set&) {
@@ -1040,8 +1040,8 @@ PYBIND11_MODULE(_turbomind, m)
                     gen_cfg.repetition_penalty
                         = get_attr_double("repetition_penalty", gen_cfg.repetition_penalty);
 
-                    // stop / bad / eos ids, if present, are passed from Python
-                    // exactly in the layout expected by C++ GenerationConfig.
+                    // eos_ids, if present, are passed from Python as a
+                    // flat list of ints.
                     auto try_copy_vec_int = [&](const char* name, std::vector<int>& dst) {
                         try {
                             auto attr = gen_cfg_obj.attr(name);
@@ -1054,8 +1054,6 @@ PYBIND11_MODULE(_turbomind, m)
                         }
                     };
                     try_copy_vec_int("eos_ids", gen_cfg.eos_ids);
-                    try_copy_vec_int("stop_ids", gen_cfg.stop_ids);
-                    try_copy_vec_int("bad_ids", gen_cfg.bad_ids);
 
                     // random_seed is optional
                     try {
