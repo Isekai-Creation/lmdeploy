@@ -81,8 +81,12 @@ def _tm_dict_to_torch_dict(tm_dict):
     """Map turbomind's tensor to torch's tensor."""
     ret = dict()
     for k, v in tm_dict.items():
-        if v.type == _tm.DataType.TYPE_UINT32:
-            v = v.view(_tm.DataType.TYPE_INT32)
+        # If the underlying tensor uses uint32, remap to int32 for
+        # PyTorch. In newer bindings we no longer expose _tm.DataType,
+        # so rely on the dtype string when available.
+        dtype = getattr(v, "dtype", None)
+        if isinstance(dtype, str) and dtype.lower() in ("uint32", "uint32_t", "u32"):
+            v = v.view("int32")
         ret[k] = torch.from_dlpack(v)
 
     return ret

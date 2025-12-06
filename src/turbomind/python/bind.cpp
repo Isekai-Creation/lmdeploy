@@ -853,32 +853,6 @@ PYBIND11_MODULE(_turbomind, m)
         "batch_size"_a = 2,
         "iters"_a = 50);
 
-    // data type
-    {
-        using namespace turbomind;
-        py::enum_<ft::DataType>(m, "DataType")
-            .value("TYPE_INVALID", kNull)
-            .value("TYPE_BOOL", kBool)
-            .value("TYPE_UINT8", kUint8)
-            .value("TYPE_UINT16", kUint16)
-            .value("TYPE_UINT32", kUint32)
-            .value("TYPE_UINT64", kUint64)
-            .value("TYPE_INT8", kInt8)
-            .value("TYPE_INT16", kInt16)
-            .value("TYPE_INT32", kInt32)
-            .value("TYPE_INT64", kInt64)
-            .value("TYPE_FP16", kFloat16)
-            .value("TYPE_FP32", kFloat32)
-            .value("TYPE_FP64", kFloat64)
-            .value("TYPE_BF16", kBfloat16);
-
-        // memory type
-        py::enum_<ft::DeviceType>(m, "MemoryType")
-            .value("MEMORY_CPU", ft::DeviceType::kCPU)
-            .value("MEMORY_CPU_PINNED", ft::DeviceType::kCPUpinned)
-            .value("MEMORY_GPU", ft::DeviceType::kDEVICE);
-    }
-
     // tensor
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
         .def_property_readonly("where", [](const Tensor& t) { return t.device().type; })
