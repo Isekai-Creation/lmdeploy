@@ -853,28 +853,6 @@ PYBIND11_MODULE(_turbomind, m)
         "batch_size"_a = 2,
         "iters"_a = 50);
 
-    py::class_<ft::GenerationConfig>(m, "GenerationConfig")
-        .def(py::init())
-        .def_readwrite("max_new_tokens", &ft::GenerationConfig::max_new_tokens)
-        .def_readwrite("min_new_tokens", &ft::GenerationConfig::min_new_tokens)
-        .def_readwrite("eos_ids", &ft::GenerationConfig::eos_ids)
-        .def_readwrite("stop_ids", &ft::GenerationConfig::stop_ids)
-        .def_readwrite("bad_ids", &ft::GenerationConfig::bad_ids)
-        .def_readwrite("top_p", &ft::GenerationConfig::top_p)
-        .def_readwrite("top_k", &ft::GenerationConfig::top_k)
-        .def_readwrite("min_p", &ft::GenerationConfig::min_p)
-        .def_readwrite("temperature", &ft::GenerationConfig::temperature)
-        .def_readwrite("repetition_penalty", &ft::GenerationConfig::repetition_penalty)
-        .def_readwrite("random_seed", &ft::GenerationConfig::random_seed)
-        .def_readwrite("output_logprobs", &ft::GenerationConfig::output_logprobs)
-        .def_readwrite("output_last_hidden_state", &ft::GenerationConfig::output_last_hidden_state)
-        .def_readwrite("output_logits", &ft::GenerationConfig::output_logits)
-        .def("__repr__", [](const ft::GenerationConfig& c) {
-            std::ostringstream oss;
-            oss << c;
-            return oss.str();
-        });
-
     py::class_<ft::RequestState, std::unique_ptr<ft::RequestState>>(m, "RequestState")
         .def_readonly("status", &ft::RequestState::status)
         .def_readonly("seq_len", &ft::RequestState::seq_len);
@@ -969,13 +947,164 @@ PYBIND11_MODULE(_turbomind, m)
     py::class_<ModelRequest>(m, "ModelRequest")
         .def(
             "forward",
-            [](ModelRequest*               model_request,
-               std::shared_ptr<TensorMap>  input_tensors,
-               const ft::SessionParam&     session,
-               const ft::GenerationConfig& gen_cfg,
-               bool                        stream_output,
-               bool                        enable_metrics,
-               std::function<void()>       cb) {
+            [](ModelRequest*              model_request,
+               std::shared_ptr<TensorMap> input_tensors,
+               py::object                 session_obj,
+               py::object                 gen_cfg_obj,
+               bool                       stream_output,
+               bool                       enable_metrics,
+               std::function<void()>      cb) {
+                // Build a C++ SessionParam from a lightweight Python
+                // object with the same fields (id, step, start, end).
+                ft::SessionParam session{};
+                if (!session_obj.is_none()) {
+                    try {
+                        auto id_attr = session_obj.attr("id");
+                        if (!id_attr.is_none()) {
+                            session.id = id_attr.cast<uint64_t>();
+                        }
+                    }
+                    catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
+                    try {
+                        auto step_attr = session_obj.attr("step");
+                        if (!step_attr.is_none()) {
+                            session.step = step_attr.cast<int>();
+                        }
+                    }
+                    catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
+                    try {
+                        auto start_attr = session_obj.attr("start");
+                        if (!start_attr.is_none()) {
+                            session.start = start_attr.cast<int>();
+                        }
+                    }
+                    catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
+                    try {
+                        auto end_attr = session_obj.attr("end");
+                        if (!end_attr.is_none()) {
+                            session.end = end_attr.cast<int>();
+                        }
+                    }
+                    catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
+                }
+
+                // Build a C++ GenerationConfig from a lightweight Python
+                // object (usually lmdeploy.messages.GenerationConfig or a
+                // compatible namespace) without exposing the C++ type to
+                // pybind11.
+                ft::GenerationConfig gen_cfg{};
+                if (!gen_cfg_obj.is_none()) {
+                    auto get_attr_int = [&](const char* name, int default_val) {
+                        try {
+                            auto attr = gen_cfg_obj.attr(name);
+                            if (!attr.is_none()) {
+                                return attr.cast<int>();
+                            }
+                        }
+                        catch (const py::error_already_set&) {
+                            PyErr_Clear();
+                        }
+                        return default_val;
+                    };
+                    auto get_attr_double = [&](const char* name, double default_val) {
+                        try {
+                            auto attr = gen_cfg_obj.attr(name);
+                            if (!attr.is_none()) {
+                                return attr.cast<double>();
+                            }
+                        }
+                        catch (const py::error_already_set&) {
+                            PyErr_Clear();
+                        }
+                        return default_val;
+                    };
+
+                    gen_cfg.max_new_tokens = get_attr_int("max_new_tokens", gen_cfg.max_new_tokens);
+                    gen_cfg.min_new_tokens = get_attr_int("min_new_tokens", gen_cfg.min_new_tokens);
+                    gen_cfg.top_k          = get_attr_int("top_k", gen_cfg.top_k);
+                    gen_cfg.output_logprobs
+                        = get_attr_int("output_logprobs", gen_cfg.output_logprobs);
+
+                    // float fields
+                    gen_cfg.top_p            = get_attr_double("top_p", gen_cfg.top_p);
+                    gen_cfg.min_p            = get_attr_double("min_p", gen_cfg.min_p);
+                    gen_cfg.temperature      = get_attr_double("temperature", gen_cfg.temperature);
+                    gen_cfg.repetition_penalty
+                        = get_attr_double("repetition_penalty", gen_cfg.repetition_penalty);
+
+                    // stop / bad / eos ids, if present, are passed from Python
+                    // exactly in the layout expected by C++ GenerationConfig.
+                    auto try_copy_vec_int = [&](const char* name, std::vector<int>& dst) {
+                        try {
+                            auto attr = gen_cfg_obj.attr(name);
+                            if (!attr.is_none()) {
+                                dst = attr.cast<std::vector<int>>();
+                            }
+                        }
+                        catch (const py::error_already_set&) {
+                            PyErr_Clear();
+                        }
+                    };
+                    try_copy_vec_int("eos_ids", gen_cfg.eos_ids);
+                    try_copy_vec_int("stop_ids", gen_cfg.stop_ids);
+                    try_copy_vec_int("bad_ids", gen_cfg.bad_ids);
+
+                    // random_seed is optional
+                    try {
+                        auto attr = gen_cfg_obj.attr("random_seed");
+                        if (!attr.is_none()) {
+                            gen_cfg.random_seed = attr.cast<uint64_t>();
+                        }
+                    }
+                    catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
+
+                    // output_last_hidden_state / output_logits may be encoded
+                    // as strings ("all" / "generation"); if so, map them here.
+                    auto map_output_mode = [](py::object const& v) -> int {
+                        if (v.is_none()) {
+                            return 0;
+                        }
+                        if (py::isinstance<py::str>(v)) {
+                            std::string s = v.cast<std::string>();
+                            if (s == "all") {
+                                return ft::GenerationConfig::kAll;
+                            }
+                            if (s == "generation") {
+                                return ft::GenerationConfig::kGeneration;
+                            }
+                        }
+                        return v.cast<int>();
+                    };
+                    try {
+                        auto attr = gen_cfg_obj.attr("output_last_hidden_state");
+                        if (!attr.is_none()) {
+                            gen_cfg.output_last_hidden_state = map_output_mode(attr);
+                        }
+                    }
+                    catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
+                    try {
+                        auto attr = gen_cfg_obj.attr("output_logits");
+                        if (!attr.is_none()) {
+                            gen_cfg.output_logits = map_output_mode(attr);
+                        }
+                    }
+                    catch (const py::error_already_set&) {
+                        PyErr_Clear();
+                    }
+                }
+
                 ModelRequest::InputParam param{};
                 param.tensors        = std::move(input_tensors);
                 param.session        = session;
@@ -991,7 +1120,23 @@ PYBIND11_MODULE(_turbomind, m)
                         std::cerr << e.what() << std::endl;
                     }
                 });
-                return std::make_tuple(std::move(ret.tensors), std::move(ret.state), std::move(ret.metrics));
+                // Convert C++ RequestMetrics (if present) into a plain
+                // Python dict so that we do not expose the C++ type via
+                // pybind11 (avoids generic_type re-registration issues).
+                py::object py_metrics = py::none();
+                if (ret.metrics) {
+                    const ft::RequestMetrics& m = *ret.metrics;
+                    py::dict d;
+                    d["enque_time"]                 = m.enque_time;
+                    d["scheduled_time"]             = m.scheduled_time;
+                    d["eagle_total_draft_tokens"]   = m.eagle_total_draft_tokens;
+                    d["eagle_total_accepted_tokens"] = m.eagle_total_accepted_tokens;
+                    d["eagle_steps"]                 = m.eagle_steps;
+                    d["eagle_total_rewound_tokens"]  = m.eagle_total_rewound_tokens;
+                    d["eagle_rewind_steps"]          = m.eagle_rewind_steps;
+                    py_metrics                       = std::move(d);
+                }
+                return std::make_tuple(std::move(ret.tensors), std::move(ret.state), std::move(py_metrics));
             },
             py::call_guard<py::gil_scoped_release>(),
             "input_tensors"_a,
@@ -1077,7 +1222,18 @@ PYBIND11_MODULE(_turbomind, m)
             "rank"_a)
         .def(
             "get_schedule_metrics",
-            [](LlamaTritonModel* model, int deviceId, int rank) { return model->getScheduleMetrics(deviceId, rank); },
+            [](LlamaTritonModel* model, int deviceId, int rank) {
+                ft::ScheduleMetrics m = model->getScheduleMetrics(deviceId, rank);
+                py::dict            d;
+                d["total_seqs"]    = m.total_seqs;
+                d["active_seqs"]   = m.active_seqs;
+                d["waiting_seqs"]  = m.waiting_seqs;
+                d["total_blocks"]  = m.total_blocks;
+                d["active_blocks"] = m.active_blocks;
+                d["cached_blocks"] = m.cached_blocks;
+                d["free_blocks"]   = m.free_blocks;
+                return d;
+            },
             py::call_guard<py::gil_scoped_release>(),
             "device_id"_a,
             "rank"_a)

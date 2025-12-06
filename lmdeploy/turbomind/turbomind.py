@@ -15,6 +15,7 @@ from functools import partial
 from multiprocessing.reduction import ForkingPickler
 from queue import Queue
 from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -495,11 +496,12 @@ class TurboMind:
         # TODO: support dp
         tm_metrics = self.model_comm.get_schedule_metrics(0, 0)
         return ScheduleMetrics(
-            active_seqs=tm_metrics.active_seqs,
-            waiting_seqs=tm_metrics.waiting_seqs,
-            total_blocks=tm_metrics.total_blocks,
-            active_blocks=tm_metrics.active_blocks,
-            free_blocks=tm_metrics.free_blocks,
+            active_seqs=tm_metrics["active_seqs"],
+            waiting_seqs=tm_metrics["waiting_seqs"],
+            total_blocks=tm_metrics["total_blocks"],
+            active_blocks=tm_metrics["active_blocks"],
+            cached_blocks=tm_metrics["cached_blocks"],
+            free_blocks=tm_metrics["free_blocks"],
         )
 
 
@@ -594,12 +596,20 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
 
     def _func(out: EngineOutput, step: int, **kwargs):
         nonlocal is_first
+
+        def _field(name: str, default: int | float = 0):
+            if isinstance(metrics, dict):
+                return metrics.get(name, default)
+            return getattr(metrics, name, default)
+
         if not is_first:
             out.req_metrics = RequestMetrics(token_timestamp=time.time())
         else:
             events = [
-                EngineEvent(EventType.QUEUED, metrics.enque_time / 1000000),
-                EngineEvent(EventType.SCHEDULED, metrics.scheduled_time / 1000000),
+                EngineEvent(EventType.QUEUED, _field("enque_time") / 1000000),
+                EngineEvent(
+                    EventType.SCHEDULED, _field("scheduled_time") / 1000000
+                ),
             ]
             out.req_metrics = RequestMetrics(
                 token_timestamp=time.time(), engine_events=events
@@ -607,10 +617,10 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
             is_first = False
 
         # Attach TurboMind EAGLE speculative decoding stats when available.
-        eagle_steps = getattr(metrics, "eagle_steps", 0)
+        eagle_steps = _field("eagle_steps", 0)
         if eagle_steps > 0:
-            num_draft = getattr(metrics, "eagle_total_draft_tokens", 0)
-            num_accept = getattr(metrics, "eagle_total_accepted_tokens", 0)
+            num_draft = _field("eagle_total_draft_tokens", 0)
+            num_accept = _field("eagle_total_accepted_tokens", 0)
             avg_accepted_per_step = (
                 float(num_accept) / float(eagle_steps) if eagle_steps > 0 else 0.0
             )
@@ -620,8 +630,8 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
                 "avg_accepted_per_step": avg_accepted_per_step,
             }
             # KV rewind metrics (optional; default to zero until wired in C++).
-            total_rewound = getattr(metrics, "eagle_total_rewound_tokens", 0)
-            rewind_steps = getattr(metrics, "eagle_rewind_steps", 0)
+            total_rewound = _field("eagle_total_rewound_tokens", 0)
+            rewind_steps = _field("eagle_rewind_steps", 0)
             if total_rewound or rewind_steps:
                 spec_info["num_rewound_tokens"] = int(total_rewound)
                 spec_info["rewind_steps"] = int(rewind_steps)
@@ -944,7 +954,7 @@ class TurboMindInstance:
                 )
                 gen_config.response_format = None
 
-        session = _tm.SessionParam(
+        session = SimpleNamespace(
             id=session_id, step=step, start=sequence_start, end=sequence_end
         )
 
@@ -1029,8 +1039,13 @@ class TurboMindInstance:
         return EngineOutput(status=self.errcode_map[status], token_ids=[])
 
     def _get_generation_config(self, cfg: GenerationConfig):
-        c = _tm.GenerationConfig()
+        # Pass a lightweight Python object to C++; the C++ binding
+        # constructs ft::GenerationConfig from these attributes.
+        from types import SimpleNamespace
+
+        c = SimpleNamespace()
         c.max_new_tokens = cfg.max_new_tokens
+        c.min_new_tokens = cfg.min_new_tokens
         c.top_k = cfg.top_k
         c.top_p = cfg.top_p
         c.min_p = cfg.min_p
