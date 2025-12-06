@@ -183,8 +183,6 @@ void LlamaV2::eagleSpeculativeStep(
     std::copy_n(draft_tokens.data(), num_draft_tokens, h_draft.data());
     std::copy_n(target_tokens.data(), num_draft_tokens, h_target.data());
 
-    const int paths_per_seq = std::min(num_paths, max_decoding_tokens);
-
     std::vector<int> h_accepted_lens(batch_size, 0);
     std::vector<int> h_accepted_tokens(batch_size * max_path_len, -1);
     std::vector<int> host_best_path_ids(batch_size, 0);
