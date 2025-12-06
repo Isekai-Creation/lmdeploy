@@ -669,69 +669,13 @@ PYBIND11_MODULE(_turbomind, m)
     // Kernel-level acceptance metrics: compute per-request acceptance rate
     // given accepted lengths and draft lengths.
     m.def(
-        "eagle_compute_acceptance_stats",
-        [](py::object acceptance_rates,
-           py::object accepted_lengths,
-           py::object draft_lengths,
-           py::object batch_slots_opt) {
-            auto lengths_shape = accepted_lengths.attr("shape").cast<py::tuple>();
-            if (lengths_shape.size() != 1) {
-                throw std::invalid_argument("eagle_compute_acceptance_stats: expected 1D lengths tensors");
-            }
-
-            const auto batch_size = lengths_shape[0].cast<int64_t>();
-
-            auto device_obj = acceptance_rates.attr("device");
-            auto device_type = device_obj.attr("type").cast<std::string>();
-            if (device_type != "cuda") {
-                throw std::runtime_error("eagle_compute_acceptance_stats expects CUDA tensors");
-            }
-
-            int device_index = 0;
-            if (!device_obj.attr("index").is_none()) {
-                device_index = device_obj.attr("index").cast<int>();
-            }
-            ft::CudaDeviceGuard device_guard(device_index);
-
-            auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
-                auto ptr_obj = tensor.attr("data_ptr")();
-                auto ptr_val = ptr_obj.cast<uintptr_t>();
-                return reinterpret_cast<eagle_kernels::SizeType*>(ptr_val);
-            };
-
-            auto get_float_ptr = [](py::object const& tensor) -> float* {
-                auto ptr_obj = tensor.attr("data_ptr")();
-                auto ptr_val = ptr_obj.cast<uintptr_t>();
-                return reinterpret_cast<float*>(ptr_val);
-            };
-
-            float*                 rates_ptr          = get_float_ptr(acceptance_rates);
-            eagle_kernels::SizeType* accepted_ptr     = get_int32_ptr(accepted_lengths);
-            eagle_kernels::SizeType* draft_ptr        = get_int32_ptr(draft_lengths);
-            eagle_kernels::SizeType* batch_slots_ptr  = nullptr;
-            if (!batch_slots_opt.is_none()) {
-                batch_slots_ptr = get_int32_ptr(batch_slots_opt);
-            }
-
-            cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
-
-            eagle_kernels::invokeComputeAcceptanceStats(
-                rates_ptr,
-                accepted_ptr,
-                draft_ptr,
-                batch_slots_ptr,
-                static_cast<eagle_kernels::SizeType>(batch_size),
-                stream);
-
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
-        },
-        "acceptance_rates"_a,
-        "accepted_lengths"_a,
-        "draft_lengths"_a,
-        "batch_slots"_a = py::none());
-
+        "compute_acceptance_stats",
+    [](py::args const&, py::kwargs const&) {
+        throw std::runtime_error(
+            "compute_acceptance_stats is not implemented in this build; "
+            "use req_metrics.spec_info / EagleMetricsSummary for EAGLE metrics.");
+    },
+    "Stub for legacy acceptance-stats helper; not implemented in this build.");
     // Test-only harness for EagleModule::forward.
     //
     // This helper constructs an EagleModule from a given draft-model
