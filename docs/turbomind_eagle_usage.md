@@ -43,6 +43,67 @@ failure modes using the new logging, NVTX ranges, and Python wrappers.
   mirrors the keys used by `EngineParam` so alignment can be checked
   offline via `check_turbomind_spec_alignment`.
 
+## Enabling EAGLE3 **multi-token** on TurboMind (single GPU, offline)
+
+Multi-token behaviour is controlled **only** by the speculative config and topology:
+
+- `SpeculativeConfig.method in {"eagle", "eagle3"}`.
+- `SpeculativeConfig.num_speculative_tokens > 1` → multi-token EAGLE3.
+- `tp == 1` → multi-token enabled; for `tp != 1` TurboMind falls back to single-token EAGLE internally.
+- A valid draft model configured via `SpeculativeConfig.model`.
+
+No `LMDEPLOY_EAGLE_*` flags and no per-request `disable_eagle_multitoken` field are required or supported for mode selection.
+
+Example (Python offline pipeline):
+
+```python
+from lmdeploy import pipeline as lm_pipeline
+from lmdeploy.messages import GenerationConfig, TurbomindEngineConfig
+from lmdeploy.speculative_config import SpeculativeConfig, validate_eagle_runtime_config
+
+spec_cfg = SpeculativeConfig(
+    method="eagle3",
+    model="/path/to/draft_model",     # EagleNet draft
+    num_speculative_tokens=4,         # >1 => multi-token
+    eagle_debug=False,
+    eagle_metrics_debug=True,
+)
+
+engine_cfg = TurbomindEngineConfig(
+    tp=1,                             # multi-token currently tp=1 only
+    session_len=256,                  # e.g. >= 4 * max_new_tokens
+    speculative_config=spec_cfg,
+    enable_metrics=True,
+)
+
+# Fail fast on misconfig (tp != 1, bad max_decoding_tokens, etc.)
+validate_eagle_runtime_config(engine_cfg, spec_cfg)
+
+pipe = lm_pipeline(
+    model_path="/path/to/turbomind_model",
+    backend_config=engine_cfg,
+    speculative_config=spec_cfg,
+)
+
+gen_cfg = GenerationConfig(
+    max_new_tokens=64,
+)
+
+out = pipe(["Hello, world"], gen_config=gen_cfg)[0]
+print(out.text)
+
+# EAGLE metrics from TurboMind
+print(out.req_metrics.spec_info)
+```
+
+Mode selection is now purely config-driven:
+
+- **EAGLE disabled**: no `speculative_config` on the engine.
+- **Single-token EAGLE**: `method in {"eagle","eagle3"}`, `num_speculative_tokens == 1`.
+- **Multi-token EAGLE3**: `method in {"eagle","eagle3"}`, `num_speculative_tokens > 1`, and `tp == 1`.
+
+If `tp != 1`, multi-token is automatically disabled inside TurboMind and the engine behaves like single-token EAGLE or baseline.
+
 ## Offline EagleModule, KV, and Metrics Behaviour
 
 The EAGLE integration in TurboMind is structured so that the main
@@ -181,15 +242,53 @@ from the rest of the decode loop:
   - `EAGLE::KVCacheRewind` – the host-side KV rewind helper +
     kernel.
 - You can further enable detailed logging via:
-  - `LMDEPLOY_EAGLE_DEBUG=1` – generic EAGLE traces.
-  - `LMDEPLOY_EAGLE_KV_DEBUG=1` – KV rewind-specific traces.
-  - `LMDEPLOY_EAGLE_METRICS_DEBUG=1` – Python-side metrics logs.
-  - `LMDEPLOY_EAGLE_FORCE_SINGLE_TOKEN=1` – force EAGLE to use a single
-    draft/engine token per step, even when `SpeculativeConfig` is set up
-    for multi-token decoding.
-  - `LMDEPLOY_EAGLE_DISABLE_MULTI_TOKEN=1` – disable multi-token EAGLE
-    behaviour and clamp the engine-side EAGLE token budget to one token
-    per step, effectively running in single-token speculative mode.
+  - `LMDEPLOY_EAGLE_KV_DEBUG=1` – KV rewind-specific traces from the C++ helper and kernel.
+
+### Debug / metrics flags (config-driven)
+
+Most EAGLE debug/metrics verbosity is controlled via `SpeculativeConfig`, not environment variables:
+
+- `eagle_debug: bool` – enables additional C++ EAGLE debug traces (e.g. draft/accept logs).
+- `eagle_metrics_debug: bool` – enables extra per-step metrics logs in both C++ (`[LlamaBatch][EAGLE_METRICS]`) and Python (`[EAGLE][Metrics]`).
+
+These flags flow through `SpeculativeConfig` → `EngineParam` and into the TurboMind backend. The only remaining env knob is `LMDEPLOY_EAGLE_KV_DEBUG` for KV-specific debugging.
+
+## Sanity checking that EAGLE3 multi-token is actually active
+
+To quickly verify that EAGLE3 multi-token is wired correctly on a single GPU, you can use the smoke helper:
+
+```python
+from lmdeploy.turbomind.eagle_inspect import eagle3_multitoken_smoke
+
+eagle3_multitoken_smoke(
+    model_path="/path/to/turbomind_model",
+    spec_model_path="/path/to/draft_model",
+    prompt="Hello, world",
+    num_spec_tokens=4,
+    max_new_tokens=32,
+)
+```
+
+This will:
+
+- Build a TurboMind pipeline with `method="eagle3"`, `num_speculative_tokens=4`, `tp=1`.
+- Run a single prompt.
+- Print:
+  - The generated text.
+  - `req_metrics.spec_info` from TurboMind.
+  - A small “sanity” summary, including:
+    - `num_drafts > 0?`
+    - `multi_token_effect? mean_acceptance_length > 1`
+
+If `mean_acceptance_length > 1`, then multi-token EAGLE3 is actually committing extra tokens (not just running in single-token mode).
+
+`inspect_offline_eagle(...)` also prints a summary line with:
+
+- `num_spec_tokens` (from `SpeculativeConfig.num_speculative_tokens`)
+- `mean_acceptance_length`
+- `mean_acceptance_rate`
+
+For multi-token to be effective, you should see `mean_acceptance_length > 1.0` for realistic prompts/models.
 
 ## Using EAGLE Metrics in Benchmarks
 

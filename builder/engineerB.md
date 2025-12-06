@@ -16,7 +16,57 @@ Your job is to wire all of that into a **correct, production-safe multi-token EA
 
 ---
 
-## 1. Reference Mental Model: What “Correct” Multi-Token EAGLE Looks Like
+## 1. Current Status (Phase 1 – single-GPU offline)
+
+For `tp=1` TurboMind engines configured with `SpeculativeConfig(method="eagle3", num_speculative_tokens>1)`, the offline pipeline now has multi-token EAGLE3 fully wired and usable:
+
+- **Config-driven mode selection**
+  - Single vs multi-token EAGLE is controlled purely by `SpeculativeConfig` and topology:
+    - No `LMDEPLOY_EAGLE_MULTI_TOKEN_EXPERIMENTAL`, `LMDEPLOY_EAGLE_FORCE_SINGLE_TOKEN`, `LMDEPLOY_EAGLE_DISABLE_MULTI_TOKEN`, or per-request `disable_eagle_multitoken` flags.
+  - The chain is:
+    - `SpeculativeConfig.num_speculative_tokens`
+      → `EngineParam.spec_max_decoding_draft_tokens`
+      → `LlamaV2::eagle_max_engine_tokens_per_step_`
+      → `LlamaBatch::compute_eagle_draft_tokens_per_seq`
+      → per-slot `eagle_planned_tokens_per_seq_` (clamped by remaining `max_new_tokens` and per-slot kills).
+
+- **Runtime behaviour (tp=1 offline)**
+  - Multi-step drafts are built from real top‑k tokens per position (no more tiling the same 1 token across `tokens_per_seq`).
+  - After EAGLE acceptance:
+    - `accepted_lens`/`accepted_tokens` drive multi-token sequence advancement in `LlamaBatch::advanceSequencesByEagleAcceptance` (extra tokens appended on the time axis, `sequence_lengths_` and `g.step` updated).
+    - Commit-time guards enforce:
+      - First accepted token matches the `DynamicDecode` token,
+      - No EOS in extra accepted tokens,
+      - Finished slots never receive multi-token advance,
+      - `max_new_tokens` budget is respected (planning + commit-time capping).
+    - Any hard violation triggers `disableEagleMultitokenForSlot(slot, reason)`; that slot is permanently single-token for the rest of the request.
+
+- **KV rewind integration**
+  - `LlamaBatch::runEagleKVRewind` computes per-slot draft/accepted lengths from `eagle_planned_tokens_per_seq_` and `accepted_lens`, builds block tables from `Sequence::blocks`, and calls `computeAndInvokeKVCacheRewind`.
+  - After the helper, tail blocks are removed from `Sequence::blocks`/`block_unique_ids`, `SequenceManager::UnlockBlocks` is called for freed blocks, and `seq->cache_len` is decremented by the rewind tokens.
+  - `RequestMetrics.eagle_total_rewound_tokens` / `eagle_rewind_steps` track KV rewinds.
+
+- **Debug/metrics controls**
+  - `SpeculativeConfig.eagle_debug` / `eagle_metrics_debug` flow into `EngineParam` and then `setEagleDebugFlags`, so EAGLE C++ logs and Python metrics logs are controlled per-engine, not via env.
+
+- **Offline tooling**
+  - `validate_eagle_runtime_config(engine_cfg, spec_cfg)` enforces:
+    - `method in {"eagle","eagle3"}`,
+    - `num_speculative_tokens >= 1`,
+    - `tp == 1` for multi-token,
+    - positive structural limits for multi-token,
+    - `session_len >= max_decoding_tokens` when set,
+    - metrics enabled.
+  - `inspect_offline_eagle` and `eagle3_multitoken_smoke` construct a TurboMind pipeline with multi-token EAGLE3 enabled, run prompts, and print:
+    - Generated text,
+    - Aggregate metrics (including `mean_acceptance_length`, `mean_acceptance_rate`, draft/accepted/rewound tokens),
+    - Simple sanity checks (`num_drafts > 0`, `mean_acceptance_length > 1.0`).
+
+Future phases will make this production-safe in multi-GPU, add CI-backed E2E equivalence tests, and refine performance.
+
+---
+
+## 2. Reference Mental Model: What “Correct” Multi-Token EAGLE Looks Like
 
 Use TensorRT-LLM EAGLE-3 as the reference behaviour:
 
@@ -108,21 +158,16 @@ Always keep **`EAGLE_TODO.md`** updated with your status; don’t check a B-item
 Already in place (you can rely on these):
 
 * **Single-token EAGLE** path is working and covered by tests.
-* `compute_eagle_draft_tokens_per_seq` now returns multi-token budgets (no final clamp to 1).
-* Eagle tree + kernels + KV rewind kernel + metrics plumbing exist (Engineer A).
-* You’ve already added:
-
-  * Env kill-switches:
-    `LMDEPLOY_EAGLE_FORCE_SINGLE_TOKEN`, `LMDEPLOY_EAGLE_DISABLE_MULTI_TOKEN`.
-  * An **experimental** multi-token helper:
-    `LlamaBatch::advanceSequencesByEagleAcceptance(...)`, gated by `LMDEPLOY_EAGLE_MULTI_TOKEN_EXPERIMENTAL` and `tp_size_ == 1`.
+* Eagle tree + kernels + KV rewind helper + metrics plumbing exist (Engineer A).
+* For `tp=1`, the multi-token EAGLE3 path is implemented and exercised by the offline helpers:
+  * `compute_eagle_draft_tokens_per_seq` returns multi-token budgets derived from `eagleMaxEngineTokensPerStep()` and `spec_max_decoding_draft_tokens`.
+  * `LlamaBatch::advanceSequencesByEagleAcceptance` and `runEagleKVRewind` implement multi-token sequence advancement and KV rewind with per-slot kill-switches and `max_new_tokens` guardrails.
+  * `validate_eagle_runtime_config`, `inspect_offline_eagle`, and `eagle3_multitoken_smoke` exercise the full path and print EAGLE metrics (including `mean_acceptance_length`).
 
 BUT:
 
-* KV rewind is not wired.
-* DynamicDecode semantics remain single-token.
-* Multi-GPU behaviour for multi-token is not guaranteed.
-* There is **no E2E multi-token test** yet.
+* Multi-GPU behaviour for multi-token is still disabled (`tp_size != 1` → single-token EAGLE).
+* Dedicated multi-token E2E tests and CI-hardening (EOS/stop equivalence, multi-GPU) remain to be done in future phases.
 
 Everything in this doc is about taking that partial work to a **full, test-backed** multi-token implementation.
 

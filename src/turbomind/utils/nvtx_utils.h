@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <string>
+
 namespace ft_nvtx {
 static std::string scope;
 std::string        getScope();

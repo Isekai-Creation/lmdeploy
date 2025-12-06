@@ -255,7 +255,6 @@ void invokePackAcceptedPaths(
     SizeType const* batch_slots,
     SizeType batch_size,
     SizeType max_batch_size,
-    SizeType max_batch_size,
     SizeType num_paths,
     SizeType max_path_len,
     cudaStream_t stream
