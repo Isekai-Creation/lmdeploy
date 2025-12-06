@@ -25,6 +25,7 @@ add_library(Llama STATIC
         EagleModule.cc
         EagleBuffers.cc
         LlamaV2_eagle.cc
+        ${CMAKE_SOURCE_DIR}/lmdeploy/turbomind/eagle_tree.cpp
 )
 set_property(TARGET Llama PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET Llama PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)
