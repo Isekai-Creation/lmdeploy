@@ -300,21 +300,6 @@ struct ScopedGIL {
 
 PYBIND11_MODULE(_turbomind, m)
 {
-    // Bind ScheduleMetrics as a module-local type. RequestMetrics is already
-    // bound by the underlying TurboMind/TensorRT-LLM extension; we rely on
-    // that binding to avoid pybind11 duplicate-type registration issues.
-    py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m,
-                                                                          "ScheduleMetrics",
-                                                                          py::module_local())
-        .def(py::init())
-        .def_readonly("total_seqs", &ft::ScheduleMetrics::total_seqs)
-        .def_readonly("active_seqs", &ft::ScheduleMetrics::active_seqs)
-        .def_readonly("waiting_seqs", &ft::ScheduleMetrics::waiting_seqs)
-        .def_readonly("total_blocks", &ft::ScheduleMetrics::total_blocks)
-        .def_readonly("active_blocks", &ft::ScheduleMetrics::active_blocks)
-        .def_readonly("cached_blocks", &ft::ScheduleMetrics::cached_blocks)
-        .def_readonly("free_blocks", &ft::ScheduleMetrics::free_blocks);
-
     // Lightweight bindings for EAGLE speculative decoding kernels used in tests.
     //
     // These helpers accept torch-like tensor objects (anything exposing
