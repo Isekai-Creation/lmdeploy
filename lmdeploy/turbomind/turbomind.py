@@ -991,7 +991,12 @@ class TurboMindInstance:
                 await sem.acquire()
                 state = shared_state.consume()
 
-                status, seq_len = state.status, state.seq_len
+                if state is None:
+                    continue
+                if isinstance(state, dict):
+                    status, seq_len = state["status"], state["seq_len"]
+                else:
+                    status, seq_len = state.status, state.seq_len
                 ret_status = ResponseType.SUCCESS
 
                 if status in [7, 8]:  # finish / canceled
@@ -1030,7 +1035,14 @@ class TurboMindInstance:
         finally:
             # Contract: `cb` won't be called again if status is non-zero
             # wait for status to be set as `finish` or `error`
-            while not state or state.status == 0:
+            def _status(s):
+                if s is None:
+                    return 0
+                if isinstance(s, dict):
+                    return s.get("status", 0)
+                return getattr(s, "status", 0)
+
+            while not state or _status(state) == 0:
                 await sem.acquire()
                 state = shared_state.consume()
             logger.info(f"[async_stream_infer] session {session_id} done")
