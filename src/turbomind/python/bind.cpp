@@ -853,48 +853,7 @@ PYBIND11_MODULE(_turbomind, m)
         "batch_size"_a = 2,
         "iters"_a = 50);
 
-    // tensor
-    py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
-        .def_property_readonly("where", [](const Tensor& t) { return t.device().type; })
-        .def_property_readonly("type", [](const Tensor& t) { return t.dtype(); })
-        .def_property_readonly("shape", [](const Tensor& t) { return t.shape(); })
-        .def_property_readonly("data", [](const Tensor& t) { return t.raw_data(); })
-        .def(
-            "copy_from",
-            [](Tensor& self, py::object obj) {
-                py::capsule      cap = obj.attr("__dlpack__")();
-                DLManagedTensor* dlmt =
-                    static_cast<DLManagedTensor*>(PyCapsule_GetPointer(cap.ptr(), kDlTensorCapsuleName));
-                auto src = DLManagedTensorToTritonTensor(dlmt);
-                // take ownership of capsule's payload
-                cap.set_name("used_dltensor");
-
-                TM_CHECK_EQ(self.byte_size(), src->byte_size()) << self << " " << *src;
-                safe_memcpy(self.raw_data(), src->raw_data(), self.byte_size());
-            },
-            "tensor"_a)
-        .def(
-            "__dlpack__",
-            [](Tensor& self, long stream) {
-                DLManagedTensor* dlmt = TritonTensorToDLManagedTensor(self);
-                return py::capsule(dlmt, kDlTensorCapsuleName, [](PyObject* obj) {
-                    DLManagedTensor* dlmt =
-                        static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, kDlTensorCapsuleName));
-                    if (dlmt) {
-                        dlmt->deleter(dlmt);
-                    }
-                    else {
-                        // The tensor has been deleted. Clear any error from
-                        // PyCapsule_GetPointer.
-                        PyErr_Clear();
-                    }
-                });
-            },
-            "stream"_a = 0)
-        .def("__dlpack_device__", [](const Tensor& self) {
-            auto device = getDLDevice(self);
-            return std::tuple<int, int>(int(device.device_type), device.device_id);
-        });
+    // DLpack bridge for pre-existing Tensor bindings.
     m.def(
         "from_dlpack",
         [](py::object obj) {
