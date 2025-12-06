@@ -991,8 +991,22 @@ void LlamaBatch::collectEagleStepHostState(const GenerationState& g,
     }
 
     core::Copy(token_ids_buf_.data() + (g.step - 1) * batch_size, batch_size, h_token_ids.data());
-    core::Copy(finished_buf_.data(), batch_size, h_finished_slots.data());
+    // finished_buf_ is a device buffer of bools; std::vector<bool> has a
+    // specialized representation, so we cannot copy into it directly via
+    // core::Copy. Use a temporary byte buffer and then map to bools.
+    static std::vector<uint8_t> h_finished_tmp;
+    if (static_cast<int>(h_finished_tmp.size()) < batch_size) {
+        h_finished_tmp.resize(batch_size);
+    }
+    check_cuda_error(cudaMemcpyAsync(h_finished_tmp.data(),
+                                     finished_buf_.data(),
+                                     static_cast<size_t>(batch_size) * sizeof(bool),
+                                     cudaMemcpyDeviceToHost,
+                                     stream_));
     check_cuda_error(cudaStreamSynchronize(stream_));
+    for (int i = 0; i < batch_size; ++i) {
+        h_finished_slots[i] = (h_finished_tmp[i] != 0);
+    }
 }
 
 void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
@@ -1277,8 +1291,8 @@ void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
                h_rewind_lengths_storage.data());
     check_cuda_error(cudaStreamSynchronize(stream_));
 
-    const int batch_size = state_->active_size;
-    for (int slot = 0; slot < batch_size; ++slot) {
+    const int active_size = state_->active_size;
+    for (int slot = 0; slot < active_size; ++slot) {
         const SizeType rewind_tokens = h_rewind_lengths_storage[slot];
         if (rewind_tokens <= 0) {
             continue;
@@ -2164,7 +2178,7 @@ bool LlamaBatch::Forward(GenerationState& g)
                     for (int i = 0; i < draft_batch_size; ++i) {
                         int planned = tokens_per_seq;
 
-                        auto* req = state_->requests[i];
+                        auto& req = state_->requests[i];
                         const Sequence* seq = state_->sequences[i];
                         if (req && seq) {
                             const int max_new_tokens = req->gen_cfg.max_new_tokens;
@@ -2581,7 +2595,7 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
         // even if planning or acceptance overestimated what is safe.
         int max_extra_allowed = std::numeric_limits<int>::max();
         if (i < state_->active_size) {
-            auto*          req = state_->requests[i];
+            auto&          req = state_->requests[i];
             const Sequence* seq = state_->sequences[i];
             if (req && seq) {
                 const int max_new_tokens = req->gen_cfg.max_new_tokens;
