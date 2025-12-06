@@ -90,7 +90,9 @@ void SpeculationTree::buildTreeWithChoices(
             continue;
         }
         auto const& children = choices[node_idx];
-        for (SizeType /*child_symbol*/ : children) {
+        for (SizeType child_symbol : children) {
+            (void)child_symbol;  // currently unused; keeps the compiler happy
+
             if (next_token_idx >= num_tokens || static_cast<SizeType>(nodes_.size()) >= max_nodes) {
                 break;
             }
