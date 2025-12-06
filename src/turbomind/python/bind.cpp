@@ -300,21 +300,9 @@ struct ScopedGIL {
 
 PYBIND11_MODULE(_turbomind, m)
 {
-    // Bind C++ RequestMetrics and ScheduleMetrics as module-local types so
-    // that we do not conflict with any other extension that may also expose
-    // the same turbomind::RequestMetrics / ScheduleMetrics in the process.
-    py::class_<ft::RequestMetrics, std::shared_ptr<ft::RequestMetrics>>(m,
-                                                                        "RequestMetrics",
-                                                                        py::module_local())
-        .def(py::init())
-        .def_readonly("enque_time", &ft::RequestMetrics::enque_time)
-        .def_readonly("scheduled_time", &ft::RequestMetrics::scheduled_time)
-        .def_readonly("eagle_total_draft_tokens", &ft::RequestMetrics::eagle_total_draft_tokens)
-        .def_readonly("eagle_total_accepted_tokens", &ft::RequestMetrics::eagle_total_accepted_tokens)
-        .def_readonly("eagle_steps", &ft::RequestMetrics::eagle_steps)
-        .def_readonly("eagle_total_rewound_tokens", &ft::RequestMetrics::eagle_total_rewound_tokens)
-        .def_readonly("eagle_rewind_steps", &ft::RequestMetrics::eagle_rewind_steps);
-
+    // Bind ScheduleMetrics as a module-local type. RequestMetrics is already
+    // bound by the underlying TurboMind/TensorRT-LLM extension; we rely on
+    // that binding to avoid pybind11 duplicate-type registration issues.
     py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m,
                                                                           "ScheduleMetrics",
                                                                           py::module_local())
