@@ -8,7 +8,10 @@ import logging
 from enum import Enum
 from typing import List, Optional, Union
 
-import _xgrammar as _xgr  # noqa: E402
+try:  # pragma: no cover - backend availability is environment-dependent
+    import _xgrammar as _xgr  # noqa: E402
+except Exception:  # noqa: BLE001
+    _xgr = None
 
 try:
     import sentencepiece
@@ -56,7 +59,7 @@ class VocabType(Enum):
     """
 
 
-class TokenizerInfo(_xgr.TokenizerInfo):
+class TokenizerInfo(_xgr.TokenizerInfo if _xgr is not None else object):
     """The tokenizer info contains the vocabulary, the type of the vocabulary,
     and necessary information for the grammar-guided generation.
 
@@ -98,6 +101,12 @@ class TokenizerInfo(_xgr.TokenizerInfo):
         add_prefix_space : bool, default: False
             Whether the tokenizer will prepend a space before the text in the tokenization process.
         """
+        if _xgr is None:
+            raise RuntimeError(
+                "TokenizerInfo requires the `_xgrammar` extension; it is not "
+                "available in this environment."
+            )
+
         if isinstance(stop_token_ids, int):
             stop_token_ids = [stop_token_ids]
 

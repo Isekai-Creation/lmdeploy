@@ -188,3 +188,261 @@ def benchmark_kv_cache_rewind(
         "rewinds_per_second": rewinds_per_second,
     }
 
+
+def benchmark_accept_draft_tokens(
+    batch_size: int = 4,
+    max_seq_len: int = 128,
+    max_draft_tokens: int = 8,
+    max_path_len: int = 8,
+    iters: int = 50,
+    device: Optional[str] = None,
+) -> Dict[str, float]:
+    """Microbenchmark for the EAGLE acceptance kernel.
+
+    When running on CUDA and the compiled _turbomind extension is available,
+    this uses ``_turbomind.eagle_accept_draft_tokens``. On CPU, it falls back
+    to a small Python implementation with the same semantics, which keeps the
+    benchmark usable on non-GPU environments.
+    """
+    import time
+
+    if iters <= 0:
+        raise ValueError("iters must be positive")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device not in ("cuda", "cpu"):
+        raise ValueError(f"Unsupported device '{device}', expected 'cuda' or 'cpu'")
+
+    tensor_device = torch.device(device)
+
+    # Synthetic tensors: drafts == targets for the happy path.
+    output_ids = torch.zeros(batch_size, max_seq_len, dtype=torch.int32, device=tensor_device)
+    draft_ids = torch.randint(
+        10,
+        1000,
+        (batch_size, max_draft_tokens),
+        dtype=torch.int32,
+        device=tensor_device,
+    )
+    target_ids = draft_ids.clone()
+    accepted_lengths = torch.zeros(batch_size, dtype=torch.int32, device=tensor_device)
+    sequence_lengths = torch.zeros(batch_size, dtype=torch.int32, device=tensor_device)
+
+    paths = torch.full(
+        (batch_size, max_draft_tokens, max_path_len),
+        -1,
+        dtype=torch.int32,
+        device=tensor_device,
+    )
+    # Use a simple linear path on path 0.
+    path_len = min(max_draft_tokens, max_path_len)
+    paths[:, 0, :path_len] = torch.arange(path_len, dtype=torch.int32, device=tensor_device)
+    best_path_ids = torch.zeros(batch_size, dtype=torch.int32, device=tensor_device)
+    batch_slots = torch.arange(batch_size, dtype=torch.int32, device=tensor_device)
+
+    def _step_cpu():
+        # Simple CPU reference mirroring MockAcceptDraftTokens.
+        for batch_idx in range(batch_size):
+            slot = int(batch_slots[batch_idx].item())
+            seq_len = int(sequence_lengths[slot].item())
+            best_path = int(best_path_ids[slot].item())
+
+            accepted = 0
+            for i in range(max_draft_tokens):
+                path_idx = int(paths[slot, best_path, i].item())
+                if path_idx < 0:
+                    break
+
+                draft_token = int(draft_ids[slot, path_idx].item())
+                target_token = int(target_ids[slot, path_idx].item())
+
+                if draft_token == target_token:
+                    output_ids[slot, seq_len + accepted] = draft_token
+                    accepted += 1
+                else:
+                    output_ids[slot, seq_len + accepted] = target_token
+                    accepted += 1
+                    break
+
+            accepted_lengths[slot] = accepted
+            sequence_lengths[slot] = seq_len + accepted
+
+    def _step_cuda():
+        try:
+            from lmdeploy.turbomind.turbomind import _turbomind  # type: ignore
+        except ImportError as exc:  # pragma: no cover - environment-specific
+            raise RuntimeError(
+                "CUDA benchmark for accept_draft_tokens requires the "
+                "_turbomind extension; rebuild lmdeploy with TurboMind enabled."
+            ) from exc
+
+        accepted_lengths.zero_()
+        sequence_lengths.zero_()
+        _turbomind.eagle_accept_draft_tokens(
+            output_ids,
+            draft_ids,
+            target_ids,
+            accepted_lengths,
+            sequence_lengths,
+            paths,
+            best_path_ids,
+            batch_slots,
+        )
+
+    # Warmup.
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device not available for benchmark_accept_draft_tokens")
+        _step_cuda()
+        torch.cuda.synchronize()
+    else:
+        _step_cpu()
+
+    start = time.perf_counter()
+    for _ in range(iters):
+        if device == "cuda":
+            _step_cuda()
+        else:
+            _step_cpu()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    avg_ms = elapsed * 1000.0 / float(iters)
+    total_accepts = int(batch_size * iters * max_draft_tokens)
+    accepts_per_sec = total_accepts / elapsed if elapsed > 0 else 0.0
+
+    return {
+        "batch_size": float(batch_size),
+        "max_draft_tokens": float(max_draft_tokens),
+        "max_seq_len": float(max_seq_len),
+        "max_path_len": float(max_path_len),
+        "iters": float(iters),
+        "avg_ms_per_call": avg_ms,
+        "accept_ops_per_second": accepts_per_sec,
+    }
+
+
+def benchmark_pack_accepted_paths(
+    batch_size: int = 4,
+    num_paths: int = 8,
+    max_path_len: int = 8,
+    iters: int = 50,
+    device: Optional[str] = None,
+) -> Dict[str, float]:
+    """Microbenchmark for the accepted-path packing kernel.
+
+    On CUDA, this uses ``_turbomind.eagle_pack_accepted_paths``; on CPU it
+    falls back to a small reference implementation that exercises the same
+    semantics. The benchmark operates on synthetic inputs and is intended
+    for quick sanity/performance checks rather than production use.
+    """
+    import time
+
+    if iters <= 0:
+        raise ValueError("iters must be positive")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device not in ("cuda", "cpu"):
+        raise ValueError(f"Unsupported device '{device}', expected 'cuda' or 'cpu'")
+
+    tensor_device = torch.device(device)
+
+    # Synthetic accepted lengths and paths.
+    # Ensure at least 1 token accepted per sequence.
+    accepted_lengths = torch.randint(
+        1,
+        max(2, max_path_len + 1),
+        (batch_size,),
+        dtype=torch.int32,
+        device=tensor_device,
+    )
+
+    accepted_lengths_cumsum = torch.zeros(batch_size, dtype=torch.int32, device=tensor_device)
+    accepted_lengths_cumsum[0] = accepted_lengths[0]
+    for i in range(1, batch_size):
+        accepted_lengths_cumsum[i] = accepted_lengths_cumsum[i - 1] + accepted_lengths[i]
+
+    total_accepted = int(accepted_lengths_cumsum[-1].item())
+
+    # Paths laid out as [batch_size, num_paths, max_path_len].
+    paths = torch.full(
+        (batch_size, num_paths, max_path_len),
+        -1,
+        dtype=torch.int32,
+        device=tensor_device,
+    )
+    for b in range(batch_size):
+        # For each slot, choose a best path and fill it with a simple range.
+        length = int(accepted_lengths[b].item())
+        length = min(length, max_path_len)
+        paths[b, 0, :length] = torch.arange(length, dtype=torch.int32, device=tensor_device)
+
+    best_path_ids = torch.zeros(batch_size, dtype=torch.int32, device=tensor_device)
+    batch_slots = torch.arange(batch_size, dtype=torch.int32, device=tensor_device)
+    paths_offsets = torch.full(total_accepted, -1, dtype=torch.int32, device=tensor_device)
+
+    def _pack_cpu():
+        offsets = []
+        for local_b in range(batch_size):
+            slot = int(batch_slots[local_b].item())
+            best = int(best_path_ids[slot].item())
+            accepted = int(accepted_lengths[slot].item())
+            for i in range(accepted):
+                idx = int(paths[slot, best, i].item())
+                offsets.append(idx)
+        paths_offsets.copy_(torch.tensor(offsets, dtype=torch.int32, device=tensor_device))
+
+    def _pack_cuda():
+        try:
+            from lmdeploy.turbomind.turbomind import _turbomind  # type: ignore
+        except ImportError as exc:  # pragma: no cover - environment-specific
+            raise RuntimeError(
+                "CUDA benchmark for pack_accepted_paths requires the "
+                "_turbomind extension; rebuild lmdeploy with TurboMind enabled."
+            ) from exc
+
+        _turbomind.eagle_pack_accepted_paths(
+            accepted_lengths_cumsum,
+            paths_offsets,
+            accepted_lengths,
+            best_path_ids,
+            paths,
+            batch_slots,
+        )
+
+    # Warmup.
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device not available for benchmark_pack_accepted_paths")
+        _pack_cuda()
+        torch.cuda.synchronize()
+    else:
+        _pack_cpu()
+
+    start = time.perf_counter()
+    for _ in range(iters):
+        if device == "cuda":
+            _pack_cuda()
+        else:
+            _pack_cpu()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    avg_ms = elapsed * 1000.0 / float(iters)
+    total_packed = int(total_accepted * iters)
+    packed_per_sec = total_packed / elapsed if elapsed > 0 else 0.0
+
+    return {
+        "batch_size": float(batch_size),
+        "num_paths": float(num_paths),
+        "max_path_len": float(max_path_len),
+        "iters": float(iters),
+        "avg_ms_per_call": avg_ms,
+        "pack_ops_per_second": packed_per_sec,
+    }

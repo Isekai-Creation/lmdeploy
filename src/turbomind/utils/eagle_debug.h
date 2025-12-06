@@ -22,43 +22,56 @@ inline bool isEnvVarEnabled(const char* name)
     return !(v[0] == '0' && v[1] == '\0');
 }
 
+// Global EAGLE debug/metrics flags, controlled by SpeculativeConfig via
+// setEagleDebugFlags(). Default to false until explicitly enabled.
+inline bool& eagleDebugFlag()
+{
+    static bool flag = false;
+    return flag;
+}
+
+inline bool& eagleMetricsDebugFlag()
+{
+    static bool flag = false;
+    return flag;
+}
+
 inline bool isEagleDebugEnabled()
 {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = isEnvVarEnabled("LMDEPLOY_EAGLE_DEBUG") ? 1 : 0;
-    }
-    return cached == 1;
+    return eagleDebugFlag();
 }
 
 inline bool isEagleKVDebugEnabled()
 {
     static int cached = -1;
     if (cached == -1) {
-        // LMDEPLOY_EAGLE_KV_DEBUG overrides the generic EAGLE flag.
-        if (isEnvVarEnabled("LMDEPLOY_EAGLE_KV_DEBUG")) {
-            cached = 1;
-        }
-        else {
-            cached = isEagleDebugEnabled() ? 1 : 0;
-        }
+        // LMDEPLOY_EAGLE_KV_DEBUG controls KV rewind-specific logging. This
+        // remains env-driven for now as it is orthogonal to decode-mode
+        // selection.
+        cached = isEnvVarEnabled("LMDEPLOY_EAGLE_KV_DEBUG") ? 1 : 0;
     }
     return cached == 1;
 }
 
 inline bool isEagleMetricsDebugEnabled()
 {
-    static int cached = -1;
-    if (cached == -1) {
-        if (isEnvVarEnabled("LMDEPLOY_EAGLE_METRICS_DEBUG")) {
-            cached = 1;
-        }
-        else {
-            cached = isEagleDebugEnabled() ? 1 : 0;
-        }
-    }
-    return cached == 1;
+    return eagleMetricsDebugFlag();
+}
+
+inline bool isEagleForceSingleTokenEnabled()
+{
+    return false;
+}
+
+inline bool isEagleDisableMultiTokenEnabled()
+{
+    return false;
+}
+
+inline void setEagleDebugFlags(bool eagle_debug, bool eagle_metrics_debug)
+{
+    eagleDebugFlag()        = eagle_debug;
+    eagleMetricsDebugFlag() = eagle_metrics_debug;
 }
 
 }  // namespace turbomind
-

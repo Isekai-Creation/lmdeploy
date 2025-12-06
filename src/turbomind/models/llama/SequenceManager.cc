@@ -179,6 +179,14 @@ void SequenceManager::VerifyAndLockCached(const Sequences& sequences)
     block_manager_->Lock(blocks);
 }
 
+void SequenceManager::UnlockBlocks(const BlockIds& ids)
+{
+    if (ids.empty()) {
+        return;
+    }
+    block_manager_->Unlock(ids);
+}
+
 void SequenceManager::CommitUnlockAndFree()
 {
     if (!unlocked_.empty()) {

@@ -185,6 +185,73 @@ def test_eagle_equals_baseline_single_token(tmp_path):
     assert baseline_outputs[0].token_ids == eagle_outputs[0].token_ids
 
 
+@pytest.mark.cuda
+@pytest.mark.cuda
+def test_eagle_multi_token_experimental_equals_baseline(tmp_path):
+    """Multi-token EAGLE (experimental flag on) should match baseline outputs.
+
+    This checks that enabling LMDEPLOY_EAGLE_MULTI_TOKEN_EXPERIMENTAL does not
+    change the generated token sequence relative to baseline decoding when
+    using greedy sampling on a small prompt.
+    """
+    model_path = os.environ.get("MODEL_PATH")
+    spec_model_path = os.environ.get("SPEC_MODEL_PATH") or model_path
+
+    if not model_path or not spec_model_path:
+        pytest.skip("MODEL_PATH / SPEC_MODEL_PATH not set; skipping multi-token equality test")
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TurboMind EAGLE tests")
+
+    # Enable experimental multi-token advance for this process.
+    os.environ["LMDEPLOY_EAGLE_MULTI_TOKEN_EXPERIMENTAL"] = "1"
+
+    engine_config = TurbomindEngineConfig(
+        tp=1,
+        max_batch_size=1,
+        cache_max_entry_count=0.5,
+        enable_prefix_caching=False,
+    )
+
+    # Baseline pipeline (no speculation)
+    baseline_pipe = lm_pipeline(
+        model_path,
+        backend_config=engine_config,
+        speculative_config=None,
+    )
+
+    # EAGLE-enabled pipeline with multi-token config
+    spec_config = SpeculativeConfig(
+        method="eagle3",
+        model=spec_model_path,
+        num_speculative_tokens=3,
+        max_path_len=8,
+        max_decoding_tokens=32,
+    )
+
+    eagle_pipe = lm_pipeline(
+        model_path,
+        backend_config=engine_config,
+        speculative_config=spec_config,
+    )
+
+    prompt = "Multi-token EAGLE experimental equality test prompt."
+    gen_configs = [
+        GenerationConfig(
+            max_new_tokens=32,
+            temperature=0.0,
+            top_k=1,
+            random_seed=123,
+        )
+    ]
+
+    baseline_outputs = baseline_pipe([prompt], gen_config=gen_configs)
+    eagle_outputs = eagle_pipe([prompt], gen_config=gen_configs)
+
+    assert len(baseline_outputs) == len(eagle_outputs) == 1
+    assert baseline_outputs[0].token_ids == eagle_outputs[0].token_ids
+
+
 def test_eagle_acceptance_metrics_sanity(tmp_path):
     """Sanity-check EAGLE acceptance metrics exposed via RequestMetrics.
 

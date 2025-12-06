@@ -159,6 +159,11 @@ public:
         return block_manager_->cached_count();
     }
 
+    // Unlock the given blocks in the underlying BlockManager, decreasing
+    // their use_count and moving them from the active set to the cached
+    // set when no sequences reference them any longer.
+    void UnlockBlocks(const BlockIds& ids);
+
     // return #total_seq, #active_seq, #cached_seq
     std::tuple<int, int, int> seq_stats() const noexcept;
 

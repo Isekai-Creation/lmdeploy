@@ -2,6 +2,11 @@
 
 This file tracks all work needed to bring TurboMind’s EAGLE speculative decoding to full, production use. Items marked `[x]` are already implemented in this repo; items marked `[ ]` are pending.
 
+Status Legend:
+- ✅ Implemented + tested (production-ready for current scope)
+- 🧪 Implemented (prototype; GPU/CI validation pending or limited in scope)
+- ⏳ Planned (not implemented)
+
 ## 1. Engine config and initialization
 
 - [x] Parse `speculative_config` into `TurbomindEngineConfig` and `EngineParam` (including `method`, `model`, `num_speculative_tokens`, `max_path_len`, `max_decoding_tokens`, `max_non_leaves_per_layer`).
@@ -240,14 +245,25 @@ Engineer A plan code mapping (A10–A20):
 
 #### Engineer A – Phase 3 (next 10 tasks, A‑scope only)
 
-21. **A21: Bind EAGLE device kernels for acceptance/mask tests**  
-    - Add lightweight C++/pybind11 bindings around the EAGLE CUDA kernels in `lmdeploy/lmdeploy/turbomind/kernels/speculative_decoding/common.{h,cu}` (at least `acceptDraftTokens` and `invokePackAcceptedPaths`) and introduce GPU-backed tests under `lmdeploy/tests/turbomind` that compare device results against the existing Python reference implementations for acceptance and path packing.
+21. **A21: Bind EAGLE device kernels for acceptance/mask tests** – **🧪 prototype (GPU/CI validation pending)**  
+    - Added lightweight C++/pybind11 bindings around the EAGLE CUDA kernels in `lmdeploy/lmdeploy/turbomind/kernels/speculative_decoding/common.{h,cu}` (at least `acceptDraftTokens` and `invokePackAcceptedPaths`) and introduced GPU-backed tests under `lmdeploy/tests/turbomind/test_speculative_kernels.py` that compare device results against the existing Python reference implementations for acceptance and path packing.  
+    - **Scope:** Not required for baseline decode; bindings are primarily for tests/benchmarks and are not a hard dependency for production EAGLE paths (core kernels are already used from C++).  
+    - **CI:**  
+      - Run `pytest lmdeploy/tests/turbomind/test_speculative_kernels.py::TestAcceptDraftTokensDevice` with CUDA and a built `_turbomind` extension.  
+      - Run `pytest lmdeploy/tests/turbomind/test_speculative_kernels.py::TestPackAcceptedPathsDevice` with CUDA and `_turbomind`.  
+      - Run `pytest lmdeploy/tests/turbomind/test_speculative_kernels.py::TestAcceptanceStatsDevice` with CUDA and `_turbomind`.  
+    - **Note:** Feature is experimental; do not rely on the Python bindings for production decode paths until the above CI jobs are green.
 
-22. **A22: Microbenchmark EAGLE acceptance and KV rewind kernels** – **done (KV rewind path)**  
-    - Implemented a Python-level microbenchmark helper `benchmark_kv_cache_rewind` in `lmdeploy/turbomind/kernels/speculative_decoding/common.py` and a lightweight test in `lmdeploy/tests/turbomind/test_speculative_kernel_bench.py`. This runs repeated KV rewind operations on synthetic inputs (CPU or CUDA via torch) and reports timing statistics, giving offline tuning a cheap way to sanity-check KV rewind performance without running a full decode loop. Additional microbenchmarks for acceptance/mask kernels can be added later if needed.
+22. **A22: Microbenchmark EAGLE acceptance and KV rewind kernels** – **🧪 prototype (coverage limited to small shapes)**  
+    - Implemented a Python-level microbenchmark helper `benchmark_kv_cache_rewind` in `lmdeploy/turbomind/kernels/speculative_decoding/common.py` and a lightweight test in `lmdeploy/tests/turbomind/test_speculative_kernel_bench.py`. This runs repeated KV rewind operations on synthetic inputs (CPU or CUDA via torch) and reports timing statistics, giving offline tuning a cheap way to sanity-check KV rewind performance without running a full decode loop.  
+    - Additional microbenchmarks for acceptance/mask kernels (`benchmark_accept_draft_tokens`, `benchmark_pack_accepted_paths`) have been added as well; these rely on `_turbomind` when running on CUDA and are validated by small sanity tests but still benefit from broader GPU/CI coverage on larger shapes.  
+    - **CI:**  
+      - Run `pytest lmdeploy/tests/turbomind/test_speculative_kernel_bench.py` with CUDA and `_turbomind` built, ensuring both KV rewind and acceptance/pack benchmarks run on GPU.  
+      - Optionally extend CI to capture benchmark outputs (e.g. as artifacts) for basic perf regression checks.
 
-23. **A23: Fuzz-style tests for `eagle_tree` invariants** – **done**  
-    - Extended `lmdeploy/tests/turbomind/test_eagle_tree.py` with `test_random_choices_preserve_invariants`, which builds random `choices` tables and draft token sequences and asserts that `SpeculationTree::buildTreeWithChoices` / `extractPaths` always produce a flattened path array of length `num_paths * max_depth`, exercising the internal invariants under a variety of shapes.
+23. **A23: Fuzz-style tests for `eagle_tree` invariants** – **✅ implemented + tested (CPU-only)**  
+    - Extended `lmdeploy/tests/turbomind/test_eagle_tree.py` with fuzz-style tests (`test_random_choices_preserve_invariants` plus larger variants) that build random `choices` tables and draft token sequences and assert that `SpeculationTree::buildTreeWithChoices` / `extractPaths` always produce a flattened path array of length `num_paths * max_depth`, exercising the internal invariants under a variety of shapes.  
+    - These tests are CPU-only and already run in standard CI; no GPU dependency here.
 
 24. **A24: Guardrails for EAGLE-disabled engines in Python pipeline** – **done (via existing metrics/benchmark tests)**  
     - Covered by the combination of `lmdeploy/tests/turbomind/test_eagle_metrics.py` (no `spec_info` when `eagle_steps == 0`), `lmdeploy/tests/test_speculative_stats.py` (no-op updates when `spec_info` is absent), and `lmdeploy/tests/test_benchmark_speculative_integration.py` (benchmark JSON only includes an `eagle_speculation` block when TurboMind provides `spec_info`). Together these ensure that when EAGLE is disabled at runtime, the Python pipeline and `BenchmarkRunner` treat runs as baseline with zero EAGLE stats.
@@ -255,8 +271,9 @@ Engineer A plan code mapping (A10–A20):
 25. **A25: EAGLE metrics summary helper for offline analysis** – **done**  
     - Added `EagleMetricsSummary` to `lmdeploy/metrics/stats.py` plus tests in `lmdeploy/tests/test_eagle_metrics_summary.py`. This helper wraps `SpeculativeDecodingStats` into a compact summary (draft count, draft/accepted token totals, draft acceptance rate, mean acceptance length) suitable for logging or saving alongside benchmark results.
 
-26. **A26: CLI utility to inspect `eagle_tree.yaml` and buffers** – **done**  
-    - Implemented `scripts/eagle_inspect_tree.py`, a small CLI that loads `eagle_tree.yaml`, reports basic tree statistics (node count, max/average branching), and, given `--max-decoding-tokens` / `--max-path-len` / `--batch-size`, prints derived `EagleBuffers` shapes for `draft_paths` and packed masks so engineers can reason about memory/shape implications offline.
+26. **A26: CLI utility to inspect `eagle_tree.yaml` and buffers** – **✅ implemented (offline-only tool)**  
+    - Implemented `scripts/eagle_inspect_tree.py`, a small CLI that loads `eagle_tree.yaml`, reports basic tree statistics (node count, max/average branching), and, given `--max-decoding-tokens` / `--max-path-len` / `--batch-size`, prints derived `EagleBuffers` shapes for `draft_paths` and packed masks so engineers can reason about memory/shape implications offline.  
+    - Later extended with rough KV-block usage estimates (`--block-size`) to help reason about speculative KV over-provisioning. This script is pure Python/CPU and does not depend on CUDA, but its assumptions should be revisited periodically as EAGLE buffer layouts evolve.
 
 27. **A27: NVTX ranges for EAGLE hot paths (debug-only)** – **done**  
     - Added NVTX scopes around key A-scope EAGLE hot paths: `EagleModule::forward` (via `NvtxScope` in `EagleModule.cc`) and the host-side KV rewind helper (`computeAndInvokeKVCacheRewind` in `kv_rewind_helper.cu`). These scopes are compatible with the existing debug env-vars and allow Nsight profiles to clearly identify EAGLE work without changing behaviour.
@@ -272,6 +289,110 @@ Engineer A plan code mapping (A10–A20):
       - It can be attached to both `PytorchEngineConfig` and `TurbomindEngineConfig` without violating their validation rules.
       - Core semantics (`method`, `num_speculative_tokens`) are identical across backends.
       - `SpeculativeConfig.to_turbomind_spec_dict()` produces a `speculative_config` mapping whose keys/values match what TurboMind’s `EngineParam` expects for EAGLE/EAGLE3.
+
+#### Engineer A – Future Phase (A31+ prototypes – GPU validation pending)
+
+31. **A31: Tree-based device acceptance kernel (paths-level)** – **🧪 prototype (GPU/CI validation pending)**  
+    - Added `invokeTreeAcceptByIdsWithPaths` in `lmdeploy/turbomind/kernels/speculative_decoding/tree_accept_kernels.{h,cu}` to evaluate SpeculationTree paths entirely on device:
+      - For each sequence, walks all candidate paths in a batched `paths` tensor `[maxBatchSize, numPaths, maxPathLen]` using the same acceptance rule as the existing host-side logic in `LlamaV2_eagle.cc` (accept while `draft_id == target_id`, include the first mismatching target token).
+      - Produces `best_path_ids` and `accepted_lens` per slot, and materializes accepted target tokens for the best path into `accepted_tokens`.  
+    - This kernel is currently only used via test/benchmark bindings (not the production decode loop) and requires **GPU-backed unit tests in CI (including different batch sizes, `num_paths`, and `max_path_len`)** before being wired into `LlamaV2_eagle` or treated as production-ready.  
+    - **Scope:** Not wired into `LlamaBatch` / `LlamaV2_eagle`; only reachable via `_turbomind` bindings and dedicated tests/benchmarks. Feature is experimental and should not be relied upon for production decode paths yet.  
+    - **CI:**  
+      - Build `_turbomind` with CUDA and run  
+        `pytest lmdeploy/tests/turbomind/test_speculative_kernels.py::TestTreeAcceptTokensDevice`.
+
+32. **A32: Pybind bindings and tests for tree-accept kernel** – **🧪 prototype (GPU/CI validation pending)**  
+    - Exposed the tree-accept kernel to Python as `_turbomind.eagle_tree_accept_tokens` in `src/turbomind/python/bind.cpp`, accepting CUDA tensors for `draft_ids`, `target_ids`, `paths`, `best_path_ids`, `accepted_lengths`, `accepted_tokens`, and optional `batch_slots`.  
+    - Added GPU-backed tests in `lmdeploy/tests/turbomind/test_speculative_kernels.py::TestTreeAcceptTokensDevice` that compare `_turbomind.eagle_tree_accept_tokens` against a Python reference mirroring the host-side acceptance logic. These tests are guarded with `torch.cuda.is_available()` and will be **skipped** on CPU-only environments; they must be exercised in a CUDA-enabled CI configuration (with a built `_turbomind` extension) before we mark A31/A32 as fully validated.  
+    - **Scope:** Binding is not used in production EAGLE paths; it exists for A-scope validation and microbenchmarks only.  
+    - **CI:**  
+      - Same as A31: run `pytest lmdeploy/tests/turbomind/test_speculative_kernels.py::TestTreeAcceptTokensDevice` with CUDA and `_turbomind` built.
+
+33. **A33: Prepare kernels for variable `tokens_per_seq` layouts** – **🧪 prototype (design scaffolding; validation pending)**  
+    - The existing acceptance and packing kernels (`acceptDraftTokens`, `invokePackAcceptedPaths`, and the new tree-accept helper) are written against batched layouts with explicit `batch_slots` mappings and max-size parameters (`max_batch_size`, `max_draft_tokens`, `num_paths`, `max_path_len`), which makes them structurally compatible with future variable `tokens_per_seq` schemes (unused positions can be denoted via sentinel indices such as `-1`).  
+    - No production call sites have been updated yet to drive truly per-sequence `tokens_per_seq` variation; additional work (and tests) will be needed to:
+      - thread per-sequence token counts into the relevant helpers, and  
+      - validate correctness under non-uniform layouts via new GPU-backed tests (once CI has a CUDA build).  
+    - For now, these kernels should be considered **prototype-ready but not fully validated for variable per-sequence layouts**; downstream engineers should treat them as experimental until dedicated GPU tests (including multi-token end-to-end scenarios, TP/PP/DP configurations, and KV rewind integration) are added and passing in CI.  
+    - **Scope:** No production call sites currently drive truly per-sequence `tokens_per_seq` variation; the design is in place, but wiring + tests are still TODO.  
+    - **CI (future):**  
+      - Add multi-token E2E tests in `lmdeploy/tests/turbomind/test_eagle_multi_token_future.py` once Engineer B’s multi-token loop is ready.  
+      - Extend `test_benchmark_speculative_integration.py` to cover multi-token EAGLE runs and validate metrics/KV rewind invariants under variable `tokens_per_seq`.
+
+34. **A34: Offline TurboMind pipeline examples for EAGLE** – **🧪 implemented (examples; manual GPU run required)**  
+    - Updated `lmdeploy/examples/speculative_decoding_example.py` to use the high-level `lmdeploy.pipeline` TurboMind backend together with `TurbomindEngineConfig` and `SpeculativeConfig` for:
+      - `draft_target` speculative decoding,
+      - `eagle3` EAGLE speculative decoding (including aggregation of `SpeculativeDecodingStats` and `EagleMetricsSummary` from pipeline responses), and
+      - `ngram` speculative decoding.  
+    - The script now demonstrates an end-to-end offline EAGLE/EAGLE3 run (kernels → EagleModule → TurboMind pipeline → Python metrics) without touching `LlamaBatch` / `LlamaV2_eagle`, and makes `req_metrics.spec_info` usage explicit for EAGLE runs.  
+    - **Scope:** Example-only; it assumes real TurboMind model artifacts at the placeholder paths and is intended for offline experimentation and debugging rather than CI.  
+    - **CI / testing:**  
+      - Syntax/packaging is covered by `python -m compileall lmdeploy/examples/speculative_decoding_example.py`.  
+      - Full runs should be exercised on a CUDA-enabled machine with small TurboMind models by engineers or future GPU CI (no dedicated pytest currently).
+
+35. **A35: Print EAGLE metrics in `benchmark_speculative.py` CLI** – **✅ implemented (leverages existing JSON tests)**  
+    - Extended `inference/benchmark_speculative.py::BenchmarkRunner.run_test_scenario` to print `mean_acceptance_rate` and `mean_acceptance_length` whenever the `eagle_speculation` block is present in the benchmark results, so offline TurboMind benchmarks surface EAGLE acceptance behaviour directly in stdout alongside throughput/latency/memory.  
+    - This keeps the JSON schema unchanged (the `eagle_speculation` block is still produced by `EagleMetricsSummary.to_dict()` plus an `enabled` flag) and simply makes EAGLE metrics more visible during manual benchmarking.  
+    - **Scope:** Purely a reporting enhancement; no changes to engine wiring, kernels, or metrics computation.  
+    - **CI / testing:**  
+      - Structural/semantic checks for the `eagle_speculation` block remain covered by `lmdeploy/tests/test_benchmark_speculative_integration.py::test_benchmark_runner_reports_eagle_metrics_when_available` (run in CUDA-enabled CI with `MODEL_PATH` / `SPEC_MODEL_PATH` set).  
+      - The new print path is best-effort and does not require additional automated tests.
+
+36. **A36: Harden core EAGLE kernels for edge cases** – **🧪 prototype (GPU/CI validation pending)**  
+    - Tightened the EAGLE acceptance, packing, tree-accept, and KV-rewind kernels in `lmdeploy/turbomind/kernels/speculative_decoding/common.{h,cu}` and `tree_accept_kernels.{h,cu}` to handle edge conditions more robustly:
+      - `acceptDraftTokensKernel` now guards against out-of-range `batch_slots`, negative `best_path_id` (treated as "no best path"), and path indices outside `[0, max_draft_tokens)`, defaulting to zero accepted tokens for such slots instead of reading out of bounds.  
+      - `packAcceptedPathsKernel` now validates `batch_slots` against `max_batch_size`, skips slots with invalid `best_path_id` or non-positive `accepted_len`, and clamps writes to the valid range implied by `accepted_lengths_cumsum`, treating negative path indices as terminators.  
+      - `kvCacheRewindKernel` now uses `max_batch_size` to ignore out-of-range slots and early-returns when batch size, block size, or max_blocks_per_seq are nonsensical, avoiding stray writes to block_tables/kv_cache_blocks.  
+      - A new GPU test in `lmdeploy/tests/turbomind/test_speculative_kernels.py::TestAcceptDraftTokensDevice::test_device_accept_handles_empty_paths_and_negative_best_path` validates that `best_path_id == -1` and all-`-1` paths result in zero accepted tokens and unchanged sequence lengths.  
+    - **Scope:** Kernel behaviour remains backward compatible for valid inputs; changes only add guards for malformed or partially-initialized buffers commonly hit during experimentation.  
+    - **CI / testing:**  
+      - Run `pytest lmdeploy/tests/turbomind/test_speculative_kernels.py::TestAcceptDraftTokensDevice` and `::TestPackAcceptedPathsDevice` on CUDA with a built `_turbomind` extension to exercise the hardened kernels on device.  
+      - Add future GPU tests for KV rewind edge cases once Engineer B wires `computeAndInvokeKVCacheRewind` into decode loops.
+
+37. **A37: Expose EagleModule buffer / tree introspection helpers** – **✅ implemented (internal utility)**  
+    - Extended `EagleModule` with additional read-only accessors used by A-scope tooling and potential future buffer sizing helpers:
+      - `getHiddenUnits()` and `getVocabSize()` expose the draft model dimensions inferred from `config.yaml`.  
+      - `getMaxTreeNodes()` reports `max_decoding_tokens * max_draft_path_len`, a conservative upper bound on per-step tree nodes for sizing SpeculationTree/EagleBuffers.  
+    - Strengthened `EagleModule::forward` checks:
+      - If `enabled_` is false, `forward` now logs a clear warning and acts as a pass-through on `hidden_states` instead of attempting a partial draft forward.  
+      - Existing hidden-dim mismatch warnings remain, but now run under an explicit "module disabled / weights not initialized" guard for cleaner failure modes.  
+    - **Scope:** No behaviour changes for correctly configured engines; the new accessors are used only by diagnostics and potential future tooling.  
+    - **CI / testing:** Covered implicitly by existing EAGLE unit/integration tests that exercise `EagleModule::load`/`forward` via TurboMind; no additional tests required in this pass.
+
+38. **A38: SpeculativeConfig/EAGLE runtime validation helper** – **✅ implemented (warning-only, offline use)**  
+    - Added `validate_eagle_runtime_config(engine_config, spec_cfg)` to `lmdeploy/speculative_config.py`. This helper performs non-fatal runtime checks for EAGLE/EAGLE3 configurations:
+      - Verifies that a non-None `SpeculativeConfig` with `method in {"eagle", "eagle3"}` is paired with an engine_config that has a `speculative_config`.  
+      - When an engine-side speculative config object is available, it attempts to obtain a dict (via `to_turbomind_spec_dict` or `__dict__`) and calls `check_turbomind_spec_alignment` to warn on drifts between Python and engine settings.  
+      - Emits a warning when `engine_config.enable_metrics` is False, since this would suppress EAGLE metrics on `req_metrics.spec_info`.  
+    - **Scope:** Helper is opt-in and side-effect free with respect to decode logic; it is intended for offline inspection tools, examples, and debug scripts.  
+    - **CI / testing:** Basic import/compile sanity is covered; callers should add targeted tests around warning behaviour as needed.
+
+39. **A39: Offline TurboMind EAGLE inspect helper (Python)** – **🧪 implemented (requires GPU / real models)**  
+    - Introduced `lmdeploy/turbomind/eagle_inspect.py::inspect_offline_eagle`, a small A-scope utility that:
+      - Builds a TurboMind pipeline via `lmdeploy.pipeline` with a `TurbomindEngineConfig(speculative_config=SpeculativeConfig(method="eagle3", ...))`.  
+      - Uses `SpeculativeDecodingStats` + `EagleMetricsSummary` to aggregate `req_metrics.spec_info` across responses.  
+      - Prints the resulting `EagleMetricsSummary.to_dict()` and returns it as a dict.  
+      - Calls `validate_eagle_runtime_config` to surface obvious misconfigurations without affecting engine behaviour.  
+    - **Scope:** Purely an offline helper; it does not alter any decode paths or B-scope integration. Intended for engineers running small EAGLE-capable models on GPU.  
+    - **CI / testing:**  
+      - Syntax is checked via `python -m compileall lmdeploy/lmdeploy/turbomind/eagle_inspect.py`.  
+      - Full runs should be exercised manually or in a GPU CI job configured with `MODEL_PATH` / `SPEC_MODEL_PATH`; no automated pytest currently drives this helper.
+
+40. **A40: EAGLE tree/CLI what-if enhancements** – **✅ implemented (offline-only tooling)**  
+    - Extended `scripts/eagle_inspect_tree.py` to provide richer guidance for tuning `SpeculativeConfig` against a given `eagle_tree.yaml`:
+      - Computes and prints the observed maximum path depth from `SpeculationTree.getPathsFlat()` and the maximum number of non-leaf nodes per level via `getNonLeafNodes(level)`, alongside existing branching stats.  
+      - Adds `--num-spec-tokens` and `--what-if` flags. In what-if mode, the script reports recommended structural fields for EAGLE/EAGLE3:
+        - `num_speculative_tokens` (from `--num-spec-tokens`),  
+        - recommended `max_path_len` (observed depth),  
+        - recommended `max_non_leaves_per_layer` (max non-leaf count per level), and
+        - the current `--max-decoding-tokens` treated as `SpeculativeConfig.max_decoding_tokens`.  
+      - Emits a warning when `num_speculative_tokens` exceeds the observed tree depth, indicating that the tree cannot represent that many speculative tokens per step.  
+      - Keeps and documents the existing rough KV-block usage estimates based on `--block-size`, now clearly labelled as speculative-only and approximate.  
+    - **Scope:** Script remains CPU-only and does not depend on TurboMind; it is intended for offline reasoning about tree/config/KV trade-offs.  
+    - **CI / testing:**  
+      - Syntax sanity via `python -m compileall scripts/eagle_inspect_tree.py`.  
+      - Behaviour is validated manually by engineers using sample `eagle_tree.yaml` files and SpeculativeConfig-like parameters.
 
 ### Engineer B (this plan) – LlamaBatch / LlamaV2_eagle / sampling / integration tests
 

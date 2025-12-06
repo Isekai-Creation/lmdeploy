@@ -113,13 +113,19 @@ struct EngineParam {
     std::vector<int> devices;
     
     // speculative decoding params
-    bool enable_speculative_decoding;
-    int spec_max_draft_path_len;
-    int spec_max_decoding_draft_tokens;
-    int spec_max_decoding_tokens;
-    int spec_max_non_leaf_nodes;
+    bool        enable_speculative_decoding;
+    int         spec_max_draft_path_len;
+    int         spec_max_decoding_draft_tokens;
+    int         spec_max_decoding_tokens;
+    int         spec_max_non_leaf_nodes;
     std::string spec_draft_model_path;
     std::string spec_method;  // "eagle", "eagle3", "ngram", etc.
+
+    // EAGLE debug/metrics verbosity flags, derived from SpeculativeConfig
+    // when present. These gate EAGLE-specific debug traces and per-step
+    // metrics logging on the TurboMind backend.
+    bool eagle_debug{false};
+    bool eagle_metrics_debug{false};
 };
 
 enum class LoraPolicy : int

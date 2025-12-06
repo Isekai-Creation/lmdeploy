@@ -309,6 +309,13 @@ void EagleModule::forward(const Tensor& input_ids,
 
     (void) input_ids;  // currently unused, reserved for future tree-aware draft nets
 
+    if (!enabled_) {
+        TM_LOG_WARNING("[EAGLE] forward() called while module is disabled; "
+                       "passing through hidden states without draft logits");
+        output_hidden_states = hidden_states;
+        return;
+    }
+
     if (!weights_.is_initialized) {
         TM_LOG_WARNING("[EAGLE] forward() called before weights are initialized");
         // Safe no-op: pass through hidden state and leave logits untouched.

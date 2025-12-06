@@ -237,3 +237,35 @@ class TestSpeculationTreeAdvanced:
             else:
                 flat = list(tree.getPathsFlat())
                 assert len(flat) == num_paths * tree.getMaxDepth()
+
+    def test_large_random_choices_preserve_invariants(self):
+        """Larger random trees should still respect basic invariants."""
+        max_depth = 6
+        max_paths = 6
+        max_nodes = max_depth * max_paths
+
+        for seed in range(3):
+            random.seed(1000 + seed)
+            num_tokens = random.randint(16, 48)
+            tokens = _build_linear_tokens(num_tokens)
+
+            tree = eagle_tree.SpeculationTree(max_depth=max_depth, max_paths=max_paths)
+
+            num_nodes = random.randint(max_paths, max_nodes)
+            choices: List[List[int]] = []
+            for node_idx in range(num_nodes):
+                num_children = random.randint(0, 4)
+                child_indices = [
+                    random.randint(0, max(0, num_tokens - 1)) for _ in range(num_children)
+                ]
+                choices.append(child_indices)
+
+            tree.buildTreeWithChoices(tokens, num_tokens, choices)
+            tree.extractPaths()
+
+            num_paths = tree.getNumPaths()
+            if num_paths == 0:
+                assert list(tree.getPathsFlat()) == []
+            else:
+                flat = list(tree.getPathsFlat())
+                assert len(flat) == num_paths * tree.getMaxDepth()

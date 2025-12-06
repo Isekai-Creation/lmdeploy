@@ -41,6 +41,7 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/memory_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 
@@ -83,6 +84,12 @@ LlamaV2::LlamaV2(DataType                     dtype,
 {
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
+    // Propagate EAGLE debug/metrics flags derived from SpeculativeConfig
+    // into the global helpers used by EagleModule and related kernels so
+    // that all EAGLE debug logging is driven by engine configuration rather
+    // than environment variables.
+    setEagleDebugFlags(engine_param_.eagle_debug, engine_param_.eagle_metrics_debug);
+
     if (comm_->d_comm && comm_->d_comm->Query(comm::kHasAllGather2D)) {
         use_allgather_2d_ = true;
     }
@@ -93,17 +100,27 @@ LlamaV2::LlamaV2(DataType                     dtype,
     dynamic_decode_ = std::make_unique<DynamicDecodeLayer>(
         kFloat32, max_batch_size, vocab_size_, vocab_size_padded_, stream_, &ctx.device_prop);
     
-    // Compute an upper bound on how many tokens per step the engine
-    // should attempt when running in EAGLE speculative mode. This is
-    // analogous to TensorRT-LLM's "max decoding engine tokens".
+    // Compute an upper bound on how many draft tokens per step the engine
+    // should attempt when running in EAGLE speculative mode. This budget is
+    // driven by SpeculativeConfig.num_speculative_tokens (mapped onto
+    // spec_max_decoding_draft_tokens) and clamped by the per-step hardware
+    // forward limit. When this budget is <= 1, EAGLE effectively runs in
+    // single-token mode.
     if (engine.enable_speculative_decoding && (engine.spec_method == "eagle" || engine.spec_method == "eagle3")) {
-        const int max_engine_tokens = std::min(engine.spec_max_decoding_tokens, engine.max_forward_token_num);
-        eagle_max_engine_tokens_per_step_ = std::max(1, max_engine_tokens);
-        TM_LOG_INFO("[LlamaV2][EAGLE] max_engine_tokens_per_step=%d "
-                    "(spec_max_decoding_tokens=%d, max_forward_token_num=%d)",
-                    eagle_max_engine_tokens_per_step_,
-                    engine.spec_max_decoding_tokens,
-                    engine.max_forward_token_num);
+        const int max_draft_tokens = engine.spec_max_decoding_draft_tokens;
+        const int hardware_cap     = engine.max_forward_token_num;
+        const int max_engine_tokens =
+            std::max(1, std::min(max_draft_tokens > 0 ? max_draft_tokens : 1, hardware_cap));
+
+        eagle_max_engine_tokens_per_step_ = max_engine_tokens;
+
+        TM_LOG_INFO(
+            "[LlamaV2][EAGLE] method=%s, spec_max_decoding_draft_tokens=%d, "
+            "max_forward_token_num=%d, eagle_max_engine_tokens_per_step=%d",
+            engine.spec_method.c_str(),
+            max_draft_tokens,
+            hardware_cap,
+            eagle_max_engine_tokens_per_step_);
     }
 
     // Initialize EAGLE speculative decoding if enabled.

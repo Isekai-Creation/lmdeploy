@@ -319,3 +319,13 @@ class EagleMetricsSummary:
             draft_acceptance_rate=draft_acceptance_rate,
             mean_acceptance_length=mean_acceptance_length,
         )
+
+    def to_dict(self) -> dict:
+        """Return a JSON-serializable representation of the summary."""
+        return {
+            "num_drafts": int(self.num_drafts),
+            "total_draft_tokens": int(self.num_draft_tokens),
+            "total_accepted_tokens": int(self.num_accepted_tokens),
+            "mean_acceptance_rate": float(self.draft_acceptance_rate),
+            "mean_acceptance_length": float(self.mean_acceptance_length),
+        }

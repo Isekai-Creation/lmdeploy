@@ -43,3 +43,17 @@ def test_eagle_metrics_summary_handles_no_drafts():
     assert summary.draft_acceptance_rate != summary.draft_acceptance_rate  # NaN
     assert summary.mean_acceptance_length != summary.mean_acceptance_length  # NaN
 
+
+def test_eagle_metrics_summary_to_dict_roundtrip():
+    """to_dict should expose a compact, JSON-like mapping."""
+    stats = SpeculativeDecodingStats(num_spec_tokens=4)
+    stats.update_per_draft(num_draft_tokens=5, num_accepted_tokens=3)
+
+    summary = EagleMetricsSummary.from_stats(stats)
+    d = summary.to_dict()
+
+    assert d["num_drafts"] == summary.num_drafts
+    assert d["total_draft_tokens"] == summary.num_draft_tokens
+    assert d["total_accepted_tokens"] == summary.num_accepted_tokens
+    assert d["mean_acceptance_rate"] == summary.draft_acceptance_rate
+    assert d["mean_acceptance_length"] == summary.mean_acceptance_length

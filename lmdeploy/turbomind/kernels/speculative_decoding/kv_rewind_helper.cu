@@ -33,7 +33,7 @@ void computeAndInvokeKVCacheRewind(
     void**                     d_kv_cache_blocks,
     cudaStream_t               stream)
 {
-    NvtxScope nvtx_scope("EAGLE_KVRewind");
+    NvtxScope nvtx_scope("EAGLE::KVCacheRewind");
     if (!d_rewind_lengths || !d_block_tables) {
         // Nothing to do without destination buffers.
         return;

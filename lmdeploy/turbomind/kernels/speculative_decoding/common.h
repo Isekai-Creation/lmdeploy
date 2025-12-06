@@ -67,6 +67,29 @@ template <typename T>
 void acceptDraftTokens(AcceptDraftTokensParams<T> const& params);
 
 /**
+ * @brief Lightweight host wrapper for the acceptance kernel.
+ *
+ * This helper is intended for test and debugging bindings. It builds an
+ * AcceptDraftTokensParams instance from raw pointers and launches the
+ * device kernel on the provided CUDA stream.
+ */
+void launchAcceptDraftTokensKernel(
+    TokenIdType*       output_ids,
+    TokenIdType const* draft_ids,
+    TokenIdType const* target_ids,
+    SizeType*          accepted_lengths,
+    SizeType*          sequence_lengths,
+    SizeType const*    paths,
+    SizeType const*    best_path_ids,
+    SizeType const*    batch_slots,
+    SizeType           batch_size,
+    SizeType           max_batch_size,
+    SizeType           max_seq_len,
+    SizeType           max_draft_tokens,
+    SizeType           max_path_len,
+    cudaStream_t       stream);
+
+/**
  * @brief Pack accepted paths for efficient memory layout
  * 
  * Linearly packs accepted paths in memory according to acceptance lengths.
@@ -85,6 +108,25 @@ void invokePackAcceptedPaths(
     SizeType max_path_len,
     cudaStream_t stream
 );
+
+/**
+ * @brief Lightweight host wrapper for the path packing kernel.
+ *
+ * This helper mirrors invokePackAcceptedPaths but is structured for
+ * direct use from pybind11 bindings and tests.
+ */
+void launchPackAcceptedPathsKernel(
+    SizeType*       accepted_lengths_cumsum,
+    SizeType*       paths_offsets,
+    SizeType const* accepted_lengths,
+    SizeType const* best_path_ids,
+    SizeType const* paths,
+    SizeType const* batch_slots,
+    SizeType        batch_size,
+    SizeType        max_batch_size,
+    SizeType        num_paths,
+    SizeType        max_path_len,
+    cudaStream_t    stream);
 
 /**
  * @brief Parameters for KV cache rewind

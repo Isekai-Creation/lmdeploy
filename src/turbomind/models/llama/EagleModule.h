@@ -93,12 +93,25 @@ public:
                  LlamaLinear& linear,
                  cudaStream_t stream);
 
-    // Lightweight accessors used by EagleBuffers and host-side tree builders
+    // Lightweight accessors used by EagleBuffers and host-side tree builders.
+    // These helpers are A-scope only and are not required for core decode.
     const EagleWeight& getWeights() const { return weights_; }
-    SizeType getNumPackedMasks() const {
-        // Number of int32 mask elements per token row
+
+    /// Return the hidden size of the draft model loaded from config.yaml.
+    int getHiddenUnits() const { return hidden_units_; }
+
+    /// Return the vocab size of the draft model loaded from config.yaml.
+    int getVocabSize() const { return vocab_size_; }
+
+    /// Return the number of int32 mask elements per token row.
+    SizeType getNumPackedMasks() const
+    {
         return (max_decoding_tokens_ + 31) / 32;
     }
+
+    /// Return a conservative upper bound on tree nodes per step
+    /// (max_decoding_tokens * max_draft_path_len).
+    SizeType getMaxTreeNodes() const { return max_decoding_tokens_ * max_draft_path_len_; }
     /**
      * @brief Get default EAGLE tree choices
      *

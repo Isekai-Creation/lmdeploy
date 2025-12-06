@@ -3,6 +3,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <cstdint>
 
 #include <cuda_runtime.h>
 
@@ -14,6 +15,8 @@
 
 #include <xgrammar/xgrammar.h>
 
+#include "lmdeploy/turbomind/kernels/speculative_decoding/common.h"
+#include "lmdeploy/turbomind/kernels/speculative_decoding/tree_accept_kernels.h"
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/core/tensor.h"
 #include "src/turbomind/engine/model_request.h"
@@ -29,6 +32,7 @@ namespace ft = turbomind;
 using namespace pybind11::literals;
 
 using ft::core::Tensor;
+namespace eagle_kernels = turbomind::kernels::speculative_decoding;
 
 // prepare to bind container
 using TensorMap = ft::core::TensorMap;
@@ -315,6 +319,418 @@ PYBIND11_MODULE(_turbomind, m)
         .def_readonly("active_blocks", &ft::ScheduleMetrics::active_blocks)
         .def_readonly("cached_blocks", &ft::ScheduleMetrics::cached_blocks)
         .def_readonly("free_blocks", &ft::ScheduleMetrics::free_blocks);
+
+    // Lightweight bindings for EAGLE speculative decoding kernels used in tests.
+    //
+    // These helpers accept torch-like tensor objects (anything exposing
+    // .shape, .device, and .data_ptr()) and launch the underlying CUDA
+    // kernels on the current device.
+    // EAGLE A21: prototype acceptance/pack bindings – see EAGLE_TODO.md (🧪, GPU/CI validation pending).
+    m.def(
+        "eagle_accept_draft_tokens",
+        [](py::object                   output_ids,
+           py::object                   draft_ids,
+           py::object                   target_ids,
+           py::object                   accepted_lengths,
+           py::object                   sequence_lengths,
+           py::object                   paths,
+           py::object                   best_path_ids,
+           py::object                   batch_slots_opt) {
+            // Infer basic shapes from tensors.
+            auto draft_shape  = draft_ids.attr("shape").cast<py::tuple>();
+            auto output_shape = output_ids.attr("shape").cast<py::tuple>();
+            auto paths_shape  = paths.attr("shape").cast<py::tuple>();
+
+            if (draft_shape.size() != 2 || output_shape.size() != 2 || paths_shape.size() != 3) {
+                throw std::invalid_argument("eagle_accept_draft_tokens: unexpected tensor ranks");
+            }
+
+            const auto batch_size       = draft_shape[0].cast<int64_t>();
+            const auto max_draft_tokens = draft_shape[1].cast<int64_t>();
+            const auto max_batch_size   = output_shape[0].cast<int64_t>();
+            const auto max_seq_len      = output_shape[1].cast<int64_t>();
+            const auto max_path_len     = paths_shape[2].cast<int64_t>();
+
+            // Resolve device from output_ids tensor.
+            auto device_obj = output_ids.attr("device");
+            auto device_type
+                = device_obj.attr("type").cast<std::string>();  // e.g. "cuda" or "cpu"
+
+            if (device_type != "cuda") {
+                throw std::runtime_error("eagle_accept_draft_tokens expects CUDA tensors");
+            }
+
+            int device_index = 0;
+            if (!device_obj.attr("index").is_none()) {
+                device_index = device_obj.attr("index").cast<int>();
+            }
+            ft::CudaDeviceGuard device_guard(device_index);
+
+            auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<eagle_kernels::SizeType*>(ptr_val);
+            };
+
+            auto get_token_ptr = [](py::object const& tensor) -> eagle_kernels::TokenIdType* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<eagle_kernels::TokenIdType*>(ptr_val);
+            };
+
+            eagle_kernels::TokenIdType* output_ids_ptr       = get_token_ptr(output_ids);
+            eagle_kernels::TokenIdType* draft_ids_ptr        = get_token_ptr(draft_ids);
+            eagle_kernels::TokenIdType* target_ids_ptr       = get_token_ptr(target_ids);
+            eagle_kernels::SizeType*    accepted_lengths_ptr = get_int32_ptr(accepted_lengths);
+            eagle_kernels::SizeType*    sequence_lengths_ptr = get_int32_ptr(sequence_lengths);
+            eagle_kernels::SizeType*    paths_ptr            = get_int32_ptr(paths);
+            eagle_kernels::SizeType*    best_path_ids_ptr    = get_int32_ptr(best_path_ids);
+
+            eagle_kernels::SizeType* batch_slots_ptr = nullptr;
+            if (!batch_slots_opt.is_none()) {
+                batch_slots_ptr = get_int32_ptr(batch_slots_opt);
+            }
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            eagle_kernels::launchAcceptDraftTokensKernel(
+                output_ids_ptr,
+                draft_ids_ptr,
+                target_ids_ptr,
+                accepted_lengths_ptr,
+                sequence_lengths_ptr,
+                paths_ptr,
+                best_path_ids_ptr,
+                batch_slots_ptr,
+                static_cast<eagle_kernels::SizeType>(batch_size),
+                static_cast<eagle_kernels::SizeType>(max_batch_size),
+                static_cast<eagle_kernels::SizeType>(max_seq_len),
+                static_cast<eagle_kernels::SizeType>(max_draft_tokens),
+                static_cast<eagle_kernels::SizeType>(max_path_len),
+                stream);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+        },
+        "output_ids"_a,
+        "draft_ids"_a,
+        "target_ids"_a,
+        "accepted_lengths"_a,
+        "sequence_lengths"_a,
+        "paths"_a,
+        "best_path_ids"_a,
+        "batch_slots"_a = py::none());
+
+    // EAGLE A21/A22: prototype path-pack bindings – see EAGLE_TODO.md (🧪, GPU/CI validation pending).
+    m.def(
+        "eagle_pack_accepted_paths",
+        [](py::object accepted_lengths_cumsum,
+           py::object paths_offsets,
+           py::object accepted_lengths,
+           py::object best_path_ids,
+           py::object paths,
+           py::object batch_slots_opt) {
+            auto lengths_shape = accepted_lengths.attr("shape").cast<py::tuple>();
+            auto paths_shape   = paths.attr("shape").cast<py::tuple>();
+
+            if (lengths_shape.size() != 1 || paths_shape.size() != 3) {
+                throw std::invalid_argument("eagle_pack_accepted_paths: unexpected tensor ranks");
+            }
+
+            const auto batch_size     = lengths_shape[0].cast<int64_t>();
+            const auto max_batch_size = paths_shape[0].cast<int64_t>();
+            const auto num_paths      = paths_shape[1].cast<int64_t>();
+            const auto max_path_len   = paths_shape[2].cast<int64_t>();
+
+            auto device_obj = paths.attr("device");
+            auto device_type
+                = device_obj.attr("type").cast<std::string>();  // e.g. "cuda" or "cpu"
+
+            if (device_type != "cuda") {
+                throw std::runtime_error("eagle_pack_accepted_paths expects CUDA tensors");
+            }
+
+            int device_index = 0;
+            if (!device_obj.attr("index").is_none()) {
+                device_index = device_obj.attr("index").cast<int>();
+            }
+            ft::CudaDeviceGuard device_guard(device_index);
+
+            auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<eagle_kernels::SizeType*>(ptr_val);
+            };
+
+            eagle_kernels::SizeType* accepted_lengths_cumsum_ptr = get_int32_ptr(accepted_lengths_cumsum);
+            eagle_kernels::SizeType* paths_offsets_ptr           = get_int32_ptr(paths_offsets);
+            eagle_kernels::SizeType* accepted_lengths_ptr        = get_int32_ptr(accepted_lengths);
+            eagle_kernels::SizeType* best_path_ids_ptr           = get_int32_ptr(best_path_ids);
+            eagle_kernels::SizeType* paths_ptr                   = get_int32_ptr(paths);
+
+            eagle_kernels::SizeType* batch_slots_ptr = nullptr;
+            if (!batch_slots_opt.is_none()) {
+                batch_slots_ptr = get_int32_ptr(batch_slots_opt);
+            }
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            eagle_kernels::launchPackAcceptedPathsKernel(
+                accepted_lengths_cumsum_ptr,
+                paths_offsets_ptr,
+                accepted_lengths_ptr,
+                best_path_ids_ptr,
+                paths_ptr,
+                batch_slots_ptr,
+                static_cast<eagle_kernels::SizeType>(batch_size),
+                static_cast<eagle_kernels::SizeType>(max_batch_size),
+                static_cast<eagle_kernels::SizeType>(num_paths),
+                static_cast<eagle_kernels::SizeType>(max_path_len),
+                stream);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+        },
+        "accepted_lengths_cumsum"_a,
+        "paths_offsets"_a,
+        "accepted_lengths"_a,
+        "best_path_ids"_a,
+        "paths"_a,
+        "batch_slots"_a = py::none());
+
+    // EAGLE A12/A36: KV rewind binding for direct kernel tests – see EAGLE_TODO.md.
+    m.def(
+        "eagle_kv_cache_rewind",
+        [](py::object rewind_lengths,
+           py::object batch_slots,
+           py::object block_tables,
+           int num_layers,
+           int block_size,
+           py::object kv_cache_blocks_opt) {
+            auto lengths_shape = rewind_lengths.attr("shape").cast<py::tuple>();
+            auto slots_shape   = batch_slots.attr("shape").cast<py::tuple>();
+            auto tables_shape  = block_tables.attr("shape").cast<py::tuple>();
+
+            if (lengths_shape.size() != 1 || slots_shape.size() != 1 || tables_shape.size() != 2) {
+                throw std::invalid_argument("eagle_kv_cache_rewind: unexpected tensor ranks");
+            }
+
+            const auto max_batch_size      = tables_shape[0].cast<int64_t>();
+            const auto max_blocks_per_seq  = tables_shape[1].cast<int64_t>();
+            const auto batch_size          = slots_shape[0].cast<int64_t>();
+
+            auto device_obj  = block_tables.attr("device");
+            auto device_type = device_obj.attr("type").cast<std::string>();
+            if (device_type != "cuda") {
+                throw std::runtime_error("eagle_kv_cache_rewind expects CUDA tensors for block_tables");
+            }
+
+            int device_index = 0;
+            if (!device_obj.attr("index").is_none()) {
+                device_index = device_obj.attr("index").cast<int>();
+            }
+            ft::CudaDeviceGuard device_guard(device_index);
+
+            auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<eagle_kernels::SizeType*>(ptr_val);
+            };
+
+            eagle_kernels::SizeType* rewind_lengths_ptr = get_int32_ptr(rewind_lengths);
+            eagle_kernels::SizeType* batch_slots_ptr    = get_int32_ptr(batch_slots);
+            eagle_kernels::SizeType* block_tables_ptr   = get_int32_ptr(block_tables);
+
+            (void)kv_cache_blocks_opt;  // kv_cache_blocks is not wired in this binding yet.
+            void** kv_cache_blocks_ptr = nullptr;
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            eagle_kernels::KVCacheRewindParams params{};
+            params.kv_cache_blocks    = kv_cache_blocks_ptr;
+            params.rewind_lengths     = rewind_lengths_ptr;
+            params.batch_slots        = batch_slots_ptr;
+            params.block_tables       = block_tables_ptr;
+            params.batch_size         = static_cast<eagle_kernels::SizeType>(batch_size);
+            params.max_batch_size     = static_cast<eagle_kernels::SizeType>(max_batch_size);
+            params.num_layers         = static_cast<eagle_kernels::SizeType>(num_layers);
+            params.block_size         = static_cast<eagle_kernels::SizeType>(block_size);
+            params.max_blocks_per_seq = static_cast<eagle_kernels::SizeType>(max_blocks_per_seq);
+            params.stream             = stream;
+
+            eagle_kernels::invokeKVCacheRewind(params);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+        },
+        "rewind_lengths"_a,
+        "batch_slots"_a,
+        "block_tables"_a,
+        "num_layers"_a,
+        "block_size"_a,
+        "kv_cache_blocks"_a = py::none());
+
+    // EAGLE A31/A32: prototype tree-accept binding – see EAGLE_TODO.md (🧪, GPU/CI validation pending).
+    m.def(
+        "eagle_tree_accept_tokens",
+        [](py::object draft_ids,
+           py::object target_ids,
+           py::object paths,
+           py::object best_path_ids,
+           py::object accepted_lengths,
+           py::object accepted_tokens,
+           py::object batch_slots_opt) {
+            auto draft_shape  = draft_ids.attr("shape").cast<py::tuple>();
+            auto target_shape = target_ids.attr("shape").cast<py::tuple>();
+            auto paths_shape  = paths.attr("shape").cast<py::tuple>();
+            auto best_shape   = best_path_ids.attr("shape").cast<py::tuple>();
+            auto lens_shape   = accepted_lengths.attr("shape").cast<py::tuple>();
+            auto acc_tok_shape = accepted_tokens.attr("shape").cast<py::tuple>();
+
+            if (draft_shape.size() != 2 || target_shape.size() != 2 || paths_shape.size() != 3
+                || best_shape.size() != 1 || lens_shape.size() != 1 || acc_tok_shape.size() != 2) {
+                throw std::invalid_argument("eagle_tree_accept_tokens: unexpected tensor ranks");
+            }
+
+            const auto max_batch_size   = draft_shape[0].cast<int64_t>();
+            const auto max_draft_tokens = draft_shape[1].cast<int64_t>();
+            const auto batch_size       = lens_shape[0].cast<int64_t>();
+            const auto num_paths        = paths_shape[1].cast<int64_t>();
+            const auto max_path_len     = paths_shape[2].cast<int64_t>();
+
+            auto device_obj = draft_ids.attr("device");
+            auto device_type = device_obj.attr("type").cast<std::string>();
+            if (device_type != "cuda") {
+                throw std::runtime_error("eagle_tree_accept_tokens expects CUDA tensors");
+            }
+
+            int device_index = 0;
+            if (!device_obj.attr("index").is_none()) {
+                device_index = device_obj.attr("index").cast<int>();
+            }
+            ft::CudaDeviceGuard device_guard(device_index);
+
+            auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<eagle_kernels::SizeType*>(ptr_val);
+            };
+
+            auto get_token_ptr = [](py::object const& tensor) -> eagle_kernels::TokenIdType* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<eagle_kernels::TokenIdType*>(ptr_val);
+            };
+
+            eagle_kernels::TokenIdType* draft_ids_ptr   = get_token_ptr(draft_ids);
+            eagle_kernels::TokenIdType* target_ids_ptr  = get_token_ptr(target_ids);
+            eagle_kernels::SizeType*    paths_ptr       = get_int32_ptr(paths);
+            eagle_kernels::SizeType*    best_path_ids_ptr = get_int32_ptr(best_path_ids);
+            eagle_kernels::SizeType*    accepted_lens_ptr = get_int32_ptr(accepted_lengths);
+            eagle_kernels::TokenIdType* accepted_tokens_ptr = get_token_ptr(accepted_tokens);
+
+            eagle_kernels::SizeType* batch_slots_ptr = nullptr;
+            if (!batch_slots_opt.is_none()) {
+                batch_slots_ptr = get_int32_ptr(batch_slots_opt);
+            }
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            eagle_kernels::invokeTreeAcceptByIdsWithPaths(
+                draft_ids_ptr,
+                target_ids_ptr,
+                paths_ptr,
+                batch_slots_ptr,
+                static_cast<eagle_kernels::SizeType>(batch_size),
+                static_cast<eagle_kernels::SizeType>(max_batch_size),
+                static_cast<eagle_kernels::SizeType>(num_paths),
+                static_cast<eagle_kernels::SizeType>(max_path_len),
+                static_cast<eagle_kernels::SizeType>(max_draft_tokens),
+                best_path_ids_ptr,
+                accepted_lens_ptr,
+                accepted_tokens_ptr,
+                stream);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+        },
+        "draft_ids"_a,
+        "target_ids"_a,
+        "paths"_a,
+        "best_path_ids"_a,
+        "accepted_lengths"_a,
+        "accepted_tokens"_a,
+        "batch_slots"_a = py::none());
+
+    // Kernel-level acceptance metrics: compute per-request acceptance rate
+    // given accepted lengths and draft lengths.
+    m.def(
+        "eagle_compute_acceptance_stats",
+        [](py::object acceptance_rates,
+           py::object accepted_lengths,
+           py::object draft_lengths,
+           py::object batch_slots_opt) {
+            auto lengths_shape = accepted_lengths.attr("shape").cast<py::tuple>();
+            if (lengths_shape.size() != 1) {
+                throw std::invalid_argument("eagle_compute_acceptance_stats: expected 1D lengths tensors");
+            }
+
+            const auto batch_size = lengths_shape[0].cast<int64_t>();
+
+            auto device_obj = acceptance_rates.attr("device");
+            auto device_type = device_obj.attr("type").cast<std::string>();
+            if (device_type != "cuda") {
+                throw std::runtime_error("eagle_compute_acceptance_stats expects CUDA tensors");
+            }
+
+            int device_index = 0;
+            if (!device_obj.attr("index").is_none()) {
+                device_index = device_obj.attr("index").cast<int>();
+            }
+            ft::CudaDeviceGuard device_guard(device_index);
+
+            auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<eagle_kernels::SizeType*>(ptr_val);
+            };
+
+            auto get_float_ptr = [](py::object const& tensor) -> float* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<float*>(ptr_val);
+            };
+
+            float*                 rates_ptr          = get_float_ptr(acceptance_rates);
+            eagle_kernels::SizeType* accepted_ptr     = get_int32_ptr(accepted_lengths);
+            eagle_kernels::SizeType* draft_ptr        = get_int32_ptr(draft_lengths);
+            eagle_kernels::SizeType* batch_slots_ptr  = nullptr;
+            if (!batch_slots_opt.is_none()) {
+                batch_slots_ptr = get_int32_ptr(batch_slots_opt);
+            }
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            eagle_kernels::invokeComputeAcceptanceStats(
+                rates_ptr,
+                accepted_ptr,
+                draft_ptr,
+                batch_slots_ptr,
+                static_cast<eagle_kernels::SizeType>(batch_size),
+                stream);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+        },
+        "acceptance_rates"_a,
+        "accepted_lengths"_a,
+        "draft_lengths"_a,
+        "batch_slots"_a = py::none());
 
     // Test-only harness for EagleModule::forward.
     //

@@ -2,7 +2,7 @@
 """Speculative decoding configuration for LMDeploy engines."""
 
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import warnings
 
 
@@ -75,6 +75,12 @@ class SpeculativeConfig:
     max_decoding_tokens: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     capture_layers: Optional[List[int]] = None
+
+    # EAGLE debug/metrics verbosity (TurboMind only). When True, enable
+    # detailed EAGLE traces and/or per-step metrics logging on the TurboMind
+    # backend for engines using this SpeculativeConfig.
+    eagle_debug: bool = False
+    eagle_metrics_debug: bool = False
 
     # NGram options (TurboMind only)
     max_matching_ngram_size: int = 4
@@ -154,6 +160,16 @@ class SpeculativeConfig:
                     f"num_speculative_tokens={self.num_speculative_tokens}"
                 )
 
+            # Ensure the speculative step size is not larger than the
+            # configured decoding budget per step.
+            if self.max_decoding_tokens is not None and self.num_speculative_tokens > self.max_decoding_tokens:
+                raise ValueError(
+                    "num_speculative_tokens must be <= max_decoding_tokens "
+                    f"for method '{self.method}', got "
+                    f"num_speculative_tokens={self.num_speculative_tokens}, "
+                    f"max_decoding_tokens={self.max_decoding_tokens}"
+                )
+
     # ---- TurboMind alignment helpers -------------------------------------------------
 
     def to_turbomind_spec_dict(self) -> Dict[str, object]:
@@ -179,6 +195,11 @@ class SpeculativeConfig:
             d["max_decoding_tokens"] = self.max_decoding_tokens
         if self.max_non_leaves_per_layer is not None:
             d["max_non_leaves_per_layer"] = self.max_non_leaves_per_layer
+
+        # Debug/metrics verbosity flags are always included explicitly so
+        # that TurboMind can distinguish between "unset" and "false".
+        d["eagle_debug"] = bool(self.eagle_debug)
+        d["eagle_metrics_debug"] = bool(self.eagle_metrics_debug)
         return d
 
 
@@ -213,5 +234,96 @@ def check_turbomind_spec_alignment(spec_cfg: SpeculativeConfig, engine_spec: Dic
         )
         warnings.warn(
             f"Turbomind speculative_config mismatch detected: {details}",
+            UserWarning,
+        )
+
+
+def validate_eagle_runtime_config(engine_config: Any, spec_cfg: Optional[SpeculativeConfig]) -> None:
+    """Runtime validation for TurboMind EAGLE configs (single-GPU, offline use).
+
+    This helper is intentionally stricter for Engineer-B's offline /
+    single-GPU path: misconfigurations raise ValueError so that the
+    pipeline fails fast instead of running with partially broken EAGLE
+    semantics.
+    """
+    if spec_cfg is None:
+        return
+
+    # Only EAGLE/EAGLE3 are supported here.
+    if spec_cfg.method not in ("eagle", "eagle3"):
+        raise ValueError(
+            f"EAGLE SpeculativeConfig.method={spec_cfg.method!r} is not supported; "
+            "expected 'eagle3' (or 'eagle')."
+        )
+
+    if engine_config is None:
+        raise ValueError(
+            "EAGLE runtime config: engine_config is None while "
+            f"SpeculativeConfig(method='{spec_cfg.method}') is in use; TurboMind cannot "
+            "run EAGLE without an engine config."
+        )
+
+    cfg_spec = getattr(engine_config, "speculative_config", None)
+    if cfg_spec is None:
+        raise ValueError(
+            "EAGLE runtime config: engine_config.speculative_config is None while "
+            f"SpeculativeConfig(method='{spec_cfg.method}') is provided; "
+            "TurboMind speculative decoding is not configured."
+        )
+
+    # Cross-check engine-side speculative config against the Python one
+    # when we can get a mapping out of it.
+    engine_spec_dict: Dict[str, object] = {}
+    try:
+        if hasattr(cfg_spec, "to_turbomind_spec_dict"):
+            engine_spec_dict = cfg_spec.to_turbomind_spec_dict()  # type: ignore[assignment]
+        elif hasattr(cfg_spec, "__dict__"):
+            engine_spec_dict = dict(cfg_spec.__dict__)
+    except Exception:
+        engine_spec_dict = {}
+
+    if engine_spec_dict:
+        check_turbomind_spec_alignment(spec_cfg, engine_spec_dict)
+
+    # num_speculative_tokens must be >= 1
+    if spec_cfg.num_speculative_tokens < 1:
+        raise ValueError(
+            f"num_speculative_tokens must be >= 1; got {spec_cfg.num_speculative_tokens}."
+        )
+
+    # Single-GPU only for multi-token (for now).
+    tp = getattr(engine_config, "tp", 1)
+    if spec_cfg.num_speculative_tokens > 1 and tp != 1:
+        raise ValueError(
+            "EAGLE3 multi-token requires tp=1. "
+            f"Got num_speculative_tokens={spec_cfg.num_speculative_tokens}, tp={tp}."
+        )
+
+    # Structural fields must be positive when multi-token is requested.
+    if spec_cfg.num_speculative_tokens > 1:
+        if spec_cfg.max_path_len is not None and spec_cfg.max_path_len <= 0:
+            raise ValueError(
+                f"max_path_len must be > 0 for multi-token; got {spec_cfg.max_path_len}."
+            )
+        if spec_cfg.max_decoding_tokens is not None and spec_cfg.max_decoding_tokens <= 0:
+            raise ValueError(
+                f"max_decoding_tokens must be > 0 for multi-token; got {spec_cfg.max_decoding_tokens}."
+            )
+
+    # Session length should be large enough for the per-step decoding budget.
+    if spec_cfg.max_decoding_tokens is not None:
+        session_len = getattr(engine_config, "session_len", None)
+        if session_len is not None and session_len < spec_cfg.max_decoding_tokens:
+            raise ValueError(
+                f"session_len={session_len} < max_decoding_tokens={spec_cfg.max_decoding_tokens}; "
+                "this may truncate EAGLE decoding."
+            )
+
+    # Ensure metrics are enabled so EAGLE statistics surface cleanly.
+    enable_metrics = getattr(engine_config, "enable_metrics", True)
+    if not enable_metrics:
+        warnings.warn(
+            "EAGLE runtime config: engine_config.enable_metrics is False; "
+            "TurboMind EAGLE runs will not populate req_metrics.spec_info.",
             UserWarning,
         )

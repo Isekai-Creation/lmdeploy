@@ -51,6 +51,8 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/debug_utils.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/eagle_debug.h"
+#include "lmdeploy/turbomind/kernels/speculative_decoding/kv_rewind_helper.h"
 
 namespace turbomind {
 
@@ -816,6 +818,18 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
     h_sampled_logprobs_ = {batch_size * kMaxLogProb, kCPUpinned};
     h_sampled_indexes_  = {batch_size * kMaxLogProb, kCPUpinned};
     h_sampled_nums_     = {batch_size, kCPUpinned};
+
+    // EAGLE KV rewind persistent buffers. These are only used when multi-token
+    // speculative decoding is enabled and the experimental flag is set.
+    eagle_kv_rewind_lengths_ = {max_batch_size_, kDEVICE};
+    eagle_kv_batch_slots_    = {max_batch_size_, kDEVICE};
+    if (kv_max_blocks_per_seq_ > 0) {
+        eagle_kv_block_tables_ = {ssize_t(max_batch_size_ * kv_max_blocks_per_seq_), kDEVICE};
+    }
+
+    // Multi-token per-slot kill switch, initially all zero (multi-token
+    // enabled). Length is fixed to `max_batch_size_`.
+    eagle_disable_multitoken_slot_.assign(max_batch_size_, 0);
 }
 
 void LlamaBatch::AllocSymmBuffers()
@@ -899,6 +913,403 @@ LlamaBatch::LlamaBatch(DataType                 data_type,
     check_cuda_error(cudaStreamSynchronize(stream_));
 
     UpdateMetrics();
+}
+
+void LlamaBatch::disableEagleMultitokenForSlot(int slot, const char* reason)
+{
+    if (slot < 0 || slot >= static_cast<int>(eagle_disable_multitoken_slot_.size())) {
+        return;
+    }
+
+    if (eagle_disable_multitoken_slot_[slot]) {
+        return;
+    }
+
+    eagle_disable_multitoken_slot_[slot] = 1;
+
+    if (tp_rank_ == 0) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][fallback] step=%d seq=%d: %s; disabling multi-token for this slot",
+            eagle_last_step_,
+            slot,
+            reason ? reason : "no reason provided");
+    }
+}
+
+bool LlamaBatch::isEagleMultiTokenStepEnabled(const GenerationState& g) const
+{
+    if (!param_.enable_speculative_decoding) {
+        return false;
+    }
+    if (tp_size_ != 1) {
+        static bool logged_tp_warning = false;
+        if (!logged_tp_warning && tp_rank_ == 0) {
+            logged_tp_warning = true;
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][fallback] Multi-token speculative decoding is only supported for tp_size==1; "
+                "multi-token behaviour will be disabled for this engine run.");
+        }
+        return false;
+    }
+    if (g.partial != 0) {
+        return false;
+    }
+    // Require the engine to have a multi-token speculative budget; when the
+    // per-step engine limit is <= 1 we treat EAGLE as single-token only.
+    if (model_->eagleMaxEngineTokensPerStep() <= 1) {
+        return false;
+    }
+    return true;
+}
+
+bool LlamaBatch::isEagleMultiTokenSlotEnabled(int slot) const
+{
+    if (slot < 0 || slot >= static_cast<int>(eagle_disable_multitoken_slot_.size())) {
+        return true;
+    }
+
+    // Per-slot kill switch driven by runtime invariants (mismatch, EOS in
+    // extra tokens, geometry issues, etc.). Once a slot is killed it never
+    // re-enters multi-token behaviour for the remainder of the request.
+    return eagle_disable_multitoken_slot_[slot] == 0;
+}
+
+void LlamaBatch::collectEagleStepHostState(const GenerationState& g,
+                                           int                    batch_size,
+                                           std::vector<int>&      h_token_ids,
+                                           std::vector<bool>&     h_finished_slots)
+{
+    if (batch_size <= 0) {
+        h_token_ids.clear();
+        h_finished_slots.clear();
+        return;
+    }
+
+    if (static_cast<int>(h_token_ids.size()) < batch_size) {
+        h_token_ids.resize(batch_size);
+        h_finished_slots.resize(batch_size);
+    }
+
+    core::Copy(token_ids_buf_.data() + (g.step - 1) * batch_size, batch_size, h_token_ids.data());
+    core::Copy(finished_buf_.data(), batch_size, h_finished_slots.data());
+    check_cuda_error(cudaStreamSynchronize(stream_));
+}
+
+void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
+                                                const std::vector<int>&  h_token_ids,
+                                                const std::vector<bool>& h_finished_slots,
+                                                int                      batch_size,
+                                                int                      max_path_len,
+                                                int                      eagle_tokens_per_seq,
+                                                const std::vector<int>&  eagle_accepted_lens,
+                                                const std::vector<int>&  eagle_accepted_tokens,
+                                                std::vector<int>&        kv_draft_lengths,
+                                                std::vector<int>&        kv_accepted_lengths)
+{
+    if (!param_.enable_metrics || eagle_accepted_lens.empty() || eagle_tokens_per_seq <= 0 || batch_size <= 0) {
+        return;
+    }
+
+    int step_draft_total    = 0;
+    int step_accepted_total = 0;
+
+    if (static_cast<int>(kv_draft_lengths.size()) < batch_size) {
+        kv_draft_lengths.resize(batch_size, 0);
+        kv_accepted_lengths.resize(batch_size, 0);
+    }
+
+    for (int i = 0; i < batch_size; ++i) {
+        auto& req = state_->requests[i];
+        if (!req || !req->metrics) {
+            continue;
+        }
+
+        const bool multi_token_slot_enabled = isEagleMultiTokenSlotEnabled(i);
+        const bool finished                 = (i < static_cast<int>(h_finished_slots.size())) ? h_finished_slots[i]
+                                                                                            : false;
+
+        int accepted_len   = 0;
+        int accepted_token = -1;
+
+        if (i < static_cast<int>(eagle_accepted_lens.size())) {
+            accepted_len = eagle_accepted_lens[i];
+            if (accepted_len > 0 && max_path_len > 0
+                && i * max_path_len < static_cast<int>(eagle_accepted_tokens.size())) {
+                accepted_token = eagle_accepted_tokens[i * max_path_len];
+            }
+        }
+
+        // If DynamicDecode has already marked this slot finished for the
+        // current step, treat any multi-token acceptance as a strong invariant
+        // violation and permanently disable multi-token for this request. For
+        // metrics/KV purposes, clamp to a single-token acceptance.
+        if (finished && accepted_len > 1) {
+            disableEagleMultitokenForSlot(i, "finished slot but EAGLE reported accepted_len > 1");
+            accepted_len = 1;
+        }
+
+        if (accepted_len > 0 && accepted_token != h_token_ids[i]) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE] step=%d, seq=%d, accepted_token=%d mismatches "
+                "dynamicDecode token=%d; treating as rejected for metrics",
+                g.step,
+                i,
+                accepted_token,
+                h_token_ids[i]);
+            accepted_len   = 0;
+            accepted_token = -1;
+        }
+
+        int planned_tokens_per_seq = eagle_tokens_per_seq;
+        if (!eagle_planned_tokens_per_seq_.empty()
+            && i < static_cast<int>(eagle_planned_tokens_per_seq_.size())) {
+            planned_tokens_per_seq = eagle_planned_tokens_per_seq_[i];
+        }
+
+        if (!multi_token_slot_enabled) {
+            planned_tokens_per_seq = 1;
+            if (accepted_len > 1) {
+                accepted_len = 1;
+            }
+        }
+
+        const int kv_draft_len    = planned_tokens_per_seq;
+        const int kv_accepted_len = std::max(1, std::min(accepted_len, kv_draft_len));
+        const int rewind_len      = std::max(0, kv_draft_len - kv_accepted_len);
+
+        kv_draft_lengths[i]    = kv_draft_len;
+        kv_accepted_lengths[i] = kv_accepted_len;
+
+        step_draft_total += planned_tokens_per_seq;
+        step_accepted_total += accepted_len;
+
+        req->metrics->eagle_total_draft_tokens += planned_tokens_per_seq;
+        req->metrics->eagle_total_accepted_tokens += accepted_len;
+        req->metrics->eagle_steps += 1;
+
+        if (rewind_len > 0) {
+            req->metrics->eagle_total_rewound_tokens += rewind_len;
+            req->metrics->eagle_rewind_steps += 1;
+        }
+
+        TM_LOG_INFO(
+            "[LlamaBatch][EAGLE] step=%d, seq=%d, dynamic_token=%d, accepted_len=%d, accepted_token=%d, "
+            "tokens_per_seq=%d, rewind_len=%d",
+            g.step,
+            i,
+            h_token_ids[i],
+            accepted_len,
+            accepted_token,
+            planned_tokens_per_seq,
+            rewind_len);
+    }
+
+    if (param_.eagle_metrics_debug && tp_rank_ == 0) {
+        TM_LOG_INFO(
+            "[LlamaBatch][EAGLE_METRICS] step=%d, batch=%d, draft_tokens=%d, accepted_tokens=%d",
+            g.step,
+            batch_size,
+            step_draft_total,
+            step_accepted_total);
+    }
+}
+
+void LlamaBatch::runEagleMultiTokenAdvance(const std::vector<int>&  h_token_ids,
+                                           const std::vector<bool>& h_finished_slots,
+                                           int                      batch_size,
+                                           int                      eagle_tokens_per_seq,
+                                           const std::vector<int>&  eagle_accepted_lens,
+                                           const std::vector<int>&  eagle_accepted_tokens,
+                                           GenerationState&         g)
+{
+    TM_LOG_INFO("[LlamaBatch][EAGLE] step=%d, verified target tokens after DynamicDecode", g.step);
+
+    advanceSequencesByEagleAcceptance(h_token_ids,
+                                      h_finished_slots,
+                                      batch_size,
+                                      eagle_tokens_per_seq,
+                                      eagle_accepted_lens,
+                                      eagle_accepted_tokens,
+                                      g);
+}
+
+void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
+                                  const std::vector<int>& kv_accepted_lengths,
+                                  int                     batch_size,
+                                  const GenerationState&  g)
+{
+    if (!isEagleMultiTokenStepEnabled(g) || kv_block_size_ <= 0 || kv_max_blocks_per_seq_ <= 0
+        || kv_draft_lengths.empty()) {
+        return;
+    }
+
+    // Fast path: if no sequence has any rejected tokens (i.e. draft_len ==
+    // accepted_len for all slots), there is nothing to rewind and we can
+    // skip all KV-related work for this step.
+    bool any_rewind = false;
+    for (int i = 0; i < batch_size && i < static_cast<int>(kv_draft_lengths.size())
+                    && i < static_cast<int>(kv_accepted_lengths.size());
+         ++i) {
+        if (kv_draft_lengths[i] > kv_accepted_lengths[i]) {
+            any_rewind = true;
+            break;
+        }
+    }
+    if (!any_rewind) {
+        return;
+    }
+
+    using namespace turbomind::kernels::speculative_decoding;
+
+    const int max_batch_size = max_batch_size_;
+    const int num_layers     = model_->layer_num_;
+
+    EagleKVRewindConfig cfg{};
+    cfg.block_size         = static_cast<SizeType>(kv_block_size_);
+    cfg.max_batch_size     = static_cast<SizeType>(max_batch_size);
+    cfg.max_blocks_per_seq = static_cast<SizeType>(kv_max_blocks_per_seq_);
+    cfg.num_layers         = static_cast<SizeType>(num_layers);
+
+    static std::vector<SizeType> draft_lengths_storage;
+    static std::vector<SizeType> accepted_lengths_storage;
+    static std::vector<SizeType> batch_slots_storage;
+
+    const int bsz = batch_size;
+
+    if (draft_lengths_storage.size() < static_cast<size_t>(max_batch_size)) {
+        draft_lengths_storage.resize(max_batch_size);
+        accepted_lengths_storage.resize(max_batch_size);
+    }
+    if (batch_slots_storage.size() < static_cast<size_t>(bsz)) {
+        batch_slots_storage.resize(bsz);
+    }
+
+    std::fill_n(draft_lengths_storage.data(), max_batch_size, SizeType{0});
+    std::fill_n(accepted_lengths_storage.data(), max_batch_size, SizeType{0});
+
+    for (int i = 0; i < bsz; ++i) {
+        draft_lengths_storage[i]    = static_cast<SizeType>(kv_draft_lengths[i]);
+        accepted_lengths_storage[i] = static_cast<SizeType>(kv_accepted_lengths[i]);
+        batch_slots_storage[i]      = static_cast<SizeType>(i);  // local index == slot
+    }
+
+    // Build a logical block table from SequenceManager's host-side
+    // block IDs for each active slot. Unused entries are filled
+    // with -1 and may be cleared further by the rewind kernel.
+    static std::vector<int> h_block_tables_storage;
+    const int               total_block_entries = max_batch_size * kv_max_blocks_per_seq_;
+    if (h_block_tables_storage.size() < static_cast<size_t>(total_block_entries)) {
+        h_block_tables_storage.resize(total_block_entries);
+    }
+    std::fill_n(h_block_tables_storage.data(), total_block_entries, -1);
+    for (int slot = 0; slot < state_->active_size; ++slot) {
+        const auto* seq = state_->sequences[slot];
+        if (!seq) {
+            continue;
+        }
+        const int count = std::min<int>(seq->blocks.size(), kv_max_blocks_per_seq_);
+        for (int j = 0; j < count; ++j) {
+            h_block_tables_storage[slot * kv_max_blocks_per_seq_ + j] = seq->blocks[j];
+        }
+    }
+
+    if (!eagle_kv_block_tables_ || !eagle_kv_batch_slots_ || !eagle_kv_rewind_lengths_) {
+        return;
+    }
+
+    core::Copy(h_block_tables_storage.data(),
+               h_block_tables_storage.size(),
+               eagle_kv_block_tables_.data());
+    core::Copy(batch_slots_storage.data(),
+               batch_slots_storage.size(),
+               eagle_kv_batch_slots_.data());
+
+    // Optional: build a flat view over BlockManager's KV blocks so the
+    // rewind kernel can null-out pointers for rewound blocks.
+    if (!eagle_kv_cache_blocks_) {
+        const size_t total_entries =
+            static_cast<size_t>(num_layers) * static_cast<size_t>(kv_max_blocks_per_seq_);
+        check_cuda_error(cudaMalloc(&eagle_kv_cache_blocks_, total_entries * sizeof(void*)));
+    }
+    static std::vector<void*> h_kv_cache_blocks;
+    const int total_blocks = std::min(kv_max_blocks_per_seq_, sequence_manager_->total_count());
+    const size_t total_entries =
+        static_cast<size_t>(num_layers) * static_cast<size_t>(kv_max_blocks_per_seq_);
+    if (h_kv_cache_blocks.size() < total_entries) {
+        h_kv_cache_blocks.resize(total_entries);
+    }
+    std::fill_n(h_kv_cache_blocks.data(), total_entries, nullptr);
+    for (int block_id = 0; block_id < total_blocks; ++block_id) {
+        void* ptr = sequence_manager_->GetBlockPtr(block_id);
+        for (int layer = 0; layer < num_layers; ++layer) {
+            const size_t idx =
+                static_cast<size_t>(layer) * static_cast<size_t>(kv_max_blocks_per_seq_)
+                + static_cast<size_t>(block_id);
+            h_kv_cache_blocks[idx] = ptr;
+        }
+    }
+    check_cuda_error(cudaMemcpyAsync(eagle_kv_cache_blocks_,
+                                     h_kv_cache_blocks.data(),
+                                     total_entries * sizeof(void*),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+
+    computeAndInvokeKVCacheRewind(cfg,
+                                  draft_lengths_storage.data(),
+                                  accepted_lengths_storage.data(),
+                                  batch_slots_storage.data(),
+                                  static_cast<SizeType>(bsz),
+                                  reinterpret_cast<SizeType*>(eagle_kv_rewind_lengths_.data()),
+                                  reinterpret_cast<SizeType const*>(eagle_kv_batch_slots_.data()),
+                                  reinterpret_cast<SizeType*>(eagle_kv_block_tables_.data()),
+                                  eagle_kv_cache_blocks_,
+                                  stream_);
+
+    // Mirror rewind lengths into SequenceManager's host-side
+    // sequences: trim tail blocks, unlock KV blocks in the
+    // BlockManager, and reduce cache_len.
+    static std::vector<SizeType> h_rewind_lengths_storage;
+    if (h_rewind_lengths_storage.size() < static_cast<size_t>(max_batch_size)) {
+        h_rewind_lengths_storage.resize(max_batch_size);
+    }
+    core::Copy(eagle_kv_rewind_lengths_.data(),
+               max_batch_size,
+               h_rewind_lengths_storage.data());
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    const int batch_size = state_->active_size;
+    for (int slot = 0; slot < batch_size; ++slot) {
+        const SizeType rewind_tokens = h_rewind_lengths_storage[slot];
+        if (rewind_tokens <= 0) {
+            continue;
+        }
+        auto* seq = const_cast<Sequence*>(state_->sequences[slot]);
+        if (!seq) {
+            continue;
+        }
+
+        const int blocks_to_free =
+            (rewind_tokens + kv_block_size_ - 1) / kv_block_size_;
+
+        if (blocks_to_free > 0 && !seq->blocks.empty()) {
+            const int old_size = static_cast<int>(seq->blocks.size());
+            const int new_size =
+                std::max(0, old_size - blocks_to_free);
+            if (new_size < old_size) {
+                BlockIds tail_blocks(seq->blocks.begin() + new_size, seq->blocks.end());
+                seq->blocks.resize(new_size);
+                // Unlock KV blocks for the rewound tail so they
+                // can be reused by the BlockManager.
+                sequence_manager_->UnlockBlocks(tail_blocks);
+
+                if (seq->cache_len > 0) {
+                    const int tokens_to_drop =
+                        std::min<int>(rewind_tokens, seq->cache_len);
+                    seq->cache_len = std::max(0, seq->cache_len - tokens_to_drop);
+                }
+            }
+        }
+    }
 }
 
 void LlamaBatch::FreeBuffer()
@@ -1467,50 +1878,58 @@ bool LlamaBatch::Forward(GenerationState& g)
     // Per-step EAGLE acceptance bookkeeping. We keep these on the host so
     // that, after DynamicDecode runs, we can reason about how many tokens
     // were accepted per sequence and how that compares to the tokens that
-    // actually advanced the decode state.
+    // actually advanced the decode state. Clear per-step state up front so
+    // no stale entries from previous steps influence this iteration.
     std::vector<int> eagle_accepted_lens;
     std::vector<int> eagle_accepted_tokens;
     int              eagle_tokens_per_seq = 0;
 
-    // Design-time helper for multi-token EAGLE: given the active decode
-    // batch size, compute how many draft tokens per sequence we would like
-    // to generate in this engine step, respecting both the global engine
-    // token budget and the per-sequence speculative token cap.
-    //
-    // For now we still sample a single draft token per sequence; this helper
-    // exists to make the intended multi-token semantics explicit in logs and
-    // to keep shapes stable once the inner speculative loop is introduced.
+    eagle_planned_tokens_per_seq_.clear();
+
+    // Helper for multi-token EAGLE: given the active decode batch size,
+    // compute how many draft tokens per sequence we would like to generate
+    // in this engine step, respecting both the global engine token budget
+    // and the per-sequence speculative token cap.
     auto compute_eagle_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
         if (!eagle_enabled || decode_batch_size <= 0) {
             return 0;
         }
         const int max_engine_tokens = model_->eagleMaxEngineTokensPerStep();
-        const int per_seq_cap       = param_.spec_max_decoding_draft_tokens;
-        if (max_engine_tokens <= 0 || per_seq_cap <= 0) {
+        if (max_engine_tokens <= 0) {
             return 0;
         }
+
+        // When the engine-side budget resolves to 1, treat this as
+        // single-token EAGLE regardless of batch size.
+        if (max_engine_tokens <= 1) {
+            return 1;
+        }
+
+        const int per_seq_cap = param_.spec_max_decoding_draft_tokens;
+        if (per_seq_cap <= 0) {
+            return 1;
+        }
+
         // Hard upper bound from engine budget: do not exceed the per-step
         // engine token allowance when spreading draft tokens across the
         // active decode batch.
         const int max_by_engine = max_engine_tokens / decode_batch_size;
         if (max_by_engine <= 0) {
-            return 0;
+            return 1;
         }
-        const int planned = std::max(1, std::min(per_seq_cap, max_by_engine));
 
-        // Until the full multi-token inner loop is implemented (including
-        // draft sampling and target verification for tokens_per_seq > 1),
-        // we clamp the effective value to 1 to avoid partially-populated
-        // layouts. The planned value is still reported in logs so that
-        // future work can enable multi-token safely.
-        return std::min(planned, 1);
+        const int tokens_per_seq = std::max(1, std::min(per_seq_cap, max_by_engine));
+        return tokens_per_seq;
     };
 
     if (tp_rank_ == 0 && eagle_enabled) {
         const int max_engine_tokens = model_->eagleMaxEngineTokensPerStep();
         TM_LOG_INFO(
-            "[LlamaBatch][EAGLE] step=%d, method=%s, max_draft_tokens=%d, "
-            "max_decoding_tokens=%d, max_engine_tokens_per_step=%d, max_non_leaf_nodes=%d",
+            "[LlamaBatch][EAGLE] step=%d, method=%s, "
+            "config_num_speculative_tokens=%d, "
+            "spec_max_decoding_tokens=%d, "
+            "engine_max_tokens_per_step=%d, "
+            "max_non_leaf_nodes=%d",
             g.step,
             param_.spec_method.c_str(),
             param_.spec_max_decoding_draft_tokens,
@@ -1703,6 +2122,7 @@ bool LlamaBatch::Forward(GenerationState& g)
 
             const int draft_batch_size      = bsz;
             const int draft_tokens_per_seq  = compute_eagle_draft_tokens_per_seq(draft_batch_size);
+            eagle_last_step_                = g.step;
             const int vocab_size       = static_cast<int>(model_->vocab_size());
             const int vocab_size_pad   = logits.shape(1);
 
@@ -1714,134 +2134,214 @@ bool LlamaBatch::Forward(GenerationState& g)
                     draft_tokens_per_seq);
             }
 
-            // Run EagleNet draft model over last-token hidden states. The helper
-            // allocates and/or populates `draft_logits` / `draft_hidden` on device.
-            Tensor draft_logits;
-            Tensor draft_hidden;
-            model_->eagleDraftForward(decoder_features, draft_logits, draft_hidden);
-
-            if (!draft_logits) {
-                TM_LOG_WARNING("[LlamaBatch][EAGLE] draft forward produced empty logits, skipping draft sampling");
+            if (draft_tokens_per_seq <= 0) {
+                TM_LOG_WARNING("[LlamaBatch][EAGLE] step=%d, decode_batch=%d, tokens_per_seq=0; "
+                               "skipping speculative draft for this step",
+                               g.step,
+                               draft_batch_size);
             }
             else {
-                // Cast draft logits to float and sample one draft token per sequence.
-                Tensor eagle_sampling_logits{{draft_batch_size, vocab_size_pad}, kFloat32, kDEVICE};
-                invokeCastFloat2D(draft_logits, eagle_sampling_logits, stream_);
-                sync_check_cuda_error();
+                // Run EagleNet draft model over last-token hidden states. The helper
+                // allocates and/or populates `draft_logits` / `draft_hidden` on device.
+                Tensor draft_logits;
+                Tensor draft_hidden;
+                model_->eagleDraftForward(decoder_features, draft_logits, draft_hidden);
 
-            std::vector<float> h_eagle_logits(draft_batch_size * vocab_size_pad);
-            check_cuda_error(cudaMemcpyAsync(h_eagle_logits.data(),
-                                             eagle_sampling_logits.buffer().raw_data(),
-                                             h_eagle_logits.size() * sizeof(float),
-                                             cudaMemcpyDeviceToHost,
-                                             stream_));
-            check_cuda_error(cudaStreamSynchronize(stream_));
-
-            std::vector<int> h_draft_tokens(draft_batch_size);
-            for (int i = 0; i < draft_batch_size; ++i) {
-                const float* row = h_eagle_logits.data() + i * vocab_size_pad;
-                int          best_id   = 0;
-                float        best_logp = -std::numeric_limits<float>::infinity();
-                for (int j = 0; j < vocab_size; ++j) {
-                    if (row[j] > best_logp) {
-                        best_logp = row[j];
-                        best_id   = j;
-                    }
+                if (!draft_logits) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE] draft forward produced empty logits, skipping draft sampling");
                 }
-                h_draft_tokens[i] = best_id;
-            }
+                else {
+                    // Initialize per-sequence planned draft token counts for
+                    // this step. Start from the step-wide plan
+                    // `draft_tokens_per_seq` and then clamp per slot by the
+                    // request's remaining max_new_tokens budget and the
+                    // per-slot multi-token gate. This keeps the engine-facing
+                    // shapes static while ensuring we do not plan more draft
+                    // tokens for a sequence than it can possibly commit.
+                    const int tokens_per_seq = std::max(1, draft_tokens_per_seq);
+                    eagle_planned_tokens_per_seq_.assign(draft_batch_size, tokens_per_seq);
+                    for (int i = 0; i < draft_batch_size; ++i) {
+                        int planned = tokens_per_seq;
 
-                // Prepare per-sequence draft and target token IDs for the one-step
-                // acceptance rule in `eagleSpeculativeStep`. Target IDs are taken
-                // from the target logits of this step (greedy).
-                // Use the same logits buffer that will be fed into
-                // DynamicDecode to derive greedy target IDs for metrics.
-                auto               sampling_logits_view = sampling_logits_.slice(0, draft_batch_size);
-                std::vector<float> h_target_logits(draft_batch_size * vocab_size_pad);
-                check_cuda_error(cudaMemcpyAsync(h_target_logits.data(),
-                                                 sampling_logits_view.buffer().raw_data(),
-                                                 h_target_logits.size() * sizeof(float),
-                                                 cudaMemcpyDeviceToHost,
-                                                 stream_));
-                check_cuda_error(cudaStreamSynchronize(stream_));
+                        auto* req = state_->requests[i];
+                        const Sequence* seq = state_->sequences[i];
+                        if (req && seq) {
+                            const int max_new_tokens = req->gen_cfg.max_new_tokens;
+                            if (max_new_tokens > 0) {
+                                int prompt_len = 0;
+                                auto it        = req->inputs.find("input_ids");
+                                if (it != req->inputs.end()) {
+                                    prompt_len = it->second.shape(0);
+                                }
+                                const int total_tokens =
+                                    static_cast<int>(seq->tokens.size());
+                                const int generated_tokens =
+                                    std::max(0, total_tokens - prompt_len);
+                                int remaining = max_new_tokens - generated_tokens;
+                                if (remaining <= 1) {
+                                    // This request is essentially at the end
+                                    // of its max_new_tokens budget. Disable
+                                    // multi-token for this slot and fall back
+                                    // to single-token semantics.
+                                    disableEagleMultitokenForSlot(
+                                        i, "remaining max_new_tokens <= 1");
+                                    planned = 1;
+                                }
+                                else {
+                                    planned = std::min(planned, remaining);
+                                }
+                            }
+                        }
 
-                std::vector<int> h_target_tokens(draft_batch_size);
-                for (int i = 0; i < draft_batch_size; ++i) {
-                    const float* row = h_target_logits.data() + i * vocab_size_pad;
-                    int          best_id   = 0;
-                    float        best_logp = -std::numeric_limits<float>::infinity();
-                    for (int j = 0; j < vocab_size; ++j) {
-                        if (row[j] > best_logp) {
-                            best_logp = row[j];
-                            best_id   = j;
+                        if (!isEagleMultiTokenSlotEnabled(i)) {
+                            planned = 1;
+                        }
+
+                        eagle_planned_tokens_per_seq_[i] = std::max(1, planned);
+                    }
+
+                    // Cast draft logits to float so we can sample draft tokens
+                    // on the host for each speculative position.
+                    Tensor eagle_sampling_logits{{draft_batch_size, vocab_size_pad}, kFloat32, kDEVICE};
+                    invokeCastFloat2D(draft_logits, eagle_sampling_logits, stream_);
+                    sync_check_cuda_error();
+
+                    std::vector<float> h_eagle_logits(draft_batch_size * vocab_size_pad);
+                    check_cuda_error(cudaMemcpyAsync(h_eagle_logits.data(),
+                                                     eagle_sampling_logits.buffer().raw_data(),
+                                                     h_eagle_logits.size() * sizeof(float),
+                                                     cudaMemcpyDeviceToHost,
+                                                     stream_));
+                    check_cuda_error(cudaStreamSynchronize(stream_));
+
+                    // Prepare per-sequence draft and target token IDs for the one-step
+                    // acceptance rule in `eagleSpeculativeStep`. Target IDs are taken
+                    // from the target logits of this step (greedy).
+                    // Use the same logits buffer that will be fed into
+                    // DynamicDecode to derive greedy target IDs for metrics.
+                    auto               sampling_logits_view = sampling_logits_.slice(0, draft_batch_size);
+                    std::vector<float> h_target_logits(draft_batch_size * vocab_size_pad);
+                    check_cuda_error(cudaMemcpyAsync(h_target_logits.data(),
+                                                     sampling_logits_view.buffer().raw_data(),
+                                                     h_target_logits.size() * sizeof(float),
+                                                     cudaMemcpyDeviceToHost,
+                                                     stream_));
+                    check_cuda_error(cudaStreamSynchronize(stream_));
+                    const int total_draft = draft_batch_size * tokens_per_seq;
+
+                    Buffer_<int> draft_tokens(total_draft, kCPU);
+                    Buffer_<int> target_tokens(total_draft, kCPU);
+
+                    // For each sequence, populate [tokens_per_seq] speculative
+                    // positions with real multi-step content by taking the top
+                    // `tokens_per_seq` tokens (without replacement) from the
+                    // draft and target logits respectively. Position 0 matches
+                    // the greedy best token, preserving existing single-token
+                    // semantics, while positions 1..tokens_per_seq-1 provide
+                    // additional speculative candidates for the EAGLE tree.
+                    std::vector<int> h_first_draft_token(draft_batch_size, -1);
+                    std::vector<int> h_first_target_token(draft_batch_size, -1);
+
+                    for (int i = 0; i < draft_batch_size; ++i) {
+                        const float* draft_row  = h_eagle_logits.data() + i * vocab_size_pad;
+                        const float* target_row = h_target_logits.data() + i * vocab_size_pad;
+
+                        std::vector<char> used_draft(vocab_size, 0);
+                        std::vector<char> used_target(vocab_size, 0);
+
+                        const int base = i * tokens_per_seq;
+
+                        for (int t = 0; t < tokens_per_seq; ++t) {
+                            int   best_draft_id   = 0;
+                            float best_draft_logp = -std::numeric_limits<float>::infinity();
+                            for (int j = 0; j < vocab_size; ++j) {
+                                if (used_draft[j]) {
+                                    continue;
+                                }
+                                const float v = draft_row[j];
+                                if (v > best_draft_logp) {
+                                    best_draft_logp = v;
+                                    best_draft_id   = j;
+                                }
+                            }
+                            used_draft[best_draft_id] = 1;
+
+                            int   best_target_id   = 0;
+                            float best_target_logp = -std::numeric_limits<float>::infinity();
+                            for (int j = 0; j < vocab_size; ++j) {
+                                if (used_target[j]) {
+                                    continue;
+                                }
+                                const float v = target_row[j];
+                                if (v > best_target_logp) {
+                                    best_target_logp = v;
+                                    best_target_id   = j;
+                                }
+                            }
+                            used_target[best_target_id] = 1;
+
+                            const int idx       = base + t;
+                            draft_tokens[idx]   = best_draft_id;
+                            target_tokens[idx]  = best_target_id;
+
+                            if (t == 0) {
+                                h_first_draft_token[i]  = best_draft_id;
+                                h_first_target_token[i] = best_target_id;
+                            }
                         }
                     }
-                    h_target_tokens[i] = best_id;
-                }
 
-                // Layout draft/target IDs as [batch, tokens_per_seq]. For now
-                // we only populate the first token per sequence (tokens_per_seq
-                // is kept at 1 in practice), but the layout is ready for
-                // multi-token speculative steps.
-                const int tokens_per_seq = std::max(1, draft_tokens_per_seq);
-                const int total_draft    = draft_batch_size * tokens_per_seq;
+                    Buffer_<int> accepted_tokens(draft_batch_size * param_.spec_max_draft_path_len, kCPU);
+                    Buffer_<int> accepted_lens(draft_batch_size, kCPU);
+                    Buffer_<int> num_accepted(1, kCPU);
 
-                Buffer_<int> draft_tokens(total_draft, kCPU);
-                Buffer_<int> target_tokens(total_draft, kCPU);
+                    model_->eagleSpeculativeStep(draft_tokens,
+                                                 target_tokens,
+                                                 total_draft,
+                                                 accepted_tokens,
+                                                 accepted_lens,
+                                                 num_accepted,
+                                                 state_->sequences.data(),
+                                                 draft_batch_size);
 
-                for (int i = 0; i < draft_batch_size; ++i) {
-                    const int base = i * tokens_per_seq;
-                    draft_tokens[base]  = h_draft_tokens[i];
-                    target_tokens[base] = h_target_tokens[i];
-                    // Remaining slots (if any) will be filled once the
-                    // multi-token engine loop is fully wired.
-                }
+                    const int total_accepted = *num_accepted.data();
 
-                Buffer_<int> accepted_tokens(draft_batch_size * param_.spec_max_draft_path_len, kCPU);
-                Buffer_<int> accepted_lens(draft_batch_size, kCPU);
-                Buffer_<int> num_accepted(1, kCPU);
+                    // Snapshot per-sequence acceptance results for this engine
+                    // step so we can later relate them to the tokens that
+                    // DynamicDecode commits to the decode state.
+                    eagle_tokens_per_seq = tokens_per_seq;
+                    eagle_accepted_lens.assign(accepted_lens.data(), accepted_lens.data() + draft_batch_size);
+                    {
+                        const int max_path_len = param_.spec_max_draft_path_len;
+                        eagle_accepted_tokens.resize(draft_batch_size * max_path_len);
+                        std::copy_n(accepted_tokens.data(),
+                                    draft_batch_size * max_path_len,
+                                    eagle_accepted_tokens.data());
+                    }
 
-                model_->eagleSpeculativeStep(draft_tokens,
-                                             target_tokens,
-                                             total_draft,
-                                             accepted_tokens,
-                                             accepted_lens,
-                                             num_accepted,
-                                             state_->sequences.data(),
-                                             draft_batch_size);
+                    TM_LOG_INFO("[LlamaBatch][EAGLE] step=%d, draft_batch=%d, config_tokens_per_seq=%d, "
+                                "num_draft_tokens=%d, num_accepted=%d",
+                                g.step,
+                                draft_batch_size,
+                                tokens_per_seq,
+                                total_draft,
+                                total_accepted);
 
-                const int total_accepted = *num_accepted.data();
-
-                // Snapshot per-sequence acceptance results for this engine
-                // step so we can later relate them to the tokens that
-                // DynamicDecode commits to the decode state.
-                eagle_tokens_per_seq = tokens_per_seq;
-                eagle_accepted_lens.assign(accepted_lens.data(), accepted_lens.data() + draft_batch_size);
-                {
-                    const int max_path_len = param_.spec_max_draft_path_len;
-                    eagle_accepted_tokens.resize(draft_batch_size * max_path_len);
-                    std::copy_n(accepted_tokens.data(),
-                                draft_batch_size * max_path_len,
-                                eagle_accepted_tokens.data());
-                }
-
-                TM_LOG_INFO("[LlamaBatch][EAGLE] step=%d, draft_batch=%d, num_draft_tokens=%d, num_accepted=%d",
-                            g.step,
-                            draft_batch_size,
-                            total_draft,
-                            total_accepted);
-
-                // Per-sequence acceptance debug logging to make multi-token
-                // behaviour observable. Detailed, decode-aware logging and
-                // metrics are emitted after DynamicDecode once we know which
-                // tokens actually advanced the decode state.
-                for (int i = 0; i < draft_batch_size; ++i) {
-                    TM_LOG_DEBUG("[LlamaBatch][EAGLE] step=%d, seq=%d, draft_token=%d, target_token=%d, accepted_len=%d",
-                                 g.step,
-                                 i,
-                                 h_draft_tokens[i],
-                                 h_target_tokens[i],
-                                 accepted_lens.data()[i]);
+                    // Per-sequence acceptance debug logging to make multi-token
+                    // behaviour observable. Detailed, decode-aware logging and
+                    // metrics are emitted after DynamicDecode once we know which
+                    // tokens actually advanced the decode state.
+                    for (int i = 0; i < draft_batch_size; ++i) {
+                        TM_LOG_DEBUG("[LlamaBatch][EAGLE] step=%d, seq=%d, draft_token=%d, target_token=%d, "
+                                     "accepted_len=%d, config_tokens_per_seq=%d",
+                                     g.step,
+                                     i,
+                                     h_first_draft_token[i],
+                                     h_first_target_token[i],
+                                     accepted_lens.data()[i],
+                                     tokens_per_seq);
+                    }
                 }
             }
         }
@@ -1866,72 +2366,39 @@ bool LlamaBatch::Forward(GenerationState& g)
                               g.step,
                               g.max_init_ctx_len);
 
-        // Integrate EAGLE acceptance into decode state at the metrics level.
-        // We verify here, on the host, how many tokens were accepted per
-        // sequence and compare those accepted tokens against the token chosen
-        // by DynamicDecode for this step. Only tokens that both (a) were
-        // accepted by EAGLE and (b) match the committed decode token are
-        // counted as accepted in RequestMetrics. Future multi-token
-        // integration will use this information to safely advance sequences
-        // by more than one token in a single engine step.
+        // Integrate EAGLE acceptance into decode state at the metrics level
+        // and, when enabled, perform experimental multi-token advancement and
+        // KV cache rewind.
         if (eagle_enabled && tp_rank_ == 0) {
-            std::vector<int> h_token_ids(bsz);
-            core::Copy(token_ids_buf_.data() + (g.step - 1) * bsz, bsz, h_token_ids.data());
-            check_cuda_error(cudaStreamSynchronize(stream_));
+            static std::vector<int>  h_token_ids_storage;
+            static std::vector<bool> h_finished_slots_storage;
+            static std::vector<int>  kv_draft_lengths;
+            static std::vector<int>  kv_accepted_lengths;
+
+            collectEagleStepHostState(g, bsz, h_token_ids_storage, h_finished_slots_storage);
+
             const int max_path_len = param_.spec_max_draft_path_len;
+            updateEagleMetricsAndKVLengths(g,
+                                           h_token_ids_storage,
+                                           h_finished_slots_storage,
+                                           bsz,
+                                           max_path_len,
+                                           eagle_tokens_per_seq,
+                                           eagle_accepted_lens,
+                                           eagle_accepted_tokens,
+                                           kv_draft_lengths,
+                                           kv_accepted_lengths);
+            if (isEagleMultiTokenStepEnabled(g)) {
+                runEagleMultiTokenAdvance(h_token_ids_storage,
+                                          h_finished_slots_storage,
+                                          bsz,
+                                          eagle_tokens_per_seq,
+                                          eagle_accepted_lens,
+                                          eagle_accepted_tokens,
+                                          g);
 
-            if (param_.enable_metrics && !eagle_accepted_lens.empty() && eagle_tokens_per_seq > 0) {
-                for (int i = 0; i < bsz; ++i) {
-                    auto& req = state_->requests[i];
-                    if (!req || !req->metrics) {
-                        continue;
-                    }
-
-                    int accepted_len   = 0;
-                    int accepted_token = -1;
-
-                    if (i < (int)eagle_accepted_lens.size()) {
-                        accepted_len = eagle_accepted_lens[i];
-                        if (accepted_len > 0 && max_path_len > 0
-                            && i * max_path_len < (int)eagle_accepted_tokens.size()) {
-                            accepted_token = eagle_accepted_tokens[i * max_path_len];
-                        }
-                    }
-
-                    // In the current single-token regime, any accepted token
-                    // must match the token committed by DynamicDecode. If it
-                    // does not, treat this step as having rejected the draft
-                    // for metrics purposes to avoid over-reporting accepted
-                    // tokens.
-                    if (accepted_len > 0 && accepted_token != h_token_ids[i]) {
-                        TM_LOG_WARNING(
-                            "[LlamaBatch][EAGLE] step=%d, seq=%d, accepted_token=%d mismatches "
-                            "dynamicDecode token=%d; treating as rejected for metrics",
-                            g.step,
-                            i,
-                            accepted_token,
-                            h_token_ids[i]);
-                        accepted_len   = 0;
-                        accepted_token = -1;
-                    }
-
-                    req->metrics->eagle_total_draft_tokens += eagle_tokens_per_seq;
-                    req->metrics->eagle_total_accepted_tokens += accepted_len;
-                    req->metrics->eagle_steps += 1;
-
-                    TM_LOG_INFO(
-                        "[LlamaBatch][EAGLE] step=%d, seq=%d, dynamic_token=%d, accepted_len=%d, accepted_token=%d, "
-                        "tokens_per_seq=%d",
-                        g.step,
-                        i,
-                        h_token_ids[i],
-                        accepted_len,
-                        accepted_token,
-                        eagle_tokens_per_seq);
-                }
+                runEagleKVRewind(kv_draft_lengths, kv_accepted_lengths, bsz, g);
             }
-
-            TM_LOG_INFO("[LlamaBatch][EAGLE] step=%d, verified target tokens after DynamicDecode", g.step);
         }
     }
 
@@ -1971,6 +2438,266 @@ bool LlamaBatch::Forward(GenerationState& g)
     g.step += 1;
 
     return true;
+}
+
+void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dynamic_tokens,
+                                                   const std::vector<bool>& finished_slots,
+                                                   int                      batch_size,
+                                                   int                      eagle_tokens_per_seq,
+                                                   const std::vector<int>&  eagle_accepted_lens,
+                                                   const std::vector<int>&  eagle_accepted_tokens,
+                                                   GenerationState&         g)
+{
+    // Multi-token advancement is currently experimental and must preserve
+    // baseline behaviour when disabled. Guard aggressively and fall back to
+    // single-token semantics on any invariant violation.
+    if (!isEagleMultiTokenStepEnabled(g)) {
+        return;
+    }
+
+    const int max_path_len = param_.spec_max_draft_path_len;
+    if (max_path_len <= 0) {
+        return;
+    }
+
+    if (batch_size <= 0) {
+        return;
+    }
+
+    const int active_size = state_->active_size;
+    if (batch_size > active_size) {
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][fallback] batch_size=%d exceeds active_size=%d; skipping multi-token advance",
+                       batch_size,
+                       active_size);
+        return;
+    }
+
+    if (dynamic_tokens.size() < static_cast<size_t>(batch_size)) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][fallback] dynamic_tokens.size()=%zu < batch_size=%d; skipping multi-token advance",
+            dynamic_tokens.size(),
+            batch_size);
+        return;
+    }
+
+    const int base_step = g.step - 1;
+    const int max_steps = session_len_ * 2;
+
+    if (base_step < 0 || base_step >= max_steps) {
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][fallback] Invalid base_step=%d (max_steps=%d); skipping multi-token advance",
+                       base_step,
+                       max_steps);
+        return;
+    }
+
+    int              max_extra     = 0;
+    std::vector<int> extra_per_seq(batch_size, 0);
+
+    for (int i = 0; i < batch_size; ++i) {
+        // Skip sequences that DynamicDecode has already marked finished on
+        // this step; their terminal token (e.g. EOS or max_new_tokens) must
+        // remain the last token in the sequence.
+        if (i < static_cast<int>(finished_slots.size()) && finished_slots[i]) {
+            continue;
+        }
+
+        // Per-request kill switch: once a hard invariant is violated for a
+        // slot, multi-token advance is permanently disabled for that slot.
+        if (!isEagleMultiTokenSlotEnabled(i)) {
+            continue;
+        }
+
+        const int len = (i < static_cast<int>(eagle_accepted_lens.size())) ? eagle_accepted_lens[i] : 0;
+
+        // `accepted_len == 0` means the draft was fully rejected. This is
+        // valid but offers no multi-token benefit, so we simply keep the
+        // single-token behaviour for this sequence.
+        if (len <= 1) {
+            continue;
+        }
+
+        const int max_path_len = param_.spec_max_draft_path_len;
+        if (len > max_path_len) {
+            disableEagleMultitokenForSlot(i, "accepted_len exceeds max_path_len");
+            continue;
+        }
+
+        // Per-sequence planned draft budget for this step. Default to the
+        // global scalar when the per-sequence vector is empty or out of
+        // range, but drive all per-slot bounds from the vector when
+        // available.
+        int planned_tokens_per_seq = eagle_tokens_per_seq;
+        if (!eagle_planned_tokens_per_seq_.empty()
+            && i < static_cast<int>(eagle_planned_tokens_per_seq_.size())) {
+            planned_tokens_per_seq = eagle_planned_tokens_per_seq_[i];
+        }
+        if (planned_tokens_per_seq <= 0) {
+            planned_tokens_per_seq = 1;
+        }
+
+        if (len > planned_tokens_per_seq) {
+            disableEagleMultitokenForSlot(i, "accepted_len exceeds planned_tokens_per_seq");
+            continue;
+        }
+
+        const int token_offset = i * max_path_len;
+        if (token_offset < 0 || token_offset + len > static_cast<int>(eagle_accepted_tokens.size())) {
+            disableEagleMultitokenForSlot(i, "accepted_len/token_offset out of range for accepted_tokens");
+            continue;
+        }
+
+        const int* seq_tokens = eagle_accepted_tokens.data() + token_offset;
+        const int  committed  = dynamic_tokens[i];
+
+        if (seq_tokens[0] != committed) {
+            disableEagleMultitokenForSlot(i, "first accepted token mismatch with DynamicDecode token");
+            continue;
+        }
+
+        // Do not allow EOS to appear in extra accepted positions; EOS handling
+        // remains owned by DynamicDecode/StopCriteria so we must not "skip"
+        // over EOS with multi-token advance. If any extra token matches the
+        // request's EOS ids, disable multi-token for this slot.
+        if (i < state_->active_size && state_->requests[i]) {
+            const auto& eos_ids = state_->requests[i]->gen_cfg.eos_ids;
+            if (!eos_ids.empty()) {
+                bool has_eos_in_extra = false;
+                for (int t = 1; t < len; ++t) {
+                    const int tok = seq_tokens[t];
+                    if (std::find(eos_ids.begin(), eos_ids.end(), tok) != eos_ids.end()) {
+                        has_eos_in_extra = true;
+                        break;
+                    }
+                }
+                if (has_eos_in_extra) {
+                    disableEagleMultitokenForSlot(i, "extra accepted token includes EOS");
+                    continue;
+                }
+            }
+        }
+
+        // Commit-time safety net: ensure we do not append more extra tokens
+        // for this request than its remaining max_new_tokens budget allows,
+        // even if planning or acceptance overestimated what is safe.
+        int max_extra_allowed = std::numeric_limits<int>::max();
+        if (i < state_->active_size) {
+            auto*          req = state_->requests[i];
+            const Sequence* seq = state_->sequences[i];
+            if (req && seq) {
+                const int max_new_tokens = req->gen_cfg.max_new_tokens;
+                if (max_new_tokens > 0) {
+                    int prompt_len = 0;
+                    auto it        = req->inputs.find("input_ids");
+                    if (it != req->inputs.end()) {
+                        prompt_len = it->second.shape(0);
+                    }
+                    const int total_tokens =
+                        static_cast<int>(seq->tokens.size());
+                    const int generated_tokens =
+                        std::max(0, total_tokens - prompt_len);
+                    int remaining = max_new_tokens - generated_tokens;
+                    int local_max_extra = remaining - 1;  // one token is the committed DD token
+                    if (local_max_extra <= 0) {
+                        disableEagleMultitokenForSlot(
+                            i,
+                            "no remaining max_new_tokens budget for extra tokens at commit time");
+                        continue;
+                    }
+                    max_extra_allowed = local_max_extra;
+                }
+            }
+        }
+
+        int extra = len - 1;
+        if (extra <= 0) {
+            continue;
+        }
+
+        if (max_extra_allowed != std::numeric_limits<int>::max()) {
+            extra = std::min(extra, max_extra_allowed);
+            if (extra <= 0) {
+                continue;
+            }
+        }
+
+        if (base_step + extra >= max_steps) {
+            extra = std::max(0, max_steps - base_step - 1);
+            if (extra <= 0) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][fallback] step=%d seq=%d extra tokens would exceed buffer (max_steps=%d); "
+                    "skipping",
+                    g.step,
+                    i,
+                    max_steps);
+                continue;
+            }
+        }
+
+        extra_per_seq[i] = extra;
+        max_extra        = std::max(max_extra, extra);
+    }
+
+    if (max_extra <= 0) {
+        return;
+    }
+
+    // Write extra accepted tokens directly into token_ids_buf_ on device,
+    // without copying the existing slice back to host. Each extra token for
+    // sequence i is placed at row (base_step + 1 + e) and column i.
+    for (int i = 0; i < batch_size; ++i) {
+        int extra = extra_per_seq[i];
+        if (extra <= 0) {
+            continue;
+        }
+
+        const int token_offset = i * max_path_len;
+        const int* seq_tokens  = eagle_accepted_tokens.data() + token_offset;
+
+        for (int e = 0; e < extra; ++e) {
+            const int row_index = base_step + 1 + e;
+            const int col_index = i;
+            const int value     = seq_tokens[1 + e];
+            int*       dst      = token_ids_buf_.data() + row_index * active_size + col_index;
+            check_cuda_error(cudaMemcpyAsync(dst, &value, sizeof(int), cudaMemcpyHostToDevice, stream_));
+        }
+    }
+
+    // Update sequence_lengths_ so that DynamicDecode sees the extra accepted
+    // tokens as part of the sequence history on the next step. Only the
+    // first `batch_size` entries are relevant for this mini-batch.
+    std::vector<int> h_seq_lengths(batch_size);
+    core::Copy(sequence_lengths_.data(), batch_size, h_seq_lengths.data());
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    for (int i = 0; i < batch_size; ++i) {
+        const int extra = extra_per_seq[i];
+        if (extra > 0) {
+            h_seq_lengths[i] += extra;
+        }
+    }
+
+    core::Copy(h_seq_lengths.data(), batch_size, sequence_lengths_.data());
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    // Advance the global generation step by the maximum number of extra
+    // accepted tokens so that subsequent steps and gatherOutput see the
+    // extended token range.
+    g.step += max_extra;
+
+    if (debug_ && tp_rank_ == 0) {
+        // Sanity-check that sequence lengths for sequences that actually
+        // received extra tokens do not outrun the global time index.
+        for (int i = 0; i < batch_size; ++i) {
+            const int extra = extra_per_seq[i];
+            if (extra <= 0) {
+                continue;
+            }
+            const int seq_len = h_seq_lengths[i];
+            if (seq_len > g.step) {
+                disableEagleMultitokenForSlot(i, "sequence_length exceeds global step after multi-token advance");
+            }
+        }
+    }
 }
 
 namespace {
@@ -2170,6 +2897,10 @@ void LlamaBatch::InitializeBufferAndKVCache()
                                                 core::Context::alloc(kDEVICE),
                                                 get_free_size});
 
+    // Cache basic KV layout parameters for EAGLE KV rewind integration.
+    kv_block_size_         = cache_block_seq_len;
+    kv_max_blocks_per_seq_ = sequence_manager_->max_block_count();
+
     const size_t max_session_len = sequence_manager_->max_block_count() * cache_block_seq_len * param_.attn_cp_size;
     if (max_session_len < session_len_) {
         if (tp_rank_ == 0) {
@@ -2200,6 +2931,11 @@ void LlamaBatch::InitializeBufferAndKVCache()
 
 void LlamaBatch::FreeBufferAndKVCache()
 {
+    if (eagle_kv_cache_blocks_) {
+        check_cuda_error(cudaFree(eagle_kv_cache_blocks_));
+        eagle_kv_cache_blocks_ = nullptr;
+    }
+
     sequence_manager_.reset();
 
     for (auto& s : states_) {

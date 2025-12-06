@@ -640,3 +640,8 @@ class SpeculativeConfig:
     method: str
     model: str = ""
     num_speculative_tokens: int = 1
+    # Optional TurboMind-only EAGLE debug/metrics flags. When set, these
+    # map onto SpeculativeConfig.eagle_debug / eagle_metrics_debug in
+    # lmdeploy.speculative_config and ultimately into TurboMind EngineParam.
+    eagle_debug: bool = False
+    eagle_metrics_debug: bool = False

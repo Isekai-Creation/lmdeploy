@@ -36,11 +36,21 @@ from lmdeploy.utils import get_logger, get_max_batch_size, get_model
 from .deploy.config import TurbomindModelConfig
 from .supported_models import is_supported
 
-# TODO: find another way import _turbomind
+# Import the compiled TurboMind backend if available. In environments where
+# the `_turbomind` extension is not built (e.g. unit tests that only exercise
+# Python-side helpers such as `_get_metrics`), we degrade gracefully and
+# leave `_tm` / `_xgr` as `None`. Callers that require the backend should
+# explicitly assert that `_tm` is not None.
 lmdeploy_dir = osp.split(lmdeploy.__file__)[0]
-sys.path.append(osp.join(lmdeploy_dir, "lib"))
-import _turbomind as _tm  # noqa: E402
-import _xgrammar as _xgr  # noqa: E402
+lib_dir = osp.join(lmdeploy_dir, "lib")
+if lib_dir not in sys.path:
+    sys.path.append(lib_dir)
+try:  # pragma: no cover - backend availability is environment-dependent
+    import _turbomind as _tm  # noqa: E402
+    import _xgrammar as _xgr  # noqa: E402
+except Exception:  # noqa: BLE001
+    _tm = None
+    _xgr = None
 
 from .tokenizer_info import TokenizerInfo  # noqa: E402
 
@@ -66,7 +76,7 @@ def _np_dict_to_tm_dict(np_dict: dict):
     return ret
 
 
-def _tm_dict_to_torch_dict(tm_dict: _tm.TensorMap):
+def _tm_dict_to_torch_dict(tm_dict):
     """Map turbomind's tensor to torch's tensor."""
     ret = dict()
     for k, v in tm_dict.items():
@@ -575,7 +585,7 @@ def _get_logprobs(outputs, output_logprobs: int):
     return _func
 
 
-def _get_metrics(metrics):
+def _get_metrics(metrics, eagle_metrics_debug: bool = False):
     import time
 
     from lmdeploy.messages import EngineEvent, EventType, RequestMetrics
@@ -598,7 +608,7 @@ def _get_metrics(metrics):
 
         # Attach TurboMind EAGLE speculative decoding stats when available.
         eagle_steps = getattr(metrics, "eagle_steps", 0)
-        if eagle_steps:
+        if eagle_steps > 0:
             num_draft = getattr(metrics, "eagle_total_draft_tokens", 0)
             num_accept = getattr(metrics, "eagle_total_accepted_tokens", 0)
             avg_accepted_per_step = (
@@ -618,7 +628,7 @@ def _get_metrics(metrics):
             out.req_metrics.spec_info = spec_info
 
             # Optional debug/trace logging for EAGLE metrics.
-            if os.getenv("LMDEPLOY_EAGLE_METRICS_DEBUG", "") not in ("", "0", "false", "False"):
+            if eagle_metrics_debug:
                 logger.info(
                     "[EAGLE][Metrics] steps=%d num_draft_tokens=%d num_accepted_tokens=%d "
                     "avg_accepted_per_step=%.4f num_rewound_tokens=%d rewind_steps=%d",
@@ -629,6 +639,9 @@ def _get_metrics(metrics):
                     int(total_rewound),
                     int(rewind_steps),
                 )
+        else:
+            # Explicitly mark EAGLE as disabled for this request.
+            out.req_metrics.spec_info = None
 
     return _func
 
@@ -728,7 +741,11 @@ class TurboMindInstance:
         if gen_config.logprobs:
             fs.append(_get_logprobs(outputs, gen_config.logprobs))
         if self.tm_model.engine_config.enable_metrics:
-            fs.append(_get_metrics(metrics))
+            spec_cfg = getattr(self.tm_model.engine_config, "speculative_config", None)
+            eagle_metrics_debug = bool(
+                getattr(spec_cfg, "eagle_metrics_debug", False)
+            ) if spec_cfg is not None else False
+            fs.append(_get_metrics(metrics, eagle_metrics_debug))
         return fs
 
     def prepare_embeddings(self, input_embeddings=None, input_embedding_ranges=None):

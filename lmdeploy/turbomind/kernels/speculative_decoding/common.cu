@@ -5,8 +5,12 @@
  */
 
 #include "common.h"
+#include "optimized_kernels.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdio>
+
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 namespace kernels {
@@ -19,50 +23,76 @@ namespace speculative_decoding {
  * matching tokens until a mismatch is found.
  */
 __global__ void acceptDraftTokensKernel(
-    TokenIdType* output_ids,
+    TokenIdType*       output_ids,
     TokenIdType const* draft_ids,
     TokenIdType const* target_ids,
-    SizeType* accepted_lengths,
-    SizeType* sequence_lengths,
-    SizeType const* paths,
-    SizeType const* best_path_ids,
-    SizeType const* batch_slots,
-    SizeType batch_size,
-    SizeType max_seq_len,
-    SizeType max_draft_tokens,
-    SizeType max_path_len
+    SizeType*          accepted_lengths,
+    SizeType*          sequence_lengths,
+    SizeType const*    paths,
+    SizeType const*    best_path_ids,
+    SizeType const*    batch_slots,
+    SizeType           batch_size,
+    SizeType           max_batch_size,
+    SizeType           max_seq_len,
+    SizeType           max_draft_tokens,
+    SizeType           max_path_len
 ) {
     int batch_idx = blockIdx.x;
-    if (batch_idx >= batch_size) return;
+    if (batch_idx >= batch_size) {
+        return;
+    }
     
     // Map to global batch slot
-    int slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
-    int seq_len = sequence_lengths[slot];
+    const int slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
+    if (slot < 0 || slot >= max_batch_size) {
+        // Out-of-range or inactive slot; leave metadata untouched.
+        return;
+    }
+
+    int seq_len   = sequence_lengths[slot];
     int best_path = best_path_ids[slot];
+
+    // A negative best_path_id conventionally means "no best path".
+    if (best_path < 0 || best_path >= max_draft_tokens) {
+        accepted_lengths[slot] = 0;
+        return;
+    }
     
     // Walk the path and accept matching tokens
     int accepted = 0;
     for (int i = 0; i < max_draft_tokens; ++i) {
         // Get path index for this position
-        int path_idx = paths[slot * max_draft_tokens * max_path_len + 
-                            best_path * max_path_len + i];
+        const int path_idx = paths[static_cast<size_t>(slot) * max_draft_tokens * max_path_len
+                                  + static_cast<size_t>(best_path) * max_path_len + i];
         
-        if (path_idx < 0) break;  // End of path marker
+        if (path_idx < 0) {
+            // End-of-path sentinel.
+            break;
+        }
+        if (path_idx >= max_draft_tokens) {
+            // Out-of-range path index – treat as terminator to avoid
+            // reading past the end of draft/target arrays.
+            break;
+        }
         
         // Get draft and target tokens at this path position
-        int draft_token = draft_ids[slot * max_draft_tokens + path_idx];
-        int target_token = target_ids[slot * max_draft_tokens + path_idx];
+        const int draft_token
+            = draft_ids[static_cast<size_t>(slot) * max_draft_tokens + path_idx];
+        const int target_token
+            = target_ids[static_cast<size_t>(slot) * max_draft_tokens + path_idx];
         
         if (draft_token == target_token) {
             // Accept token
             if (seq_len + accepted < max_seq_len) {
-                output_ids[slot * max_seq_len + seq_len + accepted] = draft_token;
+                output_ids[static_cast<size_t>(slot) * max_seq_len + seq_len + accepted]
+                    = draft_token;
                 accepted++;
             }
         } else {
             // Rejection: stop here, but add the correct target token
             if (seq_len + accepted < max_seq_len) {
-                output_ids[slot * max_seq_len + seq_len + accepted] = target_token;
+                output_ids[static_cast<size_t>(slot) * max_seq_len + seq_len + accepted]
+                    = target_token;
                 accepted++;
             }
             break;
@@ -76,59 +106,142 @@ __global__ void acceptDraftTokensKernel(
 
 template <typename T>
 void acceptDraftTokens(AcceptDraftTokensParams<T> const& params) {
-    // One block per batch item, single thread per block for simplicity
-    // TODO: Optimize with multiple threads per block for large paths
-    dim3 grid(params.batch_size);
-    dim3 block(1);
-    
-    acceptDraftTokensKernel<<<grid, block, 0, params.stream>>>(
-        params.output_ids,
-        params.draft_ids,
-        params.target_ids,
-        params.accepted_lengths,
-        params.sequence_lengths,
-        params.paths,
-        params.best_path_ids,
-        params.batch_slots,
-        params.batch_size,
-        params.max_seq_len,
-        params.max_draft_tokens,
-        params.max_path_len
-    );
+    // For small paths, a single-threaded kernel is sufficient and avoids
+    // launch overhead; for larger paths, dispatch to the optimized
+    // multi-threaded version defined in optimized_kernels.cu.
+    if (params.max_draft_tokens <= 8) {
+        dim3 grid(params.batch_size);
+        dim3 block(1);
+
+        acceptDraftTokensKernel<<<grid, block, 0, params.stream>>>(
+            params.output_ids,
+            params.draft_ids,
+            params.target_ids,
+            params.accepted_lengths,
+            params.sequence_lengths,
+            params.paths,
+            params.best_path_ids,
+            params.batch_slots,
+            params.batch_size,
+            params.max_batch_size,
+            params.max_seq_len,
+            params.max_draft_tokens,
+            params.max_path_len);
+    }
+    else {
+        acceptDraftTokensOptimized<T>(params);
+    }
 }
 
 // Explicit template instantiation for common types
 template void acceptDraftTokens<float>(AcceptDraftTokensParams<float> const&);
 template void acceptDraftTokens<half>(AcceptDraftTokensParams<half> const&);
 
+void launchAcceptDraftTokensKernel(
+    TokenIdType*       output_ids,
+    TokenIdType const* draft_ids,
+    TokenIdType const* target_ids,
+    SizeType*          accepted_lengths,
+    SizeType*          sequence_lengths,
+    SizeType const*    paths,
+    SizeType const*    best_path_ids,
+    SizeType const*    batch_slots,
+    SizeType           batch_size,
+    SizeType           max_batch_size,
+    SizeType           max_seq_len,
+    SizeType           max_draft_tokens,
+    SizeType           max_path_len,
+    cudaStream_t       stream)
+{
+    AcceptDraftTokensParams<float> params{};
+    params.output_ids       = const_cast<TokenIdType*>(output_ids);
+    params.draft_ids        = draft_ids;
+    params.target_ids       = target_ids;
+    params.accepted_lengths = accepted_lengths;
+    params.sequence_lengths = sequence_lengths;
+    params.paths            = paths;
+    params.best_path_ids    = best_path_ids;
+    params.end_ids          = nullptr;
+    params.finished_states  = nullptr;
+    params.batch_slots      = batch_slots;
+    params.batch_size       = batch_size;
+    params.max_batch_size   = max_batch_size;
+    params.max_seq_len      = max_seq_len;
+    params.max_draft_tokens = max_draft_tokens;
+    params.max_path_len     = max_path_len;
+    params.stream           = stream;
+
+    if (batch_size <= 0 || max_batch_size <= 0 || max_draft_tokens <= 0 || max_seq_len <= 0
+        || max_path_len <= 0) {
+        if (::turbomind::isEagleDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[EAGLE][accept] early-return: batch_size=%d max_batch_size=%d "
+                         "max_seq_len=%d max_draft_tokens=%d max_path_len=%d\n",
+                         static_cast<int>(batch_size),
+                         static_cast<int>(max_batch_size),
+                         static_cast<int>(max_seq_len),
+                         static_cast<int>(max_draft_tokens),
+                         static_cast<int>(max_path_len));
+        }
+        return;
+    }
+
+    // Reuse the main acceptance helper, which will choose between the
+    // scalar and optimized kernels based on max_draft_tokens.
+    acceptDraftTokens<float>(params);
+}
+
 /**
  * @brief Kernel: Pack accepted paths into linear memory
  */
 __global__ void packAcceptedPathsKernel(
-    SizeType* accepted_lengths_cumsum,
-    SizeType* paths_offsets,
+    SizeType*       accepted_lengths_cumsum,
+    SizeType*       paths_offsets,
     SizeType const* accepted_lengths,
     SizeType const* best_path_ids,
     SizeType const* paths,
     SizeType const* batch_slots,
-    SizeType batch_size,
-    SizeType num_paths,
-    SizeType max_path_len
+    SizeType        batch_size,
+    SizeType        max_batch_size,
+    SizeType        num_paths,
+    SizeType        max_path_len
 ) {
     int batch_idx = blockIdx.x;
-    if (batch_idx >= batch_size) return;
+    if (batch_idx >= batch_size) {
+        return;
+    }
     
-    int slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
-    int best_path = best_path_ids[slot];
-    int accepted_len = accepted_lengths[slot];
+    const int slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
+    if (slot < 0 || slot >= max_batch_size) {
+        return;
+    }
+
+    const int best_path = best_path_ids[slot];
+    const int accepted_len = accepted_lengths[slot];
+
+    if (best_path < 0 || best_path >= num_paths || accepted_len <= 0) {
+        return;
+    }
     
     // Compute cumulative sum offset
-    int offset = (batch_idx == 0) ? 0 : accepted_lengths_cumsum[batch_idx - 1];
+    const SizeType offset = (batch_idx == 0) ? 0 : accepted_lengths_cumsum[batch_idx - 1];
+    const SizeType total_accepted = accepted_lengths_cumsum[batch_size - 1];
+    if (offset >= total_accepted) {
+        return;
+    }
+
+    const SizeType max_writable = total_accepted - offset;
+    const SizeType len = static_cast<SizeType>(accepted_len) < max_writable
+                             ? static_cast<SizeType>(accepted_len)
+                             : max_writable;
     
     // Pack accepted path
-    for (int i = 0; i < accepted_len && i < max_path_len; ++i) {
-        int path_idx = paths[slot * num_paths * max_path_len + 
-                            best_path * max_path_len + i];
+    for (SizeType i = 0; i < len && i < max_path_len; ++i) {
+        const SizeType path_idx = paths[static_cast<size_t>(slot) * num_paths * max_path_len
+                                       + static_cast<size_t>(best_path) * max_path_len + i];
+        if (path_idx < 0) {
+            break;
+        }
         paths_offsets[offset + i] = path_idx;
     }
 }
@@ -141,6 +254,7 @@ void invokePackAcceptedPaths(
     SizeType const* paths,
     SizeType const* batch_slots,
     SizeType batch_size,
+    SizeType max_batch_size,
     SizeType max_batch_size,
     SizeType num_paths,
     SizeType max_path_len,
@@ -157,9 +271,49 @@ void invokePackAcceptedPaths(
         paths,
         batch_slots,
         batch_size,
+        max_batch_size,
         num_paths,
-        max_path_len
-    );
+        max_path_len);
+}
+
+void launchPackAcceptedPathsKernel(
+    SizeType*       accepted_lengths_cumsum,
+    SizeType*       paths_offsets,
+    SizeType const* accepted_lengths,
+    SizeType const* best_path_ids,
+    SizeType const* paths,
+    SizeType const* batch_slots,
+    SizeType        batch_size,
+    SizeType        max_batch_size,
+    SizeType        num_paths,
+    SizeType        max_path_len,
+    cudaStream_t    stream)
+{
+    if (batch_size <= 0 || max_batch_size <= 0 || num_paths <= 0 || max_path_len <= 0) {
+        if (::turbomind::isEagleDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[EAGLE][pack] early-return: batch_size=%d max_batch_size=%d "
+                         "num_paths=%d max_path_len=%d\n",
+                         static_cast<int>(batch_size),
+                         static_cast<int>(max_batch_size),
+                         static_cast<int>(num_paths),
+                         static_cast<int>(max_path_len));
+        }
+        return;
+    }
+
+    invokePackAcceptedPaths(
+        accepted_lengths_cumsum,
+        paths_offsets,
+        accepted_lengths,
+        best_path_ids,
+        paths,
+        batch_slots,
+        batch_size,
+        max_batch_size,
+        num_paths,
+        max_path_len,
+        stream);
 }
 
 /**
@@ -170,22 +324,31 @@ void invokePackAcceptedPaths(
  * cache manager (e.g. TurboMind’s SequenceManager / BlockManager).
  */
 __global__ void kvCacheRewindKernel(
-    void** kv_cache_blocks,
-    SizeType const* rewind_lengths,
-    SizeType const* batch_slots,
-    SizeType const* block_tables,
-    SizeType batch_size,
-    SizeType num_layers,
-    SizeType block_size,
-    SizeType max_blocks_per_seq
+    void**           kv_cache_blocks,
+    SizeType const*  rewind_lengths,
+    SizeType const*  batch_slots,
+    SizeType const*  block_tables,
+    SizeType         batch_size,
+    SizeType         max_batch_size,
+    SizeType         num_layers,
+    SizeType         block_size,
+    SizeType         max_blocks_per_seq
 ) {
     int batch_idx = blockIdx.x;
-    if (batch_idx >= batch_size) return;
+    if (batch_idx >= batch_size) {
+        return;
+    }
     
-    int slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
-    int rewind_len = rewind_lengths ? rewind_lengths[slot] : 0;
+    const int slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
+    if (slot < 0 || slot >= max_batch_size) {
+        return;
+    }
+
+    const int rewind_len = rewind_lengths ? rewind_lengths[slot] : 0;
     
-    if (rewind_len <= 0) return;
+    if (rewind_len <= 0) {
+        return;
+    }
     
     // Calculate how many whole blocks from the tail we should consider
     // rewinding for this sequence.
@@ -222,6 +385,20 @@ __global__ void kvCacheRewindKernel(
 }
 
 void invokeKVCacheRewind(KVCacheRewindParams const& params) {
+    if (params.batch_size <= 0 || params.max_batch_size <= 0 || params.block_size <= 0
+        || params.max_blocks_per_seq <= 0) {
+        if (::turbomind::isEagleKVDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[EAGLE][kv_rewind] early-return: batch_size=%d max_batch_size=%d "
+                         "block_size=%d max_blocks_per_seq=%d\n",
+                         static_cast<int>(params.batch_size),
+                         static_cast<int>(params.max_batch_size),
+                         static_cast<int>(params.block_size),
+                         static_cast<int>(params.max_blocks_per_seq));
+        }
+        return;
+    }
+
     dim3 grid(params.batch_size);
     dim3 block(1);
     
@@ -231,10 +408,10 @@ void invokeKVCacheRewind(KVCacheRewindParams const& params) {
         params.batch_slots,
         params.block_tables,
         params.batch_size,
+        params.max_batch_size,
         params.num_layers,
         params.block_size,
-        params.max_blocks_per_seq
-    );
+        params.max_blocks_per_seq);
 }
 
 } // namespace speculative_decoding
