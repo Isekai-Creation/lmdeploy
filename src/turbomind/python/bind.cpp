@@ -300,7 +300,12 @@ struct ScopedGIL {
 
 PYBIND11_MODULE(_turbomind, m)
 {
-    py::class_<ft::RequestMetrics, std::shared_ptr<ft::RequestMetrics>>(m, "RequestMetrics")
+    // Bind C++ RequestMetrics and ScheduleMetrics as module-local types so
+    // that we do not conflict with any other extension that may also expose
+    // the same turbomind::RequestMetrics / ScheduleMetrics in the process.
+    py::class_<ft::RequestMetrics, std::shared_ptr<ft::RequestMetrics>>(m,
+                                                                        "RequestMetrics",
+                                                                        py::module_local())
         .def(py::init())
         .def_readonly("enque_time", &ft::RequestMetrics::enque_time)
         .def_readonly("scheduled_time", &ft::RequestMetrics::scheduled_time)
@@ -310,7 +315,9 @@ PYBIND11_MODULE(_turbomind, m)
         .def_readonly("eagle_total_rewound_tokens", &ft::RequestMetrics::eagle_total_rewound_tokens)
         .def_readonly("eagle_rewind_steps", &ft::RequestMetrics::eagle_rewind_steps);
 
-    py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m, "ScheduleMetrics")
+    py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m,
+                                                                          "ScheduleMetrics",
+                                                                          py::module_local())
         .def(py::init())
         .def_readonly("total_seqs", &ft::ScheduleMetrics::total_seqs)
         .def_readonly("active_seqs", &ft::ScheduleMetrics::active_seqs)
