@@ -169,7 +169,7 @@ LlamaV2::LlamaV2(DataType                     dtype,
             TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE module initialized successfully");
         }
         else {
-            spec_mode_ = SpeculativeDecodingMode::Disabled();
+            spec_mode_ = SpeculativeDecodingMode::None();
             eagle_module_.reset();
             eagle_buffers_.reset();
             TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE disabled; falling back to baseline decoding for this engine");

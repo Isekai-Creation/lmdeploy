@@ -247,13 +247,6 @@ private:
                           int                     batch_size,
                           const GenerationState&  g);
 
-    bool isEagleMultiTokenStepEnabled(const GenerationState& g) const;
-
-    // Returns true if multi-token speculative decoding is currently enabled
-    // for the given slot, taking into account per-slot runtime kill-switches
-    // and per-request configuration.
-    bool isEagleMultiTokenSlotEnabled(int slot) const;
-
     // Disable multi-token speculative decoding for a given slot and latch the
     // corresponding request into single-token mode for the remainder of its
     // lifetime. This is the only place that should mutate
