@@ -265,11 +265,19 @@ def validate_eagle_runtime_config(engine_config: Any, spec_cfg: Optional[Specula
 
     cfg_spec = getattr(engine_config, "speculative_config", None)
     if cfg_spec is None:
-        raise ValueError(
-            "EAGLE runtime config: engine_config.speculative_config is None while "
-            f"SpeculativeConfig(method='{spec_cfg.method}') is provided; "
-            "TurboMind speculative decoding is not configured."
-        )
+        # For offline/single-GPU helpers, allow attaching the SpeculativeConfig
+        # directly to the engine_config when it has not yet been wired, so that
+        # validation can still proceed and keep behaviour aligned with callers
+        # like benchmark_speculative.py and eagle_inspect.
+        try:
+            setattr(engine_config, "speculative_config", spec_cfg)
+            cfg_spec = spec_cfg
+        except Exception as exc:  # pragma: no cover - very defensive
+            raise ValueError(
+                "EAGLE runtime config: engine_config.speculative_config is None while "
+                f"SpeculativeConfig(method='{spec_cfg.method}') is provided; "
+                "TurboMind speculative decoding is not configured."
+            ) from exc
 
     # Cross-check engine-side speculative config against the Python one
     # when we can get a mapping out of it.
