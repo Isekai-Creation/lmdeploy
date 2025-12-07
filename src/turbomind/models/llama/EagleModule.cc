@@ -130,9 +130,21 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         return;
     }
 
+    // Some EAGLE draft checkpoints (e.g. NVIDIA's GPT‑OSS EAGLE3 models)
+    // intentionally use hidden_size that does NOT equal
+    // num_attention_heads * head_dim. The rest of EagleModule only relies
+    // on `hidden_units` and `intermediate_size` for buffer and weight
+    // shapes, so we treat this mismatch as a warning instead of a hard
+    // error. As long as the exported weights match `hidden_units` and
+    // `intermediate_size`, the draft network can run correctly.
     if (hidden_units != head_num * head_dim) {
-        logEagleError("hidden_units != head_num * size_per_head in config.yaml");
-        return;
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] hidden_units (%d) != head_num (%d) * size_per_head (%d); "
+            "continuing with hidden_units=%d based on config.yaml",
+            hidden_units,
+            head_num,
+            head_dim,
+            hidden_units);
     }
 
     hidden_units_ = hidden_units;
