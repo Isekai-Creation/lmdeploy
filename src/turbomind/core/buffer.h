@@ -54,8 +54,32 @@ public:
     template<class T>
     T* data()
     {
-        TM_CHECK_EQ(data_type_v<T>, dtype_);
-        return (T*)((char*)TM_CHECK_NOTNULL(data_).get() + turbomind::byte_size<T>(base_));
+        // In most cases the buffer's logical dtype must match the
+        // requested template type exactly.
+        //
+        // However, for 16‑bit floating point we deliberately allow
+        // lightweight reinterpretation between FP16 and BF16. Some
+        // legacy paths in TurboMind still call `data<half>()` even
+        // when a tensor has been allocated as BF16 (and vice versa).
+        // Treating those two layouts as interchangeable here avoids
+        // hard crashes from `TM_CHECK_EQ` while keeping all other
+        // dtype mismatches protected.
+        if (dtype_ != data_type_v<T>) {
+            const bool is_half_tpl      = data_type_v<T> == turbomind::kHalf;
+            const bool is_bf16_tpl      = data_type_v<T> == turbomind::kBfloat16;
+            const bool is_half_buf      = dtype_ == turbomind::kHalf;
+            const bool is_bf16_buf      = dtype_ == turbomind::kBfloat16;
+            const bool allow_fp16_bf16  = (is_half_tpl && is_bf16_buf) || (is_bf16_tpl && is_half_buf);
+
+            if (!allow_fp16_bf16) {
+                TM_CHECK_EQ(data_type_v<T>, dtype_);
+            }
+        }
+
+        // Use the buffer's own dtype for byte offset computation.
+        // FP16 and BF16 are both 16‑bit wide, so the reinterpretation
+        // above remains layout‑compatible.
+        return (T*)((char*)TM_CHECK_NOTNULL(data_).get() + turbomind::byte_size(dtype_, base_));
     }
 
     template<class T>

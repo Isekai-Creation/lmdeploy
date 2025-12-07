@@ -114,10 +114,18 @@ class SpeculativeConfig:
         # Set EAGLE defaults if not specified (TurboMind only)
         if self.method in ["eagle", "eagle3"]:
             if self.max_path_len is None:
+                # Default tree depth. For single-token speculation we keep
+                # this small; for multi-token we allow a bit more room so
+                # the tree can represent extra candidates.
                 self.max_path_len = 5  # Sensible default
             if self.max_decoding_tokens is None:
-                # Auto-set based on num_speculative_tokens
-                self.max_decoding_tokens = self.num_speculative_tokens * 2
+                # Auto-set based on num_speculative_tokens. Ensure that
+                # max_decoding_tokens is always at least as large as
+                # max_path_len so that the tree depth constraint can be
+                # satisfied even for small num_speculative_tokens.
+                self.max_decoding_tokens = max(
+                    self.num_speculative_tokens * 2, self.max_path_len
+                )
             if self.max_non_leaves_per_layer is None:
                 self.max_non_leaves_per_layer = 10
             if self.capture_layers is None:
@@ -144,14 +152,17 @@ class SpeculativeConfig:
 
             # max_path_len cannot exceed max_decoding_tokens and should be at
             # least as large as num_speculative_tokens (otherwise the tree
-            # cannot represent the speculative step).
+            # cannot represent the speculative step). When users provide
+            # partially conflicting values, we auto-clamp max_path_len down
+            # to max_decoding_tokens rather than failing hard, as long as
+            # the result is still usable.
             if self.max_path_len > self.max_decoding_tokens:
-                raise ValueError(
-                    "max_path_len must be <= max_decoding_tokens "
-                    f"for method '{self.method}', got "
-                    f"max_path_len={self.max_path_len}, "
-                    f"max_decoding_tokens={self.max_decoding_tokens}"
+                warnings.warn(
+                    "SpeculativeConfig: max_path_len=%d exceeds max_decoding_tokens=%d "
+                    "for method '%s'; clamping max_path_len to max_decoding_tokens."
+                    % (self.max_path_len, self.max_decoding_tokens, self.method)
                 )
+                self.max_path_len = self.max_decoding_tokens
             if self.max_path_len < self.num_speculative_tokens:
                 raise ValueError(
                     "max_path_len must be >= num_speculative_tokens "

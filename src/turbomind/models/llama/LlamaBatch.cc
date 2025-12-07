@@ -1042,14 +1042,27 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
         const bool finished                 = (i < static_cast<int>(h_finished_slots.size())) ? h_finished_slots[i]
                                                                                             : false;
 
+        // Raw acceptance from EAGLE (prior to any alignment with
+        // DynamicDecode). We keep this for metrics so that aggregate
+        // acceptance can be inspected even when we conservatively
+        // clamp or reject tokens at the integration boundary.
+        int raw_accepted_len   = 0;
+        int raw_accepted_token = -1;
+
+        // Effective acceptance used for KV length and multi-token
+        // advancement decisions. This may be stricter than the raw
+        // acceptance (e.g. when DynamicDecode chooses a different
+        // first token).
         int accepted_len   = 0;
         int accepted_token = -1;
 
         if (i < static_cast<int>(eagle_accepted_lens.size())) {
-            accepted_len = eagle_accepted_lens[i];
+            raw_accepted_len = eagle_accepted_lens[i];
+            accepted_len     = raw_accepted_len;
             if (accepted_len > 0 && max_path_len > 0
                 && i * max_path_len < static_cast<int>(eagle_accepted_tokens.size())) {
-                accepted_token = eagle_accepted_tokens[i * max_path_len];
+                raw_accepted_token = eagle_accepted_tokens[i * max_path_len];
+                accepted_token     = raw_accepted_token;
             }
         }
 
@@ -1095,10 +1108,10 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
         kv_accepted_lengths[i] = kv_accepted_len;
 
         step_draft_total += planned_tokens_per_seq;
-        step_accepted_total += accepted_len;
+        step_accepted_total += raw_accepted_len;
 
         req->metrics->eagle_total_draft_tokens += planned_tokens_per_seq;
-        req->metrics->eagle_total_accepted_tokens += accepted_len;
+        req->metrics->eagle_total_accepted_tokens += raw_accepted_len;
         req->metrics->eagle_steps += 1;
 
         if (rewind_len > 0) {
@@ -1107,11 +1120,12 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
         }
 
         TM_LOG_INFO(
-            "[LlamaBatch][EAGLE] step=%d, seq=%d, dynamic_token=%d, accepted_len=%d, accepted_token=%d, "
-            "tokens_per_seq=%d, rewind_len=%d",
+            "[LlamaBatch][EAGLE] step=%d, seq=%d, dynamic_token=%d, raw_accepted_len=%d, "
+            "effective_accepted_len=%d, accepted_token=%d, tokens_per_seq=%d, rewind_len=%d",
             g.step,
             i,
             h_token_ids[i],
+            raw_accepted_len,
             accepted_len,
             accepted_token,
             planned_tokens_per_seq,

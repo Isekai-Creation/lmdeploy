@@ -381,6 +381,17 @@ def _convert_eagle3_midlayer(
     )
     _write_tensor(lm_head, os.path.join(out_dir, "output.weight"), w_dtype)
 
+    # Token embeddings: the Eagle3 midlayer checkpoint for GPT‑OSS does
+    # not ship its own input token embedding table, but EagleModule's
+    # on‑disk layout includes a `tok_embeddings.weight` slot. Populate it
+    # with a zero‑initialised BF16 matrix so that EagleModule::load does
+    # not emit hard errors about missing files. The current draft
+    # forward path does not consume these embeddings directly.
+    tok_emb_path = os.path.join(out_dir, "tok_embeddings.weight")
+    if not os.path.exists(tok_emb_path):
+        tok_emb = torch.zeros(vocab_size, hidden_size, dtype=w_dtype)
+        _write_tensor(tok_emb, tok_emb_path, w_dtype)
+
     # Midlayer norms.
     attn_norm = get("midlayer.input_layernorm.weight", optional=True)
     if attn_norm is not None:
