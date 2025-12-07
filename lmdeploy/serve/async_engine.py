@@ -551,7 +551,14 @@ class AsyncEngine(LogitsMixin):
                                     model_name=None,
                                     chat_template_name=None,
                                     engine_config=draft_engine_cfg,
-                                    group_size=None,
+                                    # Use 0 as a sentinel so that
+                                    # quantized models can derive a
+                                    # valid group_size from their
+                                    # quantization_config and
+                                    # non-quantized models fall back
+                                    # to a safe default inside the
+                                    # converter.
+                                    group_size=0,
                                     out_dir=out_dir,
                                 )
                                 tm_model.export()
