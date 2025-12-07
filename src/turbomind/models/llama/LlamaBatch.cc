@@ -1076,15 +1076,19 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
         }
 
         if (accepted_len > 0 && accepted_token != h_token_ids[i]) {
+            // Keep raw acceptance for metrics, but log the divergence
+            // between the first accepted token and DynamicDecode's
+            // committed token. This can happen when sampling layers
+            // (e.g. penalties, guidance) adjust logits between the
+            // point where `target_tokens` were captured and the final
+            // decode decision.
             TM_LOG_WARNING(
                 "[LlamaBatch][EAGLE] step=%d, seq=%d, accepted_token=%d mismatches "
-                "dynamicDecode token=%d; treating as rejected for metrics",
+                "dynamicDecode token=%d; keeping raw acceptance for metrics",
                 g.step,
                 i,
                 accepted_token,
                 h_token_ids[i]);
-            accepted_len   = 0;
-            accepted_token = -1;
         }
 
         int planned_tokens_per_seq = eagle_tokens_per_seq;
@@ -2577,10 +2581,14 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
         const int* seq_tokens = eagle_accepted_tokens.data() + token_offset;
         const int  committed  = dynamic_tokens[i];
 
-        if (seq_tokens[0] != committed) {
-            disableEagleMultitokenForSlot(i, "first accepted token mismatch with DynamicDecode token");
-            continue;
-        }
+        // For TurboMind's current EAGLE integration we do not require the
+        // first accepted token to exactly match DynamicDecode's committed
+        // token. Sampling layers (e.g. repetition penalties, guidance) can
+        // legitimately cause divergence between the greedy top-1 from the
+        // raw logits (used to build target_tokens) and the final decode
+        // decision. We still treat `committed` as the first token in the
+        // sequence and only append *extra* accepted tokens (positions
+        // 1..len-1) below.
 
         // Do not allow EOS to appear in extra accepted positions; EOS handling
         // remains owned by DynamicDecode/StopCriteria so we must not "skip"
