@@ -336,14 +336,27 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     bool   w1_ok = load_with_variants(w1, "layers.0.feed_forward.w1.weight");
     bool   w3_ok = load_with_variants(w3, "layers.0.feed_forward.w3.weight");
     if (w1_ok && w3_ok) {
-        const size_t w_size = static_cast<size_t>(w1.size()) * sizeof(half);
-        check_cuda_error(cudaMemcpy(
-            weights_.mlp_gate_up.data<half>(), w1.data<half>(), w_size, cudaMemcpyDeviceToDevice));
-        check_cuda_error(cudaMemcpy(
-            reinterpret_cast<char*>(weights_.mlp_gate_up.data<half>()) + w_size,
-            w3.data<half>(),
-            w_size,
-            cudaMemcpyDeviceToDevice));
+        const size_t elem_count = static_cast<size_t>(w1.size());
+        if (dtype == kBfloat16) {
+            const size_t w_bytes = elem_count * sizeof(bfloat16_t);
+            check_cuda_error(cudaMemcpy(
+                weights_.mlp_gate_up.data<bfloat16_t>(), w1.data<bfloat16_t>(), w_bytes, cudaMemcpyDeviceToDevice));
+            check_cuda_error(cudaMemcpy(
+                static_cast<char*>(weights_.mlp_gate_up.data<bfloat16_t>()) + w_bytes,
+                w3.data<bfloat16_t>(),
+                w_bytes,
+                cudaMemcpyDeviceToDevice));
+        }
+        else {
+            const size_t w_bytes = elem_count * sizeof(half);
+            check_cuda_error(cudaMemcpy(
+                weights_.mlp_gate_up.data<half>(), w1.data<half>(), w_bytes, cudaMemcpyDeviceToDevice));
+            check_cuda_error(cudaMemcpy(
+                reinterpret_cast<char*>(weights_.mlp_gate_up.data<half>()) + w_bytes,
+                w3.data<half>(),
+                w_bytes,
+                cudaMemcpyDeviceToDevice));
+        }
     }
     else {
         TM_LOG_WARNING(
