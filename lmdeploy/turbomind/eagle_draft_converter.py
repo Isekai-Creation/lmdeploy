@@ -381,22 +381,63 @@ def _convert_eagle3_midlayer(
                     hidden_size,
                     inter_size,
                 )
-        _write_half_tensor(
+        _write_tensor(
             down_aligned,
             os.path.join(out_dir, "layers.0.feed_forward.w2.weight"),
             w_dtype,
         )
 
-    # Attention and FC in the Eagle3 midlayer checkpoint do not match the
-    # simple EagleNet shapes (e.g. q_proj/k_proj/v_proj are [*, 2*hidden]
-    # and fc.weight is [hidden, 3*hidden]). Rather than force a brittle
-    # reshaping, we currently leave these out and let EagleModule fall
-    # back to the robust RMSNorm+LM‑head path for hidden_states. This
-    # still gives a valid, allocation‑stable draft network.
+    # Pre-FC over concatenated hidden states. The Eagle3 checkpoint's
+    # `fc.weight` has shape [hidden, 3 * hidden] (out, in). For the
+    # simplified EagleNet block, approximate this by reusing the part
+    # that would act on the last 2 * hidden features. We then
+    # transpose to obtain a [2 * hidden, hidden] matrix matching the
+    # EagleNet FC geometry.
+    fc_w = get("fc.weight", optional=True)
+    if fc_w is not None:
+        if fc_w.shape != (hidden_size, hidden_size * 3):
+            if log:
+                log.warning(
+                    "fc.weight shape %s != (%d, %d); "
+                    "skipping EagleNet fc mapping.",
+                    tuple(fc_w.shape),
+                    hidden_size,
+                    hidden_size * 3,
+                )
+        else:
+            fc_slice = fc_w[:, hidden_size : 3 * hidden_size]  # [hidden, 2*hidden]
+            fc_eaglenet = fc_slice.transpose(0, 1)  # [2*hidden, hidden]
+            _write_tensor(
+                fc_eaglenet,
+                os.path.join(out_dir, "fc.weight"),
+                w_dtype,
+            )
+
+    # Attention weights (midlayer.self_attn.*) do not map cleanly onto
+    # the simplified EagleNet geometry (which assumes [hidden, 3 *
+    # hidden] QKV with hidden-dim inputs). Instead of forcing a fragile
+    # reshaping, we currently provide a lightweight identity-style
+    # attention block so that EagleModule can exercise its shallow
+    # attention+FC path while the majority of learned behaviour comes
+    # from the Eagle3 norms, FC, MLP, and LM head above.
     #
-    # If you later want to experiment with a more faithful mapping of
-    # midlayer.self_attn.* into EagleNet's QKV/O block, that can be
-    # added here.
+    # Concretely: Q, K, and V are each initialised as identity
+    # projections over the hidden_units, and Wo is identity. This keeps
+    # the draft network well-defined and allocation-stable without
+    # inventing an arbitrary mapping for the midlayer.self_attn.*
+    # matrices.
+    eye = torch.eye(hidden_size, dtype=w_dtype)
+    qkv_eye = torch.cat([eye, eye, eye], dim=1)  # [hidden, 3*hidden]
+    _write_tensor(
+        qkv_eye,
+        os.path.join(out_dir, "layers.0.attention.w_qkv.weight"),
+        w_dtype,
+    )
+    _write_tensor(
+        eye,
+        os.path.join(out_dir, "layers.0.attention.wo.weight"),
+        w_dtype,
+    )
 
 
 def prepare_eagle_draft_from_hf(
