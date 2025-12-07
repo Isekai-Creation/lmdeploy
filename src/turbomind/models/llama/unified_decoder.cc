@@ -44,6 +44,21 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
     if (std::accumulate(model.inter_size.begin(), model.inter_size.end(), 0LL)) {
         ffn_layer_ = std::make_unique<LlamaFfnLayer>(model, ctx);
     }
+
+    // Enable multi-layer hidden capture for Eagle3 when requested by the
+    // engine. For GPT‑OSS Eagle3 we capture the last 3 layers when
+    // available, otherwise fall back to the last layer only.
+    if (engine.enable_speculative_decoding && engine.spec_method == "eagle3") {
+        const int L = static_cast<int>(layer_num_);
+        if (L >= 3) {
+            eagle_capture_layers_ = {L - 3, L - 2, L - 1};
+            eagle_capture_enabled_ = true;
+        }
+        else if (L > 0) {
+            eagle_capture_layers_ = {L - 1};
+            eagle_capture_enabled_ = true;
+        }
+    }
 }
 
 void UnifiedDecoder::AllreduceResidualRMSnorm(Tensor&       hidden_states,
@@ -130,6 +145,22 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
     Tensor global_hidden_states = args.at("decoder_output");
 
     Tensor local_hidden_states = global_hidden_states;
+
+    // Optional buffer where multi-layer Eagle3 captures will be stored.
+    Tensor eagle_capture_hidden;
+    int    eagle_num_capture_layers = 0;
+    if (eagle_capture_enabled_ && args.find("eagle_capture_hidden") != args.end()) {
+        eagle_capture_hidden = args.at("eagle_capture_hidden");
+        eagle_num_capture_layers = static_cast<int>(eagle_capture_layers_.size());
+        if (!eagle_capture_hidden
+            || eagle_capture_hidden.shape(0) != batch_size
+            || eagle_capture_hidden.shape(1) != static_cast<int>(hidden_units_ * eagle_num_capture_layers)) {
+            eagle_capture_hidden = Tensor{{batch_size, static_cast<int>(hidden_units_ * eagle_num_capture_layers)},
+                                          local_hidden_states.dtype(),
+                                          kDEVICE};
+            args.at("eagle_capture_hidden") = eagle_capture_hidden;
+        }
+    }
 
     const auto global_token_num = global_hidden_states.shape(0);
     const auto local_token_num  = local_residual.size() ? local_residual.shape(0) : 0;
@@ -222,6 +253,44 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
 
         TM_DEBUG_TENSOR(local_residual, Concat("residual1", layer), 2);
         TM_DEBUG_TENSOR(local_hidden_states, Concat("norm0", layer + 1), 2);
+
+        // After the final RMSNorm for this layer, capture last-token hidden
+        // states for Eagle3 when this layer is one of the configured capture
+        // layers.
+        if (eagle_capture_enabled_ && eagle_capture_hidden) {
+            auto it = std::find(eagle_capture_layers_.begin(), eagle_capture_layers_.end(), layer);
+            if (it != eagle_capture_layers_.end()) {
+                const int slot        = static_cast<int>(it - eagle_capture_layers_.begin());
+                const int num_capture = eagle_num_capture_layers;
+                using T = uint16_t;  // matches last_token_hidden_units dtype
+
+                T* capture_base = (T*)eagle_capture_hidden.raw_data();
+                // Layout: [batch, hidden * num_capture_layers]
+                // Slot `slot` occupies a contiguous [batch, hidden] chunk.
+                T* layer_dst = capture_base + static_cast<size_t>(slot) * hidden_units_;
+
+                if (decode_num) {
+                    // For decode tokens, copy the last-token hidden states for
+                    // each sequence directly from local_hidden_states.
+                    check_cuda_error(cudaMemcpyAsync(layer_dst,
+                                                     (T*)local_hidden_states.raw_data(),
+                                                     sizeof(T) * decode_num * hidden_units_,
+                                                     cudaMemcpyDefault,
+                                                     stream_));
+                }
+
+                if (prefil_num) {
+                    invokeGetFeatureOfLastToken(
+                        layer_dst + static_cast<size_t>(decode_num) * hidden_units_,  //
+                        (T*)local_hidden_states.raw_data(),
+                        attn_layer_->d_cu_q_len() + decode_num,
+                        hidden_units_,
+                        prefil_num,
+                        stream_);
+                    sync_check_cuda_error();
+                }
+            }
+        }
     }
 
     /// TODO

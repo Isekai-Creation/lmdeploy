@@ -444,27 +444,38 @@ def _convert_eagle3_midlayer(
 
     # Pre-FC over concatenated hidden states. The Eagle3 checkpoint's
     # `fc.weight` has shape [hidden, 3 * hidden] (out, in). For the
-    # simplified EagleNet block, approximate this by reusing the part
-    # that would act on the last 2 * hidden features. We then
-    # transpose to obtain a [2 * hidden, hidden] matrix matching the
-    # EagleNet FC geometry.
+    # simplified EagleNet block, we:
+    #   - export a legacy EagleNet-style FC as `fc.weight`
+    #     with shape [2 * hidden, hidden] (for existing paths), and
+    #   - export the full Eagle3 FC as `eagle_fc.weight` with shape
+    #     [3 * hidden, hidden] so EagleModule can consume the true
+    #     Eagle3 geometry when multi-layer capture is enabled.
     fc_w = get("fc.weight", optional=True)
     if fc_w is not None:
         if fc_w.shape != (hidden_size, hidden_size * 3):
             if log:
                 log.warning(
                     "fc.weight shape %s != (%d, %d); "
-                    "skipping EagleNet fc mapping.",
+                    "skipping EagleNet/Eagle3 fc mapping.",
                     tuple(fc_w.shape),
                     hidden_size,
                     hidden_size * 3,
                 )
         else:
+            # Legacy EagleNet-style FC (last 2 * hidden features).
             fc_slice = fc_w[:, hidden_size : 3 * hidden_size]  # [hidden, 2*hidden]
             fc_eaglenet = fc_slice.transpose(0, 1)  # [2*hidden, hidden]
             _write_tensor(
                 fc_eaglenet,
                 os.path.join(out_dir, "fc.weight"),
+                w_dtype,
+            )
+
+            # Full Eagle3 FC over all 3 * hidden concatenated features.
+            fc_full = fc_w.to(w_dtype).transpose(0, 1)  # [3*hidden, hidden]
+            _write_tensor(
+                fc_full,
+                os.path.join(out_dir, "eagle_fc.weight"),
                 w_dtype,
             )
 

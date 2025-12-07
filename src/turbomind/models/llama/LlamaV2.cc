@@ -352,6 +352,17 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
                    {"kv_block_ptrs", kv_block_ptrs},
                    {"local_token_nums", local_token_nums}};
 
+    // When running Eagle3 speculative decoding with TurboMind we ask
+    // UnifiedDecoder to capture last-token hidden states from a small
+    // set of decoder layers (typically the last 3). The captured
+    // hidden states are concatenated into a single
+    // [batch, hidden * num_capture_layers] tensor which is written
+    // back into this entry in the args map.
+    if (engine_param_.enable_speculative_decoding && engine_param_.spec_method == "eagle3") {
+        eagle_capture_hidden_ = Tensor{};
+        args.insert({"eagle_capture_hidden", eagle_capture_hidden_});
+    }
+
     if (mrope != nullptr && mrope->position_ids) {
         args.insert({"mrope_position_ids", mrope->position_ids});
         args.insert({"mrope_position_delta", mrope->position_delta});
@@ -359,6 +370,19 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
     }
 
     unified_decoder_->Forward(args, weights_->decoder_layer_weights);
+
+    // If Eagle3 capture was requested, pull the populated tensor back
+    // from the args map so that eagleDraftForward can feed it into
+    // EagleModule.
+    if (engine_param_.enable_speculative_decoding && engine_param_.spec_method == "eagle3") {
+        auto it = args.find("eagle_capture_hidden");
+        if (it != args.end()) {
+            eagle_capture_hidden_ = it->second;
+        }
+        else {
+            eagle_capture_hidden_ = Tensor{};
+        }
+    }
 }
 
 Tensor LlamaV2::postDecodeEmbedding(const Tensor& features, Buffer local_logits)
@@ -463,17 +487,20 @@ void LlamaV2::eagleDraftForward(const Tensor& hidden_states,
         return;
     }
 
-    // Current EagleModule::forward implementation consumes hidden_states and
-    // produces normalized hidden_states + logits via the draft LM head.
-    // Input ids are unused for the minimal draft network, so we pass a
-    // default tensor here.
+    // EagleModule::forward consumes last-token hidden states together
+    // with an optional concatenation of captured per-layer hidden
+    // states (for Eagle3) and produces normalized hidden_states +
+    // logits via the draft LM head. Input ids are unused for the
+    // minimal draft network, so we pass a default tensor here.
     Tensor dummy_input_ids;
+    const Tensor& captured_hidden = eagle_capture_hidden_;
     eagle_module_->forward(
-        dummy_input_ids,   // input_ids (unused in current implementation)
-        hidden_states,     // last-token hidden states from target model
-        draft_logits,      // [batch, vocab_size_padded]
-        draft_hidden,      // [batch, hidden_units]
-        linear_,           // reuse LlamaLinear for LM head matmul
+        dummy_input_ids,    // input_ids (unused in current implementation)
+        hidden_states,      // last-token hidden states from target model
+        captured_hidden,    // optional multi-layer capture buffer
+        draft_logits,       // [batch, vocab_size_padded]
+        draft_hidden,       // [batch, hidden_units]
+        linear_,            // reuse LlamaLinear for LM head matmul
         stream_);
 }
 

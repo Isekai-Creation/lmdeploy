@@ -19,6 +19,7 @@ struct EagleWeight {
     // Model level
     Tensor embed_tokens;
     Tensor fc;
+    Tensor eagle_fc;
     
     // Layer level (single layer for Eagle3)
     Tensor input_norm;
@@ -83,15 +84,26 @@ public:
     
     // Run draft model forward pass
     // input_ids: [batch_size]
-    // hidden_states: [batch_size, hidden_units] (from target model)
+    // last_hidden_states: [batch_size, hidden_units] (from target model)
+    // captured_hidden_states: [batch_size, hidden_units * N] (optional,
+    //   concatenated per-layer hidden states for Eagle3; may be empty)
     // output_logits: [batch_size, vocab_size]
     // output_hidden_states: [batch_size, hidden_units]
     void forward(const Tensor& input_ids,
+                 const Tensor& last_hidden_states,
+                 const Tensor& captured_hidden_states,
+                 Tensor&       output_logits,
+                 Tensor&       output_hidden_states,
+                 LlamaLinear&  linear,
+                 cudaStream_t  stream);
+
+    // Backwards-compatible wrapper that ignores captured_hidden_states.
+    void forward(const Tensor& input_ids,
                  const Tensor& hidden_states,
-                 Tensor& output_logits,
-                 Tensor& output_hidden_states,
-                 LlamaLinear& linear,
-                 cudaStream_t stream);
+                 Tensor&       output_logits,
+                 Tensor&       output_hidden_states,
+                 LlamaLinear&  linear,
+                 cudaStream_t  stream);
 
     // Lightweight accessors used by EagleBuffers and host-side tree builders.
     // These helpers are A-scope only and are not required for core decode.
@@ -158,12 +170,15 @@ private:
     int eagle_kv_size_{0};
     int eagle_qkv_in_dim_{0};
     int eagle_qkv_in_factor_{0};
+    int eagle_fc_in_dim_{0};
+    int eagle_fc_in_factor_{0};
 
     // Shallow EagleNet block weights formatted for LlamaLinear
     // (single self‑attention + FC “MLP” style block).
     LlamaDenseWeight attn_qkv_weight_;
     LlamaDenseWeight attn_o_weight_;
     LlamaDenseWeight fc_weight_;
+    LlamaDenseWeight eagle_fc_weight_;
     bool             draft_block_prepared_{false};
 
     // Scratch buffers reused across forward calls to avoid per‑step
@@ -174,6 +189,7 @@ private:
     Tensor attn_out_scratch_;          // [batch, hidden]
     Tensor mlp_input_scratch_;    // [batch, 2 * hidden]
     Tensor mlp_out_scratch_;      // [batch, hidden]
+    Tensor eagle_fc_out_scratch_; // [batch, hidden] for Eagle3 pre-FC
     Tensor normed_hidden_scratch_;
     Tensor logits_scratch_;
 

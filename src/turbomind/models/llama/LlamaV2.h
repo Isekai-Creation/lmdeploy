@@ -169,6 +169,11 @@ private:
     SpeculativeDecodingMode spec_mode_{SpeculativeDecodingMode::None()};
     std::unique_ptr<EagleModule> eagle_module_;
     std::unique_ptr<EagleBuffers> eagle_buffers_;
+    // Concatenated hidden states captured from a small set of
+    // decoder layers (e.g. the last 3) for Eagle3. This is
+    // populated by UnifiedDecoder when speculative Eagle3 is
+    // enabled and consumed by EagleModule in eagleDraftForward.
+    Tensor eagle_capture_hidden_;
     const EngineParam engine_param_;
     int eagle_max_engine_tokens_per_step_{0};
 };

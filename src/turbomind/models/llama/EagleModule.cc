@@ -169,6 +169,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     eagle_kv_size_       = model_config["eagle_kv_size"] ? model_config["eagle_kv_size"].as<int>() : 0;
     eagle_qkv_in_dim_    = model_config["eagle_qkv_in_dim"] ? model_config["eagle_qkv_in_dim"].as<int>() : 0;
     eagle_qkv_in_factor_ = model_config["eagle_qkv_in_factor"] ? model_config["eagle_qkv_in_factor"].as<int>() : 0;
+    eagle_fc_in_dim_     = model_config["eagle_fc_in_dim"] ? model_config["eagle_fc_in_dim"].as<int>() : 0;
+    eagle_fc_in_factor_  = model_config["eagle_fc_in_factor"] ? model_config["eagle_fc_in_factor"].as<int>() : 0;
 
     hidden_units_ = hidden_units;
     vocab_size_   = vocab_size;
@@ -195,10 +197,14 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     weights_.embed_tokens = Tensor{{vocab_size, hidden_units}, dtype, kDEVICE};
 
-    // FC input dim remains 2 * hidden for now even for Eagle3 drafts; we
-    // reuse the existing EagleNet FC layout and leave any 3×hidden
-    // Eagle3 FC geometry to future extensions.
     weights_.fc = Tensor{{hidden_units * 2, hidden_units}, dtype, kDEVICE};
+
+    // Optional Eagle3-specific FC weight that consumes the full
+    // concatenated multi-layer hidden (e.g. 3 * hidden) before
+    // attention. When absent we fall back to the legacy EagleNet FC.
+    if (eagle3 && eagle_fc_in_dim_ > 0) {
+        weights_.eagle_fc = Tensor{{eagle_fc_in_dim_, hidden_units}, dtype, kDEVICE};
+    }
 
     // Layer weights (single EagleNet / Eagle3 shallow layer)
     weights_.input_norm  = Tensor{{hidden_units}, dtype, kDEVICE};
@@ -287,6 +293,15 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     if (!fc_ok) {
         TM_LOG_WARNING(
             "[EAGLE][EagleModule::load] fc.weight missing; shallow EagleNet block will fall back to RMSNorm+LM head");
+    }
+
+    bool eagle_fc_ok = true;
+    if (weights_.eagle_fc) {
+        eagle_fc_ok = load_with_variants(weights_.eagle_fc, "eagle_fc.weight");
+        if (!eagle_fc_ok) {
+            TM_LOG_WARNING(
+                "[EAGLE][EagleModule::load] eagle_fc.weight missing; Eagle3 pre-FC will be disabled");
+        }
     }
 
     // Layer 0 norms and attention (all optional – when absent we fall
@@ -430,7 +445,11 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     // Prepare shallow EagleNet / Eagle3 attention + FC block wrappers for LlamaLinear.
     if (!draft_block_prepared_) {
-        if (weights_.attn_qkv && weights_.attn_o && weights_.fc && fc_ok) {
+        const bool have_attn      = weights_.attn_qkv && weights_.attn_o;
+        const bool have_legacy_fc = weights_.fc && fc_ok;
+        const bool have_eagle_fc  = weights_.eagle_fc && eagle_fc_ok;
+
+        if (have_attn && (have_legacy_fc || have_eagle_fc)) {
             const int qkv_in  = weights_.attn_qkv.shape(0);
             const int qkv_out = weights_.attn_qkv.shape(1);
             attn_qkv_weight_.emplace(
@@ -454,17 +473,34 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             attn_o_weight_.input_type  = weight_dtype_;
             attn_o_weight_.prepare(/*fused_moe=*/false);
 
-            // FC “MLP” projection: [fc_in_dim, hidden]
-            const int fc_in  = weights_.fc.shape(0);
-            const int fc_out = weights_.fc.shape(1);
-            fc_weight_.emplace(
-                fc_in, fc_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
-            fc_weight_.weight      = weights_.fc.borrow();
-            fc_weight_.bias        = {};
-            fc_weight_.data_type   = weight_dtype_;
-            fc_weight_.weight_type = weight_dtype_;
-            fc_weight_.input_type  = weight_dtype_;
-            fc_weight_.prepare(/*fused_moe=*/false);
+            // Legacy EagleNet FC “MLP” projection: [2 * hidden, hidden]
+            if (have_legacy_fc) {
+                const int fc_in  = weights_.fc.shape(0);
+                const int fc_out = weights_.fc.shape(1);
+                fc_weight_.emplace(
+                    fc_in, fc_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                fc_weight_.weight      = weights_.fc.borrow();
+                fc_weight_.bias        = {};
+                fc_weight_.data_type   = weight_dtype_;
+                fc_weight_.weight_type = weight_dtype_;
+                fc_weight_.input_type  = weight_dtype_;
+                fc_weight_.prepare(/*fused_moe=*/false);
+            }
+
+            // Eagle3 pre-FC over concatenated multi-layer hidden:
+            // [eagle_fc_in_dim, hidden]
+            if (have_eagle_fc) {
+                const int eagle_fc_in  = weights_.eagle_fc.shape(0);
+                const int eagle_fc_out = weights_.eagle_fc.shape(1);
+                eagle_fc_weight_.emplace(
+                    eagle_fc_in, eagle_fc_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                eagle_fc_weight_.weight      = weights_.eagle_fc.borrow();
+                eagle_fc_weight_.bias        = {};
+                eagle_fc_weight_.data_type   = weight_dtype_;
+                eagle_fc_weight_.weight_type = weight_dtype_;
+                eagle_fc_weight_.input_type  = weight_dtype_;
+                eagle_fc_weight_.prepare(/*fused_moe=*/false);
+            }
 
             draft_block_prepared_ = true;
         }
@@ -520,10 +556,25 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
 void EagleModule::forward(const Tensor& input_ids,
                           const Tensor& hidden_states,
-                          Tensor& output_logits,
-                          Tensor& output_hidden_states,
-                          LlamaLinear& linear,
-                          cudaStream_t stream)
+                          Tensor&       output_logits,
+                          Tensor&       output_hidden_states,
+                          LlamaLinear&  linear,
+                          cudaStream_t  stream)
+{
+    // Backwards-compatible wrapper: no captured multi-layer hidden
+    // states are provided, so we pass an empty tensor for the new
+    // parameter and keep behaviour identical to pre-Eagle3 wiring.
+    Tensor empty_captured;
+    forward(input_ids, hidden_states, empty_captured, output_logits, output_hidden_states, linear, stream);
+}
+
+void EagleModule::forward(const Tensor& input_ids,
+                          const Tensor& last_hidden_states,
+                          const Tensor& captured_hidden_states,
+                          Tensor&       output_logits,
+                          Tensor&       output_hidden_states,
+                          LlamaLinear&  linear,
+                          cudaStream_t  stream)
 {
     NvtxScope nvtx_scope("EagleModule::forward");
     if (isEagleDebugEnabled()) {
@@ -535,20 +586,21 @@ void EagleModule::forward(const Tensor& input_ids,
     if (!enabled_) {
         TM_LOG_WARNING("[EAGLE] forward() called while module is disabled; "
                        "passing through hidden states without draft logits");
-        output_hidden_states = hidden_states;
+        output_hidden_states = last_hidden_states;
         return;
     }
 
     if (!weights_.is_initialized) {
         TM_LOG_WARNING("[EAGLE] forward() called before weights are initialized");
         // Safe no-op: pass through hidden state and leave logits untouched.
-        output_hidden_states = hidden_states;
+        output_hidden_states = last_hidden_states;
         return;
     }
 
     // Basic shape / dtype checks
-    const int batch_size = hidden_states.shape(0);
-    const int hidden_dim = hidden_states.shape(1);
+    const Tensor& hidden_states = last_hidden_states;
+    const int     batch_size    = hidden_states.shape(0);
+    const int     hidden_dim    = hidden_states.shape(1);
 
     if (hidden_dim != hidden_units_) {
         TM_LOG_WARNING("[EAGLE] hidden_units mismatch in forward: got %d, expected %d",
@@ -563,12 +615,26 @@ void EagleModule::forward(const Tensor& input_ids,
     // back to baseline decoding instead of triggering a hard check
     // failure inside invokeRMSNorm.
     const auto hidden_dtype = hidden_states.dtype();
-    if (weights_.output_norm && weights_.output_norm.dtype() != hidden_dtype) {
-        TM_LOG_WARNING(
-            "[EAGLE] output_norm dtype mismatch in forward: weights=%d, hidden=%d; "
-            "disabling EAGLE for this engine and passing through hidden states.",
-            static_cast<int>(weights_.output_norm.dtype()),
-            static_cast<int>(hidden_dtype));
+    auto       norm_mismatch = [&](const Tensor& w, const char* name) -> bool {
+        if (!w) {
+            return false;
+        }
+        if (w.dtype() != hidden_dtype || w.shape(-1) != hidden_dim) {
+            TM_LOG_WARNING(
+                "[EAGLE] %s norm mismatch in forward: weight_dtype=%d hidden_dtype=%d "
+                "weight_dim=%d hidden_dim=%d; disabling EAGLE for this engine.",
+                name,
+                static_cast<int>(w.dtype()),
+                static_cast<int>(hidden_dtype),
+                w.shape(-1),
+                hidden_dim);
+            return true;
+        }
+        return false;
+    };
+    if (norm_mismatch(weights_.input_norm, "input")
+        || norm_mismatch(weights_.hidden_norm, "hidden")
+        || norm_mismatch(weights_.output_norm, "output")) {
         enabled_             = false;
         output_hidden_states = hidden_states;
         return;
@@ -602,6 +668,14 @@ void EagleModule::forward(const Tensor& input_ids,
     if (draft_block_prepared_) {
         const bool eagle3 = eagle_mode_ == EagleMode::kEagle3;
 
+        // Optional Eagle3 pre-FC over concatenated multi-layer hidden
+        // states captured from UnifiedDecoder. When available and the
+        // geometry matches, we use the resulting features together
+        // with the normalized last-layer hidden states to build the
+        // QKV input for Eagle3 attention.
+        Tensor fc_out;
+        bool   can_use_eagle_fc = false;
+
         // 1) Pre-attention RMSNorm with the draft input norm.
         bool need_attn_in =
             !attn_input_scratch_ || attn_input_scratch_.dtype() != hidden_dtype
@@ -612,6 +686,27 @@ void EagleModule::forward(const Tensor& input_ids,
         }
         Tensor& attn_input = attn_input_scratch_;
         invokeRMSNorm(attn_input, hidden_states, weights_.input_norm, kEps, stream);
+
+        // If we have a full Eagle3 FC and a captured multi-layer hidden
+        // buffer whose width matches eagle_fc_in_dim_, run the pre-FC
+        // to obtain an additional set of features that will participate
+        // in the Eagle3 QKV input assembly.
+        if (eagle3 && eagle_fc_weight_ && weights_.eagle_fc && eagle_fc_in_dim_ > 0
+            && captured_hidden_states && captured_hidden_states.shape(0) == batch_size
+            && captured_hidden_states.shape(1) == eagle_fc_in_dim_
+            && captured_hidden_states.dtype() == hidden_dtype) {
+            bool need_fc_out =
+                !eagle_fc_out_scratch_ || eagle_fc_out_scratch_.dtype() != hidden_dtype
+                || eagle_fc_out_scratch_.device().type != kDEVICE
+                || eagle_fc_out_scratch_.shape(0) < batch_size
+                || eagle_fc_out_scratch_.shape(1) != hidden_dim;
+            if (need_fc_out) {
+                eagle_fc_out_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+            }
+            fc_out = eagle_fc_out_scratch_;
+            linear.Forward(captured_hidden_states, eagle_fc_weight_, /*output=*/fc_out);
+            can_use_eagle_fc = true;
+        }
 
         // 2) Single-token self-attention (degenerates to a learned projection
         // for one token). For Eagle3 we build a 2×hidden (or more general)
@@ -639,28 +734,82 @@ void EagleModule::forward(const Tensor& input_ids,
             }
             Tensor& qkv_input = attn_qkv_input_scratch_;
 
-            // Fill qkv_input by repeating the normalized hidden state along the
-            // last dimension `factor` times. This matches the 2×hidden input
-            // geometry expected by Eagle3 when factor == 2.
             check_cuda_error(cudaMemsetAsync(qkv_input.raw_data(), 0, qkv_input.byte_size(), stream));
 
             const size_t elem_bytes    = byte_size(hidden_dtype, 8) / 8;
-            const size_t src_row_bytes = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
             const size_t dst_row_bytes = static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
-            const size_t copy_bytes    = static_cast<size_t>(hidden_dim) * elem_bytes;
+            char*        dst_base      = static_cast<char*>(qkv_input.raw_data());
 
-            char* src_base = static_cast<char*>(attn_input.raw_data());
-            char* dst_base = static_cast<char*>(qkv_input.raw_data());
+            // When we have a valid Eagle3 pre-FC output and a 2×hidden
+            // QKV input, build the input as [attn_input, fc_out]. This
+            // lets the shallow Eagle3 block see both the normalized
+            // last-layer hidden state and the transformed multi-layer
+            // features from eagle_fc.
+            if (can_use_eagle_fc && qkv_in_dim >= 2 * hidden_dim) {
+                const size_t src_row_bytes_attn = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
+                const size_t src_row_bytes_fc   = static_cast<size_t>(fc_out.stride(0)) * elem_bytes;
+                const size_t copy_bytes         = static_cast<size_t>(hidden_dim) * elem_bytes;
+                char*        attn_base          = static_cast<char*>(attn_input.raw_data());
+                char*        fc_base            = static_cast<char*>(fc_out.raw_data());
 
-            for (int b = 0; b < batch_size; ++b) {
-                char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-                char* dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-                for (int r = 0; r < factor && (r * hidden_dim) < qkv_in_dim; ++r) {
-                    check_cuda_error(cudaMemcpyAsync(dst_row + static_cast<size_t>(r * hidden_dim) * elem_bytes,
-                                                     src_row,
+                for (int b = 0; b < batch_size; ++b) {
+                    char* dst_row   = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+                    char* attn_row = attn_base + static_cast<size_t>(b) * src_row_bytes_attn;
+                    char* fc_row   = fc_base + static_cast<size_t>(b) * src_row_bytes_fc;
+
+                    // First hidden_dim features from attn_input
+                    check_cuda_error(cudaMemcpyAsync(dst_row,
+                                                     attn_row,
                                                      copy_bytes,
                                                      cudaMemcpyDeviceToDevice,
                                                      stream));
+                    // Second hidden_dim features from fc_out
+                    check_cuda_error(cudaMemcpyAsync(dst_row + static_cast<size_t>(hidden_dim) * elem_bytes,
+                                                     fc_row,
+                                                     copy_bytes,
+                                                     cudaMemcpyDeviceToDevice,
+                                                     stream));
+                }
+            }
+            else {
+                // Fallback: previous behaviour – either consume the
+                // concatenated multi-layer hidden directly (when
+                // available) or repeat the normalized last-layer
+                // hidden state `factor` times.
+                bool use_captured = false;
+                if (captured_hidden_states && captured_hidden_states.shape(0) == batch_size
+                    && captured_hidden_states.shape(1) >= qkv_in_dim
+                    && captured_hidden_states.dtype() == hidden_dtype) {
+                    use_captured = true;
+                }
+
+                if (use_captured) {
+                    const size_t src_row_bytes = static_cast<size_t>(captured_hidden_states.stride(0)) * elem_bytes;
+                    const size_t copy_bytes    = static_cast<size_t>(qkv_in_dim) * elem_bytes;
+                    char*        src_base      = static_cast<char*>(captured_hidden_states.raw_data());
+                    for (int b = 0; b < batch_size; ++b) {
+                        char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
+                        char* dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+                        check_cuda_error(cudaMemcpyAsync(
+                            dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+                else {
+                    const size_t src_row_bytes = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
+                    const size_t copy_hidden   = static_cast<size_t>(hidden_dim) * elem_bytes;
+                    char*        src_base      = static_cast<char*>(attn_input.raw_data());
+                    for (int b = 0; b < batch_size; ++b) {
+                        char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
+                        char* dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+                        for (int r = 0; r < factor && (r * hidden_dim) < qkv_in_dim; ++r) {
+                            check_cuda_error(cudaMemcpyAsync(
+                                dst_row + static_cast<size_t>(r * hidden_dim) * elem_bytes,
+                                src_row,
+                                copy_hidden,
+                                cudaMemcpyDeviceToDevice,
+                                stream));
+                        }
+                    }
                 }
             }
 

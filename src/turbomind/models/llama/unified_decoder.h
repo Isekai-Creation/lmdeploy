@@ -46,6 +46,13 @@ private:
     std::unique_ptr<LlamaFfnLayer>         ffn_layer_;
     std::unique_ptr<MoeFfnLayer>           moe_ffn_layer_;
 
+    // Eagle3 multi-layer hidden capture metadata. When enabled, the
+    // decoder will capture last-token hidden states from a small set
+    // of layers (e.g. the last 3) into a concatenated buffer for
+    // EagleModule to consume.
+    std::vector<int> eagle_capture_layers_;
+    bool             eagle_capture_enabled_{false};
+
     void AllreduceResidualRMSnorm(Tensor&       hidden_states,
                                   Tensor&       residual,
                                   const Tensor& bias,
