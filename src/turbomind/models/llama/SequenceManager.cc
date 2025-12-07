@@ -184,6 +184,15 @@ void SequenceManager::UnlockBlocks(const BlockIds& ids)
     if (ids.empty()) {
         return;
     }
+    // When rewinding KV cache blocks (e.g. after rejecting excess draft
+    // tokens in EAGLE multi-token speculative decoding), we want those
+    // blocks to transition from "active" to "cached" in the BlockManager
+    // so they can be safely reused or evicted later. The BlockManager
+    // invariant is that cached blocks have use_count == 0 and a non-zero
+    // timestamp; Unlock() asserts is_cached() when a block's use_count
+    // drops to zero. Touch the blocks first to bump their timestamps,
+    // then unlock them.
+    block_manager_->Touch(ids);
     block_manager_->Unlock(ids);
 }
 
