@@ -147,6 +147,29 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             hidden_units);
     }
 
+    // Parse optional Eagle3 geometry hints. When absent, we fall back to
+    // the legacy EagleNet layout (single-hidden QKV / FC).
+    std::string eagle_mode_str;
+    if (model_config["eagle_mode"]) {
+        try {
+            eagle_mode_str = model_config["eagle_mode"].as<std::string>();
+        }
+        catch (const std::exception&) {
+            eagle_mode_str.clear();
+        }
+    }
+    if (eagle_mode_str == "eagle3") {
+        eagle_mode_ = EagleMode::kEagle3;
+    }
+    else {
+        eagle_mode_ = EagleMode::kEagleNet;
+    }
+
+    eagle_q_size_        = model_config["eagle_q_size"] ? model_config["eagle_q_size"].as<int>() : 0;
+    eagle_kv_size_       = model_config["eagle_kv_size"] ? model_config["eagle_kv_size"].as<int>() : 0;
+    eagle_qkv_in_dim_    = model_config["eagle_qkv_in_dim"] ? model_config["eagle_qkv_in_dim"].as<int>() : 0;
+    eagle_qkv_in_factor_ = model_config["eagle_qkv_in_factor"] ? model_config["eagle_qkv_in_factor"].as<int>() : 0;
+
     hidden_units_ = hidden_units;
     vocab_size_   = vocab_size;
 
@@ -168,15 +191,40 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     }
     weight_dtype_ = dtype;
 
-    weights_.embed_tokens = Tensor{{vocab_size, hidden_units}, dtype, kDEVICE};
-    weights_.fc           = Tensor{{hidden_units * 2, hidden_units}, dtype, kDEVICE};
+    const bool eagle3 = eagle_mode_ == EagleMode::kEagle3;
 
-    // Layer weights (single EagleNet layer)
+    weights_.embed_tokens = Tensor{{vocab_size, hidden_units}, dtype, kDEVICE};
+
+    // FC input dim remains 2 * hidden for now even for Eagle3 drafts; we
+    // reuse the existing EagleNet FC layout and leave any 3×hidden
+    // Eagle3 FC geometry to future extensions.
+    weights_.fc = Tensor{{hidden_units * 2, hidden_units}, dtype, kDEVICE};
+
+    // Layer weights (single EagleNet / Eagle3 shallow layer)
     weights_.input_norm  = Tensor{{hidden_units}, dtype, kDEVICE};
     weights_.hidden_norm = Tensor{{hidden_units}, dtype, kDEVICE};
 
-    weights_.attn_qkv  = Tensor{{hidden_units, hidden_units * 3}, dtype, kDEVICE};
-    weights_.attn_o    = Tensor{{hidden_units, hidden_units}, dtype, kDEVICE};
+    // Attention weight shapes differ slightly between EagleNet and Eagle3:
+    //  - EagleNet: [hidden, 3 * hidden] and Wo [hidden, hidden]
+    //  - Eagle3:   [qkv_in_dim, q_size + 2 * kv_size] and Wo [q_size, hidden]
+    int qkv_in_dim = hidden_units;
+    int q_size     = hidden_units;
+    int kv_size    = hidden_units;
+    if (eagle3) {
+        if (eagle_qkv_in_dim_ > 0) {
+            qkv_in_dim = eagle_qkv_in_dim_;
+        }
+        if (eagle_q_size_ > 0) {
+            q_size = eagle_q_size_;
+        }
+        if (eagle_kv_size_ > 0) {
+            kv_size = eagle_kv_size_;
+        }
+    }
+    const int qkv_out_dim = q_size + 2 * kv_size;
+
+    weights_.attn_qkv = Tensor{{qkv_in_dim, qkv_out_dim}, dtype, kDEVICE};
+    weights_.attn_o   = Tensor{{q_size, hidden_units}, dtype, kDEVICE};
     weights_.attn_norm = Tensor{{hidden_units}, dtype, kDEVICE};
 
     weights_.mlp_gate_up = Tensor{{intermediate_size * 2, hidden_units}, dtype, kDEVICE};
@@ -380,12 +428,13 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         lm_head_prepared_ = true;
     }
 
-    // Prepare shallow EagleNet attention + FC block wrappers for LlamaLinear.
+    // Prepare shallow EagleNet / Eagle3 attention + FC block wrappers for LlamaLinear.
     if (!draft_block_prepared_) {
         if (weights_.attn_qkv && weights_.attn_o && weights_.fc && fc_ok) {
-            // QKV: [hidden, 3 * hidden]
+            const int qkv_in  = weights_.attn_qkv.shape(0);
+            const int qkv_out = weights_.attn_qkv.shape(1);
             attn_qkv_weight_.emplace(
-                hidden_units_, hidden_units_ * 3, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                qkv_in, qkv_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
             attn_qkv_weight_.weight      = weights_.attn_qkv.borrow();
             attn_qkv_weight_.bias        = {};
             attn_qkv_weight_.data_type   = weight_dtype_;
@@ -393,9 +442,11 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             attn_qkv_weight_.input_type  = weight_dtype_;
             attn_qkv_weight_.prepare(/*fused_moe=*/false);
 
-            // Attention output: [hidden, hidden]
+            // Attention output: [q_size, hidden]
+            const int attn_o_in  = weights_.attn_o.shape(0);
+            const int attn_o_out = weights_.attn_o.shape(1);
             attn_o_weight_.emplace(
-                hidden_units_, hidden_units_, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                attn_o_in, attn_o_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
             attn_o_weight_.weight      = weights_.attn_o.borrow();
             attn_o_weight_.bias        = {};
             attn_o_weight_.data_type   = weight_dtype_;
@@ -403,9 +454,11 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             attn_o_weight_.input_type  = weight_dtype_;
             attn_o_weight_.prepare(/*fused_moe=*/false);
 
-            // FC “MLP” projection: [2 * hidden, hidden]
+            // FC “MLP” projection: [fc_in_dim, hidden]
+            const int fc_in  = weights_.fc.shape(0);
+            const int fc_out = weights_.fc.shape(1);
             fc_weight_.emplace(
-                hidden_units_ * 2, hidden_units_, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                fc_in, fc_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
             fc_weight_.weight      = weights_.fc.borrow();
             fc_weight_.bias        = {};
             fc_weight_.data_type   = weight_dtype_;
@@ -541,13 +594,14 @@ void EagleModule::forward(const Tensor& input_ids,
     // Use a fixed epsilon for now; can be made configurable from draft config.yaml.
     constexpr float kEps = 1e-5f;
 
-    // When we have a prepared shallow EagleNet block, run a single
-    // self-attention + FC “MLP” block followed by a final RMSNorm.
-    // This uses the draft model’s attention and FC weights while
-    // keeping the network lightweight. If the block is not prepared
-    // (e.g., older checkpoints), fall back to the original RMSNorm +
-    // LM head path.
+    // When we have a prepared shallow EagleNet / Eagle3 block, run a
+    // single self-attention + FC “MLP” block followed by a final RMSNorm.
+    // This uses the draft model’s attention and FC weights while keeping
+    // the network lightweight. If the block is not prepared (e.g., older
+    // checkpoints), fall back to the original RMSNorm + LM head path.
     if (draft_block_prepared_) {
+        const bool eagle3 = eagle_mode_ == EagleMode::kEagle3;
+
         // 1) Pre-attention RMSNorm with the draft input norm.
         bool need_attn_in =
             !attn_input_scratch_ || attn_input_scratch_.dtype() != hidden_dtype
@@ -559,20 +613,81 @@ void EagleModule::forward(const Tensor& input_ids,
         Tensor& attn_input = attn_input_scratch_;
         invokeRMSNorm(attn_input, hidden_states, weights_.input_norm, kEps, stream);
 
-        // 2) Single-token self-attention (degenerates to a learned projection for one token).
-        const int qkv_dim = hidden_dim * 3;
+        // 2) Single-token self-attention (degenerates to a learned projection
+        // for one token). For Eagle3 we build a 2×hidden (or more general)
+        // input to match the fused QKV geometry; for legacy EagleNet we keep
+        // the original [hidden, 3 * hidden] layout.
+        const int qkv_out_dim = weights_.attn_qkv.shape(1);
         bool      need_qkv =
             !qkv_scratch_ || qkv_scratch_.dtype() != weight_dtype_ || qkv_scratch_.device().type != kDEVICE
-            || qkv_scratch_.shape(0) < batch_size || qkv_scratch_.shape(1) != qkv_dim;
+            || qkv_scratch_.shape(0) < batch_size || qkv_scratch_.shape(1) != qkv_out_dim;
         if (need_qkv) {
-            qkv_scratch_ = Tensor{{batch_size, qkv_dim}, weight_dtype_, kDEVICE};
+            qkv_scratch_ = Tensor{{batch_size, qkv_out_dim}, weight_dtype_, kDEVICE};
         }
         Tensor& qkv = qkv_scratch_;
-        linear.Forward(attn_input, attn_qkv_weight_, /*output=*/qkv);
 
-        // Extract V from [Q|K|V] and project with Wo. For a single token,
-        // attention reduces to a learned value projection.
-        Tensor v = qkv.slice({0, 2 * hidden_dim}, {batch_size, hidden_dim});
+        if (eagle3) {
+            const int qkv_in_dim = weights_.attn_qkv.shape(0);
+            const int factor     = eagle_qkv_in_factor_ > 0 ? eagle_qkv_in_factor_ : 2;
+
+            bool need_qkv_in =
+                !attn_qkv_input_scratch_ || attn_qkv_input_scratch_.dtype() != hidden_dtype
+                || attn_qkv_input_scratch_.device().type != kDEVICE || attn_qkv_input_scratch_.shape(0) < batch_size
+                || attn_qkv_input_scratch_.shape(1) != qkv_in_dim;
+            if (need_qkv_in) {
+                attn_qkv_input_scratch_ = Tensor{{batch_size, qkv_in_dim}, hidden_dtype, kDEVICE};
+            }
+            Tensor& qkv_input = attn_qkv_input_scratch_;
+
+            // Fill qkv_input by repeating the normalized hidden state along the
+            // last dimension `factor` times. This matches the 2×hidden input
+            // geometry expected by Eagle3 when factor == 2.
+            check_cuda_error(cudaMemsetAsync(qkv_input.raw_data(), 0, qkv_input.byte_size(), stream));
+
+            const size_t elem_bytes    = byte_size(hidden_dtype, 8) / 8;
+            const size_t src_row_bytes = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
+            const size_t dst_row_bytes = static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
+            const size_t copy_bytes    = static_cast<size_t>(hidden_dim) * elem_bytes;
+
+            char* src_base = static_cast<char*>(attn_input.raw_data());
+            char* dst_base = static_cast<char*>(qkv_input.raw_data());
+
+            for (int b = 0; b < batch_size; ++b) {
+                char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
+                char* dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+                for (int r = 0; r < factor && (r * hidden_dim) < qkv_in_dim; ++r) {
+                    check_cuda_error(cudaMemcpyAsync(dst_row + static_cast<size_t>(r * hidden_dim) * elem_bytes,
+                                                     src_row,
+                                                     copy_bytes,
+                                                     cudaMemcpyDeviceToDevice,
+                                                     stream));
+                }
+            }
+
+            linear.Forward(qkv_input, attn_qkv_weight_, /*output=*/qkv);
+        }
+        else {
+            const int qkv_dim = hidden_dim * 3;
+            bool      need_qkv_in =
+                !qkv_scratch_ || qkv_scratch_.dtype() != weight_dtype_ || qkv_scratch_.device().type != kDEVICE
+                || qkv_scratch_.shape(0) < batch_size || qkv_scratch_.shape(1) != qkv_dim;
+            if (need_qkv_in) {
+                qkv_scratch_ = Tensor{{batch_size, qkv_dim}, weight_dtype_, kDEVICE};
+            }
+            Tensor& qkv_legacy = qkv_scratch_;
+            linear.Forward(attn_input, attn_qkv_weight_, /*output=*/qkv_legacy);
+        }
+
+        // Extract the value to project with Wo. For Eagle3 we use the Q slice;
+        // for legacy EagleNet we keep using V as before.
+        Tensor value;
+        if (eagle3 && eagle_q_size_ > 0) {
+            const int q_size = eagle_q_size_;
+            value            = qkv.slice({0, 0}, {batch_size, q_size});
+        }
+        else {
+            value = qkv.slice({0, 2 * hidden_dim}, {batch_size, hidden_dim});
+        }
 
         bool need_attn_out =
             !attn_out_scratch_ || attn_out_scratch_.dtype() != weight_dtype_
@@ -582,7 +697,7 @@ void EagleModule::forward(const Tensor& input_ids,
             attn_out_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
         }
         Tensor& attn_out = attn_out_scratch_;
-        linear.Forward(v, attn_o_weight_, /*output=*/attn_out);
+        linear.Forward(value, attn_o_weight_, /*output=*/attn_out);
 
         // 3) Lightweight FC “MLP” block using the EagleNet fc weight.
         const int mlp_in_dim = hidden_dim * 2;

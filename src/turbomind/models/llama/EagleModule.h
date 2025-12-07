@@ -141,6 +141,24 @@ private:
     LlamaDenseWeight lm_head_weight_;
     bool             lm_head_prepared_{false};
 
+    // Draft mode and geometry metadata. For legacy EagleNet drafts we
+    // treat everything as a single-hidden block. For Eagle3 drafts, the
+    // converter exposes a 2×hidden QKV input and separate Q / KV sizes
+    // so that the shallow attention path can mirror TensorRT‑LLM’s
+    // Eagle3 geometry.
+    enum class EagleMode
+    {
+        kEagleNet,
+        kEagle3,
+    };
+
+    EagleMode eagle_mode_{EagleMode::kEagleNet};
+
+    int eagle_q_size_{0};
+    int eagle_kv_size_{0};
+    int eagle_qkv_in_dim_{0};
+    int eagle_qkv_in_factor_{0};
+
     // Shallow EagleNet block weights formatted for LlamaLinear
     // (single self‑attention + FC “MLP” style block).
     LlamaDenseWeight attn_qkv_weight_;
@@ -150,9 +168,10 @@ private:
 
     // Scratch buffers reused across forward calls to avoid per‑step
     // allocations in the speculative decode hot path.
-    Tensor attn_input_scratch_;   // [batch, hidden]
-    Tensor qkv_scratch_;          // [batch, 3 * hidden]
-    Tensor attn_out_scratch_;     // [batch, hidden]
+    Tensor attn_input_scratch_;        // [batch, hidden]
+    Tensor attn_qkv_input_scratch_;    // [batch, qkv_in_dim] for Eagle3
+    Tensor qkv_scratch_;               // [batch, q_size + 2 * kv_size]
+    Tensor attn_out_scratch_;          // [batch, hidden]
     Tensor mlp_input_scratch_;    // [batch, 2 * hidden]
     Tensor mlp_out_scratch_;      // [batch, hidden]
     Tensor normed_hidden_scratch_;
