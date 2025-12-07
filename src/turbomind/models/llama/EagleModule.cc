@@ -148,7 +148,11 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     }
 
     // Parse optional Eagle3 geometry hints. When absent, we fall back to
-    // the legacy EagleNet layout (single-hidden QKV / FC).
+    // the legacy EagleNet layout (single-hidden QKV / FC). For backward
+    // compatibility with older config.yaml files that only contain the
+    // geometry ints (eagle_qkv_in_dim, etc.) but no explicit
+    // `eagle_mode` string, we treat the presence of those ints as an
+    // implicit Eagle3 indicator.
     std::string eagle_mode_str;
     if (model_config["eagle_mode"]) {
         try {
@@ -158,12 +162,6 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             eagle_mode_str.clear();
         }
     }
-    if (eagle_mode_str == "eagle3") {
-        eagle_mode_ = EagleMode::kEagle3;
-    }
-    else {
-        eagle_mode_ = EagleMode::kEagleNet;
-    }
 
     eagle_q_size_        = model_config["eagle_q_size"] ? model_config["eagle_q_size"].as<int>() : 0;
     eagle_kv_size_       = model_config["eagle_kv_size"] ? model_config["eagle_kv_size"].as<int>() : 0;
@@ -171,6 +169,16 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     eagle_qkv_in_factor_ = model_config["eagle_qkv_in_factor"] ? model_config["eagle_qkv_in_factor"].as<int>() : 0;
     eagle_fc_in_dim_     = model_config["eagle_fc_in_dim"] ? model_config["eagle_fc_in_dim"].as<int>() : 0;
     eagle_fc_in_factor_  = model_config["eagle_fc_in_factor"] ? model_config["eagle_fc_in_factor"].as<int>() : 0;
+
+    const bool has_eagle_geometry =
+        eagle_qkv_in_dim_ > 0 || eagle_q_size_ > 0 || eagle_kv_size_ > 0 || eagle_fc_in_dim_ > 0;
+
+    if (eagle_mode_str == "eagle3" || (eagle_mode_str.empty() && has_eagle_geometry)) {
+        eagle_mode_ = EagleMode::kEagle3;
+    }
+    else {
+        eagle_mode_ = EagleMode::kEagleNet;
+    }
 
     hidden_units_ = hidden_units;
     vocab_size_   = vocab_size;
