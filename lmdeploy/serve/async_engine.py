@@ -486,99 +486,94 @@ class AsyncEngine(LogitsMixin):
         speculative_config: Optional[SpeculativeConfig] = None,
         **kwargs,
     ):
-        """Innter build method for turbomind backend."""
+        """Inner build method for TurboMind backend.
+
+        This is also where we integrate EAGLE/EAGLE3 speculative
+        decoding for TurboMind when a SpeculativeConfig is provided.
+
+        Behaviour:
+          - backend_config.speculative_config is populated whenever
+            speculative_config is not None.
+          - For EAGLE/EAGLE3, speculative_config.model may be:
+              * an EagleNet/TurboMind draft directory (config.yaml
+                present) – used as-is;
+              * a full TM export (triton_models/weights) – we point
+                EagleModule at the weights directory;
+              * a HF Eagle3 model directory or repo id – we convert it
+                into an EagleNet draft layout using
+                lmdeploy.turbomind.eagle_draft_converter.
+        """
         from lmdeploy import turbomind as tm
 
-        # Pass speculative_config to backend_config
         if speculative_config is not None and backend_config is not None:
-            backend_config.speculative_config = speculative_config
+            spec_cfg = speculative_config
 
-            # For TurboMind EAGLE/EAGLE3, allow users to pass a
-            # HuggingFace-style draft model path (or repo id) and
-            # transparently convert it into a TurboMind/EagleModule
-            # draft directory when needed.
+            # Attach the SpeculativeConfig so TurboMind (LlamaV2,
+            # EagleModule, etc.) can read EAGLE parameters directly
+            # from engine_config.
+            backend_config.speculative_config = spec_cfg
+
+            # Optional: resolve HF-style draft paths for EAGLE/EAGLE3.
             try:
-                from lmdeploy.utils import get_model
-                from lmdeploy.turbomind.deploy.converter import get_tm_model
-                from lmdeploy.messages import TurbomindEngineConfig as _TMEngineCfg
-                import os
-                import tempfile
-
-                spec_cfg = speculative_config
-                if spec_cfg is not None and spec_cfg.method in ("eagle", "eagle3"):
+                if spec_cfg.method in ("eagle", "eagle3") and spec_cfg.model:
                     draft_path = spec_cfg.model
-                    if draft_path:
-                        # Resolve HF repo id or remote path to a local directory.
-                        if not os.path.exists(draft_path):
-                            download_dir = getattr(backend_config, "download_dir", None)
-                            draft_path = get_model(draft_path, download_dir)
 
-                        # If this already looks like a TurboMind model, keep it:
-                        #  - EagleModule-style draft: config.yaml at root.
-                        #  - Full TM engine: triton_models/weights/config.yaml.
-                        if os.path.exists(os.path.join(draft_path, "config.yaml")):
-                            spec_cfg.model = draft_path
-                        elif os.path.exists(
-                            os.path.join(
-                                draft_path, "triton_models", "weights", "config.yaml"
-                            )
-                        ):
-                            spec_cfg.model = os.path.join(
-                                draft_path, "triton_models", "weights"
-                            )
-                        else:
-                            # Treat as a HF transformers model and convert
-                            # it to a minimal TurboMind export suitable for
-                            # EagleModule::load. We cache the result under a
-                            # deterministic subdirectory so repeated runs
-                            # don't re-convert.
-                            base_dir = (
-                                getattr(backend_config, "download_dir", None)
-                                or tempfile.gettempdir()
-                            )
-                            safe_name = os.path.basename(
-                                os.path.normpath(draft_path)
-                            ) or "eagle_draft"
-                            out_dir = os.path.join(
-                                base_dir, f"turbomind_eagle_draft_{safe_name}"
+                    import os
+                    import tempfile
+
+                    from lmdeploy.utils import get_model
+
+                    # Resolve HF repo id or remote path to a local directory.
+                    if not os.path.exists(draft_path):
+                        download_dir = getattr(backend_config, "download_dir", None)
+                        draft_path = get_model(draft_path, download_dir)
+
+                    # If this already looks like a TurboMind model, keep it:
+                    #  - EagleModule-style draft: config.yaml at root.
+                    #  - Full TM engine: triton_models/weights/config.yaml.
+                    if os.path.exists(os.path.join(draft_path, "config.yaml")):
+                        spec_cfg.model = draft_path
+                    elif os.path.exists(
+                        os.path.join(
+                            draft_path, "triton_models", "weights", "config.yaml"
+                        )
+                    ):
+                        spec_cfg.model = os.path.join(
+                            draft_path, "triton_models", "weights"
+                        )
+                    else:
+                        # Treat as a HF Eagle3-style model and convert it to
+                        # a minimal EagleNet draft for EagleModule::load.
+                        # Conversion is cached under a deterministic name.
+                        base_dir = (
+                            getattr(backend_config, "download_dir", None)
+                            or tempfile.gettempdir()
+                        )
+                        safe_name = (
+                            os.path.basename(os.path.normpath(draft_path))
+                            or "eagle_draft"
+                        )
+                        out_dir = os.path.join(
+                            base_dir, f"turbomind_eagle_draft_{safe_name}"
+                        )
+
+                        try:
+                            from lmdeploy.turbomind.eagle_draft_converter import (
+                                prepare_eagle_draft_from_hf,
                             )
 
-                            # Always (re)convert the HF EAGLE draft into a
-                            # TurboMind-style export. Earlier partial
-                            # conversions (e.g. from failed runs) may leave
-                            # behind a config.yaml without the required
-                            # weight files, so we rebuild on each pipeline
-                            # construction to guarantee a complete draft
-                            # directory for EagleModule::load.
-                            os.makedirs(out_dir, exist_ok=True)
-                            # For EAGLE draft conversion we run a single‑GPU
-                            # TurboMind export. Make sure all tp-related
-                            # fields are concrete so the converter does not
-                            # see None when padding intermediate sizes, etc.
-                            draft_engine_cfg = _TMEngineCfg(tp=1)
-                            if draft_engine_cfg.attn_tp_size is None:
-                                draft_engine_cfg.attn_tp_size = draft_engine_cfg.tp
-                            if draft_engine_cfg.mlp_tp_size is None:
-                                draft_engine_cfg.mlp_tp_size = draft_engine_cfg.tp
-                            if draft_engine_cfg.attn_cp_size is None:
-                                draft_engine_cfg.attn_cp_size = draft_engine_cfg.cp or 1
-                            tm_model = get_tm_model(
-                                model_path=draft_path,
-                                model_name=None,
-                                chat_template_name=None,
-                                engine_config=draft_engine_cfg,
-                                # Use 0 as a sentinel so that quantized models
-                                # can derive a valid group_size from their
-                                # quantization_config and non-quantized
-                                # models fall back to a safe default inside
-                                # the converter.
-                                group_size=0,
-                                out_dir=out_dir,
-                            )
-                            tm_model.export()
-
+                            prepare_eagle_draft_from_hf(draft_path, out_dir)
                             spec_cfg.model = out_dir
-                            backend_config.speculative_config = spec_cfg
+                        except Exception as conv_exc:  # noqa: BLE001
+                            logger.warning(
+                                "Failed to convert HF draft model %r into EagleNet layout: %s. "
+                                "TurboMind will fall back to baseline decoding if EAGLE cannot be initialized.",
+                                draft_path,
+                                conv_exc,
+                            )
+
+                    # Ensure backend_config sees any updated model path.
+                    backend_config.speculative_config = spec_cfg
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "Failed to prepare TurboMind EAGLE draft model from %r: %s. "

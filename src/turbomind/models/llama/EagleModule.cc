@@ -212,12 +212,23 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             "[EAGLE][EagleModule::load] fc.weight missing; shallow EagleNet block will fall back to RMSNorm+LM head");
     }
 
-    // Layer 0 norms and attention
-    success &= load_with_variants(weights_.input_norm, "layers.0.attention_norm.weight");
-    success &= load_with_variants(weights_.hidden_norm, "layers.0.hidden_norm.weight");
-    success &= load_with_variants(weights_.attn_qkv, "layers.0.attention.w_qkv.weight");
-    success &= load_with_variants(weights_.attn_o, "layers.0.attention.wo.weight");
-    success &= load_with_variants(weights_.attn_norm, "layers.0.ffn_norm.weight");
+    // Layer 0 norms and attention (all optional – when absent we fall
+    // back to a minimal RMSNorm + LM head path).
+    if (!load_with_variants(weights_.input_norm, "layers.0.attention_norm.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention_norm.weight missing");
+    }
+    if (!load_with_variants(weights_.hidden_norm, "layers.0.hidden_norm.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.hidden_norm.weight missing");
+    }
+    if (!load_with_variants(weights_.attn_qkv, "layers.0.attention.w_qkv.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention.w_qkv.weight missing");
+    }
+    if (!load_with_variants(weights_.attn_o, "layers.0.attention.wo.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention.wo.weight missing");
+    }
+    if (!load_with_variants(weights_.attn_norm, "layers.0.ffn_norm.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.ffn_norm.weight missing");
+    }
 
     // MLP gate/up: merge w1 and w3 into mlp_gate_up.
     Tensor w1{{intermediate_size, hidden_units}, dtype, kDEVICE};
@@ -235,12 +246,19 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             cudaMemcpyDeviceToDevice));
     }
     else {
-        success = false;
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] feed_forward w1/w3 weights missing; skipping draft MLP gate/up block");
     }
 
-    success &= load_with_variants(weights_.mlp_down, "layers.0.feed_forward.w2.weight");
-    success &= load_with_variants(weights_.output_norm, "norm.weight");
-    success &= load_with_variants(weights_.lm_head, "output.weight");
+    if (!load_with_variants(weights_.mlp_down, "layers.0.feed_forward.w2.weight")) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] layers.0.feed_forward.w2.weight missing; draft MLP down block disabled");
+    }
+
+    // Output norm and LM head are required for EagleModule to be usable.
+    bool output_norm_ok = load_with_variants(weights_.output_norm, "norm.weight");
+    bool lm_head_ok     = load_with_variants(weights_.lm_head, "output.weight");
+    success &= output_norm_ok && lm_head_ok;
 
     // Prepare LM head wrapper for LlamaLinear.
     if (weights_.lm_head) {
