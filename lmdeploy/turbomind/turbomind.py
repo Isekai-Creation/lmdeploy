@@ -42,13 +42,9 @@ from .supported_models import is_supported
 # Python-side helpers such as `_get_metrics`), we degrade gracefully and
 # leave `_tm` / `_xgr` as `None`. Callers that require the backend should
 # explicitly assert that `_tm` is not None.
-lmdeploy_dir = osp.split(lmdeploy.__file__)[0]
-lib_dir = osp.join(lmdeploy_dir, "lib")
-if lib_dir not in sys.path:
-    sys.path.append(lib_dir)
 try:  # pragma: no cover - backend availability is environment-dependent
-    import _turbomind as _tm  # noqa: E402
-    import _xgrammar as _xgr  # noqa: E402
+    from lmdeploy.lib import _turbomind as _tm  # type: ignore[attr-defined]
+    from lmdeploy.lib import _xgrammar as _xgr  # type: ignore[attr-defined]
 except Exception:  # noqa: BLE001
     _tm = None
     _xgr = None
