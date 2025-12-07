@@ -58,18 +58,36 @@ std::tuple<BlockIds, UniqueIds> BlockTrie::Match(const Sequence& seq)
 std::tuple<BlockIds, UniqueIds> BlockTrie::Cache(const Sequence& seq, const std::vector<int>& tokens)
 {
     FT_CHECK(seq.status != Sequence::kCached);
-    FT_CHECK(tokens.size() <= seq.blocks.size() * block_seq_len_);
+    // When KV blocks are rewound (e.g. after speculative decoding rejects
+    // draft tokens), it is possible for `tokens.size()` to exceed the
+    // capacity implied by `seq.blocks`. Rather than asserting, clamp the
+    // cached prefix to the number of full blocks that are actually backed
+    // by KV blocks and log a warning.
+    const size_t max_tokens_capacity = seq.blocks.size() * block_seq_len_;
+    if (tokens.size() > max_tokens_capacity) {
+        TM_LOG_WARNING(
+            "[BlockTrie][cache] tokens.size()=%zu exceeds block capacity=%zu; "
+            "clamping cached prefix to available blocks",
+            tokens.size(),
+            max_tokens_capacity);
+    }
+
+    // Number of full blocks that are safe to cache:
+    //  - at most seq.blocks.size() - 1 (we skip the last block),
+    //  - at most tokens.size() / block_seq_len_ (only full blocks).
+    const int max_block_count       = static_cast<int>(seq.blocks.size());
+    const int full_blocks_by_tokens = static_cast<int>(tokens.size() / block_seq_len_);
+    const int num_cache_blocks =
+        std::max(0, std::min(max_block_count - 1, full_blocks_by_tokens));
 
     std::shared_ptr<TrieNode> curr_node = root_;
-    int                       idx       = 0;
 
     BlockIds  cache_block_ids;
     UniqueIds cache_block_unique_ids;
 
-    // We don't cache the last block of the sequence, since it might not be full
-    // TODO(lvhan): determine wether the last block is full or not. It is not trivial
-    // considering chunk prefill
-    for (int idx = 0; idx < (int)seq.blocks.size() - 1; ++idx) {
+    // We don't cache the last block of the sequence by design, since it
+    // might not be full. Cache up to `num_cache_blocks` full blocks.
+    for (int idx = 0; idx < num_cache_blocks; ++idx) {
         auto start = tokens.begin() + idx * block_seq_len_;
         auto end   = start + block_seq_len_;
 
