@@ -714,12 +714,12 @@ void EagleModule::forward(const Tensor& input_ids,
                 }
 
                 if (use_captured) {
-                    const size_t src_row_bytes = static_cast<size_t>(captured_hidden_states.stride(0)) * elem_bytes;
-                    const size_t copy_bytes    = static_cast<size_t>(qkv_in_dim) * elem_bytes;
-                    char*        src_base      = static_cast<char*>(captured_hidden_states.raw_data());
+                    const size_t   src_row_bytes = static_cast<size_t>(captured_hidden_states.stride(0)) * elem_bytes;
+                    const size_t   copy_bytes    = static_cast<size_t>(qkv_in_dim) * elem_bytes;
+                    const char*    src_base      = static_cast<const char*>(captured_hidden_states.raw_data());
                     for (int b = 0; b < batch_size; ++b) {
-                        char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-                        char* dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+                        const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
+                        char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
                         check_cuda_error(cudaMemcpyAsync(
                             dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
                     }
