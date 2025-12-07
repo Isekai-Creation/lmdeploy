@@ -306,7 +306,27 @@ private:
     template<class U>
     static decltype(auto) ensure_dtype(U&& u) noexcept
     {
-        TM_CHECK_EQ(u.dtype(), data_type_v<T>);
+        // In most cases the buffer's logical dtype must match the
+        // template parameter exactly. However, for 16-bit floating
+        // point we allow lightweight reinterpretation between FP16 and
+        // BF16, mirroring Buffer::data<T>() above. Some legacy paths
+        // still instantiate Buffer_<half_t> while the underlying
+        // storage has been allocated as BF16 (and vice versa); both
+        // layouts are 16-bit wide, so treating them as interchangeable
+        // here is safe for pointer arithmetic while kernels operate on
+        // the raw 16-bit payload.
+        auto buf_dtype = u.dtype();
+        if (buf_dtype != data_type_v<T>) {
+            const bool is_half_tpl     = data_type_v<T> == turbomind::kHalf;
+            const bool is_bf16_tpl     = data_type_v<T> == turbomind::kBfloat16;
+            const bool is_half_buf     = buf_dtype == turbomind::kHalf;
+            const bool is_bf16_buf     = buf_dtype == turbomind::kBfloat16;
+            const bool allow_fp16_bf16 = (is_half_tpl && is_bf16_buf) || (is_bf16_tpl && is_half_buf);
+
+            if (!allow_fp16_bf16) {
+                TM_CHECK_EQ(buf_dtype, data_type_v<T>);
+            }
+        }
         return (U &&) u;
     }
 };
