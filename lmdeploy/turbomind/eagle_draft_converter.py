@@ -68,9 +68,9 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 
-def _write_half_tensor(t: torch.Tensor, path: str) -> None:
-    """Write a tensor as FP16 raw binary to ``path``."""
-    t = t.to(torch.float16)
+def _write_tensor(t: torch.Tensor, path: str, dtype: torch.dtype) -> None:
+    """Write a tensor as raw binary with the given dtype."""
+    t = t.to(dtype)
     arr = t.contiguous().cpu().numpy()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     arr.tofile(path)
@@ -193,16 +193,19 @@ def _convert_llama_like(
     shards = _find_safetensor_shards(hf_dir)
     keys = _collect_all_keys(shards)
 
+    # Use FP16 for standard Llama-like drafts.
+    w_dtype = torch.float16
+
     # Token embeddings (optional).
     emb = _load_tensor_from_shards(
         shards, "model.embed_tokens.weight", optional=True
     )
     if emb is not None:
-        _write_half_tensor(emb, os.path.join(out_dir, "tok_embeddings.weight"))
+        _write_tensor(emb, os.path.join(out_dir, "tok_embeddings.weight"), w_dtype)
 
     # Output norm and LM head (required).
     norm = _load_tensor_from_shards(shards, "model.norm.weight")
-    _write_half_tensor(norm, os.path.join(out_dir, "norm.weight"))
+    _write_tensor(norm, os.path.join(out_dir, "norm.weight"), w_dtype)
 
     lm_head = _load_tensor_from_shards(shards, "lm_head.weight")
     # HF lm_head is typically [vocab, hidden]; EagleModule expects [hidden, vocab].
@@ -210,29 +213,32 @@ def _convert_llama_like(
         lm_head_t = lm_head.transpose(0, 1)
     else:
         lm_head_t = lm_head
-    _write_half_tensor(lm_head_t, os.path.join(out_dir, "output.weight"))
+    _write_tensor(lm_head_t, os.path.join(out_dir, "output.weight"), w_dtype)
 
     # Layer‑0 norms.
     attn_norm = _load_tensor_from_shards(
         shards, "model.layers.0.input_layernorm.weight", optional=True
     )
     if attn_norm is not None:
-        _write_half_tensor(
+        _write_tensor(
             attn_norm,
             os.path.join(out_dir, "layers.0.attention_norm.weight"),
+            w_dtype,
         )
 
     ffn_norm = _load_tensor_from_shards(
         shards, "model.layers.0.post_attention_layernorm.weight", optional=True
     )
     if ffn_norm is not None:
-        _write_half_tensor(
+        _write_tensor(
             ffn_norm,
             os.path.join(out_dir, "layers.0.ffn_norm.weight"),
+            w_dtype,
         )
-        _write_half_tensor(
+        _write_tensor(
             ffn_norm,
             os.path.join(out_dir, "layers.0.hidden_norm.weight"),
+            w_dtype,
         )
 
     # Attention / MLP when present – optional, purely best‑effort.
@@ -250,13 +256,14 @@ def _convert_llama_like(
     )
     if q_w is not None and k_w is not None and v_w is not None:
         qkv = torch.cat([q_w, k_w, v_w], dim=0)
-        _write_half_tensor(
+        _write_tensor(
             qkv,
             os.path.join(out_dir, "layers.0.attention.w_qkv.weight"),
+            w_dtype,
         )
     if o_w is not None:
-        _write_half_tensor(
-            o_w, os.path.join(out_dir, "layers.0.attention.wo.weight")
+        _write_tensor(
+            o_w, os.path.join(out_dir, "layers.0.attention.wo.weight"), w_dtype
         )
 
     gate_w = _load_tensor_from_shards(
@@ -269,19 +276,20 @@ def _convert_llama_like(
         shards, "model.layers.0.mlp.down_proj.weight", optional=True
     )
     if gate_w is not None:
-        _write_half_tensor(
+        _write_tensor(
             gate_w,
             os.path.join(out_dir, "layers.0.feed_forward.w1.weight"),
+            w_dtype,
         )
     if up_w is not None:
-        _write_half_tensor(
+        _write_tensor(
             up_w,
             os.path.join(out_dir, "layers.0.feed_forward.w3.weight"),
+            w_dtype,
         )
     if down_w is not None:
-        _write_half_tensor(
-            down_w,
-            os.path.join(out_dir, "layers.0.feed_forward.w2.weight"),
+        _write_tensor(
+            down_w, os.path.join(out_dir, "layers.0.feed_forward.w2.weight"), w_dtype
         )
 
 
@@ -302,38 +310,44 @@ def _convert_eagle3_midlayer(
     def get(name: str, *, optional: bool = False) -> Optional[torch.Tensor]:
         return _load_tensor_from_shards(shards, name, optional=optional)
 
+    # Use BF16 for Eagle3 midlayer drafts (matches HF checkpoint).
+    w_dtype = torch.bfloat16
+
     # Output norm from draft.
     norm = get("norm.weight")
     if norm is None:
         raise RuntimeError("norm.weight not found in Eagle3 draft checkpoint")
-    _write_half_tensor(norm, os.path.join(out_dir, "norm.weight"))
+    _write_tensor(norm, os.path.join(out_dir, "norm.weight"), w_dtype)
 
     # LM head: ideally from base LM; otherwise synthetic.
     lm_head = _resolve_base_lm_head(
         base_model_dir, hidden_size, vocab_size, logger=log
     )
-    _write_half_tensor(lm_head, os.path.join(out_dir, "output.weight"))
+    _write_tensor(lm_head, os.path.join(out_dir, "output.weight"), w_dtype)
 
     # Midlayer norms.
     attn_norm = get("midlayer.input_layernorm.weight", optional=True)
     if attn_norm is not None:
-        _write_half_tensor(
+        _write_tensor(
             attn_norm,
             os.path.join(out_dir, "layers.0.attention_norm.weight"),
+            w_dtype,
         )
 
     hidden_norm = get("midlayer.hidden_norm.weight", optional=True)
     if hidden_norm is not None:
-        _write_half_tensor(
+        _write_tensor(
             hidden_norm,
             os.path.join(out_dir, "layers.0.hidden_norm.weight"),
+            w_dtype,
         )
 
     ffn_norm = get("midlayer.post_attention_layernorm.weight", optional=True)
     if ffn_norm is not None:
-        _write_half_tensor(
+        _write_tensor(
             ffn_norm,
             os.path.join(out_dir, "layers.0.ffn_norm.weight"),
+            w_dtype,
         )
 
     # Midlayer MLP gate/up/down.
@@ -342,14 +356,16 @@ def _convert_eagle3_midlayer(
     down_w = get("midlayer.mlp.down_proj.weight", optional=True)
 
     if gate_w is not None:
-        _write_half_tensor(
+        _write_tensor(
             gate_w,
             os.path.join(out_dir, "layers.0.feed_forward.w1.weight"),
+            w_dtype,
         )
     if up_w is not None:
-        _write_half_tensor(
+        _write_tensor(
             up_w,
             os.path.join(out_dir, "layers.0.feed_forward.w3.weight"),
+            w_dtype,
         )
     if down_w is not None:
         # Expect [hidden, inter] – transpose to [inter, hidden].
@@ -368,6 +384,7 @@ def _convert_eagle3_midlayer(
         _write_half_tensor(
             down_aligned,
             os.path.join(out_dir, "layers.0.feed_forward.w2.weight"),
+            w_dtype,
         )
 
     # Attention and FC in the Eagle3 midlayer checkpoint do not match the
@@ -424,7 +441,20 @@ def prepare_eagle_draft_from_hf(
         head_dim = hidden_size // num_heads
     inter_size = int(getattr(cfg, "intermediate_size"))
 
-    # Write config.yaml for EagleModule.
+    # Peek at keys to decide layout.
+    shards = _find_safetensor_shards(hf_model_dir)
+    if not shards:
+        raise RuntimeError(f"No *.safetensors files found under {hf_model_dir!r}")
+    keys = _collect_all_keys(shards).keys()
+    layout = _detect_layout(keys)
+
+    # Decide draft weight dtype and record it in config.yaml so
+    # EagleModule::load can allocate tensors with the correct dtype.
+    if layout == "eagle3_midlayer":
+        eagle_dtype = "bf16"
+    else:
+        eagle_dtype = "fp16"
+
     tm_cfg = {
         "model_config": {
             "hidden_units": hidden_size,
@@ -432,17 +462,11 @@ def prepare_eagle_draft_from_hf(
             "head_num": num_heads,
             "size_per_head": head_dim,
             "inter_size": inter_size,
+            "eagle_weight_dtype": eagle_dtype,
         }
     }
     with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(tm_cfg, f)
-
-    # Peek at keys to decide layout.
-    shards = _find_safetensor_shards(hf_model_dir)
-    if not shards:
-        raise RuntimeError(f"No *.safetensors files found under {hf_model_dir!r}")
-    keys = _collect_all_keys(shards).keys()
-    layout = _detect_layout(keys)
 
     if layout == "eagle3_midlayer":
         if log:
@@ -476,4 +500,3 @@ def prepare_eagle_draft_from_hf(
 
 
 __all__ = ["prepare_eagle_draft_from_hf"]
-

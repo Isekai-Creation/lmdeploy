@@ -150,9 +150,23 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     hidden_units_ = hidden_units;
     vocab_size_   = vocab_size;
 
-    // Allocate weights using FP16 (matches typical EagleNet precision).
+    // Allocate weights using a dtype hinted in config.yaml when
+    // available. For NVIDIA GPT‑OSS Eagle3 drafts, we prefer BF16
+    // (eagle_weight_dtype: bf16); otherwise we default to FP16.
     DataType dtype = kFloat16;
-    weight_dtype_  = dtype;
+    if (model_config["eagle_weight_dtype"]) {
+        try {
+            const auto eagle_dtype = model_config["eagle_weight_dtype"].as<std::string>();
+            if (eagle_dtype == "bf16" || eagle_dtype == "bfloat16" || eagle_dtype == "BF16"
+                || eagle_dtype == "BFloat16") {
+                dtype = kBfloat16;
+            }
+        }
+        catch (const std::exception&) {
+            // If parsing fails, keep default FP16.
+        }
+    }
+    weight_dtype_ = dtype;
 
     weights_.embed_tokens = Tensor{{vocab_size, hidden_units}, dtype, kDEVICE};
     weights_.fc           = Tensor{{hidden_units * 2, hidden_units}, dtype, kDEVICE};
@@ -180,7 +194,100 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     // loading weights from a TurboMind export directory.
     auto load_with_variants = [&](Tensor& tensor, const std::string& canonical) -> bool {
         const std::string primary = base + canonical;
-        if (loadTensorFromFile<half>(tensor, primary)) {
+        // Use the same element type as the allocated tensor.
+        if (tensor.dtype() == kBfloat16) {
+            if (loadTensorFromFile<bfloat16_t>(tensor, primary)) {
+                return true;
+            }
+        }
+        else {
+            if (loadTensorFromFile<half>(tensor, primary)) {
+                return true;
+            }
+        }
+
+        // Fallback: TP‑split layout (".0" before the last extension).
+        auto pos = canonical.rfind('.');
+        if (pos != std::string::npos) {
+            std::string split_name = canonical.substr(0, pos) + ".0" + canonical.substr(pos);
+            const std::string alt  = base + split_name;
+            if (tensor.dtype() == kBfloat16) {
+                if (loadTensorFromFile<bfloat16_t>(tensor, alt)) {
+                    return true;
+                }
+            }
+            else {
+                if (loadTensorFromFile<half>(tensor, alt)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    };
+
+    // Model-level weights
+    // Note: embed_tokens and fc are optional for the current EagleModule
+    // forward path (which uses target hidden states + draft LM head).
+    // When missing, we log a warning but keep the module enabled.
+    if (!load_with_variants(weights_.embed_tokens, "tok_embeddings.weight")) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] tok_embeddings.weight missing; draft module will skip token embeddings");
+    }
+
+    bool fc_ok = load_with_variants(weights_.fc, "fc.weight");
+    if (!fc_ok) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] fc.weight missing; shallow EagleNet block will fall back to RMSNorm+LM head");
+    }
+
+    // Layer 0 norms and attention (all optional – when absent we fall
+    // back to a minimal RMSNorm + LM head path).
+    if (!load_with_variants(weights_.input_norm, "layers.0.attention_norm.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention_norm.weight missing");
+    }
+    if (!load_with_variants(weights_.hidden_norm, "layers.0.hidden_norm.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.hidden_norm.weight missing");
+    }
+    if (!load_with_variants(weights_.attn_qkv, "layers.0.attention.w_qkv.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention.w_qkv.weight missing");
+    }
+    if (!load_with_variants(weights_.attn_o, "layers.0.attention.wo.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention.wo.weight missing");
+    }
+    if (!load_with_variants(weights_.attn_norm, "layers.0.ffn_norm.weight")) {
+        TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.ffn_norm.weight missing");
+    }
+
+    // MLP gate/up: merge w1 and w3 into mlp_gate_up.
+    Tensor w1{{intermediate_size, hidden_units}, dtype, kDEVICE};
+    Tensor w3{{intermediate_size, hidden_units}, dtype, kDEVICE};
+    bool   w1_ok = load_with_variants(w1, "layers.0.feed_forward.w1.weight");
+    bool   w3_ok = load_with_variants(w3, "layers.0.feed_forward.w3.weight");
+    if (w1_ok && w3_ok) {
+        const size_t elem_size = tensor_byte_size(dtype);
+        const size_t w_bytes   = static_cast<size_t>(w1.size()) * elem_size;
+        check_cuda_error(cudaMemcpy(
+            weights_.mlp_gate_up.data<void>(), w1.data<void>(), w_bytes, cudaMemcpyDeviceToDevice));
+        check_cuda_error(cudaMemcpy(
+            static_cast<char*>(weights_.mlp_gate_up.data<void>()) + w_bytes,
+            w3.data<void>(),
+            w_bytes,
+            cudaMemcpyDeviceToDevice));
+    }
+    else {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] feed_forward w1/w3 weights missing; skipping draft MLP gate/up block");
+    }
+
+    if (!load_with_variants(weights_.mlp_down, "layers.0.feed_forward.w2.weight")) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] layers.0.feed_forward.w2.weight missing; draft MLP down block disabled");
+    }
+
+    // Output norm and LM head are required for EagleModule to be usable.
+    bool output_norm_ok = load_with_variants(weights_.output_norm, "norm.weight");
+    bool lm_head_ok     = load_with_variants(weights_.lm_head, "output.weight");
             return true;
         }
 
@@ -386,7 +493,7 @@ void EagleModule::forward(const Tensor& input_ids,
         return;
     }
 
-    // Basic shape checks
+    // Basic shape / dtype checks
     const int batch_size = hidden_states.shape(0);
     const int hidden_dim = hidden_states.shape(1);
 
@@ -394,6 +501,24 @@ void EagleModule::forward(const Tensor& input_ids,
         TM_LOG_WARNING("[EAGLE] hidden_units mismatch in forward: got %d, expected %d",
                        hidden_dim,
                        hidden_units_);
+    }
+    // RMSNorm kernels require that the norm weights and activations
+    // share the same dtype. Draft weights are currently stored in
+    // weight_dtype_ (typically FP16), while some target models (e.g.
+    // GPT‑OSS) run with BF16 activations. If we detect a mismatch
+    // here, conservatively disable EAGLE for this engine and fall
+    // back to baseline decoding instead of triggering a hard check
+    // failure inside invokeRMSNorm.
+    const auto hidden_dtype = hidden_states.dtype();
+    if (weights_.output_norm && weights_.output_norm.dtype() != hidden_dtype) {
+        TM_LOG_WARNING(
+            "[EAGLE] output_norm dtype mismatch in forward: weights=%d, hidden=%d; "
+            "disabling EAGLE for this engine and passing through hidden states.",
+            static_cast<int>(weights_.output_norm.dtype()),
+            static_cast<int>(hidden_dtype));
+        enabled_             = false;
+        output_hidden_states = hidden_states;
+        return;
     }
 
     // Ensure LM head wrapper is ready (defensive in case load() was skipped)
@@ -412,7 +537,6 @@ void EagleModule::forward(const Tensor& input_ids,
     // To keep the speculative decode hot path allocation-free, reuse
     // internal scratch buffers whenever possible instead of allocating
     // new temporaries on each call.
-    const auto hidden_dtype = hidden_states.dtype();
 
     // Use a fixed epsilon for now; can be made configurable from draft config.yaml.
     constexpr float kEps = 1e-5f;
