@@ -562,7 +562,15 @@ class AsyncEngine(LogitsMixin):
                                 prepare_eagle_draft_from_hf,
                             )
 
-                            prepare_eagle_draft_from_hf(draft_path, out_dir)
+                            # Use the target model_path as base_model_dir
+                            # so the converter can optionally pull the LM
+                            # head from the base model when appropriate.
+                            prepare_eagle_draft_from_hf(
+                                draft_path,
+                                out_dir,
+                                base_model_dir=model_path,
+                                logger=logger,
+                            )
                             spec_cfg.model = out_dir
                         except Exception as conv_exc:  # noqa: BLE001
                             logger.warning(
