@@ -2262,8 +2262,10 @@ bool LlamaBatch::Forward(GenerationState& g)
                     check_cuda_error(cudaStreamSynchronize(stream_));
                     const int total_draft = draft_batch_size * tokens_per_seq;
 
-                    Buffer_<int> draft_tokens(total_draft, kCPU);
-                    Buffer_<int> target_tokens(total_draft, kCPU);
+                    Buffer_<int>   draft_tokens(total_draft, kCPU);
+                    Buffer_<int>   target_tokens(total_draft, kCPU);
+                    Buffer_<float> draft_token_scores(total_draft, kCPU);
+                    Buffer_<float> target_token_scores(total_draft, kCPU);
 
                     // For each sequence, populate [tokens_per_seq] speculative
                     // positions with real multi-step content by taking the top
@@ -2313,9 +2315,18 @@ bool LlamaBatch::Forward(GenerationState& g)
                             }
                             used_target[best_target_id] = 1;
 
-                            const int idx       = base + t;
-                            draft_tokens[idx]   = best_draft_id;
-                            target_tokens[idx]  = best_target_id;
+                            const int idx      = base + t;
+                            draft_tokens[idx]  = best_draft_id;
+                            target_tokens[idx] = best_target_id;
+
+                            // For probability-based acceptance we compare
+                            // draft vs. target confidence on the *target*
+                            // token selected at this slot. Record the raw
+                            // logits here so that LlamaV2::eagleSpeculativeStep
+                            // can approximate P_target vs. P_draft.
+                            const int token_id = best_target_id;
+                            draft_token_scores[idx]  = draft_row[token_id];
+                            target_token_scores[idx] = target_row[token_id];
 
                             if (t == 0) {
                                 h_first_draft_token[i]  = best_draft_id;
@@ -2353,13 +2364,15 @@ bool LlamaBatch::Forward(GenerationState& g)
                         }
                     }
 
-                    Buffer_<int> accepted_tokens(draft_batch_size * param_.spec_max_draft_path_len, kCPU);
-                    Buffer_<int> accepted_lens(draft_batch_size, kCPU);
-                    Buffer_<int> num_accepted(1, kCPU);
+                    Buffer_<int>   accepted_tokens(draft_batch_size * param_.spec_max_draft_path_len, kCPU);
+                    Buffer_<int>   accepted_lens(draft_batch_size, kCPU);
+                    Buffer_<int>   num_accepted(1, kCPU);
 
                     model_->eagleSpeculativeStep(draft_tokens,
                                                  target_tokens,
                                                  total_draft,
+                                                 draft_token_scores,
+                                                 target_token_scores,
                                                  accepted_tokens,
                                                  accepted_lens,
                                                  num_accepted,

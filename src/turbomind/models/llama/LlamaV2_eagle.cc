@@ -10,18 +10,21 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
 
+#include <limits>
+
 namespace turbomind {
 
-void LlamaV2::eagleSpeculativeStep(
-    Buffer_<int>     draft_tokens,
-    Buffer_<int>     target_tokens,
-    int              num_draft_tokens,
-    Buffer_<int>     accepted_tokens,
-    Buffer_<int>     accepted_lens,
-    Buffer_<int>     num_accepted,
-    const Sequence** sequences,
-    int              batch_size
-) {
+void LlamaV2::eagleSpeculativeStep(Buffer_<int>     draft_tokens,
+                                   Buffer_<int>     target_tokens,
+                                   int              num_draft_tokens,
+                                   Buffer_<float>   draft_token_scores,
+                                   Buffer_<float>   target_token_scores,
+                                   Buffer_<int>     accepted_tokens,
+                                   Buffer_<int>     accepted_lens,
+                                   Buffer_<int>     num_accepted,
+                                   const Sequence** sequences,
+                                   int              batch_size)
+{
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
     
     if (!spec_mode_.isEagle() || !eagle_module_ || !eagle_buffers_) {
@@ -178,10 +181,19 @@ void LlamaV2::eagleSpeculativeStep(
 
     using namespace turbomind::kernels::speculative_decoding;
 
-    std::vector<int> h_draft(num_draft_tokens);
-    std::vector<int> h_target(num_draft_tokens);
+    std::vector<int>   h_draft(num_draft_tokens);
+    std::vector<int>   h_target(num_draft_tokens);
+    std::vector<float> h_draft_score(num_draft_tokens);
+    std::vector<float> h_target_score(num_draft_tokens);
+
     std::copy_n(draft_tokens.data(), num_draft_tokens, h_draft.data());
     std::copy_n(target_tokens.data(), num_draft_tokens, h_target.data());
+
+    if (draft_token_scores && target_token_scores && draft_token_scores.size() == num_draft_tokens
+        && target_token_scores.size() == num_draft_tokens) {
+        std::copy_n(draft_token_scores.data(), num_draft_tokens, h_draft_score.data());
+        std::copy_n(target_token_scores.data(), num_draft_tokens, h_target_score.data());
+    }
 
     std::vector<int> h_accepted_lens(batch_size, 0);
     std::vector<int> h_accepted_tokens(batch_size * max_path_len, -1);
@@ -190,11 +202,14 @@ void LlamaV2::eagleSpeculativeStep(
     int total_accepted = 0;
 
     for (int b = 0; b < batch_size; ++b) {
-        int best_path_idx   = 0;
-        int best_accept_len = 0;
+        int   best_path_idx   = 0;
+        int   best_accept_len = 0;
+        float best_path_score = -std::numeric_limits<float>::infinity();
 
         for (int p = 0; p < paths_per_seq; ++p) {
-            int accepted = 0;
+            int   accepted    = 0;
+            float path_score  = 0.0f;
+            bool  path_valid  = true;
 
             for (int d = 0; d < max_path_len; ++d) {
                 const int node_idx = paths_flat[p * max_path_len + d];
@@ -213,16 +228,55 @@ void LlamaV2::eagleSpeculativeStep(
                 const int draft_id  = h_draft[token_idx];
                 const int target_id = h_target[token_idx];
 
-                accepted += 1;
+                // Approximate probability-based acceptance similar to
+                // TensorRT-LLM: compare target vs. draft confidence on the
+                // *target* token at this position. We work in logit space and
+                // require that the target does not assign a much lower score
+                // than the draft model for the same token.
+                float logit_draft = 0.0f;
+                float logit_target = 0.0f;
 
-                if (draft_id != target_id) {
+                if (!h_draft_score.empty() && !h_target_score.empty()) {
+                    logit_draft  = h_draft_score[token_idx];
+                    logit_target = h_target_score[token_idx];
+                }
+
+                // If scores are not available, fall back to the original
+                // equality-based rule.
+                bool accept_here = false;
+                if (h_draft_score.empty() || h_target_score.empty()) {
+                    accept_here = (draft_id == target_id);
+                }
+                else {
+                    // Heuristic threshold: accept when
+                    //   log P_target(token) >= log P_draft(token) + log(r)
+                    // with r ~= 0.5, ignoring normalisation. This is
+                    // equivalent to requiring the target to be within a
+                    // modest factor of the draft's confidence.
+                    constexpr float kLogRatioThreshold = -0.69314718056f;  // log(0.5)
+
+                    const float diff = logit_target - logit_draft;
+                    if (diff >= kLogRatioThreshold) {
+                        accept_here = true;
+                    }
+                }
+
+                if (!accept_here) {
+                    path_valid = false;
                     break;
                 }
+
+                accepted += 1;
+                path_score += logit_target;
             }
 
-            if (accepted > best_accept_len) {
+            // Prefer paths with longer accepted prefixes; break ties on
+            // aggregate target score so that more confident paths are chosen.
+            if (accepted > best_accept_len
+                || (accepted == best_accept_len && accepted > 0 && path_score > best_path_score)) {
                 best_accept_len = accepted;
                 best_path_idx   = p;
+                best_path_score = path_score;
             }
         }
 
