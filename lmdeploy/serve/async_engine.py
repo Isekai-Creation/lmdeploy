@@ -493,6 +493,79 @@ class AsyncEngine(LogitsMixin):
         if speculative_config is not None and backend_config is not None:
             backend_config.speculative_config = speculative_config
 
+            # For TurboMind EAGLE/EAGLE3, allow users to pass a
+            # HuggingFace-style draft model path (or repo id) and
+            # transparently convert it into a TurboMind/EagleModule
+            # draft directory when needed.
+            try:
+                from lmdeploy.utils import get_model
+                from lmdeploy.turbomind.deploy.converter import get_tm_model
+                from lmdeploy.messages import TurbomindEngineConfig as _TMEngineCfg
+                import os
+                import tempfile
+
+                spec_cfg = speculative_config
+                if spec_cfg is not None and spec_cfg.method in ("eagle", "eagle3"):
+                    draft_path = spec_cfg.model
+                    if draft_path:
+                        # Resolve HF repo id or remote path to a local directory.
+                        if not os.path.exists(draft_path):
+                            download_dir = getattr(backend_config, "download_dir", None)
+                            draft_path = get_model(draft_path, download_dir)
+
+                        # If this already looks like a TurboMind model, keep it:
+                        #  - EagleModule-style draft: config.yaml at root.
+                        #  - Full TM engine: triton_models/weights/config.yaml.
+                        if os.path.exists(os.path.join(draft_path, "config.yaml")):
+                            spec_cfg.model = draft_path
+                        elif os.path.exists(
+                            os.path.join(
+                                draft_path, "triton_models", "weights", "config.yaml"
+                            )
+                        ):
+                            spec_cfg.model = os.path.join(
+                                draft_path, "triton_models", "weights"
+                            )
+                        else:
+                            # Treat as a HF transformers model and convert
+                            # it to a minimal TurboMind export suitable for
+                            # EagleModule::load. We cache the result under a
+                            # deterministic subdirectory so repeated runs
+                            # don't re-convert.
+                            base_dir = (
+                                getattr(backend_config, "download_dir", None)
+                                or tempfile.gettempdir()
+                            )
+                            safe_name = os.path.basename(
+                                os.path.normpath(draft_path)
+                            ) or "eagle_draft"
+                            out_dir = os.path.join(
+                                base_dir, f"turbomind_eagle_draft_{safe_name}"
+                            )
+
+                            if not os.path.exists(os.path.join(out_dir, "config.yaml")):
+                                os.makedirs(out_dir, exist_ok=True)
+                                draft_engine_cfg = _TMEngineCfg(tp=1)
+                                tm_model = get_tm_model(
+                                    model_path=draft_path,
+                                    model_name=None,
+                                    chat_template_name=None,
+                                    engine_config=draft_engine_cfg,
+                                    group_size=None,
+                                    out_dir=out_dir,
+                                )
+                                tm_model.export()
+
+                            spec_cfg.model = out_dir
+                            backend_config.speculative_config = spec_cfg
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Failed to prepare TurboMind EAGLE draft model from %r: %s. "
+                    "TurboMind will fall back to baseline decoding if EAGLE cannot be initialized.",
+                    getattr(speculative_config, "model", "<unknown>"),
+                    e,
+                )
+
         return tm.TurboMind.from_pretrained(
             model_path, engine_config=backend_config, **kwargs
         )

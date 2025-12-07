@@ -129,7 +129,11 @@ LlamaV2::LlamaV2(DataType                     dtype,
     // draft model path is provided and EagleModule::load succeeds. Otherwise
     // we explicitly disable speculative mode so TurboMind falls back to
     // baseline decoding with no partial EAGLE side effects or metrics.
-    if (engine.enable_speculative_decoding && engine.spec_method == "eagle") {
+    // For TurboMind, both "eagle" and "eagle3" methods share the same
+    // EagleModule-based integration; "eagle3" just enables the newer
+    // multi-token/tree behaviour. Treat both as enabling the EAGLE path.
+    if (engine.enable_speculative_decoding
+        && (engine.spec_method == "eagle" || engine.spec_method == "eagle3")) {
         TM_LOG_INFO("[LlamaV2] Initializing EAGLE speculative decoding: "
                     "max_path_len=%d, num_spec_tokens=%d, max_decoding_tokens=%d",
                     engine.spec_max_draft_path_len,
