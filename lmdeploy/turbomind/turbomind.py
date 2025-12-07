@@ -496,12 +496,12 @@ class TurboMind:
         # TODO: support dp
         tm_metrics = self.model_comm.get_schedule_metrics(0, 0)
         return ScheduleMetrics(
-            active_seqs=tm_metrics["active_seqs"],
-            waiting_seqs=tm_metrics["waiting_seqs"],
-            total_blocks=tm_metrics["total_blocks"],
-            active_blocks=tm_metrics["active_blocks"],
-            cached_blocks=tm_metrics["cached_blocks"],
-            free_blocks=tm_metrics["free_blocks"],
+            active_seqs=tm_metrics.active_seqs,
+            waiting_seqs=tm_metrics.waiting_seqs,
+            total_blocks=tm_metrics.total_blocks,
+            active_blocks=tm_metrics.active_blocks,
+            cached_blocks=tm_metrics.cached_blocks,
+            free_blocks=tm_metrics.free_blocks,
         )
 
 
@@ -598,17 +598,15 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
         nonlocal is_first
 
         def _field(name: str, default: int | float = 0):
-            if isinstance(metrics, dict):
-                return metrics.get(name, default)
             return getattr(metrics, name, default)
 
         if not is_first:
             out.req_metrics = RequestMetrics(token_timestamp=time.time())
         else:
             events = [
-                EngineEvent(EventType.QUEUED, _field("enque_time") / 1000000),
+                EngineEvent(EventType.QUEUED, metrics.enque_time / 1000000),
                 EngineEvent(
-                    EventType.SCHEDULED, _field("scheduled_time") / 1000000
+                    EventType.SCHEDULED, metrics.scheduled_time / 1000000
                 ),
             ]
             out.req_metrics = RequestMetrics(
@@ -954,7 +952,7 @@ class TurboMindInstance:
                 )
                 gen_config.response_format = None
 
-        session = SimpleNamespace(
+        session = _tm.SessionParam(
             id=session_id, step=step, start=sequence_start, end=sequence_end
         )
 
@@ -963,7 +961,6 @@ class TurboMindInstance:
         sem = StreamingSemaphore()
         signal_cb = partial(self.async_signal_cb, sem)
 
-        # Run the normal TurboMind forward pass
         outputs, shared_state, metrics = self.model_inst.forward(
             inputs,
             session,
@@ -989,14 +986,9 @@ class TurboMindInstance:
         try:
             while True:
                 await sem.acquire()
-                state = shared_state() if callable(shared_state) else shared_state
+                state = shared_state.consume()
 
-                if state is None:
-                    continue
-                if isinstance(state, dict):
-                    status, seq_len = state["status"], state["seq_len"]
-                else:
-                    status, seq_len = state.status, state.seq_len
+                status, seq_len = state.status, state.seq_len
                 ret_status = ResponseType.SUCCESS
 
                 if status in [7, 8]:  # finish / canceled
@@ -1035,29 +1027,17 @@ class TurboMindInstance:
         finally:
             # Contract: `cb` won't be called again if status is non-zero
             # wait for status to be set as `finish` or `error`
-            def _status(s):
-                if s is None:
-                    return 0
-                if isinstance(s, dict):
-                    return s.get("status", 0)
-                return getattr(s, "status", 0)
-
-            while not state or _status(state) == 0:
+            while not state or state.status == 0:
                 await sem.acquire()
-                state = shared_state() if callable(shared_state) else shared_state
+                state = shared_state.consume()
             logger.info(f"[async_stream_infer] session {session_id} done")
 
     def _get_error_output(self, status):
         return EngineOutput(status=self.errcode_map[status], token_ids=[])
 
     def _get_generation_config(self, cfg: GenerationConfig):
-        # Pass a lightweight Python object to C++; the C++ binding
-        # constructs ft::GenerationConfig from these attributes.
-        from types import SimpleNamespace
-
-        c = SimpleNamespace()
+        c = _tm.GenerationConfig()
         c.max_new_tokens = cfg.max_new_tokens
-        c.min_new_tokens = cfg.min_new_tokens
         c.top_k = cfg.top_k
         c.top_p = cfg.top_p
         c.min_p = cfg.min_p
