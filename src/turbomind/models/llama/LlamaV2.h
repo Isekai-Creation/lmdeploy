@@ -102,17 +102,9 @@ private:
                        int    max_context_len);
     
     // EAGLE speculative decoding step
-    //
-    //  - draft_tokens:        flattened [batch_size, tokens_per_seq] draft IDs (host)
-    //  - target_tokens:       flattened [batch_size, tokens_per_seq] target IDs (host)
-    //  - draft_token_scores:  per‑position draft scores (logits) for the
-    //                         *target* token ID at each slot; used to
-    //                         approximate P_draft in the acceptance rule.
-    //  - target_token_scores: per‑position target scores (logits) for the
-    //                         same target token ID; used to approximate
-    //                         P_target in the acceptance rule.
-    //  - accepted_tokens:     host buffer for per‑sequence accepted target
-    //                         tokens along the best path.
+    // draft_tokens:  flattened [batch_size, tokens_per_seq] draft IDs (host)
+    // target_tokens: flattened [batch_size, tokens_per_seq] target IDs (host)
+    // accepted_tokens: host buffer for per‑sequence accepted target tokens
     void eagleSpeculativeStep(Buffer_<int>     draft_tokens,
                               Buffer_<int>     target_tokens,
                               int              num_draft_tokens,

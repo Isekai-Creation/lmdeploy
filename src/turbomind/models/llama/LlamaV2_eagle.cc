@@ -9,6 +9,7 @@
 #include "lmdeploy/turbomind/kernels/speculative_decoding/common.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 #include <limits>
 
@@ -228,11 +229,13 @@ void LlamaV2::eagleSpeculativeStep(Buffer_<int>     draft_tokens,
                 const int draft_id  = h_draft[token_idx];
                 const int target_id = h_target[token_idx];
 
-                // Approximate probability-based acceptance similar to
-                // TensorRT-LLM: compare target vs. draft confidence on the
-                // *target* token at this position. We work in logit space and
-                // require that the target does not assign a much lower score
-                // than the draft model for the same token.
+                // Approximate probability-based acceptance inspired by
+                // TensorRT-LLM's typical-acceptance sampling: compare target
+                // vs. draft confidence on the *target* token at this position.
+                // We work in logit space and require that the target does not
+                // assign a much lower score than the draft model for the same
+                // token. When scores are unavailable, we fall back to pure
+                // id-equality, matching Medusa/EAGLE acceptance.
                 float logit_draft = 0.0f;
                 float logit_target = 0.0f;
 
@@ -248,12 +251,15 @@ void LlamaV2::eagleSpeculativeStep(Buffer_<int>     draft_tokens,
                     accept_here = (draft_id == target_id);
                 }
                 else {
-                    // Heuristic threshold: accept when
-                    //   log P_target(token) >= log P_draft(token) + log(r)
-                    // with r ~= 0.5, ignoring normalisation. This is
-                    // equivalent to requiring the target to be within a
-                    // modest factor of the draft's confidence.
-                    constexpr float kLogRatioThreshold = -0.69314718056f;  // log(0.5)
+                    // Heuristic threshold: accept when target is not
+                    // dramatically less confident than the draft on this
+                    // token. A relatively loose ratio keeps the rule closer
+                    // to id-equality while still allowing Eagle3 to accept
+                    // tokens where the target strongly agrees.
+                    //
+                    // diff = log P_target - log P_draft
+                    // Accept when diff >= log(r) with r ~= 0.1.
+                    constexpr float kLogRatioThreshold = -2.30258509299f;  // log(0.1f)
 
                     const float diff = logit_target - logit_draft;
                     if (diff >= kLogRatioThreshold) {
@@ -306,6 +312,65 @@ void LlamaV2::eagleSpeculativeStep(Buffer_<int>     draft_tokens,
         }
     }
 
+    // Optional per-sequence debug logging of accepted paths and tokens to
+    // make Eagle3 behaviour easier to inspect offline. This is gated behind
+    // the EAGLE debug flag to avoid flooding logs in normal runs.
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        for (int b = 0; b < batch_size; ++b) {
+            const int len     = h_accepted_lens[b];
+            const int path_id = host_best_path_ids[b];
+            if (len <= 0) {
+                TM_LOG_INFO("[EAGLE] step_spec seq=%d no accepted tokens (best_path=%d)", b, path_id);
+                continue;
+            }
+
+            std::ostringstream draft_ss;
+            std::ostringstream target_ss;
+            std::ostringstream accepted_ss;
+
+            for (int d = 0; d < max_path_len; ++d) {
+                const int node_idx = paths_flat[path_id * max_path_len + d];
+                if (node_idx <= 0) {
+                    if (node_idx < 0) {
+                        break;
+                    }
+                    continue;
+                }
+                const int token_idx = node_idx - 1;
+                if (token_idx < 0 || token_idx >= num_draft_tokens) {
+                    break;
+                }
+
+                const int draft_id  = h_draft[token_idx];
+                const int target_id = h_target[token_idx];
+
+                if (draft_ss.tellp() > 0) {
+                    draft_ss << ',';
+                    target_ss << ',';
+                }
+                draft_ss << draft_id;
+                target_ss << target_id;
+            }
+
+            for (int t = 0; t < len; ++t) {
+                if (t) {
+                    accepted_ss << ',';
+                }
+                accepted_ss << h_accepted_tokens[b * max_path_len + t];
+            }
+
+            TM_LOG_INFO("[EAGLE] step_spec seq=%d best_path=%d accepted_len=%d "
+                        "path_draft_tokens=[%s] path_target_tokens=[%s] "
+                        "accepted_tokens=[%s]",
+                        b,
+                        path_id,
+                        len,
+                        draft_ss.str().c_str(),
+                        target_ss.str().c_str(),
+                        accepted_ss.str().c_str());
+        }
+    }
+
     if (accepted_lens) {
         TM_CHECK(accepted_lens.size() >= batch_size);
         std::copy(h_accepted_lens.begin(), h_accepted_lens.end(), accepted_lens.data());
@@ -352,6 +417,8 @@ void LlamaV2::eagleSpeculativeStep(Buffer_<int>     draft_tokens,
             paths_per_seq,
             max_path_len,
             stream_);
+
+        check_cuda_error(cudaFree(d_batch_slots));
     }
     
     // ========== Step 6: Rewind KV cache for rejected tokens ==========
