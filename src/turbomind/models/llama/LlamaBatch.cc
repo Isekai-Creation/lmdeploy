@@ -2324,6 +2324,35 @@ bool LlamaBatch::Forward(GenerationState& g)
                         }
                     }
 
+                    // Optional detailed token-level debug: log the full set
+                    // of draft / target token IDs per sequence that will be
+                    // fed into the Eagle speculation tree. This is gated by
+                    // the EAGLE debug flag to avoid flooding logs in normal
+                    // runs.
+                    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+                        for (int i = 0; i < draft_batch_size; ++i) {
+                            std::ostringstream draft_ss;
+                            std::ostringstream target_ss;
+                            const int base = i * tokens_per_seq;
+                            for (int t = 0; t < tokens_per_seq; ++t) {
+                                const int dt = draft_tokens[base + t];
+                                const int tt = target_tokens[base + t];
+                                if (t) {
+                                    draft_ss << ",";
+                                    target_ss << ",";
+                                }
+                                draft_ss << dt;
+                                target_ss << tt;
+                            }
+                            TM_LOG_INFO(
+                                "[LlamaBatch][EAGLE] step=%d, seq=%d, draft_tokens=[%s], target_tokens=[%s]",
+                                g.step,
+                                i,
+                                draft_ss.str().c_str(),
+                                target_ss.str().c_str());
+                        }
+                    }
+
                     Buffer_<int> accepted_tokens(draft_batch_size * param_.spec_max_draft_path_len, kCPU);
                     Buffer_<int> accepted_lens(draft_batch_size, kCPU);
                     Buffer_<int> num_accepted(1, kCPU);
@@ -2675,6 +2704,33 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
 
     if (max_extra <= 0) {
         return;
+    }
+
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        for (int i = 0; i < batch_size; ++i) {
+            const int extra = extra_per_seq[i];
+            if (extra <= 0) {
+                continue;
+            }
+            const int len_i =
+                (i < static_cast<int>(eagle_accepted_lens.size())) ? eagle_accepted_lens[i] : 0;
+            const int* seq_tokens = eagle_accepted_tokens.data() + i * max_path_len;
+            std::ostringstream accepted_ss;
+            for (int e = 0; e < len_i; ++e) {
+                if (e) {
+                    accepted_ss << ",";
+                }
+                accepted_ss << seq_tokens[e];
+            }
+            TM_LOG_INFO(
+                "[LlamaBatch][EAGLE] step=%d, seq=%d, committing %d extra accepted tokens (base_step=%d), "
+                "accepted_tokens=[%s]",
+                g.step,
+                i,
+                extra,
+                base_step,
+                accepted_ss.str().c_str());
+        }
     }
 
     // Write extra accepted tokens directly into token_ids_buf_ on device,
