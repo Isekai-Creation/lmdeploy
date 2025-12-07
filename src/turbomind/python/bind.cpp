@@ -300,6 +300,108 @@ struct ScopedGIL {
 
 PYBIND11_MODULE(_turbomind, m)
 {
+    // ------------------------------------------------------------------
+    // Core LMDeploy / TurboMind bindings (restored from commit
+    // 91e84148c16da37c21b004c1f1504e59b938e0bd). These bindings expose
+    // the original C++ metrics, config, and state types so existing
+    // Python code that relies on them continues to work. New EAGLE3
+    // functionality is layered on top of this core.
+    // ------------------------------------------------------------------
+
+    py::class_<ft::RequestMetrics, std::shared_ptr<ft::RequestMetrics>>(m, "RequestMetrics")
+        .def(py::init())
+        .def_readonly("enque_time", &ft::RequestMetrics::enque_time)
+        .def_readonly("scheduled_time", &ft::RequestMetrics::scheduled_time);
+
+    py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m, "ScheduleMetrics")
+        .def(py::init())
+        .def_readonly("total_seqs", &ft::ScheduleMetrics::total_seqs)
+        .def_readonly("active_seqs", &ft::ScheduleMetrics::active_seqs)
+        .def_readonly("waiting_seqs", &ft::ScheduleMetrics::waiting_seqs)
+        .def_readonly("total_blocks", &ft::ScheduleMetrics::total_blocks)
+        .def_readonly("active_blocks", &ft::ScheduleMetrics::active_blocks)
+        .def_readonly("cached_blocks", &ft::ScheduleMetrics::cached_blocks)
+        .def_readonly("free_blocks", &ft::ScheduleMetrics::free_blocks);
+
+    py::class_<ft::SessionParam>(m, "SessionParam")
+        .def(py::init([](uint64_t id, int step, bool start, bool end) {
+                 if (!start && end) {
+                     throw std::logic_error("unsupported arguments: start=false, end=true");
+                 }
+                 ft::SessionParam param{};
+                 param.id         = id;
+                 param.step       = step;
+                 param.start_flag = start;
+                 param.end_flag   = end;
+                 return param;
+             }),
+             "id"_a,
+             "step"_a,
+             "start"_a,
+             "end"_a)
+        .def_readwrite("id", &ft::SessionParam::id)
+        .def_readwrite("step", &ft::SessionParam::step)
+        .def_readwrite("start", &ft::SessionParam::start_flag)
+        .def_readwrite("end", &ft::SessionParam::end_flag);
+
+    py::class_<ft::GenerationConfig>(m, "GenerationConfig")
+        .def(py::init())
+        .def_readwrite("max_new_tokens", &ft::GenerationConfig::max_new_tokens)
+        .def_readwrite("min_new_tokens", &ft::GenerationConfig::min_new_tokens)
+        .def_readwrite("eos_ids", &ft::GenerationConfig::eos_ids)
+        .def_readwrite("stop_ids", &ft::GenerationConfig::stop_ids)
+        .def_readwrite("bad_ids", &ft::GenerationConfig::bad_ids)
+        .def_readwrite("top_p", &ft::GenerationConfig::top_p)
+        .def_readwrite("top_k", &ft::GenerationConfig::top_k)
+        .def_readwrite("min_p", &ft::GenerationConfig::min_p)
+        .def_readwrite("temperature", &ft::GenerationConfig::temperature)
+        .def_readwrite("repetition_penalty", &ft::GenerationConfig::repetition_penalty)
+        .def_readwrite("random_seed", &ft::GenerationConfig::random_seed)
+        .def_readwrite("output_logprobs", &ft::GenerationConfig::output_logprobs)
+        .def_readwrite("output_last_hidden_state", &ft::GenerationConfig::output_last_hidden_state)
+        .def_readwrite("output_logits", &ft::GenerationConfig::output_logits)
+        .def("__repr__", [](const ft::GenerationConfig& c) {
+            std::ostringstream oss;
+            oss << c;
+            return oss.str();
+        });
+
+    py::class_<ft::RequestState, std::unique_ptr<ft::RequestState>>(m, "RequestState")
+        .def_readonly("status", &ft::RequestState::status)
+        .def_readonly("seq_len", &ft::RequestState::seq_len);
+
+    py::class_<ft::AtomicRequestState, std::shared_ptr<ft::AtomicRequestState>>(m, "AtomicRequestState")
+        .def("consume", [](ft::AtomicRequestState& s) { return s.exchange(nullptr); });
+
+    // DataType / MemoryType enums
+    {
+        using namespace turbomind;
+        py::enum_<ft::DataType>(m, "DataType")
+            .value("TYPE_INVALID", kNull)
+            .value("TYPE_BOOL", kBool)
+            .value("TYPE_UINT8", kUint8)
+            .value("TYPE_UINT16", kUint16)
+            .value("TYPE_UINT32", kUint32)
+            .value("TYPE_UINT64", kUint64)
+            .value("TYPE_INT8", kInt8)
+            .value("TYPE_INT16", kInt16)
+            .value("TYPE_INT32", kInt32)
+            .value("TYPE_INT64", kInt64)
+            .value("TYPE_FP16", kFloat16)
+            .value("TYPE_FP32", kFloat32)
+            .value("TYPE_FP64", kFloat64)
+            .value("TYPE_BF16", kBfloat16);
+
+        py::enum_<ft::DeviceType>(m, "MemoryType")
+            .value("MEMORY_CPU", ft::DeviceType::kCPU)
+            .value("MEMORY_CPU_PINNED", ft::DeviceType::kCPUpinned)
+            .value("MEMORY_GPU", ft::DeviceType::kDEVICE);
+    }
+
+    // ------------------------------------------------------------------
+    // EAGLE3 / speculative decoding helpers (additive to the core above)
+    // ------------------------------------------------------------------
+
     // Lightweight bindings for EAGLE speculative decoding kernels used in tests.
     //
     // These helpers accept torch-like tensor objects (anything exposing
@@ -853,54 +955,59 @@ PYBIND11_MODULE(_turbomind, m)
         "batch_size"_a = 2,
         "iters"_a = 50);
 
+    // tensor
+    //
     // Expose core::Tensor so it can be used as the value type in
-    // TensorMap and be stored in Python containers (tm_params).  We
-    // only need a minimal API here; the main requirement is that the
-    // type is registered with pybind11 so that returning
-    // std::map<std::string, Tensor> (or TensorMap) works without
-    // "Unregistered type : turbomind::core::Tensor" errors.
+    // TensorMap and be stored in Python containers (tm_params).  This
+    // binding mirrors the original LMDeploy/TurboMind core and keeps
+    // DLPack semantics intact.
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
+        .def_property_readonly("where", [](const Tensor& t) { return t.device().type; })
+        .def_property_readonly("type", [](const Tensor& t) { return t.dtype(); })
+        .def_property_readonly("shape", [](const Tensor& t) { return t.shape(); })
+        .def_property_readonly("data", [](const Tensor& t) { return t.raw_data(); })
         .def(
             "copy_from",
-            [](Tensor& self, py::object src) {
-                // Copy raw bytes from a torch-like tensor into this
-                // TurboMind Tensor. We intentionally avoid assuming
-                // any particular frontend type; anything exposing
-                // .data_ptr(), .numel() and .element_size() is
-                // accepted.
-                auto ptr_obj     = src.attr("data_ptr")();
-                auto ptr_val     = ptr_obj.cast<uintptr_t>();
-                void* src_ptr    = reinterpret_cast<void*>(ptr_val);
-                auto numel       = src.attr("numel")().cast<int64_t>();
-                auto element_sz  = src.attr("element_size")().cast<int64_t>();
-                size_t src_bytes = static_cast<size_t>(numel) * static_cast<size_t>(element_sz);
-                size_t dst_bytes = static_cast<size_t>(self.byte_size());
+            [](Tensor& self, py::object obj) {
+                // Use DLPack to import from a torch-like tensor and
+                // then copy via the CUDA-aware helper so CPU/GPU and
+                // peer copies are handled robustly.
+                py::capsule      cap = obj.attr("__dlpack__")();
+                DLManagedTensor* dlmt =
+                    static_cast<DLManagedTensor*>(PyCapsule_GetPointer(cap.ptr(), kDlTensorCapsuleName));
+                auto src = DLManagedTensorToTritonTensor(dlmt);
+                // take ownership of capsule's payload
+                cap.set_name("used_dltensor");
 
-                if (src_bytes != dst_bytes) {
-                    std::ostringstream oss;
-                    oss << "Tensor.copy_from: size mismatch, src_bytes=" << src_bytes
-                        << " dst_bytes=" << dst_bytes;
-                    throw std::runtime_error(oss.str());
-                }
-
-                // Use the CUDA-aware helper so CPU/GPU and peer copies
-                // are handled robustly.
-                safe_memcpy(self.raw_data(), src_ptr, src_bytes);
+                TM_CHECK_EQ(self.byte_size(), src->byte_size()) << self << " " << *src;
+                safe_memcpy(self.raw_data(), src->raw_data(), self.byte_size());
             },
-            "src"_a,
-            R"pbdoc(
-            Copy data from a torch-like tensor into this TurboMind Tensor.
+            "tensor"_a)
+        .def(
+            "__dlpack__",
+            [](Tensor& self, long /*stream*/) {
+                DLManagedTensor* dlmt = TritonTensorToDLManagedTensor(self);
+                return py::capsule(dlmt, kDlTensorCapsuleName, [](PyObject* obj) {
+                    DLManagedTensor* dlmt =
+                        static_cast<DLManagedTensor*>(PyCapsule_GetPointer(obj, kDlTensorCapsuleName));
+                    if (dlmt) {
+                        dlmt->deleter(dlmt);
+                    }
+                    else {
+                        // The tensor has been deleted. Clear any error from
+                        // PyCapsule_GetPointer.
+                        PyErr_Clear();
+                    }
+                });
+            },
+            "stream"_a = 0)
+        .def("__dlpack_device__", [](const Tensor& self) {
+            auto device = getDLDevice(self);
+            return std::tuple<int, int>(int(device.device_type), device.device_id);
+        });
 
-            The source tensor must expose:
-              - data_ptr() -> int
-              - numel() -> int
-              - element_size() -> int
-
-            and must have the same total byte size as the destination Tensor.
-            )pbdoc");
-
-    // DLpack bridge for pre-existing Tensor bindings (and for the
-    // Tensor class defined above).
+    // DLpack bridge helper for creating a TurboMind Tensor from a
+    // DLPack-capable object (e.g. a torch tensor).
     m.def(
         "from_dlpack",
         [](py::object obj) {
