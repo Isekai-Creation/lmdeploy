@@ -341,26 +341,20 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     bool   w3_ok = load_with_variants(w3, "layers.0.feed_forward.w3.weight");
     if (w1_ok && w3_ok) {
         const size_t elem_count = static_cast<size_t>(w1.size());
-        if (dtype == kBfloat16) {
-            const size_t w_bytes = elem_count * sizeof(bfloat16_t);
-            check_cuda_error(cudaMemcpy(
-                weights_.mlp_gate_up.data<bfloat16_t>(), w1.data<bfloat16_t>(), w_bytes, cudaMemcpyDeviceToDevice));
-            check_cuda_error(cudaMemcpy(
-                static_cast<char*>(weights_.mlp_gate_up.data<bfloat16_t>()) + w_bytes,
-                w3.data<bfloat16_t>(),
-                w_bytes,
-                cudaMemcpyDeviceToDevice));
-        }
-        else {
-            const size_t w_bytes = elem_count * sizeof(half);
-            check_cuda_error(cudaMemcpy(
-                weights_.mlp_gate_up.data<half>(), w1.data<half>(), w_bytes, cudaMemcpyDeviceToDevice));
-            check_cuda_error(cudaMemcpy(
-                reinterpret_cast<char*>(weights_.mlp_gate_up.data<half>()) + w_bytes,
-                w3.data<half>(),
-                w_bytes,
-                cudaMemcpyDeviceToDevice));
-        }
+        const size_t elem_bytes = static_cast<size_t>(byte_size(dtype, 1));
+        const size_t w_bytes    = elem_count * elem_bytes;
+        void*        dst_base   = weights_.mlp_gate_up.raw_data();
+        void*        src_w1     = w1.raw_data();
+        void*        src_w3     = w3.raw_data();
+
+        // Copy w1 into the first half of mlp_gate_up, and w3 into the second
+        // half, treating the buffers as contiguous ranges of `dtype` elements.
+        check_cuda_error(
+            cudaMemcpy(dst_base, src_w1, w_bytes, cudaMemcpyDeviceToDevice));
+        check_cuda_error(cudaMemcpy(static_cast<char*>(dst_base) + w_bytes,
+                                    src_w3,
+                                    w_bytes,
+                                    cudaMemcpyDeviceToDevice));
     }
     else {
         TM_LOG_WARNING(
