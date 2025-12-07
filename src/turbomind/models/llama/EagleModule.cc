@@ -175,22 +175,55 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     const std::string base = model_dir + "/";
 
+    // Helper that tries both canonical and TP‑split names (e.g.
+    // `tok_embeddings.weight` and `tok_embeddings.0.weight`) when
+    // loading weights from a TurboMind export directory.
+    auto load_with_variants = [&](Tensor& tensor, const std::string& canonical) -> bool {
+        const std::string primary = base + canonical;
+        if (loadTensorFromFile<half>(tensor, primary)) {
+            return true;
+        }
+
+        // Fallback: TP‑split layout (".0" before the last extension).
+        auto pos = canonical.rfind('.');
+        if (pos != std::string::npos) {
+            std::string split_name = canonical.substr(0, pos) + ".0" + canonical.substr(pos);
+            const std::string alt  = base + split_name;
+            if (loadTensorFromFile<half>(tensor, alt)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
     // Model-level weights
-    success &= loadTensorFromFile<half>(weights_.embed_tokens, base + "tok_embeddings.weight");
-    success &= loadTensorFromFile<half>(weights_.fc, base + "fc.weight");
+    // Note: embed_tokens and fc are optional for the current EagleModule
+    // forward path (which uses target hidden states + draft LM head).
+    // When missing, we log a warning but keep the module enabled.
+    if (!load_with_variants(weights_.embed_tokens, "tok_embeddings.weight")) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] tok_embeddings.weight missing; draft module will skip token embeddings");
+    }
+
+    bool fc_ok = load_with_variants(weights_.fc, "fc.weight");
+    if (!fc_ok) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] fc.weight missing; shallow EagleNet block will fall back to RMSNorm+LM head");
+    }
 
     // Layer 0 norms and attention
-    success &= loadTensorFromFile<half>(weights_.input_norm, base + "layers.0.attention_norm.weight");
-    success &= loadTensorFromFile<half>(weights_.hidden_norm, base + "layers.0.hidden_norm.weight");
-    success &= loadTensorFromFile<half>(weights_.attn_qkv, base + "layers.0.attention.w_qkv.weight");
-    success &= loadTensorFromFile<half>(weights_.attn_o, base + "layers.0.attention.wo.weight");
-    success &= loadTensorFromFile<half>(weights_.attn_norm, base + "layers.0.ffn_norm.weight");
+    success &= load_with_variants(weights_.input_norm, "layers.0.attention_norm.weight");
+    success &= load_with_variants(weights_.hidden_norm, "layers.0.hidden_norm.weight");
+    success &= load_with_variants(weights_.attn_qkv, "layers.0.attention.w_qkv.weight");
+    success &= load_with_variants(weights_.attn_o, "layers.0.attention.wo.weight");
+    success &= load_with_variants(weights_.attn_norm, "layers.0.ffn_norm.weight");
 
     // MLP gate/up: merge w1 and w3 into mlp_gate_up.
     Tensor w1{{intermediate_size, hidden_units}, dtype, kDEVICE};
     Tensor w3{{intermediate_size, hidden_units}, dtype, kDEVICE};
-    bool   w1_ok = loadTensorFromFile<half>(w1, base + "layers.0.feed_forward.w1.weight");
-    bool   w3_ok = loadTensorFromFile<half>(w3, base + "layers.0.feed_forward.w3.weight");
+    bool   w1_ok = load_with_variants(w1, "layers.0.feed_forward.w1.weight");
+    bool   w3_ok = load_with_variants(w3, "layers.0.feed_forward.w3.weight");
     if (w1_ok && w3_ok) {
         const size_t w_size = static_cast<size_t>(w1.size()) * sizeof(half);
         check_cuda_error(cudaMemcpy(
@@ -205,9 +238,9 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         success = false;
     }
 
-    success &= loadTensorFromFile<half>(weights_.mlp_down, base + "layers.0.feed_forward.w2.weight");
-    success &= loadTensorFromFile<half>(weights_.output_norm, base + "norm.weight");
-    success &= loadTensorFromFile<half>(weights_.lm_head, base + "output.weight");
+    success &= load_with_variants(weights_.mlp_down, "layers.0.feed_forward.w2.weight");
+    success &= load_with_variants(weights_.output_norm, "norm.weight");
+    success &= load_with_variants(weights_.lm_head, "output.weight");
 
     // Prepare LM head wrapper for LlamaLinear.
     if (weights_.lm_head) {
@@ -224,7 +257,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     // Prepare shallow EagleNet attention + FC block wrappers for LlamaLinear.
     if (!draft_block_prepared_) {
-        if (weights_.attn_qkv && weights_.attn_o && weights_.fc) {
+        if (weights_.attn_qkv && weights_.attn_o && weights_.fc && fc_ok) {
             // QKV: [hidden, 3 * hidden]
             attn_qkv_weight_.emplace(
                 hidden_units_, hidden_units_ * 3, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);

@@ -543,36 +543,39 @@ class AsyncEngine(LogitsMixin):
                                 base_dir, f"turbomind_eagle_draft_{safe_name}"
                             )
 
-                            if not os.path.exists(os.path.join(out_dir, "config.yaml")):
-                                os.makedirs(out_dir, exist_ok=True)
-                                # For EAGLE draft conversion we run a
-                                # single‑GPU TurboMind export. Make sure
-                                # all tp-related fields are concrete so
-                                # the converter does not see None when
-                                # padding intermediate sizes, etc.
-                                draft_engine_cfg = _TMEngineCfg(tp=1)
-                                if draft_engine_cfg.attn_tp_size is None:
-                                    draft_engine_cfg.attn_tp_size = draft_engine_cfg.tp
-                                if draft_engine_cfg.mlp_tp_size is None:
-                                    draft_engine_cfg.mlp_tp_size = draft_engine_cfg.tp
-                                if draft_engine_cfg.attn_cp_size is None:
-                                    draft_engine_cfg.attn_cp_size = draft_engine_cfg.cp or 1
-                                tm_model = get_tm_model(
-                                    model_path=draft_path,
-                                    model_name=None,
-                                    chat_template_name=None,
-                                    engine_config=draft_engine_cfg,
-                                    # Use 0 as a sentinel so that
-                                    # quantized models can derive a
-                                    # valid group_size from their
-                                    # quantization_config and
-                                    # non-quantized models fall back
-                                    # to a safe default inside the
-                                    # converter.
-                                    group_size=0,
-                                    out_dir=out_dir,
-                                )
-                                tm_model.export()
+                            # Always (re)convert the HF EAGLE draft into a
+                            # TurboMind-style export. Earlier partial
+                            # conversions (e.g. from failed runs) may leave
+                            # behind a config.yaml without the required
+                            # weight files, so we rebuild on each pipeline
+                            # construction to guarantee a complete draft
+                            # directory for EagleModule::load.
+                            os.makedirs(out_dir, exist_ok=True)
+                            # For EAGLE draft conversion we run a single‑GPU
+                            # TurboMind export. Make sure all tp-related
+                            # fields are concrete so the converter does not
+                            # see None when padding intermediate sizes, etc.
+                            draft_engine_cfg = _TMEngineCfg(tp=1)
+                            if draft_engine_cfg.attn_tp_size is None:
+                                draft_engine_cfg.attn_tp_size = draft_engine_cfg.tp
+                            if draft_engine_cfg.mlp_tp_size is None:
+                                draft_engine_cfg.mlp_tp_size = draft_engine_cfg.tp
+                            if draft_engine_cfg.attn_cp_size is None:
+                                draft_engine_cfg.attn_cp_size = draft_engine_cfg.cp or 1
+                            tm_model = get_tm_model(
+                                model_path=draft_path,
+                                model_name=None,
+                                chat_template_name=None,
+                                engine_config=draft_engine_cfg,
+                                # Use 0 as a sentinel so that quantized models
+                                # can derive a valid group_size from their
+                                # quantization_config and non-quantized
+                                # models fall back to a safe default inside
+                                # the converter.
+                                group_size=0,
+                                out_dir=out_dir,
+                            )
+                            tm_model.export()
 
                             spec_cfg.model = out_dir
                             backend_config.speculative_config = spec_cfg
