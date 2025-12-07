@@ -853,7 +853,54 @@ PYBIND11_MODULE(_turbomind, m)
         "batch_size"_a = 2,
         "iters"_a = 50);
 
-    // DLpack bridge for pre-existing Tensor bindings.
+    // Expose core::Tensor so it can be used as the value type in
+    // TensorMap and be stored in Python containers (tm_params).  We
+    // only need a minimal API here; the main requirement is that the
+    // type is registered with pybind11 so that returning
+    // std::map<std::string, Tensor> (or TensorMap) works without
+    // "Unregistered type : turbomind::core::Tensor" errors.
+    py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
+        .def(
+            "copy_from",
+            [](Tensor& self, py::object src) {
+                // Copy raw bytes from a torch-like tensor into this
+                // TurboMind Tensor. We intentionally avoid assuming
+                // any particular frontend type; anything exposing
+                // .data_ptr(), .numel() and .element_size() is
+                // accepted.
+                auto ptr_obj     = src.attr("data_ptr")();
+                auto ptr_val     = ptr_obj.cast<uintptr_t>();
+                void* src_ptr    = reinterpret_cast<void*>(ptr_val);
+                auto numel       = src.attr("numel")().cast<int64_t>();
+                auto element_sz  = src.attr("element_size")().cast<int64_t>();
+                size_t src_bytes = static_cast<size_t>(numel) * static_cast<size_t>(element_sz);
+                size_t dst_bytes = static_cast<size_t>(self.byte_size());
+
+                if (src_bytes != dst_bytes) {
+                    std::ostringstream oss;
+                    oss << "Tensor.copy_from: size mismatch, src_bytes=" << src_bytes
+                        << " dst_bytes=" << dst_bytes;
+                    throw std::runtime_error(oss.str());
+                }
+
+                // Use the CUDA-aware helper so CPU/GPU and peer copies
+                // are handled robustly.
+                safe_memcpy(self.raw_data(), src_ptr, src_bytes);
+            },
+            "src"_a,
+            R"pbdoc(
+            Copy data from a torch-like tensor into this TurboMind Tensor.
+
+            The source tensor must expose:
+              - data_ptr() -> int
+              - numel() -> int
+              - element_size() -> int
+
+            and must have the same total byte size as the destination Tensor.
+            )pbdoc");
+
+    // DLpack bridge for pre-existing Tensor bindings (and for the
+    // Tensor class defined above).
     m.def(
         "from_dlpack",
         [](py::object obj) {
