@@ -183,16 +183,10 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     hidden_units_ = hidden_units;
     vocab_size_   = vocab_size;
 
-    // Decide draft weight dtype. The converter records the on-disk
-    // precision in `eagle_weight_dtype` so we can allocate tensors
-    // with the matching type:
+    // Decide draft weight dtype from config.yaml. The converter records
+    // the on-disk precision in `eagle_weight_dtype`:
     //   - "bf16"  -> kBfloat16
     //   - "fp16"  -> kFloat16 (default)
-    //
-    // Both paths are supported as long as the calling TurboMind
-    // engine was compiled with BF16 enabled. Runtime RMSNorm checks
-    // in forward() will disable EAGLE gracefully if activations and
-    // norm weights use different dtypes.
     DataType   dtype      = kFloat16;
     const auto dtype_node = model_config["eagle_weight_dtype"];
     if (dtype_node && dtype_node.IsScalar()) {

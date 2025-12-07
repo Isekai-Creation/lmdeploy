@@ -365,7 +365,8 @@ def _convert_eagle3_midlayer(
     def get(name: str, *, optional: bool = False) -> Optional[torch.Tensor]:
         return _load_tensor_from_shards(shards, name, optional=optional)
 
-    # Use BF16 for Eagle3 midlayer drafts (matches HF checkpoint).
+    # Use BF16 for Eagle3 midlayer drafts to match the HF checkpoint.
+    # EagleModule::load will read these back as BF16 tensors.
     w_dtype = torch.bfloat16
 
     # Output norm from draft.
@@ -589,6 +590,8 @@ def prepare_eagle_draft_from_hf(
     # Decide draft weight dtype and record it in config.yaml so
     # EagleModule::load can allocate tensors with the correct dtype.
     if layout == "eagle3_midlayer":
+        # Keep Eagle3 drafts in BF16 to match the HF checkpoint and
+        # maximise accuracy; EagleModule will treat these as BF16.
         eagle_dtype = "bf16"
     else:
         eagle_dtype = "fp16"
