@@ -69,9 +69,16 @@ from transformers import AutoConfig
 
 
 def _write_tensor(t: torch.Tensor, path: str, dtype: torch.dtype) -> None:
-    """Write a tensor as raw binary with the given dtype."""
+    """Write a tensor as raw 16-bit binary with the given dtype.
+
+    Note: NumPy does not have native BF16 support, so we always
+    reinterpret the storage as int16 on the PyTorch side and dump
+    the raw 16-bit values. EagleModule::load reads these back as
+    either half or bfloat16 based on config.yaml.
+    """
     t = t.to(dtype)
-    arr = t.contiguous().cpu().numpy()
+    # Reinterpret as int16 to keep raw 16-bit payload.
+    arr = t.contiguous().view(torch.int16).cpu().numpy()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     arr.tofile(path)
 
