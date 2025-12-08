@@ -134,15 +134,38 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
         check_cuda_error(cudaStreamSynchronize(stream_));
     }
 
-    if (output_ids.ndim() < 2) {
+    int max_seq_len = 0;
+    if (output_ids.ndim() >= 2) {
+        // Normal case: output_ids is [max_seq_len, batch_size, ...]
+        max_seq_len = output_ids.shape(0);
+    }
+    else {
+        // Fallback: output_ids is a flat buffer. Infer [max_seq_len, batch_size]
+        // from the total size and batch_size, matching the indexing pattern
+        //   idx = pos * batch_size + i
+        const int total_elems = static_cast<int>(output_ids.size());
+        if (batch_size <= 0 || total_elems <= 0 || (total_elems % batch_size) != 0) {
+            TM_LOG_WARNING(
+                "%s: output_ids tensor has ndim=%d and size=%d; cannot infer "
+                "[max_seq_len, batch_size] layout; skipping tail tokens",
+                __PRETTY_FUNCTION__,
+                output_ids.ndim(),
+                total_elems);
+            TM_LOG_DEBUG("%s stop (invalid flat output_ids)", __PRETTY_FUNCTION__);
+            return;
+        }
+        max_seq_len = total_elems / batch_size;
         TM_LOG_WARNING(
-            "%s: output_ids tensor has invalid ndim=%d; skipping tail tokens", __PRETTY_FUNCTION__, output_ids.ndim());
-        TM_LOG_DEBUG("%s stop (invalid output_ids)", __PRETTY_FUNCTION__);
-        return;
+            "%s: output_ids tensor has ndim=%d; inferring max_seq_len=%d from "
+            "flat buffer of size=%d and batch_size=%d",
+            __PRETTY_FUNCTION__,
+            output_ids.ndim(),
+            max_seq_len,
+            total_elems,
+            batch_size);
     }
 
-    const int max_seq_len = output_ids.shape(0);
-    const int step        = *args.at("step").data<int>();
+    const int step = *args.at("step").data<int>();
 
     const int* forced_tokens  = forced_ctx->forced_tokens;
     const int* forced_lengths = forced_ctx->forced_lengths;

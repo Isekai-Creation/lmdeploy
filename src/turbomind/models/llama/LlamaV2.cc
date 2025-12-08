@@ -3134,14 +3134,12 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
     // Allocate a 2-D tail buffer for DynamicDecodeLayer::ForwardMultiStep.
     // Layout: [max_tail_len, batch_size]
-    Tensor forced_output_ids{{max_tail_len, batch_size}, kInt32, kDEVICE};
 
     ForcedTailContext forced{};
     forced.max_tail_len      = max_tail_len;
     forced.forced_tokens     = forced_tokens.data();
     forced.forced_lengths    = forced_lengths.data();
     forced.committed_lengths = committed_lengths.data();
-    forced.output_ids        = forced_output_ids;  // 2-D tail buffer
 
     dynamicDecodeMultiStep(token_ids,
                            finished,
