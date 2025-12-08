@@ -223,6 +223,11 @@ private:
     // the full-KV path until the partial-KV decode path is wired.
     void initSpecPVFromFullKV(int verified_seq_len);
 
+    // Update SpecPV bookkeeping after a decode step using the committed
+    // sequence lengths. This is called from the fused EAGLE path once
+    // DynamicDecodeLayer has applied any accepted tail tokens.
+    void updateSpecPVAfterAcceptance(const Buffer& sequence_length, int batch_size);
+
     // Max engine tokens TurboMind should handle per decode step
     // when running in EAGLE speculative mode.
     int eagleMaxEngineTokensPerStep() const noexcept

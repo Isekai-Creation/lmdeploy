@@ -339,6 +339,9 @@ into TurboMind for long‑context EAGLE3 runs.
         of a full‑prefix scratch KV.
   - Keep tree masks (`spec_packed_mask`) and post‑decode logic
     (logits → target_tokens → acceptance) unchanged.
+  - Implementation status:
+    - `runEagleTargetTreeDecode` still uses the full‑KV scratch path for all modes; SpecPV currently only tracks verified lengths and step
+      counters and does not yet alter the KV layout or attention cost.
 
 - [ ] **[B] Seed SpecPV from a full‑KV tree step**
   - After the first full‑KV target‑tree decode at long context:
@@ -348,6 +351,11 @@ into TurboMind for long‑context EAGLE3 runs.
         prefix length.
       - Mark `retrieval_initialized = false` so the next call to
         `refresh_retrieval` can populate retrieval blocks.
+  - Implementation status:
+    - `LlamaV2::initSpecPVFromFullKV` and `updateSpecPVAfterAcceptance` now keep `PartialKVCache`’s verified lengths in sync with committed
+      sequence lengths after DynamicDecode+EAGLE acceptance, and `specpv_partial_steps_` / buffer capacity drive a simple full‑refresh reset.
+    - Actual KV copying and retrieval/window population from full KV into `PartialKVCache` remain TODO; current behaviour is bookkeeping‑only
+      and leaves the tree decode path identical to the full‑KV implementation.
 
 ### 5.4 Partial/full switching and refresh
 

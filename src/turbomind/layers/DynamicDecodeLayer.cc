@@ -153,14 +153,24 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
     std::vector<int>  h_seq_len(batch_size);
     std::vector<bool> h_finished(batch_size);
 
-    check_cuda_error(cudaMemcpyAsync(
-        h_seq_len.data(), sequence_length.data<int>(), batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream_));
-    {
-        cudaError_t err = cudaMemcpyAsync(
-            h_finished.data(), finished.buffer().raw_data(), batch_size * sizeof(bool), cudaMemcpyDeviceToHost, stream_);
-        check_cuda_error(err);
-    }
-    check_cuda_error(cudaStreamSynchronize(stream_));
+    cudaError_t err = cudaMemcpyAsync(
+        h_seq_len.data(),
+        sequence_length.data<int>(),
+        batch_size * sizeof(int),
+        cudaMemcpyDeviceToHost,
+        stream_);
+    check_cuda_error(err);
+
+    err = cudaMemcpyAsync(
+        h_finished.data(),
+        finished.buffer().raw_data(),
+        batch_size * sizeof(bool),
+        cudaMemcpyDeviceToHost,
+        stream_);
+    check_cuda_error(err);
+
+    err = cudaStreamSynchronize(stream_);
+    check_cuda_error(err);
 
     int* d_output_ids = output_ids.data<int>();
 

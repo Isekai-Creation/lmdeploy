@@ -666,32 +666,6 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         h_k_len[i] = seq_len_i;
     }
 
-    // For SpecPV, decide whether this step should be treated as a
-    // candidate for partial verification based on the maximum history
-    // length across active slots. The current implementation only tracks
-    // logical verified lengths and a simple partial-step counter; it does
-    // not yet alter the KV layout used by UnifiedDecoder, so behaviour
-    // remains identical to the full-KV target-tree path when SpecPV is
-    // enabled.
-    if (isSpecPVEnabled() && max_history_len > 0 && shouldUseSpecPV(max_history_len)) {
-        initSpecPVFromFullKV(max_history_len);
-
-        if (engine_param_.specpv_full_refresh_steps > 0) {
-            ++specpv_partial_steps_;
-            if (specpv_partial_steps_ > engine_param_.specpv_full_refresh_steps) {
-                TM_LOG_INFO(
-                    "[LlamaV2][SpecPV] partial-step budget exceeded for this engine "
-                    "(steps=%d, refresh_steps=%d); resetting partial KV lengths.",
-                    specpv_partial_steps_,
-                    engine_param_.specpv_full_refresh_steps);
-                if (specpv_kv_cache_) {
-                    specpv_kv_cache_->reset();
-                }
-                specpv_partial_steps_ = 0;
-            }
-        }
-    }
-
     // Build a per-slot block table that reuses existing prefix KV blocks as
     // read-only (via SequenceManager) and allocates a scratch region for
     // any additional blocks needed to store tree tokens. The logical block
@@ -1234,6 +1208,73 @@ void LlamaV2::initSpecPVFromFullKV(int verified_seq_len)
     }
 
     TM_LOG_INFO("[LlamaV2][SpecPV] initialized partial KV verified_len=%d", clamped_len);
+}
+
+void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length, int batch_size)
+{
+    if (!isSpecPVEnabled() || !specpv_kv_cache_ || batch_size <= 0) {
+        return;
+    }
+
+    if (sequence_length.device() != kDEVICE || sequence_length.dtype() != kInt32) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] sequence_length buffer has unexpected device/dtype; "
+            "disabling SpecPV for this engine.");
+        specpv_supported_ = false;
+        specpv_kv_cache_.reset();
+        return;
+    }
+
+    std::vector<int> h_seq_len(batch_size, 0);
+
+    const int* d_seq_len = sequence_length.data<int>();
+    if (!d_seq_len) {
+        return;
+    }
+
+    check_cuda_error(cudaMemcpyAsync(
+        h_seq_len.data(), d_seq_len, static_cast<size_t>(batch_size) * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    int max_len = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        if (h_seq_len[i] > max_len) {
+            max_len = h_seq_len[i];
+        }
+    }
+
+    if (max_len <= 0 || !shouldUseSpecPV(max_len)) {
+        return;
+    }
+
+    // Seed or refresh the partial KV length view from the fully
+    // committed prefix. The current implementation uses only length
+    // bookkeeping; KV contents remain managed by the full-KV path.
+    initSpecPVFromFullKV(max_len);
+
+    if (engine_param_.specpv_full_refresh_steps > 0) {
+        ++specpv_partial_steps_;
+
+        const int buffer_tokens = specpv_cache_config_.buffer_size();
+        const int current_len   = specpv_kv_cache_->global_verified_len();
+        const int step_budget   = std::max(1, eagleMaxEngineTokensPerStep());
+        const bool buffer_close_to_full =
+            buffer_tokens > 0 && (current_len + step_budget > buffer_tokens);
+
+        if (specpv_partial_steps_ > engine_param_.specpv_full_refresh_steps || buffer_close_to_full) {
+            TM_LOG_INFO(
+                "[LlamaV2][SpecPV] full-refresh trigger: partial_steps=%d, refresh_steps=%d, "
+                "buffer_tokens=%d, current_len=%d, step_budget=%d",
+                specpv_partial_steps_,
+                engine_param_.specpv_full_refresh_steps,
+                buffer_tokens,
+                current_len,
+                step_budget);
+
+            specpv_kv_cache_->reset();
+            specpv_partial_steps_ = 0;
+        }
+    }
 }
 
 Tensor LlamaV2::postDecodeEmbedding(const Tensor& features, Buffer local_logits)
@@ -2605,6 +2646,11 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     }
 
     eagle_step_max_extra_ = max_extra_committed;
+
+    // Update SpecPV bookkeeping based on the final committed sequence
+    // lengths for this step. This keeps partial-KV length tracking in
+    // sync with DynamicDecodeLayer and EAGLE acceptance.
+    updateSpecPVAfterAcceptance(sequence_length, batch_size);
 }
 
 void LlamaV2::getEagleAcceptanceForStep(std::vector<int>& accepted_lens,
