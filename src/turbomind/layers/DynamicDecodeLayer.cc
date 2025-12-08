@@ -150,8 +150,9 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
     int*       committed      = forced_ctx->committed_lengths;
 
     // Host copies of sequence lengths and finished flags for per-slot updates.
-    std::vector<int>  h_seq_len(batch_size);
-    std::vector<bool> h_finished(batch_size);
+    std::vector<int>     h_seq_len(batch_size);
+    std::vector<uint8_t> h_finished_bytes(batch_size);
+    std::vector<bool>    h_finished(batch_size);
 
     cudaError_t err = cudaMemcpyAsync(
         h_seq_len.data(),
@@ -162,7 +163,7 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
     check_cuda_error(err);
 
     err = cudaMemcpyAsync(
-        h_finished.data(),
+        h_finished_bytes.data(),
         finished.buffer().raw_data(),
         batch_size * sizeof(bool),
         cudaMemcpyDeviceToHost,
@@ -171,6 +172,11 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
 
     err = cudaStreamSynchronize(stream_);
     check_cuda_error(err);
+
+    // Decode host finished bytes into bool flags.
+    for (int i = 0; i < batch_size; ++i) {
+        h_finished[i] = h_finished_bytes[i] != 0;
+    }
 
     int* d_output_ids = output_ids.data<int>();
 
@@ -336,15 +342,18 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
 
     // Propagate updated finished flags (including EOS-triggered tails) back
     // to device so subsequent decode steps see the correct termination state.
-    {
-        std::vector<uint8_t> h_finished_bytes(batch_size);
-        for (int i = 0; i < batch_size; ++i) {
-            h_finished_bytes[i] = static_cast<uint8_t>(h_finished[i] ? 1 : 0);
-        }
-        check_cuda_error(cudaMemcpyAsync(
-            finished.buffer().raw_data(), h_finished_bytes.data(), batch_size * sizeof(bool), cudaMemcpyHostToDevice, stream_));
-        check_cuda_error(cudaStreamSynchronize(stream_));
+    for (int i = 0; i < batch_size; ++i) {
+        h_finished_bytes[i] = static_cast<uint8_t>(h_finished[i] ? 1 : 0);
     }
+    err = cudaMemcpyAsync(
+        finished.buffer().raw_data(),
+        h_finished_bytes.data(),
+        batch_size * sizeof(bool),
+        cudaMemcpyHostToDevice,
+        stream_);
+    check_cuda_error(err);
+    err = cudaStreamSynchronize(stream_);
+    check_cuda_error(err);
 
     TM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
