@@ -12,6 +12,8 @@
 
 #include <limits>
 
+#include "lmdeploy/turbomind/kernels/speculative_decoding/specpv_kv_kernels.h"
+
 namespace turbomind {
 
 PartialKVCache::PartialKVCache(const SpecPVCacheConfig& cfg,
@@ -235,8 +237,32 @@ void PartialKVCache::summary_key_states(int layer_idx, const Tensor& key_states,
     const int max_B = std::min(B, max_batch_size_);
     const int max_H = std::min(H, num_kv_heads_);
 
-    // Copy the full [B,H,L,D] keys to host once; summaries are small compared
-    // to the main KV so this is acceptable for a first implementation.
+    // Attempt a device-side summary when key_states already live on
+    // device; fall back to the host path otherwise.
+    if (key_states.device() == kDEVICE) {
+        using kernels::specpv::invokeSummaryKeyStates;
+
+        float* smax   = key_summary_max_[layer_idx].data<float>();
+        float* smin   = key_summary_min_[layer_idx].data<float>();
+        const int sink_tokens = cfg_.sink_size();
+
+        invokeSummaryKeyStates(key_states.data<float>(),
+                               max_B,
+                               max_H,
+                               L,
+                               D,
+                               sink_tokens,
+                               cfg_.block_size,
+                               existing_blocks,
+                               max_summary_blocks_,
+                               smax,
+                               smin,
+                               key_states.stream());
+        summary_block_count_[layer_idx] = expected_blocks;
+        return;
+    }
+
+    // Host fallback path: copy keys to CPU and compute summaries there.
     Tensor host_keys{{B, H, L, D}, kv_dtype_, kCPU};
     core::Copy(key_states, host_keys);
 
@@ -328,6 +354,53 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
         return;
     }
 
+    const int retrieval_tokens = cfg_.retrieval_size();
+    const int window_tokens    = std::min(cfg_.window_size(), L);
+
+    Tensor retrieval_k_t = retrieval(layer_idx);
+    Tensor retrieval_v_t = retrieval_v(layer_idx);
+    Tensor window_k_t    = window(layer_idx);
+    Tensor window_v_t    = window_v(layer_idx);
+
+    if (!retrieval_k_t || !retrieval_v_t || !window_k_t || !window_v_t) {
+        return;
+    }
+
+    // Prefer a device-side implementation when inputs and summaries are
+    // already on device; fall back to the existing host path otherwise.
+    if (query_states.device() == kDEVICE && key_states.device() == kDEVICE
+        && value_states.device() == kDEVICE && key_summary_max_[layer_idx].device() == kCPU
+        && key_summary_min_[layer_idx].device() == kCPU) {
+        using kernels::specpv::invokeRefreshRetrieval;
+
+        // Copy summaries to temporary device buffers for scoring.
+        Tensor smax_dev{{B, num_kv_heads_, blocks, D}, kv_dtype_, kDEVICE};
+        Tensor smin_dev{{B, num_kv_heads_, blocks, D}, kv_dtype_, kDEVICE};
+        core::Copy(key_summary_max_[layer_idx], smax_dev);
+        core::Copy(key_summary_min_[layer_idx], smin_dev);
+
+        invokeRefreshRetrieval(query_states.data<float>(),
+                               key_states.data<float>(),
+                               value_states.data<float>(),
+                               smax_dev.data<float>(),
+                               smin_dev.data<float>(),
+                               max_B,
+                               max_H,
+                               Q,
+                               L,
+                               D,
+                               blocks,
+                               R_blocks,
+                               cfg_.block_size,
+                               window_tokens,
+                               retrieval_k_t.data<float>(),
+                               retrieval_v_t.data<float>(),
+                               window_k_t.data<float>(),
+                               window_v_t.data<float>(),
+                               query_states.stream());
+        return;
+    }
+
     // Host copies for queries and full K/V.
     Tensor host_q{{B, H, Q, D}, kv_dtype_, kCPU};
     Tensor host_k{{B, H, L, D}, kv_dtype_, kCPU};
@@ -348,18 +421,6 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
     // Per-[B,H] scores over blocks.
     std::vector<float> scores(static_cast<size_t>(blocks));
     std::vector<int>   top_indices(static_cast<size_t>(blocks));
-
-    const int retrieval_tokens = cfg_.retrieval_size();
-    const int window_tokens    = std::min(cfg_.window_size(), L);
-
-    Tensor retrieval_k_t = retrieval(layer_idx);
-    Tensor retrieval_v_t = retrieval_v(layer_idx);
-    Tensor window_k_t    = window(layer_idx);
-    Tensor window_v_t    = window_v(layer_idx);
-
-    if (!retrieval_k_t || !retrieval_v_t || !window_k_t || !window_v_t) {
-        return;
-    }
 
     Tensor host_retrieval_k{retrieval_k_t.layout(), retrieval_k_t.dtype(), kCPU};
     Tensor host_retrieval_v{retrieval_v_t.layout(), retrieval_v_t.dtype(), kCPU};

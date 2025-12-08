@@ -112,6 +112,9 @@ public:
     /// Return the hidden size of the draft model loaded from config.yaml.
     int getHiddenUnits() const { return hidden_units_; }
 
+    /// Return the Eagle3 FC input dimension when available (0 otherwise).
+    int getEagleFcInDim() const { return eagle_fc_in_dim_; }
+
     /// Return the vocab size of the draft model loaded from config.yaml.
     int getVocabSize() const { return vocab_size_; }
 

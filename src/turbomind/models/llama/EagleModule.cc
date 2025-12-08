@@ -207,13 +207,39 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     const bool eagle3 = eagle_mode_ == EagleMode::kEagle3;
 
+    if (eagle3) {
+        // For Eagle3 we require full geometry to be present and
+        // consistent with the config; otherwise the draft head is
+        // considered unusable for this engine.
+        if (eagle_q_size_ <= 0 || eagle_kv_size_ <= 0 || eagle_qkv_in_dim_ <= 0 || eagle_fc_in_dim_ <= 0) {
+            logEagleError(
+                "Eagle3 config.yaml is missing required geometry "
+                "(eagle_q_size/eagle_kv_size/eagle_qkv_in_dim/eagle_fc_in_dim)");
+            return;
+        }
+        if (eagle_qkv_in_factor_ > 0 && eagle_qkv_in_dim_ != eagle_qkv_in_factor_ * hidden_units_) {
+            TM_LOG_WARNING(
+                "[EAGLE][EagleModule::load] Eagle3 qkv_in_dim (%d) != factor (%d) * hidden_units (%d); "
+                "continuing but behaviour may not match the source draft.",
+                eagle_qkv_in_dim_,
+                eagle_qkv_in_factor_,
+                hidden_units_);
+        }
+        if (eagle_fc_in_factor_ > 0 && eagle_fc_in_dim_ != eagle_fc_in_factor_ * hidden_units_) {
+            TM_LOG_WARNING(
+                "[EAGLE][EAGLE3][EagleModule::load] fc_in_dim (%d) != factor (%d) * hidden_units (%d);",
+                eagle_fc_in_dim_,
+                eagle_fc_in_factor_,
+                hidden_units_);
+        }
+    }
+
     weights_.embed_tokens = Tensor{{vocab_size, hidden_units}, dtype, kDEVICE};
 
     weights_.fc = Tensor{{hidden_units * 2, hidden_units}, dtype, kDEVICE};
 
-    // Optional Eagle3-specific FC weight that consumes the full
-    // concatenated multi-layer hidden (e.g. 3 * hidden) before
-    // attention. When absent we fall back to the legacy EagleNet FC.
+    // Eagle3-specific FC weight that consumes the full concatenated
+    // multi-layer hidden (e.g. 3 * hidden) before attention.
     if (eagle3 && eagle_fc_in_dim_ > 0) {
         weights_.eagle_fc = Tensor{{eagle_fc_in_dim_, hidden_units}, dtype, kDEVICE};
     }
@@ -647,8 +673,10 @@ void EagleModule::forward(const Tensor& input_ids,
 
         // If we have a full Eagle3 FC and a captured multi-layer hidden
         // buffer whose width matches eagle_fc_in_dim_, run the pre-FC
-        // to obtain an additional set of features that will participate
-        // in the Eagle3 QKV input assembly.
+        // to obtain an additional set of features. For Eagle3, we then
+        // re-normalize these FC features to drive the attention input,
+        // so the shallow block sees the same representation as the
+        // intended Eagle3 head.
         if (eagle3 && eagle_fc_weight_ && weights_.eagle_fc && eagle_fc_in_dim_ > 0
             && captured_hidden_states && captured_hidden_states.shape(0) == batch_size
             && captured_hidden_states.shape(1) == eagle_fc_in_dim_
@@ -663,7 +691,25 @@ void EagleModule::forward(const Tensor& input_ids,
             }
             fc_out = eagle_fc_out_scratch_;
             linear.Forward(captured_hidden_states, eagle_fc_weight_, /*output=*/fc_out);
+
+            // Eagle3: use the FC output as the input to the draft
+            // attention block, normalized by the draft input norm.
+            invokeRMSNorm(attn_input, fc_out, weights_.input_norm, kEps, stream);
+
             can_use_eagle_fc = true;
+
+            if (isEagleDebugEnabled()) {
+                TM_LOG_DEBUG(
+                    "[EAGLE][EagleModule] Eagle3 FC+norm active: batch=%d in_dim=%d hidden=%d",
+                    batch_size,
+                    eagle_fc_in_dim_,
+                    hidden_dim);
+            }
+        }
+        else if (eagle3 && isEagleDebugEnabled()) {
+            TM_LOG_WARNING(
+                "[EAGLE][EagleModule] Eagle3 FC path disabled for this step "
+                "(capture missing or shape/dtype mismatch)");
         }
 
         // 2) Single-token self-attention (degenerates to a learned projection

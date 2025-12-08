@@ -463,33 +463,30 @@ def _convert_eagle3_midlayer(
     #     [3 * hidden, hidden] so EagleModule can consume the true
     #     Eagle3 geometry when multi-layer capture is enabled.
     fc_w = get("fc.weight", optional=True)
-    if fc_w is not None:
-        if fc_w.shape != (hidden_size, hidden_size * 3):
-            if log:
-                log.warning(
-                    "fc.weight shape %s != (%d, %d); "
-                    "skipping EagleNet/Eagle3 fc mapping.",
-                    tuple(fc_w.shape),
-                    hidden_size,
-                    hidden_size * 3,
-                )
-        else:
-            # Legacy EagleNet-style FC (last 2 * hidden features).
-            fc_slice = fc_w[:, hidden_size : 3 * hidden_size]  # [hidden, 2*hidden]
-            fc_eaglenet = fc_slice.transpose(0, 1)  # [2*hidden, hidden]
-            _write_tensor(
-                fc_eaglenet,
-                os.path.join(out_dir, "fc.weight"),
-                w_dtype,
-            )
+    if fc_w is None:
+        raise RuntimeError("Eagle3 draft checkpoint is missing fc.weight")
+    if fc_w.shape != (hidden_size, hidden_size * 3):
+        raise RuntimeError(
+            f"Eagle3 fc.weight shape {tuple(fc_w.shape)} != "
+            f"({hidden_size}, {hidden_size * 3}); cannot convert draft"
+        )
 
-            # Full Eagle3 FC over all 3 * hidden concatenated features.
-            fc_full = fc_w.to(w_dtype).transpose(0, 1)  # [3*hidden, hidden]
-            _write_tensor(
-                fc_full,
-                os.path.join(out_dir, "eagle_fc.weight"),
-                w_dtype,
-            )
+    # Legacy EagleNet-style FC (last 2 * hidden features).
+    fc_slice = fc_w[:, hidden_size : 3 * hidden_size]  # [hidden, 2*hidden]
+    fc_eaglenet = fc_slice.transpose(0, 1)  # [2*hidden, hidden]
+    _write_tensor(
+        fc_eaglenet,
+        os.path.join(out_dir, "fc.weight"),
+        w_dtype,
+    )
+
+    # Full Eagle3 FC over all 3 * hidden concatenated features.
+    fc_full = fc_w.to(w_dtype).transpose(0, 1)  # [3*hidden, hidden]
+    _write_tensor(
+        fc_full,
+        os.path.join(out_dir, "eagle_fc.weight"),
+        w_dtype,
+    )
 
     # Real Eagle3 attention weights (midlayer.self_attn.*). HF stores
     # them as [out, in]; EagleModule expects a fused [in, q+2*kv] QKV
@@ -501,52 +498,35 @@ def _convert_eagle3_midlayer(
     v_w = get("midlayer.self_attn.v_proj.weight", optional=True)
     o_w = get("midlayer.self_attn.o_proj.weight", optional=True)
 
-    if q_w is not None and k_w is not None and v_w is not None:
-        q_in = q_w.shape[1]
-        if k_w.shape[1] != q_in or v_w.shape[1] != q_in:
-            if log:
-                log.warning(
-                    "EAGLE3 q/k/v in_dims differ: q=%s k=%s v=%s; "
-                    "falling back to identity attention.",
-                    tuple(q_w.shape),
-                    tuple(k_w.shape),
-                    tuple(v_w.shape),
-                )
-            q_w = k_w = v_w = None
-        else:
-            q_t = q_w.to(w_dtype).transpose(0, 1)  # [in, q_size]
-            k_t = k_w.to(w_dtype).transpose(0, 1)  # [in, kv_size]
-            v_t = v_w.to(w_dtype).transpose(0, 1)  # [in, kv_size]
-            qkv_fused = torch.cat([q_t, k_t, v_t], dim=1)  # [in, q+2*kv]
-            _write_tensor(
-                qkv_fused,
-                os.path.join(out_dir, "layers.0.attention.w_qkv.weight"),
-                w_dtype,
-            )
-
-    if q_w is None or k_w is None or v_w is None:
-        eye = torch.eye(hidden_size, dtype=w_dtype)
-        qkv_eye = torch.cat([eye, eye, eye], dim=1)  # [hidden, 3*hidden]
-        _write_tensor(
-            qkv_eye,
-            os.path.join(out_dir, "layers.0.attention.w_qkv.weight"),
-            w_dtype,
+    if q_w is None or k_w is None or v_w is None or o_w is None:
+        raise RuntimeError(
+            "Eagle3 draft checkpoint is missing one of "
+            "midlayer.self_attn.{q_proj,k_proj,v_proj,o_proj}.weight"
         )
 
-    if o_w is not None:
-        o_t = o_w.to(w_dtype).transpose(0, 1)  # [q_size, hidden]
-        _write_tensor(
-            o_t,
-            os.path.join(out_dir, "layers.0.attention.wo.weight"),
-            w_dtype,
+    q_in = q_w.shape[1]
+    if k_w.shape[1] != q_in or v_w.shape[1] != q_in:
+        raise RuntimeError(
+            "Eagle3 q/k/v in_dims differ: "
+            f"q={tuple(q_w.shape)} k={tuple(k_w.shape)} v={tuple(v_w.shape)}"
         )
-    else:
-        eye = torch.eye(hidden_size, dtype=w_dtype)
-        _write_tensor(
-            eye,
-            os.path.join(out_dir, "layers.0.attention.wo.weight"),
-            w_dtype,
-        )
+
+    q_t = q_w.to(w_dtype).transpose(0, 1)  # [in, q_size]
+    k_t = k_w.to(w_dtype).transpose(0, 1)  # [in, kv_size]
+    v_t = v_w.to(w_dtype).transpose(0, 1)  # [in, kv_size]
+    qkv_fused = torch.cat([q_t, k_t, v_t], dim=1)  # [in, q+2*kv]
+    _write_tensor(
+        qkv_fused,
+        os.path.join(out_dir, "layers.0.attention.w_qkv.weight"),
+        w_dtype,
+    )
+
+    o_t = o_w.to(w_dtype).transpose(0, 1)  # [q_size, hidden]
+    _write_tensor(
+        o_t,
+        os.path.join(out_dir, "layers.0.attention.wo.weight"),
+        w_dtype,
+    )
 
 
 def prepare_eagle_draft_from_hf(
@@ -617,24 +597,19 @@ def prepare_eagle_draft_from_hf(
     }
 
     if layout == "eagle3_midlayer":
-        try:
-            geo = _infer_eagle3_geometry(shards, hidden_size, logger=log)
-            for k, v in geo.items():
-                if k == "eagle_mode":
-                    # sentinel, not expected from _infer_eagle3_geometry
-                    continue
-                model_cfg[k] = int(v)
-            if "eagle_q_size" in model_cfg or "eagle_fc_in_factor" in model_cfg:
-                # Tag as Eagle3 so EagleModule can branch.
-                model_cfg["eagle_mode"] = "eagle3"
-        except Exception as exc:  # pragma: no cover - very defensive
-            if log:
-                log.warning(
-                    "Failed to infer Eagle3 geometry from %s: %s; "
-                    "falling back to EagleNet defaults.",
-                    hf_model_dir,
-                    exc,
-                )
+        geo = _infer_eagle3_geometry(shards, hidden_size, logger=log)
+        for k, v in geo.items():
+            if k == "eagle_mode":
+                continue
+            model_cfg[k] = int(v)
+        required = ("eagle_q_size", "eagle_kv_size", "eagle_qkv_in_dim", "eagle_fc_in_dim")
+        if not all(k in model_cfg for k in required):
+            raise RuntimeError(
+                f"Failed to infer full Eagle3 geometry for {hf_model_dir!r}: "
+                f"missing one of {required}"
+            )
+        # Tag as Eagle3 so EagleModule can branch.
+        model_cfg["eagle_mode"] = "eagle3"
 
     tm_cfg = {"model_config": model_cfg}
     with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as f:

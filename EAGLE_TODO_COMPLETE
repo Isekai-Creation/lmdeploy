@@ -317,8 +317,9 @@ into TurboMind for long‑context EAGLE3 runs.
         top blocks and fills retrieval/window K/V slices from full KV; `update` writes new K/V into the buffer and returns active
         `[sink+retrieval+window+buffer]` views; `reset_buffer` clears buffer K/V and resets verified lengths.
     - Seeding from the live TurboMind full-KV cache is now provided by `LlamaV2::initSpecPVFromFullKV` (Section 5.3), which flattens the
-      prefix KV into `[B,H,L,D]` tensors and calls `summary_key_states` / `refresh_retrieval` per layer. The remaining work at this level is
-      purely performance-oriented (moving some host logic to CUDA) and extending dtype coverage beyond the current fp16/bf16→fp32 path.
+      prefix KV into `[B,H,L,D]` tensors (fp16/bf16 → float32) and calls `summary_key_states` / `refresh_retrieval` per layer. PartialKVCache
+      and its CUDA helpers operate on float32 K/V internally, while the tree decode scratch KV is kept in fp16 or bf16 to match the base
+      model KV dtype. Quantized KV caches (int8/int4) explicitly disable SpecPV and fall back to full-KV EAGLE3.
 
 - [x] **[B] Attach PartialKVCache to LlamaV2**
   - Add a `SpecPVCacheConfig specpv_cache_config_` and

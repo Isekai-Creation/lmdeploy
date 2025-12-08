@@ -793,12 +793,17 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         kv_dtype = kUint4;
     }
 
-    // SpecPV integration currently supports only unquantized fp16 KV
-    // for the tree decode path. On any other KV dtype we fall back to
+    // SpecPV integration currently supports only unquantized fp16/bf16
+    // KV for the tree decode path. On any other KV dtype we fall back to
     // the full-KV EAGLE3 pipeline.
-    if (use_specpv && (dtype_ != kFloat16 || kv_dtype != kFloat16)) {
+    bool kv_dtype_ok = (dtype_ == kFloat16 && kv_dtype == kFloat16);
+#if ENABLE_BF16
+    kv_dtype_ok = kv_dtype_ok || (dtype_ == kBfloat16 && kv_dtype == kBfloat16);
+#endif
+
+    if (use_specpv && !kv_dtype_ok) {
         TM_LOG_WARNING(
-            "[LlamaV2][SpecPV][fallback] partial KV tree decode only supports fp16 KV "
+            "[LlamaV2][SpecPV][fallback] partial KV tree decode only supports fp16/bf16 KV "
             "(model_dtype=%s, kv_dtype=%s); disabling SpecPV for this engine.",
             to_string(dtype_),
             to_string(kv_dtype));
@@ -915,7 +920,7 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             const int kv_heads  = static_cast<int>(local_kv_head_num_);
             bool      specpv_ok = true;
 
-            auto fill_layer = [&](auto head_dim_tag) {
+            auto fill_layer_half = [&](auto head_dim_tag) {
                 constexpr int kHeadDim = decltype(head_dim_tag)::value;
 
                 block::Config<half, half, kHeadDim> cfg{kv_heads, block_seq_len};
@@ -1007,21 +1012,148 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
                 }
             };
 
+            auto fill_layer_bf16 = [&](auto head_dim_tag) {
+#if ENABLE_BF16
+                constexpr int kHeadDim = decltype(head_dim_tag)::value;
+
+                block::Config<nv_bfloat16, nv_bfloat16, kHeadDim> cfg{kv_heads, block_seq_len};
+                block::Layout<block::Config<nv_bfloat16, nv_bfloat16, kHeadDim>> layout{cfg};
+
+                const int prefix_tokens = partial_prefix_tokens;
+
+                for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
+                    auto [k_prefix, v_prefix] = specpv_kv_cache_->active_prefix(layer, prefix_tokens);
+                    if (!k_prefix || !v_prefix || k_prefix.dtype() != kFloat32 || v_prefix.dtype() != kFloat32) {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][SpecPV][fallback] invalid active_prefix for layer=%d in tree decode; "
+                            "disabling SpecPV.",
+                            layer);
+                        specpv_ok = false;
+                        return;
+                    }
+
+                    const int B = static_cast<int>(k_prefix.shape(0));
+                    const int H = static_cast<int>(k_prefix.shape(1));
+                    const int S = static_cast<int>(k_prefix.shape(2));
+                    const int D = static_cast<int>(k_prefix.shape(3));
+
+                    if (B < batch_size || H < kv_heads || D != kHeadDim || S <= 0) {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][SpecPV][fallback] active_prefix shape mismatch for layer=%d "
+                            "(B=%d,H=%d,S=%d,D=%d, batch=%d, kv_heads=%d, head_dim=%d); disabling SpecPV.",
+                            layer,
+                            B,
+                            H,
+                            S,
+                            D,
+                            batch_size,
+                            kv_heads,
+                            kHeadDim);
+                        specpv_ok = false;
+                        return;
+                    }
+
+                    const float* k_src = k_prefix.data<float>();
+                    const float* v_src = v_prefix.data<float>();
+
+                    for (int slot = 0; slot < batch_size && specpv_ok; ++slot) {
+                        const int prefix_len_i = std::min(h_prefix_len[slot], prefix_tokens);
+                        const int prefix_blocks = h_prefix_blocks[slot];
+                        const int base_index    = h_cu_block_nums[slot];
+
+                        for (int b = 0; b < prefix_blocks; ++b) {
+                            const int global_block = base_index + b;
+                            char*     block_ptr    = kv_base
+                                                  + static_cast<size_t>(global_block) * kv_block_bytes;
+
+                            std::vector<uint8_t> host_block(static_cast<size_t>(kv_block_bytes), 0);
+
+                            for (int head = 0; head < kv_heads; ++head) {
+                                for (int t = 0; t < block_seq_len; ++t) {
+                                    const int global_t = b * block_seq_len + t;
+                                    if (global_t >= prefix_len_i || global_t >= S) {
+                                        break;
+                                    }
+
+                                    const ssize_t src_base =
+                                        (((static_cast<ssize_t>(slot) * H + head) * S + global_t)
+                                         * D);
+
+                                    const float* k_row = k_src + src_base;
+                                    const float* v_row = v_src + src_base;
+
+                                    const int k_off = layout.k_data(layer, head, t);
+                                    const int v_off = layout.v_data(layer, head, t);
+
+                                    auto* k_dst =
+                                        reinterpret_cast<nv_bfloat16*>(host_block.data() + k_off);
+                                    auto* v_dst =
+                                        reinterpret_cast<nv_bfloat16*>(host_block.data() + v_off);
+
+                                    for (int d = 0; d < D; ++d) {
+                                        k_dst[d] = __float2bfloat16(k_row[d]);
+                                        v_dst[d] = __float2bfloat16(v_row[d]);
+                                    }
+                                }
+                            }
+
+                            check_cuda_error(cudaMemcpyAsync(block_ptr,
+                                                             host_block.data(),
+                                                             kv_block_bytes,
+                                                             cudaMemcpyHostToDevice,
+                                                             stream_));
+                        }
+                    }
+                }
+#else
+                (void)head_dim_tag;
+                specpv_ok = false;
+#endif
+            };
+
             if (specpv_ok) {
-                if (head_dim == 64) {
-                    fill_layer(std::integral_constant<int, 64>{});
+                if (dtype_ == kFloat16) {
+                    if (head_dim == 64) {
+                        fill_layer_half(std::integral_constant<int, 64>{});
+                    }
+                    else if (head_dim == 128) {
+                        fill_layer_half(std::integral_constant<int, 128>{});
+                    }
+                    else if (head_dim == 192) {
+                        fill_layer_half(std::integral_constant<int, 192>{});
+                    }
+                    else {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][SpecPV][fallback] unsupported head_dim=%d for partial KV tree decode; "
+                            "disabling SpecPV.",
+                            head_dim);
+                        specpv_ok = false;
+                    }
                 }
-                else if (head_dim == 128) {
-                    fill_layer(std::integral_constant<int, 128>{});
+#if ENABLE_BF16
+                else if (dtype_ == kBfloat16) {
+                    if (head_dim == 64) {
+                        fill_layer_bf16(std::integral_constant<int, 64>{});
+                    }
+                    else if (head_dim == 128) {
+                        fill_layer_bf16(std::integral_constant<int, 128>{});
+                    }
+                    else if (head_dim == 192) {
+                        fill_layer_bf16(std::integral_constant<int, 192>{});
+                    }
+                    else {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][SpecPV][fallback] unsupported head_dim=%d for partial KV tree decode; "
+                            "disabling SpecPV.",
+                            head_dim);
+                        specpv_ok = false;
+                    }
                 }
-                else if (head_dim == 192) {
-                    fill_layer(std::integral_constant<int, 192>{});
-                }
+#endif
                 else {
                     TM_LOG_WARNING(
-                        "[LlamaV2][SpecPV][fallback] unsupported head_dim=%d for partial KV tree decode; "
-                        "disabling SpecPV.",
-                        head_dim);
+                        "[LlamaV2][SpecPV][fallback] unsupported dtype/head_dim combination for partial KV "
+                        "tree decode; disabling SpecPV.");
                     specpv_ok = false;
                 }
             }
@@ -1431,7 +1563,8 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
 
     // If Eagle3 capture was requested, pull the populated tensor back
     // from the args map so that eagleDraftForward can feed it into
-    // EagleModule.
+    // EagleModule. When capture is enabled, the UnifiedDecoder will
+    // ensure the buffer has shape [batch, hidden * num_capture_layers].
     if (engine_param_.enable_speculative_decoding && engine_param_.spec_method == "eagle3") {
         auto it = args.find("eagle_capture_hidden");
         if (it != args.end()) {
@@ -1439,6 +1572,21 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
         }
         else {
             eagle_capture_hidden_ = Tensor{};
+        }
+
+        if (eagle_capture_hidden_ && eagle_module_) {
+            const int expected_width = eagle_module_->getEagleFcInDim();
+            if (expected_width > 0
+                && (eagle_capture_hidden_.shape(0) != decoder_out.shape(0)
+                    || eagle_capture_hidden_.shape(1) != expected_width)) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE] Eagle3 capture buffer has shape [%d, %d], "
+                    "expected [%d, %d]; Eagle3 FC path may be disabled.",
+                    eagle_capture_hidden_.shape(0),
+                    eagle_capture_hidden_.shape(1),
+                    decoder_out.shape(0),
+                    expected_width);
+            }
         }
     }
 }
@@ -2821,6 +2969,76 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     }
 
     eagle_step_max_extra_ = max_extra_committed;
+
+    // Force the accepted root token for each slot to match the base token
+    // actually committed by DynamicDecodeLayer, and instrument tail depth
+    // statistics. This keeps accepted_tokens[0] aligned with the true
+    // decode base while still using extras (indices >= 1) for tails.
+    const int max_path_len = engine_param_.spec_max_draft_path_len;
+    if (max_path_len > 0 && !eagle_step_accepted_lens_.empty() && !eagle_step_accepted_tokens_.empty()) {
+        // Host view of the base token committed at time index g.step for
+        // each slot in this decode batch.
+        std::vector<int> h_base_tokens(batch_size, -1);
+        {
+            int* base_ptr = token_ids.data<int>() + g.step * batch_size;
+            check_cuda_error(cudaMemcpyAsync(
+                h_base_tokens.data(),
+                base_ptr,
+                static_cast<size_t>(batch_size) * sizeof(int),
+                cudaMemcpyDeviceToHost,
+                stream_));
+            check_cuda_error(cudaStreamSynchronize(stream_));
+        }
+
+        int max_accepted_len = 0;
+        int slots_ge2        = 0;
+        int mismatch_slots   = 0;
+
+        for (int i = 0; i < batch_size; ++i) {
+            const int len = (i < static_cast<int>(eagle_step_accepted_lens_.size()))
+                                ? eagle_step_accepted_lens_[i]
+                                : 0;
+            if (len <= 0) {
+                continue;
+            }
+
+            max_accepted_len = std::max(max_accepted_len, len);
+            if (len >= 2) {
+                ++slots_ge2;
+            }
+
+            const int token_offset = i * max_path_len;
+            if (token_offset >= static_cast<int>(eagle_step_accepted_tokens_.size())) {
+                continue;
+            }
+
+            const int decode_base =
+                (i < static_cast<int>(h_base_tokens.size())) ? h_base_tokens[i] : -1;
+            const int eagle_base_before = eagle_step_accepted_tokens_[token_offset];
+
+            if (decode_base != -1 && eagle_base_before != decode_base) {
+                ++mismatch_slots;
+            }
+
+            // Force the accepted root token to match the DynamicDecode base
+            // token so that tails are always built on top of the committed
+            // base, even when the raw tree-accept root disagrees.
+            if (decode_base != -1) {
+                eagle_step_accepted_tokens_[token_offset] = decode_base;
+            }
+        }
+
+        if (isEagleDebugEnabled() && tp_rank_ == 0) {
+            TM_LOG_DEBUG(
+                "[LlamaV2][EAGLE][stats] step=%d tokens_per_seq=%d max_accepted_len=%d "
+                "slots_ge2=%d base_mismatch_slots=%d",
+                g.step,
+                eagle_step_tokens_per_seq_,
+                max_accepted_len,
+                slots_ge2,
+                mismatch_slots);
+        }
+    }
 
     // Update SpecPV bookkeeping based on the final committed sequence
     // lengths for this step. This keeps partial-KV length tracking in
