@@ -466,10 +466,10 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
     }
 
     // Copy retrieval/window back to device for both K and V.
-    core::Copy(host_retrieval_k, retrieval_k);
-    core::Copy(host_retrieval_v, retrieval_v);
-    core::Copy(host_window_k, window_k);
-    core::Copy(host_window_v, window_v);
+    core::Copy(host_retrieval_k, retrieval_k_t);
+    core::Copy(host_retrieval_v, retrieval_v_t);
+    core::Copy(host_window_k, window_k_t);
+    core::Copy(host_window_v, window_v_t);
 }
 
 std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,

@@ -218,15 +218,33 @@ private:
                                   const Sequence** sequences);
 
     // Seed the SpecPV partial-KV cache from a fully-verified prefix up to
-    // `verified_seq_len` tokens. The current implementation only tracks
-    // logical lengths; KV contents remain managed by SequenceManager and
-    // the full-KV path until the partial-KV decode path is wired.
-    void initSpecPVFromFullKV(int verified_seq_len);
+    // `verified_seq_len` tokens. This flattens the live full-KV prefix
+    // for each active slot into per-layer [B, H_kv, L, D] tensors and
+    // uses PartialKVCache to populate sink / retrieval / window slices.
+    // `sequences` and `batch_size` describe the active slots for this
+    // engine step; `h_seq_len` is the host-side sequence_length view.
+    void initSpecPVFromFullKV(int              verified_seq_len,
+                              const Sequence** sequences,
+                              int              batch_size,
+                              const int*       h_seq_len);
+
+    // Flatten the full-prefix KV for a single layer into contiguous
+    // [batch_size, local_kv_head_num_, verified_seq_len, head_dim]
+    // tensors on device. Returns false on any geometry / KV mismatch.
+    bool flattenPrefixKVForLayer(int              layer_idx,
+                                 int              verified_seq_len,
+                                 const Sequence** sequences,
+                                 int              batch_size,
+                                 const int*       h_seq_len,
+                                 Tensor&          out_k,
+                                 Tensor&          out_v);
 
     // Update SpecPV bookkeeping after a decode step using the committed
     // sequence lengths. This is called from the fused EAGLE path once
     // DynamicDecodeLayer has applied any accepted tail tokens.
-    void updateSpecPVAfterAcceptance(const Buffer& sequence_length, int batch_size);
+    void updateSpecPVAfterAcceptance(const Buffer& sequence_length,
+                                     int           batch_size,
+                                     const Sequence** sequences);
 
     // Max engine tokens TurboMind should handle per decode step
     // when running in EAGLE speculative mode.
@@ -304,6 +322,7 @@ private:
     std::unique_ptr<PartialKVCache>      specpv_kv_cache_;
     bool specpv_supported_{false};
     int  specpv_partial_steps_{0};
+    bool specpv_retrieval_initialized_{false};
 
     // Cached per-step acceptance summary for EAGLE. These vectors live on
     // host and are updated once per decode step on the TP leader rank.

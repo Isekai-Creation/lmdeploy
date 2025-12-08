@@ -272,12 +272,15 @@ LlamaV2::LlamaV2(DataType                     dtype,
                 }
                 else {
                     const int kv_head_dim = static_cast<int>(size_per_head_);
-                    specpv_kv_cache_      = std::make_unique<PartialKVCache>(specpv_cache_config_,
+                    // SpecPV maintains its own float32 KV view irrespective
+                    // of the base model compute dtype. Full-KV cache contents
+                    // are flattened and converted as needed when seeding.
+                    specpv_kv_cache_ = std::make_unique<PartialKVCache>(specpv_cache_config_,
                                                                         max_batch_size,
                                                                         static_cast<int>(layer_num_),
                                                                         static_cast<int>(local_kv_head_num_),
                                                                         kv_head_dim,
-                                                                        dtype_);
+                                                                        kFloat32);
 
                     if (!specpv_kv_cache_ || !specpv_kv_cache_->is_enabled()) {
                         TM_LOG_WARNING(
@@ -1192,24 +1195,287 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
     }
 }
 
-void LlamaV2::initSpecPVFromFullKV(int verified_seq_len)
+bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
+                                      int              verified_seq_len,
+                                      const Sequence** sequences,
+                                      int              batch_size,
+                                      const int*       h_seq_len,
+                                      Tensor&          out_k,
+                                      Tensor&          out_v)
+{
+    if (!sequence_manager_ || !sequences || batch_size <= 0 || verified_seq_len <= 0) {
+        return false;
+    }
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(layer_num_)) {
+        return false;
+    }
+
+    // For now we flatten only when the base KV cache uses a fp16/bf16
+    // layout; quantized caches are not supported in SpecPV mode.
+    if (dtype_ != kFloat16
+#if ENABLE_BF16
+        && dtype_ != kBFloat16
+#endif
+    ) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer only supports fp16/bf16 KV "
+            "(dtype=%s); disabling SpecPV for this engine.",
+            to_string(dtype_));
+        return false;
+    }
+
+    const int block_seq_len = attn_param_.cache_block_seq_len;
+    if (block_seq_len <= 0) {
+        return false;
+    }
+
+    // Host-side per-slot prefix lengths and block counts.
+    std::vector<int> h_prefix_len(batch_size, 0);
+    std::vector<int> h_cu_k_len(batch_size + 1, 0);
+    std::vector<int> h_block_counts(batch_size, 0);
+    std::vector<int> h_cu_block_counts(batch_size + 1, 0);
+
+    for (int i = 0; i < batch_size; ++i) {
+        const Sequence* seq = sequences[i];
+        const int       cache_len =
+            seq ? std::max(0, seq->cache_len) : 0;
+        int len_i = verified_seq_len;
+        if (h_seq_len) {
+            len_i = std::min(len_i, std::max(0, h_seq_len[i]));
+        }
+        len_i = std::min(len_i, cache_len);
+        if (len_i < 0) {
+            len_i = 0;
+        }
+        h_prefix_len[i]    = len_i;
+        h_cu_k_len[i + 1]  = h_cu_k_len[i] + len_i;
+        const int blocks_i = seq ? static_cast<int>(seq->blocks.size()) : 0;
+        h_block_counts[i]  = blocks_i;
+        h_cu_block_counts[i + 1] = h_cu_block_counts[i] + blocks_i;
+    }
+
+    const int total_tokens = h_cu_k_len[batch_size];
+    const int total_blocks = h_cu_block_counts[batch_size];
+    if (total_tokens <= 0 || total_blocks <= 0) {
+        return false;
+    }
+
+    // Build block pointer table for the active sequences.
+    std::vector<char*> h_blocks(static_cast<size_t>(total_blocks), nullptr);
+    int                cursor = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        const Sequence* seq = sequences[i];
+        if (!seq) {
+            continue;
+        }
+        for (int block_id : seq->blocks) {
+            if (cursor >= total_blocks) {
+                break;
+            }
+            h_blocks[cursor++] = static_cast<char*>(sequence_manager_->GetBlockPtr(block_id));
+        }
+    }
+
+    if (cursor != total_blocks) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer saw inconsistent block counts "
+            "(cursor=%d, total_blocks=%d); disabling SpecPV.",
+            cursor,
+            total_blocks);
+        return false;
+    }
+
+    Buffer_<int>   d_cu_k_len(batch_size + 1, kDEVICE);
+    Buffer_<int>   d_cu_block_num(batch_size + 1, kDEVICE);
+    Buffer_<char*> d_blocks(total_blocks, kDEVICE);
+
+    check_cuda_error(cudaMemcpyAsync(
+        d_cu_k_len.data(), h_cu_k_len.data(), sizeof(int) * (batch_size + 1), cudaMemcpyHostToDevice, stream_));
+    check_cuda_error(cudaMemcpyAsync(d_cu_block_num.data(),
+                                     h_cu_block_counts.data(),
+                                     sizeof(int) * (batch_size + 1),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+    check_cuda_error(cudaMemcpyAsync(
+        d_blocks.data(), h_blocks.data(), sizeof(char*) * total_blocks, cudaMemcpyHostToDevice, stream_));
+
+    // Flatten per-layer KV for this prefix into a temporary fp16/bf16
+    // buffer and then convert to float32 for SpecPV.
+    const int head_num    = static_cast<int>(local_kv_head_num_);
+    const int head_dim    = static_cast<int>(size_per_head_);
+    const int max_seq_len = verified_seq_len;
+
+    Tensor flat_k_half{{batch_size, head_num, max_seq_len, head_dim}, dtype_, kDEVICE};
+    Tensor flat_v_half{{batch_size, head_num, max_seq_len, head_dim}, dtype_, kDEVICE};
+
+    if (!flat_k_half || !flat_v_half) {
+        TM_LOG_WARNING("[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer allocation failure "
+                       "(batch=%d, heads=%d, len=%d, dim=%d)",
+                       batch_size,
+                       head_num,
+                       max_seq_len,
+                       head_dim);
+        return false;
+    }
+
+    const int64_t stride_b = static_cast<int64_t>(head_num) * max_seq_len;
+    const int64_t stride_c = 0;               // ignore global token offset
+    const int64_t stride_h = max_seq_len;
+    const int64_t stride_s = 1;
+
+    RopeKernelParam rope_param{};
+
+    const int cp_rank = engine_param_.attn_cp_rank;
+    cutlass::FastDivmod cp_size(engine_param_.attn_cp_size > 0 ? engine_param_.attn_cp_size : 1);
+
+    auto* k_ptr = flat_k_half.raw_data();
+    auto* v_ptr = flat_v_half.raw_data();
+
+    if (dtype_ == kFloat16) {
+        invokeFlattenKV_v2(reinterpret_cast<half*>(k_ptr),
+                           reinterpret_cast<half*>(v_ptr),
+                           d_blocks.data(),
+                           d_cu_k_len.data(),
+                           d_cu_block_num.data(),
+                           rope_param,
+                           stride_b,
+                           stride_c,
+                           stride_h,
+                           stride_s,
+                           block_seq_len,
+                           layer_idx,
+                           cp_rank,
+                           cp_size,
+                           max_seq_len,
+                           head_num,
+                           head_dim,
+                           batch_size,
+                           param_.quant_policy,
+                           stream_);
+    }
+#if ENABLE_BF16
+    else if (dtype_ == kBFloat16) {
+        invokeFlattenKV_v2(reinterpret_cast<nv_bfloat16*>(k_ptr),
+                           reinterpret_cast<nv_bfloat16*>(v_ptr),
+                           d_blocks.data(),
+                           d_cu_k_len.data(),
+                           d_cu_block_num.data(),
+                           rope_param,
+                           stride_b,
+                           stride_c,
+                           stride_h,
+                           stride_s,
+                           block_seq_len,
+                           layer_idx,
+                           cp_rank,
+                           cp_size,
+                           max_seq_len,
+                           head_num,
+                           head_dim,
+                           batch_size,
+                           param_.quant_policy,
+                           stream_);
+    }
+#endif
+    else {
+        return false;
+    }
+
+    sync_check_cuda_error();
+
+    // Convert flattened KV to float32 for SpecPV summarization.
+    out_k = Tensor{{batch_size, head_num, max_seq_len, head_dim}, kFloat32, kDEVICE};
+    out_v = Tensor{{batch_size, head_num, max_seq_len, head_dim}, kFloat32, kDEVICE};
+    if (!out_k || !out_v) {
+        TM_LOG_WARNING("[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer float32 allocation failure "
+                       "(batch=%d, heads=%d, len=%d, dim=%d)",
+                       batch_size,
+                       head_num,
+                       max_seq_len,
+                       head_dim);
+        return false;
+    }
+
+    core::Copy(flat_k_half, out_k);
+    core::Copy(flat_v_half, out_v);
+
+    return true;
+}
+
+void LlamaV2::initSpecPVFromFullKV(int              verified_seq_len,
+                                   const Sequence** sequences,
+                                   int              batch_size,
+                                   const int*       h_seq_len)
 {
     if (!specpv_kv_cache_ || !specpv_kv_cache_->is_enabled()) {
         return;
     }
 
-    const int clamped_len = std::max(0, std::min(verified_seq_len, specpv_cache_config_.total_budget()));
-
-    for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
-        specpv_kv_cache_->set_verified_length(layer, clamped_len);
+    if (!sequence_manager_ || !sequences || batch_size <= 0) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] initSpecPVFromFullKV missing SequenceManager or sequences; "
+            "disabling SpecPV for this engine.");
+        specpv_supported_ = false;
+        specpv_kv_cache_.reset();
+        return;
     }
 
-    TM_LOG_INFO("[LlamaV2][SpecPV] initialized partial KV verified_len=%d", clamped_len);
+    const int clamped_len =
+        std::max(0, std::min(verified_seq_len, specpv_cache_config_.total_budget()));
+
+    if (clamped_len <= 0) {
+        specpv_kv_cache_->reset_buffer();
+        for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
+            specpv_kv_cache_->set_verified_length(layer, 0);
+        }
+        specpv_retrieval_initialized_ = false;
+        TM_LOG_INFO("[LlamaV2][SpecPV] initialized partial KV with empty prefix (verified_len=0)");
+        return;
+    }
+
+    specpv_kv_cache_->reset_buffer();
+    specpv_retrieval_initialized_ = false;
+
+    for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
+        Tensor full_k;
+        Tensor full_v;
+
+        if (!flattenPrefixKVForLayer(layer, clamped_len, sequences, batch_size, h_seq_len, full_k, full_v)) {
+            TM_LOG_WARNING(
+                "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer failed for layer=%d; disabling SpecPV.",
+                layer);
+            specpv_supported_ = false;
+            specpv_kv_cache_.reset();
+            specpv_retrieval_initialized_ = false;
+            return;
+        }
+
+        specpv_kv_cache_->summary_key_states(layer, full_k, clamped_len);
+
+        const int q_window = std::min(clamped_len, 4);
+        if (q_window > 0) {
+            std::vector<ssize_t> q_idx{0, 0, clamped_len - q_window, 0};
+            std::vector<ssize_t> q_shape{
+                full_k.shape(0), full_k.shape(1), q_window, full_k.shape(3)};
+            Tensor query_states = full_k.slice(q_idx, q_shape);
+
+            specpv_kv_cache_->refresh_retrieval(layer, query_states, full_k, full_v, clamped_len);
+        }
+
+        // Start with an empty speculative buffer; all verified prefix
+        // tokens are represented via sink/retrieval/window slices.
+        specpv_kv_cache_->set_verified_length(layer, 0);
+    }
+
+    specpv_retrieval_initialized_ = true;
+    TM_LOG_INFO("[LlamaV2][SpecPV] partial KV seeded from full KV (verified_len=%d)", clamped_len);
 }
 
-void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length, int batch_size)
+void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length,
+                                          int           batch_size,
+                                          const Sequence** sequences)
 {
-    if (!isSpecPVEnabled() || !specpv_kv_cache_ || batch_size <= 0) {
+    if (!isSpecPVEnabled() || !specpv_kv_cache_ || batch_size <= 0 || !sequences) {
         return;
     }
 
@@ -1244,10 +1510,10 @@ void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length, int bat
         return;
     }
 
-    // Seed or refresh the partial KV length view from the fully
-    // committed prefix. The current implementation uses only length
-    // bookkeeping; KV contents remain managed by the full-KV path.
-    initSpecPVFromFullKV(max_len);
+    // Seed or refresh the partial KV view from the fully committed
+    // prefix. KV contents are flattened from the live full-KV cache
+    // into SpecPV's partial cache.
+    initSpecPVFromFullKV(max_len, sequences, batch_size, h_seq_len.data());
 
     if (engine_param_.specpv_full_refresh_steps > 0) {
         ++specpv_partial_steps_;
@@ -2212,7 +2478,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     // Update SpecPV bookkeeping based on the final committed sequence
     // lengths for this step. This keeps partial-KV length tracking in
     // sync with DynamicDecodeLayer and EAGLE acceptance.
-    updateSpecPVAfterAcceptance(sequence_length, batch_size);
+    updateSpecPVAfterAcceptance(sequence_length, batch_size, spec_ctx.sequences);
 }
 
 void LlamaV2::getEagleAcceptanceForStep(std::vector<int>& accepted_lens,
