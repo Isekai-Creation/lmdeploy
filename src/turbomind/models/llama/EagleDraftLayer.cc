@@ -15,13 +15,13 @@ Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
                                    LlamaFfnLayer*                ffn_layer,
                                    float                         rmsnorm_eps):
     weight_{weight},
-    attn_layer_{attn_layer},
     ffn_layer_{ffn_layer},
     rmsnorm_eps_{rmsnorm_eps},
     debug_fc_out_{},
     debug_attn_out_{},
     debug_ffn_out_{},
     debug_pre_head_hidden_{},
+    attn_layer_{attn_layer},
     head_num_{0},
     kv_head_num_{0},
     size_per_head_{0}
@@ -33,9 +33,7 @@ Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
     }
 }
 
-void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
-                               Tensor&       output_hidden,
-                               cudaStream_t  stream)
+void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden, cudaStream_t stream)
 {
     if (!input_hidden) {
         return;
@@ -99,8 +97,8 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         debug_fc_out_ = hidden_norm;
     }
 
-    // 2) Attention: prefer real UnifiedAttentionLayer if available and geometry sane,
-    //    otherwise fall back to shallow QKV+V→Wo path.
+    // 2) Attention: prefer real UnifiedAttentionLayer if available and geometry is sane;
+    //    otherwise fall back to the shallow QKV+V→Wo path.
     Tensor attn_out{{batch_size, hidden_dim}, dtype, input_hidden.device()};
 
     const bool has_attn_layer = (attn_layer_ != nullptr);
@@ -109,7 +107,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         if (head_num_ <= 0 || size_per_head_ <= 0) {
             return false;
         }
-        // Standard MHA: hidden_dim = head_num * size_per_head
+        // For standard MHA we expect hidden_dim == head_num_ * size_per_head_.
         if (hidden_dim != head_num_ * size_per_head_) {
             return false;
         }
@@ -123,14 +121,13 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         param.input    = hidden_norm;
         param.output   = attn_out;
         param.weights  = &weight_->attn;
-        param.layer_id = 0;  // no layer-specific KV for draft v1
+        param.layer_id = 0;
 
         attn_layer_->Forward(param);
         sync_check_cuda_error();
 
         used_unified_attention = true;
-    }
-    else {
+    } else {
         if (has_attn_layer && !attn_geom_ok()) {
             TM_LOG_WARNING(
                 "[EAGLE3][Draft] invalid attention geometry (head_num=%d, size_per_head=%d, hidden_dim=%d); "
@@ -217,10 +214,9 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         debug_ffn_out_ = output_hidden;
     }
 
-    void* residual_ptr = const_cast<void*>(input_hidden.raw_data());
     invokeResidualBiasRMSNorm(
         /*hidden_states=*/output_hidden.raw_data(),
-        /*residual=*/residual_ptr,
+        /*residual=*/input_hidden.raw_data(),
         /*weights=*/weight_->output_norm.raw_data(),
         /*bias=*/nullptr,
         dtype,
