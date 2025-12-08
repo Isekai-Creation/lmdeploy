@@ -548,6 +548,26 @@ std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
     return {k_active, v_active};
 }
 
+std::pair<Tensor, Tensor> PartialKVCache::active_prefix(int layer_idx, int prefix_tokens)
+{
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(key_cache_.size())) {
+        return {Tensor{}, Tensor{}};
+    }
+    if (prefix_tokens <= 0) {
+        return {Tensor{}, Tensor{}};
+    }
+
+    const int max_tokens = cfg_.total_budget();
+    const int clamped    = std::max(0, std::min(prefix_tokens, max_tokens));
+    if (clamped <= 0) {
+        return {Tensor{}, Tensor{}};
+    }
+
+    Tensor k = slice_tokens(key_cache_, layer_idx, 0, clamped);
+    Tensor v = slice_tokens(value_cache_, layer_idx, 0, clamped);
+    return {k, v};
+}
+
 void PartialKVCache::reset_buffer()
 {
     for (int layer = 0; layer < num_layers_; ++layer) {

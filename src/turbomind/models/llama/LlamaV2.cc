@@ -614,10 +614,7 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
     // Derive per-slot prefix (history) lengths from the live sequences when
     // available so that tree decode can reuse prefix KV as read-only. When
     // sequences are not provided or SequenceManager is unavailable we fall
-    // back to a history_len=0 interpretation for this step. When SpecPV is
-    // enabled and has been seeded, we may clamp the effective prefix length
-    // to the partial-KV budget so that tree decode attends only to the
-    // partial view instead of the full prefix.
+    // back to a history_len=0 interpretation for this step.
     const int block_seq_len = attn_param_.cache_block_seq_len;
 
     std::vector<int> h_prefix_len(batch_size, 0);
@@ -629,34 +626,6 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             }
             h_prefix_len[i] = std::max(0, seq->cache_len);
         }
-    }
-
-    // Decide whether to apply a SpecPV-aware clamp on the effective
-    // prefix length used by this tree decode step. This keeps the KV
-    // layout unchanged (we still reuse SequenceManager blocks) but
-    // limits the history span that attention can see to the partial
-    // SpecPV budget when enabled.
-    bool use_specpv_for_tree = false;
-    if (isSpecPVEnabled() && specpv_kv_cache_ && specpv_retrieval_initialized_) {
-        int max_prefix_len = 0;
-        for (int i = 0; i < batch_size; ++i) {
-            max_prefix_len = std::max(max_prefix_len, h_prefix_len[i]);
-        }
-        if (max_prefix_len > 0 && shouldUseSpecPV(max_prefix_len)) {
-            const int partial_tokens = specpv_cache_config_.sink_size()
-                                       + specpv_cache_config_.retrieval_size()
-                                       + specpv_cache_config_.window_size()
-                                       + specpv_kv_cache_->global_verified_len();
-            const int clamp_len = std::max(0, std::min(max_prefix_len, partial_tokens));
-            if (clamp_len > 0) {
-                for (int i = 0; i < batch_size; ++i) {
-                    h_prefix_len[i] = std::min(h_prefix_len[i], clamp_len);
-                }
-                use_specpv_for_tree = true;
-            }
-        }
-    }
-    (void)use_specpv_for_tree;
     }
 
     int max_history_len = 0;
@@ -702,6 +671,15 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         h_k_len[i] = seq_len_i;
     }
 
+    // Decide whether to run tree decode against the SpecPV partial KV
+    // view instead of the full prefix KV. In SpecPV mode we rely on the
+    // partial cache geometry and verified length to bound the effective
+    // history length seen by attention.
+    bool use_specpv = isSpecPVEnabled()
+                      && specpv_kv_cache_
+                      && specpv_retrieval_initialized_
+                      && shouldUseSpecPV(max_history_len);
+
     // Build a per-slot block table that reuses existing prefix KV blocks as
     // read-only (via SequenceManager) and allocates a scratch region for
     // any additional blocks needed to store tree tokens. The logical block
@@ -713,26 +691,51 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
     std::vector<int> h_prefix_blocks(batch_size, 0);
     std::vector<int> h_extra_blocks(batch_size, 0);
 
+    // In SpecPV mode we override the prefix geometry based on the
+    // partial KV budget; otherwise we keep the existing full-KV path.
+    const int partial_prefix_tokens = use_specpv
+        ? specpv_cache_config_.sink_size()
+              + specpv_cache_config_.retrieval_size()
+              + specpv_cache_config_.window_size()
+              + specpv_kv_cache_->global_verified_len()
+        : 0;
+
     for (int i = 0; i < batch_size; ++i) {
         const int tree_len   = h_tree_lens[i];
         const int prefix_len = h_prefix_len[i];
 
         int prefix_blocks = 0;
-        if (sequences && sequence_manager_) {
-            const Sequence* seq = sequences[i];
-            if (seq) {
-                prefix_blocks = static_cast<int>(seq->blocks.size());
+
+        if (use_specpv) {
+            const int prefix_len_i = std::min(prefix_len, partial_prefix_tokens);
+            const int total_len    = prefix_len_i + tree_len;
+
+            h_k_len[i] = total_len;
+
+            prefix_blocks = (prefix_len_i > 0)
+                                ? (prefix_len_i + block_seq_len - 1) / block_seq_len
+                                : 0;
+        }
+        else {
+            if (sequences && sequence_manager_) {
+                const Sequence* seq = sequences[i];
+                if (seq) {
+                    prefix_blocks = static_cast<int>(seq->blocks.size());
+                }
             }
+
+            const int total_len = prefix_len + tree_len;
+            h_k_len[i]          = total_len;
         }
 
-        const int total_len     = prefix_len + tree_len;
-        const int required_blk  = total_len > 0 ? (total_len + block_seq_len - 1) / block_seq_len : 0;
-        const int extra_blocks  = std::max(0, required_blk - prefix_blocks);
+        const int required_blk = (h_k_len[i] > 0)
+                                     ? (h_k_len[i] + block_seq_len - 1) / block_seq_len
+                                     : 0;
+        const int extra_blocks = std::max(0, required_blk - prefix_blocks);
 
-        h_prefix_blocks[i] = std::max(prefix_blocks, 0);
-        h_extra_blocks[i]  = std::max(extra_blocks, 0);
-
-        const int blocks_i = h_prefix_blocks[i] + h_extra_blocks[i];
+        h_prefix_blocks[i]    = std::max(prefix_blocks, 0);
+        h_extra_blocks[i]     = std::max(extra_blocks, 0);
+        const int blocks_i    = h_prefix_blocks[i] + h_extra_blocks[i];
         h_cu_block_nums[i + 1] = h_cu_block_nums[i] + blocks_i;
     }
 
@@ -756,16 +759,25 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         kv_dtype = kUint4;
     }
 
-    const size_t kv_block_bytes = get_cache_block_size(
-        dtype_, kv_dtype, static_cast<int>(layer_num_), static_cast<int>(local_kv_head_num_), static_cast<int>(size_per_head_), block_seq_len);
+    const size_t kv_block_bytes = get_cache_block_size(dtype_,
+                                                       kv_dtype,
+                                                       static_cast<int>(layer_num_),
+                                                       static_cast<int>(local_kv_head_num_),
+                                                       static_cast<int>(size_per_head_),
+                                                       block_seq_len);
 
-    // Scratch blocks are used only for the tree portion of each sequence.
+    // Scratch blocks are used for the tree portion of each sequence.
+    // In SpecPV mode we also place the partial prefix KV into scratch
+    // blocks so that tree decode can attend over the partial KV view
+    // without touching SequenceManager blocks.
     int total_extra_blocks = 0;
     for (int i = 0; i < batch_size; ++i) {
         total_extra_blocks += h_extra_blocks[i];
     }
 
-    Buffer scratch_kv_blocks(static_cast<ssize_t>(std::max(1, total_extra_blocks))
+    const int scratch_blocks = use_specpv ? total_blocks : std::max(1, total_extra_blocks);
+
+    Buffer scratch_kv_blocks(static_cast<ssize_t>(scratch_blocks)
                                  * static_cast<ssize_t>(kv_block_bytes),
                              kUint8,
                              kDEVICE);
@@ -779,44 +791,60 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         const int extra_blocks  = h_extra_blocks[slot];
         const int base_index    = h_cu_block_nums[slot];
 
-        // Prefix KV: reuse existing block pointers from SequenceManager as
-        // read-only so tree tokens can attend to committed history without
-        // mutating live KV state.
-        if (sequence_manager_ && sequences && sequences[slot]) {
-            const Sequence* seq        = sequences[slot];
-            const int       seq_blocks = static_cast<int>(seq->blocks.size());
+        if (use_specpv) {
+            // In SpecPV mode all prefix + tree blocks for this slot live in
+            // scratch_kv_blocks; SequenceManager blocks are not used for
+            // tree decode KV.
+            const int blocks_i = prefix_blocks + extra_blocks;
+            for (int j = 0; j < blocks_i; ++j) {
+                const int global_idx = base_index + j;
+                h_block_ptrs[static_cast<size_t>(global_idx)] =
+                    reinterpret_cast<uintptr_t>(kv_base
+                                                + static_cast<size_t>(scratch_block_cursor + j) * kv_block_bytes);
+            }
+            scratch_block_cursor += blocks_i;
+        }
+        else {
+            // Prefix KV: reuse existing block pointers from SequenceManager as
+            // read-only so tree tokens can attend to committed history without
+            // mutating live KV state.
+            if (sequence_manager_ && sequences && sequences[slot]) {
+                const Sequence* seq        = sequences[slot];
+                const int       seq_blocks = static_cast<int>(seq->blocks.size());
 
-            // Invariant: prefix_blocks must match the live sequence's block
-            // count when we are reusing prefix KV; otherwise the KV layout is
-            // inconsistent and we must fall back to single-step targets.
-            if (prefix_blocks != seq_blocks) {
-                TM_LOG_WARNING(
-                    "[LlamaV2][EAGLE][fallback] target-tree KV invariant violated for slot=%d "
-                    "(prefix_blocks=%d, seq.blocks.size()=%d); disabling target-tree.",
-                    slot,
-                    prefix_blocks,
-                    seq_blocks);
-                target_tree_supported_          = false;
-                eagle_tree_target_tokens_valid_ = false;
-                return;
+                // Invariant: prefix_blocks must match the live sequence's block
+                // count when we are reusing prefix KV; otherwise the KV layout is
+                // inconsistent and we must fall back to single-step targets.
+                if (prefix_blocks != seq_blocks) {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][EAGLE][fallback] target-tree KV invariant violated for slot=%d "
+                        "(prefix_blocks=%d, seq.blocks.size()=%d); disabling target-tree.",
+                        slot,
+                        prefix_blocks,
+                        seq_blocks);
+                    target_tree_supported_          = false;
+                    eagle_tree_target_tokens_valid_ = false;
+                    return;
+                }
+
+                for (int j = 0; j < seq_blocks; ++j) {
+                    const int   block_id = seq->blocks[j];
+                    void* const ptr      = sequence_manager_->GetBlockPtr(block_id);
+                    h_block_ptrs[static_cast<size_t>(base_index + j)] =
+                        reinterpret_cast<uintptr_t>(ptr);
+                }
             }
 
-            for (int j = 0; j < seq_blocks; ++j) {
-                const int   block_id = seq->blocks[j];
-                void* const ptr      = sequence_manager_->GetBlockPtr(block_id);
-                h_block_ptrs[static_cast<size_t>(base_index + j)] =
-                    reinterpret_cast<uintptr_t>(ptr);
+            // Scratch KV for tree tokens beyond the existing prefix coverage.
+            for (int j = 0; j < extra_blocks; ++j) {
+                const int global_idx = base_index + prefix_blocks + j;
+                h_block_ptrs[static_cast<size_t>(global_idx)] =
+                    reinterpret_cast<uintptr_t>(kv_base
+                                                + static_cast<size_t>(scratch_block_cursor + j) * kv_block_bytes);
             }
-        }
 
-        // Scratch KV for tree tokens beyond the existing prefix coverage.
-        for (int j = 0; j < extra_blocks; ++j) {
-            const int global_idx = base_index + prefix_blocks + j;
-            h_block_ptrs[static_cast<size_t>(global_idx)] =
-                reinterpret_cast<uintptr_t>(kv_base + static_cast<size_t>(scratch_block_cursor + j) * kv_block_bytes);
+            scratch_block_cursor += extra_blocks;
         }
-
-        scratch_block_cursor += extra_blocks;
     }
 
     // Final safety check: ensure that the total KV coverage implied by the

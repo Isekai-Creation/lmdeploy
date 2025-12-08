@@ -133,6 +133,12 @@ public:
     // does not yet move real KV data.
     std::pair<Tensor, Tensor> update(int layer_idx, const Tensor& new_keys, const Tensor& new_values);
 
+    // Lightweight helper to expose a contiguous prefix view over the
+    // partial KV cache for a given layer. This returns a pair of
+    // [B, H_kv, prefix_tokens, D] tensors for keys and values,
+    // clamped to the configured total_budget().
+    std::pair<Tensor, Tensor> active_prefix(int layer_idx, int prefix_tokens);
+
     void reset_buffer();
 
 private:
