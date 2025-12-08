@@ -309,10 +309,16 @@ into TurboMind for long‑context EAGLE3 runs.
       - `init_from_full_kv(...)` – seed sink/retrieval/window from full KV once.
       - `reset()` / `reset_buffer()`.
   - Implementation status:
-    - `SpecPVCacheConfig` and a minimal `PartialKVCache` (owning per-layer KV buffers and tracking per-layer/global verified lengths) are now
-      present in `specpv_kv_cache.{h,cc}` and wired into `LlamaV2` construction and SpecPV gating.
-    - Summary/retrieval/buffer operations (`summary_key_states`, `refresh_retrieval`, `update`, `init_from_full_kv` data movement) are still
-      TODO and the current SpecPV path is bookkeeping-only (no change to the KV layout used by target-tree decode yet).
+    - `SpecPVCacheConfig` and `PartialKVCache` now exist in `specpv_kv_cache.{h,cc}` and are wired into `LlamaV2` construction and SpecPV
+      gating:
+      - Per-layer KV buffers `[max_batch, num_kv_heads, total_budget, head_dim]` are allocated on device for both keys and values.
+      - Segment views (`sink`, `retrieval`, `window`, `buffer`) are implemented for K and V.
+      - `summary_key_states` computes real Kmax/Kmin block summaries (float32) on host; `refresh_retrieval` uses those summaries to select
+        top blocks and fills retrieval/window K/V slices from full KV; `update` writes new K/V into the buffer and returns active
+        `[sink+retrieval+window+buffer]` views; `reset_buffer` clears buffer K/V and resets verified lengths.
+    - What remains at this level is seeding from the full TurboMind KV cache (`init_from_full_kv` behaviour), which is handled by
+      `LlamaV2::initSpecPVFromFullKV` in Section 5.3; until that wiring is complete, partial KV is not yet populated from live prefix KV
+      and tree decode still uses the full‑KV layout.
 
 - [ ] **[B] Attach PartialKVCache to LlamaV2**
   - Add a `SpecPVCacheConfig specpv_cache_config_` and
@@ -336,7 +342,13 @@ into TurboMind for long‑context EAGLE3 runs.
       - Appends tree tokens’ K/V into the buffer via
         `PartialKVCache::update(...)`.
       - Runs `UnifiedDecoder::Forward` over this partial KV view instead
-        of a full‑prefix scratch KV.
+        of a full‑prefix scratch KV:
+        - Build `h_prefix_blocks` / `h_extra_blocks` for the partial
+          prefix and tree tokens only,
+        - Construct `kv_block_ptrs` over SpecPV’s active K/V region
+          (sink+retrieval+window+buffer_verified) plus tree scratch,
+        - Set `h_k_len` for each slot to the partial prefix length plus
+          `tree_len` instead of `prefix_len + tree_len` from full KV.
   - Keep tree masks (`spec_packed_mask`) and post‑decode logic
     (logits → target_tokens → acceptance) unchanged.
   - Implementation status:
@@ -345,17 +357,25 @@ into TurboMind for long‑context EAGLE3 runs.
 
 - [ ] **[B] Seed SpecPV from a full‑KV tree step**
   - After the first full‑KV target‑tree decode at long context:
-    - Call `init_from_full_kv` on `specpv_kv_cache_` to:
-      - Copy sink + window segments from full KV into the partial cache.
-      - Initialize `global_verified_lens` to the current fully verified
-        prefix length.
-      - Mark `retrieval_initialized = false` so the next call to
-        `refresh_retrieval` can populate retrieval blocks.
+    - Call `LlamaV2::initSpecPVFromFullKV(committed_prefix_len)` to:
+      - Flatten the full prefix KV cache per layer into contiguous
+        `[B, H, L, D]` tensors (e.g. via an internal helper that reuses
+        `invokeFlattenKV_v2`),
+      - Call `PartialKVCache::summary_key_states` and
+        `PartialKVCache::refresh_retrieval` for each layer to populate:
+        - sink / retrieval / window K/V slices inside the partial cache,
+      - Reset buffer usage (`reset_buffer`) and mark a
+        `specpv_retrieval_initialized_` flag on `LlamaV2` so subsequent
+        tree decodes can safely use the partial KV view.
   - Implementation status:
-    - `LlamaV2::initSpecPVFromFullKV` and `updateSpecPVAfterAcceptance` now keep `PartialKVCache`’s verified lengths in sync with committed
-      sequence lengths after DynamicDecode+EAGLE acceptance, and `specpv_partial_steps_` / buffer capacity drive a simple full‑refresh reset.
-    - Actual KV copying and retrieval/window population from full KV into `PartialKVCache` remain TODO; current behaviour is bookkeeping‑only
-      and leaves the tree decode path identical to the full‑KV implementation.
+    - `LlamaV2::initSpecPVFromFullKV` and `updateSpecPVAfterAcceptance` currently keep `PartialKVCache`’s verified lengths in sync with
+      committed sequence lengths after DynamicDecode+EAGLE acceptance, and `specpv_partial_steps_` / buffer capacity drive a simple
+      full‑refresh reset.
+    - Actual KV flattening from full KV into `[B,H,L,D]`, and
+      retrieval/window population inside `PartialKVCache`, remain TODO;
+      until these are implemented, SpecPV is length/bookkeeping only and
+      the tree decode path behaves identically to the full‑KV
+      implementation.
 
 ### 5.4 Partial/full switching and refresh
 

@@ -105,72 +105,95 @@ void PartialKVCache::recompute_global_verified_len() noexcept
     global_verified_len_ = v;
 }
 
+Tensor PartialKVCache::slice_tokens(std::vector<Tensor>& cache, int layer_idx, int token_start, int token_count)
+{
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(cache.size())) {
+        return {};
+    }
+    if (token_count <= 0) {
+        return {};
+    }
+
+    Tensor& base = cache[layer_idx];
+    if (!base) {
+        return {};
+    }
+
+    const int L = static_cast<int>(base.shape(2));
+    if (token_start < 0 || token_start >= L) {
+        return {};
+    }
+
+    const int clamped_count = std::min(token_count, L - token_start);
+    if (clamped_count <= 0) {
+        return {};
+    }
+
+    std::vector<ssize_t> base_idx{0, 0, token_start, 0};
+    std::vector<ssize_t> shape{base.shape(0), base.shape(1), clamped_count, base.shape(3)};
+    return base.slice(base_idx, shape);
+}
+
 Tensor PartialKVCache::sink(int layer_idx)
 {
-    if (layer_idx < 0 || layer_idx >= static_cast<int>(key_cache_.size())) {
-        return {};
-    }
     const int sink_tokens = cfg_.sink_size();
-    if (sink_tokens <= 0) {
-        return {};
-    }
-    Tensor& base = key_cache_[layer_idx];
-    std::vector<ssize_t> base_idx{0, 0, 0, 0};
-    std::vector<ssize_t> shape{base.shape(0), base.shape(1), sink_tokens, base.shape(3)};
-    return base.slice(base_idx, shape);
+    return slice_tokens(key_cache_, layer_idx, 0, sink_tokens);
 }
 
 Tensor PartialKVCache::retrieval(int layer_idx)
 {
-    if (layer_idx < 0 || layer_idx >= static_cast<int>(key_cache_.size())) {
-        return {};
-    }
     const int sink_tokens      = cfg_.sink_size();
     const int retrieval_tokens = cfg_.retrieval_size();
-    if (retrieval_tokens <= 0) {
-        return {};
-    }
-    Tensor& base = key_cache_[layer_idx];
-    std::vector<ssize_t> base_idx{0, 0, sink_tokens, 0};
-    std::vector<ssize_t> shape{base.shape(0), base.shape(1), retrieval_tokens, base.shape(3)};
-    return base.slice(base_idx, shape);
+    return slice_tokens(key_cache_, layer_idx, sink_tokens, retrieval_tokens);
 }
 
 Tensor PartialKVCache::window(int layer_idx)
 {
-    if (layer_idx < 0 || layer_idx >= static_cast<int>(key_cache_.size())) {
-        return {};
-    }
     const int sink_tokens      = cfg_.sink_size();
     const int retrieval_tokens = cfg_.retrieval_size();
     const int window_tokens    = cfg_.window_size();
-    if (window_tokens <= 0) {
-        return {};
-    }
-    Tensor& base = key_cache_[layer_idx];
-    std::vector<ssize_t> base_idx{0, 0, sink_tokens + retrieval_tokens, 0};
-    std::vector<ssize_t> shape{base.shape(0), base.shape(1), window_tokens, base.shape(3)};
-    return base.slice(base_idx, shape);
+    return slice_tokens(key_cache_, layer_idx, sink_tokens + retrieval_tokens, window_tokens);
 }
 
 Tensor PartialKVCache::buffer(int layer_idx)
 {
-    if (layer_idx < 0 || layer_idx >= static_cast<int>(key_cache_.size())) {
-        return {};
-    }
     const int sink_tokens      = cfg_.sink_size();
     const int retrieval_tokens = cfg_.retrieval_size();
     const int window_tokens    = cfg_.window_size();
     const int buffer_tokens    = cfg_.buffer_size();
-    if (buffer_tokens <= 0) {
-        return {};
-    }
-    const int start = sink_tokens + retrieval_tokens + window_tokens;
+    const int start            = sink_tokens + retrieval_tokens + window_tokens;
+    return slice_tokens(key_cache_, layer_idx, start, buffer_tokens);
+}
 
-    Tensor& base = key_cache_[layer_idx];
-    std::vector<ssize_t> base_idx{0, 0, start, 0};
-    std::vector<ssize_t> shape{base.shape(0), base.shape(1), buffer_tokens, base.shape(3)};
-    return base.slice(base_idx, shape);
+Tensor PartialKVCache::sink_v(int layer_idx)
+{
+    const int sink_tokens = cfg_.sink_size();
+    return slice_tokens(value_cache_, layer_idx, 0, sink_tokens);
+}
+
+Tensor PartialKVCache::retrieval_v(int layer_idx)
+{
+    const int sink_tokens      = cfg_.sink_size();
+    const int retrieval_tokens = cfg_.retrieval_size();
+    return slice_tokens(value_cache_, layer_idx, sink_tokens, retrieval_tokens);
+}
+
+Tensor PartialKVCache::window_v(int layer_idx)
+{
+    const int sink_tokens      = cfg_.sink_size();
+    const int retrieval_tokens = cfg_.retrieval_size();
+    const int window_tokens    = cfg_.window_size();
+    return slice_tokens(value_cache_, layer_idx, sink_tokens + retrieval_tokens, window_tokens);
+}
+
+Tensor PartialKVCache::buffer_v(int layer_idx)
+{
+    const int sink_tokens      = cfg_.sink_size();
+    const int retrieval_tokens = cfg_.retrieval_size();
+    const int window_tokens    = cfg_.window_size();
+    const int buffer_tokens    = cfg_.buffer_size();
+    const int start            = sink_tokens + retrieval_tokens + window_tokens;
+    return slice_tokens(value_cache_, layer_idx, start, buffer_tokens);
 }
 
 void PartialKVCache::summary_key_states(int layer_idx, const Tensor& key_states, int seq_len)
@@ -329,18 +352,24 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
     const int retrieval_tokens = cfg_.retrieval_size();
     const int window_tokens    = std::min(cfg_.window_size(), L);
 
-    Tensor retrieval_view = retrieval(layer_idx);
-    Tensor window_view    = window(layer_idx);
+    Tensor retrieval_k = retrieval(layer_idx);
+    Tensor retrieval_v = retrieval_v(layer_idx);
+    Tensor window_k    = window(layer_idx);
+    Tensor window_v    = window_v(layer_idx);
 
-    if (!retrieval_view || !window_view) {
+    if (!retrieval_k || !retrieval_v || !window_k || !window_v) {
         return;
     }
 
-    Tensor host_retrieval{retrieval_view.layout(), retrieval_view.dtype(), kCPU};
-    Tensor host_window{window_view.layout(), window_view.dtype(), kCPU};
+    Tensor host_retrieval_k{retrieval_k.layout(), retrieval_k.dtype(), kCPU};
+    Tensor host_retrieval_v{retrieval_v.layout(), retrieval_v.dtype(), kCPU};
+    Tensor host_window_k{window_k.layout(), window_k.dtype(), kCPU};
+    Tensor host_window_v{window_v.layout(), window_v.dtype(), kCPU};
 
-    float* retr_host = host_retrieval.data<float>();
-    float* win_host  = host_window.data<float>();
+    float* retr_k_host = host_retrieval_k.data<float>();
+    float* retr_v_host = host_retrieval_v.data<float>();
+    float* win_k_host  = host_window_k.data<float>();
+    float* win_v_host  = host_window_v.data<float>();
 
     for (int bb = 0; bb < max_B; ++bb) {
         for (int hh = 0; hh < max_H; ++hh) {
@@ -408,7 +437,8 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
                               + dst_token)
                              * D)
                             + d;
-                        retr_host[dst_idx] = k_host[src_idx];
+                        retr_k_host[dst_idx] = k_host[src_idx];
+                        retr_v_host[dst_idx] = v_host[src_idx];
                     }
                 }
             }
@@ -427,16 +457,19 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
                               + dst_token)
                              * D)
                             + d;
-                        win_host[dst_idx] = k_host[src_idx];
+                        win_k_host[dst_idx] = k_host[src_idx];
+                        win_v_host[dst_idx] = v_host[src_idx];
                     }
                 }
             }
         }
     }
 
-    // Copy retrieval/window back to device.
-    core::Copy(host_retrieval, retrieval_view);
-    core::Copy(host_window, window_view);
+    // Copy retrieval/window back to device for both K and V.
+    core::Copy(host_retrieval_k, retrieval_k);
+    core::Copy(host_retrieval_v, retrieval_v);
+    core::Copy(host_window_k, window_k);
+    core::Copy(host_window_v, window_v);
 }
 
 std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
@@ -518,9 +551,13 @@ std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
 void PartialKVCache::reset_buffer()
 {
     for (int layer = 0; layer < num_layers_; ++layer) {
-        Tensor buf = buffer(layer);
-        if (buf) {
-            core::Clear(buf);
+        Tensor buf_k = buffer(layer);
+        Tensor buf_v = buffer_v(layer);
+        if (buf_k) {
+            core::Clear(buf_k);
+        }
+        if (buf_v) {
+            core::Clear(buf_v);
         }
         verified_lens_[layer] = 0;
     }

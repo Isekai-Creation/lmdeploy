@@ -56,6 +56,8 @@
 
 namespace turbomind {
 
+using eagle::TokenIdType;
+
 /// TODO: Padded vocab size should also be divisible by 8
 inline int pad_vocab_size(int vocab_size, int tp)
 {
@@ -1431,9 +1433,9 @@ void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
     eagle_step_accepted_tokens_.clear();
     eagle_step_max_extra_ = 0;
 
-    // Route EAGLE-enabled engines through the fused multi-step path so that
-    // base decode, tree decode, acceptance, and tail commit are centralized
-    // in dynamicDecodeWithSpecMulti.
+    // EAGLE-enabled engines use the fused multi-step path so that base
+    // decode, tree decode, acceptance, and tail commit are handled in a
+    // single place (dynamicDecodeWithSpecMulti).
     if (spec_ctx.enable_eagle && isEagleEnabled() && eagle_module_ && eagle_buffers_) {
         dynamicDecodeWithSpecMulti(g,
                                    token_ids,
@@ -1454,8 +1456,8 @@ void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
         return;
     }
 
-    // Baseline path when EAGLE is disabled or not fully initialized: keep
-    // the original single-step DynamicDecode semantics.
+    // Baseline path when EAGLE is disabled or not fully initialized:
+    // keep the original single-step DynamicDecode semantics.
     dynamicDecode(token_ids,
                   finished,
                   sequence_length,
@@ -1470,294 +1472,6 @@ void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
                   sampled_nums,
                   g.step,
                   max_context_len);
-
-    // ========= Step 1: Build EAGLE tree from draft tokens =========
-    const int num_draft_tokens = total_draft;
-    const int inferred_tokens_per_seq =
-        batch_size > 0 ? std::max(1, num_draft_tokens / batch_size) : 1;
-    const int expected_total = batch_size * inferred_tokens_per_seq;
-    if (expected_total != num_draft_tokens) {
-        TM_LOG_WARNING("[LlamaV2][EAGLE] draft_tokens size (%d) is not a multiple of batch_size (%d); "
-                       "interpreting as tokens_per_seq=%d and ignoring any trailing entries",
-                       num_draft_tokens,
-                       batch_size,
-                       inferred_tokens_per_seq);
-    }
-
-    eagle::SpeculationTree tree(
-        engine_param_.spec_max_draft_path_len,
-        engine_param_.spec_max_decoding_tokens);
-
-    const auto& choices = eagle_module_->getDefaultChoices();
-    if (!choices.empty()) {
-        tree.buildTreeWithChoices(draft_tokens.data(), inferred_tokens_per_seq, choices);
-    }
-    else {
-        tree.buildTree(draft_tokens.data(), inferred_tokens_per_seq);
-    }
-    tree.extractPaths();
-
-    const int* paths_flat = tree.getPathsFlat();
-    const int  num_paths  = tree.getNumPaths();
-    const int  max_path_len = engine_param_.spec_max_draft_path_len;
-    const int  max_decoding_tokens = engine_param_.spec_max_decoding_tokens;
-
-    if (num_paths == 0) {
-        TM_LOG_WARNING("[LlamaV2][EAGLE] No valid paths in tree");
-        return;
-    }
-
-    TM_LOG_DEBUG("[LlamaV2][EAGLE] Built tree with %d paths, max_depth=%d",
-                 num_paths,
-                 max_path_len);
-
-    // ========= Step 2: Mirror paths into EagleBuffers =========
-    // Prepare per-sequence path buffers. The current tree is single-sequence,
-    // so we replicate its paths across all batch slots.
-    std::vector<int> host_paths(batch_size * max_decoding_tokens * max_path_len, -1);
-    const int paths_per_seq = std::min(num_paths, max_decoding_tokens);
-
-    for (int b = 0; b < batch_size; ++b) {
-        for (int p = 0; p < paths_per_seq; ++p) {
-            const int* src = paths_flat + p * max_path_len;
-            int*       dst = host_paths.data() + (b * max_decoding_tokens + p) * max_path_len;
-            std::copy(src, src + max_path_len, dst);
-        }
-    }
-
-    cudaMemcpyAsync(eagle_buffers_->inputs.draft_paths,
-                    host_paths.data(),
-                    host_paths.size() * sizeof(int),
-                    cudaMemcpyHostToDevice,
-                    stream_);
-
-    sync_check_cuda_error();
-
-    // ========= Step 3: Generate leaf mask and packed masks =========
-    kernels::eagle::invokeBuildLeafMask(
-        eagle_buffers_->inputs.leaf_mask,
-        eagle_buffers_->inputs.draft_paths,
-        batch_size,
-        engine_param_.spec_max_decoding_tokens,
-        engine_param_.spec_max_draft_path_len,
-        stream_);
-
-    std::vector<int> batch_slots(batch_size);
-    for (int i = 0; i < batch_size; ++i) {
-        batch_slots[i] = i;
-    }
-
-    int* d_batch_slots = nullptr;
-    check_cuda_error(cudaMalloc(&d_batch_slots, batch_size * sizeof(int)));
-    check_cuda_error(cudaMemcpyAsync(
-        d_batch_slots,
-        batch_slots.data(),
-        batch_size * sizeof(int),
-        cudaMemcpyHostToDevice,
-        stream_));
-
-    kernels::eagle::invokeGetPackedMaskFromPath(
-        eagle_buffers_->inputs.packed_masks,
-        reinterpret_cast<kernels::eagle::SizeType*>(d_batch_slots),
-        reinterpret_cast<kernels::eagle::SizeType const*>(eagle_buffers_->inputs.draft_paths),
-        engine_param_.spec_max_decoding_tokens,
-        engine_param_.spec_max_draft_path_len,
-        stream_);
-
-    sync_check_cuda_error();
-
-    TM_LOG_DEBUG("[LlamaV2][EAGLE] Generated masks for %d paths", num_paths);
-
-    // Optional target-tree decode over the speculative tree.
-    if (spec_ctx.enable_eagle_target_tree && isTargetTreeDecodeEnabled()) {
-        runEagleTargetTreeDecode(batch_size, spec_ctx.d_sequence_lengths, spec_ctx.sequences);
-    }
-
-    // ========= Step 4: Device-side acceptance over tree paths =========
-    std::vector<int> h_draft(num_draft_tokens);
-    std::vector<int> h_target(num_draft_tokens);
-    std::copy_n(draft_tokens.data(), num_draft_tokens, h_draft.data());
-
-    std::vector<int> h_accepted_lens(batch_size, 0);
-    std::vector<int> h_accepted_tokens(batch_size * max_path_len, -1);
-    std::vector<int> host_best_path_ids(batch_size, 0);
-
-    using SpecSizeType    = kernels::speculative_decoding::SizeType;
-    using SpecTokenIdType = kernels::speculative_decoding::TokenIdType;
-
-    const SpecSizeType max_batch_size   = static_cast<SpecSizeType>(batch_size);
-    const SpecSizeType max_draft_tokens = static_cast<SpecSizeType>(inferred_tokens_per_seq);
-    const SpecSizeType num_paths_device = static_cast<SpecSizeType>(paths_per_seq);
-    const SpecSizeType max_path_len_dev = static_cast<SpecSizeType>(max_path_len);
-
-    kernels::speculative_decoding::invokeTreeAcceptByIdsWithPaths(
-        reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.draft_tokens),
-        reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.target_tokens),
-        reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
-        reinterpret_cast<SpecSizeType const*>(d_batch_slots),
-        static_cast<SpecSizeType>(batch_size),
-        max_batch_size,
-        num_paths_device,
-        max_path_len_dev,
-        max_draft_tokens,
-        reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.best_path_ids),
-        reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_lens),
-        reinterpret_cast<SpecTokenIdType*>(eagle_buffers_->outputs.accepted_tokens),
-        stream_);
-
-    sync_check_cuda_error();
-
-    if (isEagleDebugEnabled() && tp_rank_ == 0) {
-        check_cuda_error(cudaMemcpyAsync(
-            host_best_path_ids.data(),
-            eagle_buffers_->outputs.best_path_ids,
-            batch_size * sizeof(SpecSizeType),
-            cudaMemcpyDeviceToHost,
-            stream_));
-    }
-
-    check_cuda_error(cudaMemcpyAsync(
-        h_accepted_lens.data(),
-        eagle_buffers_->outputs.accepted_lens,
-        batch_size * sizeof(SpecSizeType),
-        cudaMemcpyDeviceToHost,
-        stream_));
-
-    check_cuda_error(cudaMemcpyAsync(
-        h_accepted_tokens.data(),
-        eagle_buffers_->outputs.accepted_tokens,
-        batch_size * max_path_len * sizeof(SpecTokenIdType),
-        cudaMemcpyDeviceToHost,
-        stream_));
-
-    check_cuda_error(cudaStreamSynchronize(stream_));
-
-    int total_accepted = 0;
-    for (int b = 0; b < batch_size; ++b) {
-        if (h_accepted_lens[b] < 0) {
-            h_accepted_lens[b] = 0;
-        }
-        total_accepted += h_accepted_lens[b];
-    }
-
-    // Optional debug logging of accepted paths/tokens.
-    if (isEagleDebugEnabled() && tp_rank_ == 0) {
-        if (isTargetTreeDecodeActiveStep()) {
-            check_cuda_error(cudaMemcpyAsync(
-                h_target.data(),
-                eagle_buffers_->inputs.target_tokens,
-                num_draft_tokens * sizeof(int),
-                cudaMemcpyDeviceToHost,
-                stream_));
-            check_cuda_error(cudaStreamSynchronize(stream_));
-        }
-        else {
-            std::copy_n(target_tokens.data(), num_draft_tokens, h_target.data());
-        }
-
-        for (int b = 0; b < batch_size; ++b) {
-            const int len     = h_accepted_lens[b];
-            const int path_id = host_best_path_ids[b];
-            if (len <= 0) {
-                TM_LOG_WARNING("[LlamaV2][EAGLE] step_spec seq=%d no accepted tokens (best_path=%d)", b, path_id);
-                continue;
-            }
-
-            std::ostringstream draft_ss;
-            std::ostringstream target_ss;
-            std::ostringstream accepted_ss;
-
-            for (int d = 0; d < max_path_len; ++d) {
-                const int node_idx = paths_flat[path_id * max_path_len + d];
-                if (node_idx <= 0) {
-                    if (node_idx < 0) {
-                        break;
-                    }
-                    continue;
-                }
-                const int token_idx = node_idx - 1;
-                if (token_idx < 0 || token_idx >= inferred_tokens_per_seq) {
-                    break;
-                }
-                const int global_idx = b * inferred_tokens_per_seq + token_idx;
-                if (global_idx < 0 || global_idx >= num_draft_tokens) {
-                    break;
-                }
-
-                const int draft_id  = h_draft[global_idx];
-                const int target_id = h_target[global_idx];
-
-                if (draft_ss.tellp() > 0) {
-                    draft_ss << ',';
-                    target_ss << ',';
-                }
-                draft_ss << draft_id;
-                target_ss << target_id;
-            }
-
-            for (int t = 0; t < len; ++t) {
-                if (t) {
-                    accepted_ss << ',';
-                }
-                accepted_ss << h_accepted_tokens[b * max_path_len + t];
-            }
-
-            TM_LOG_WARNING("[LlamaV2][EAGLE] step_spec seq=%d best_path=%d accepted_len=%d "
-                           "path_draft_tokens=[%s] path_target_tokens=[%s] "
-                           "accepted_tokens=[%s]",
-                           b,
-                           path_id,
-                           len,
-                           draft_ss.str().c_str(),
-                           target_ss.str().c_str(),
-                           accepted_ss.str().c_str());
-        }
-    }
-
-    if (eagle_buffers_ && eagle_buffers_->isAllocated()) {
-        // Pack accepted paths on device for downstream KV / context helpers.
-        kernels::speculative_decoding::invokePackAcceptedPaths(
-            reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_lengths_cumsum),
-            reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_path_offsets),
-            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.accepted_lens),
-            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.best_path_ids),
-            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
-            reinterpret_cast<SpecSizeType const*>(d_batch_slots),
-            static_cast<SpecSizeType>(batch_size),
-            static_cast<SpecSizeType>(batch_size),
-            static_cast<SpecSizeType>(paths_per_seq),
-            static_cast<SpecSizeType>(max_path_len),
-            stream_);
-
-        check_cuda_error(cudaFree(d_batch_slots));
-    }
-
-    const int effective_draft_tokens = batch_size;  // one token considered per seq
-    float      acceptance_rate       = (effective_draft_tokens > 0)
-                                           ? static_cast<float>(total_accepted)
-                                                 / static_cast<float>(effective_draft_tokens)
-                                           : 0.0f;
-
-    TM_LOG_WARNING("[LlamaV2][EAGLE] Accepted %d/%d draft tokens (%.1f%% acceptance rate)",
-                   total_accepted,
-                   effective_draft_tokens,
-                   acceptance_rate * 100.0f);
-
-    float h_acceptance_rate = acceptance_rate;
-    cudaMemcpyAsync(
-        eagle_buffers_->outputs.acceptance_rate,
-        &h_acceptance_rate,
-        sizeof(float),
-        cudaMemcpyHostToDevice,
-        stream_);
-
-    sync_check_cuda_error();
-
-    // Cache per-step acceptance summary for LlamaBatch metrics and
-    // multi-token advancement.
-    eagle_step_tokens_per_seq_  = inferred_tokens_per_seq;
-        eagle_step_accepted_lens_   = std::move(h_accepted_lens);
-        eagle_step_accepted_tokens_ = std::move(h_accepted_tokens);
 }
 
 void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
@@ -1920,7 +1634,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     const int total_draft    = batch_size * tokens_per_seq;
 
     // Prepare FP32 draft logits for GPU top-k.
-    Tensor eagle_sampling_logits{{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
+    Tensor eagle_sampling_logits{core::Layout{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
     if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
         TM_LOG_WARNING(
             "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32 in dynamicDecodeWithSpecMulti; "

@@ -103,12 +103,17 @@ public:
 
     void reset() noexcept;
 
-    // Segment views over the per-layer KV buffer. These are lightweight
+    // Segment views over the per-layer KV buffers. These are lightweight
     // Tensor slices; they do not allocate or copy.
-    Tensor sink(int layer_idx);
+    Tensor sink(int layer_idx);     // K view
     Tensor retrieval(int layer_idx);
     Tensor window(int layer_idx);
     Tensor buffer(int layer_idx);
+
+    Tensor sink_v(int layer_idx);   // V view
+    Tensor retrieval_v(int layer_idx);
+    Tensor window_v(int layer_idx);
+    Tensor buffer_v(int layer_idx);
 
     // Summary and retrieval helpers modelled after SpecPV. The initial
     // implementation focuses on maintaining block counts and placeholders
@@ -132,6 +137,8 @@ public:
 
 private:
     void recompute_global_verified_len() noexcept;
+
+    Tensor slice_tokens(std::vector<Tensor>& cache, int layer_idx, int token_start, int token_count);
 
 private:
     SpecPVCacheConfig cfg_{};
