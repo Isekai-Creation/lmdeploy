@@ -38,6 +38,7 @@
 
 #include "src/turbomind/kernels/gpt_kernels.h"
 #include "src/turbomind/kernels/attention/kv_cache_utils_v2.h"
+#include "src/turbomind/kernels/attention/block.h"
 #include "src/turbomind/kernels/sampling_topk_kernels.h"
 
 #include "src/turbomind/models/llama/llama_kernels.h"
@@ -256,6 +257,24 @@ LlamaV2::LlamaV2(DataType                     dtype,
                                    && specpv_cache_config_.total_budget() > 0
                                    && local_kv_head_num_ > 0
                                    && hidden_units_ > 0;
+
+                // Hard guard: the SpecPV buffer must be large enough to hold
+                // at least one step worth of EAGLE tree tokens for this
+                // engine. If it is smaller than the configured
+                // eagle_max_engine_tokens_per_step_ we disable SpecPV at
+                // construction time and fall back to the full-KV EAGLE3
+                // pipeline so that tree decode invariants are preserved.
+                const int tree_step_budget = std::max(1, eagle_max_engine_tokens_per_step_);
+                if (geometry_ok
+                    && specpv_cache_config_.n_spec_tokens_buf > 0
+                    && specpv_cache_config_.n_spec_tokens_buf < tree_step_budget) {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][SpecPV][fallback] partial KV buffer too small for EAGLE tree "
+                        "(spec_tokens_buf=%d, step_budget=%d); disabling SpecPV for this engine.",
+                        specpv_cache_config_.n_spec_tokens_buf,
+                        tree_step_budget);
+                    geometry_ok = false;
+                }
 
                 if (!geometry_ok) {
                     TM_LOG_WARNING(
