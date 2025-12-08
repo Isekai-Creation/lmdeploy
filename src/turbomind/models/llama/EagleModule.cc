@@ -2,8 +2,10 @@
 // Adapted from TensorRT-LLM's EAGLE implementation
 
 #include "src/turbomind/models/llama/EagleModule.h"
+#include "src/turbomind/models/llama/EagleBuffers.h"
 #include "src/turbomind/models/llama/LlamaLinear.h"
 #include "src/turbomind/models/llama/llama_utils.h"
+#include "src/turbomind/models/llama/llama_kernels.h"
 #include "src/turbomind/kernels/norm/rms_norm.h"
 #include "src/turbomind/kernels/activation.h"
 #include "src/turbomind/core/data_type.h"
@@ -14,8 +16,9 @@
 #include "src/turbomind/utils/eagle_debug.h"
 
 #include <fstream>
-#include <vector>
+#include <new>
 #include <string>
+#include <vector>
 
 #include <yaml-cpp/yaml.h>
 
@@ -502,16 +505,16 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         const int tp_rank    = 0;
         const int group_size = 1;
 
-        eagle3_draft_layer_->ffn = LlamaFfnWeight(hidden_units,
-                                                  inter_size,
-                                                  /*bias=*/false,
-                                                  tp_size,
-                                                  tp_rank,
-                                                  weight_dtype_,
-                                                  weight_dtype_,
-                                                  group_size,
-                                                  ActivationType::Silu,
-                                                  /*fuse_silu_act=*/true);
+        new (&eagle3_draft_layer_->ffn) LlamaFfnWeight(hidden_units,
+                                                       inter_size,
+                                                       /*bias=*/false,
+                                                       tp_size,
+                                                       tp_rank,
+                                                       weight_dtype_,
+                                                       weight_dtype_,
+                                                       group_size,
+                                                       ActivationType::kSilu,
+                                                       /*fuse_silu_act=*/true);
 
         eagle3_draft_layer_->ffn.fused_gating_intermediate.weight = weights_.mlp_gate_up.borrow();
         eagle3_draft_layer_->ffn.output.weight                    = weights_.mlp_down.borrow();
@@ -571,24 +574,24 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             // standard attention layout; otherwise we rely on the
             // existing shallow linearised path.
             if (draft_ok) {
-                const int kv_head_num = head_num;  // simple single-group KV
-                const bool bias       = false;
-                const bool qk_norm    = false;
+                const int  kv_head_num = head_num;  // simple single-group KV
+                const bool bias        = false;
+                const bool qk_norm     = false;
                 MLAParam   mla_param{};
-                eagle3_draft_layer_->attn = LlamaAttentionWeight(hidden_units,
-                                                                 head_dim,
-                                                                 head_num,
-                                                                 kv_head_num,
-                                                                 mla_param,
-                                                                 bias,
-                                                                 qk_norm,
-                                                                 /*tp_size=*/1,
-                                                                 /*tp_rank=*/0,
-                                                                 weight_dtype_,
-                                                                 weight_dtype_,
-                                                                 /*group_size=*/1,
-                                                                 /*window_size=*/0,
-                                                                 /*sink=*/false);
+                new (&eagle3_draft_layer_->attn) LlamaAttentionWeight(hidden_units,
+                                                                      head_dim,
+                                                                      head_num,
+                                                                      kv_head_num,
+                                                                      mla_param,
+                                                                      bias,
+                                                                      qk_norm,
+                                                                      /*tp_size=*/1,
+                                                                      /*tp_rank=*/0,
+                                                                      weight_dtype_,
+                                                                      weight_dtype_,
+                                                                      /*group_size=*/1,
+                                                                      /*window_size=*/0,
+                                                                      /*sink=*/false);
 
                 // Only alias Eagle3 QKV / Wo into the attention weight
                 // when shapes are exactly compatible; otherwise mark the
