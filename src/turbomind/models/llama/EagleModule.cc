@@ -1321,16 +1321,15 @@ void EagleModule::forward(const Tensor& input_ids,
             // holds FFN(norm(attn_out)) and `attn_out_scratch_` is the
             // residual from attention.
             invokeResidualBiasRMSNorm(
-                /*hidden_states=*/output_hidden.raw_data(),
-                /*residual=*/const_cast<void*>(input_hidden.raw_data()),
-                /*weights=*/weight_->output_norm.raw_data(),
+                /*hidden_states=*/ffn_out.raw_data(),
+                /*residual=*/attn_out_scratch_.raw_data(),
+                /*weights=*/eagle3_draft_layer_->output_norm.raw_data(),
                 /*bias=*/nullptr,
-                dtype,
+                weight_dtype_,
                 hidden_dim,
                 batch_size,
-                rmsnorm_eps_,
+                kEps,
                 stream);
-
             output_hidden_states = ffn_out;
             if (isEagleDebugEnabled()) {
                 debug_pre_head_hidden_ = ffn_out;
