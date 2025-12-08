@@ -55,14 +55,13 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         return;
     }
 
-    if (!weight_ || !ffn_layer_) {
+    if (!weight_) {
         TM_LOG_WARNING(
-            "[EAGLE][Eagle3DraftLayer][fallback] draft layer weights or FFN layer unavailable; "
+            "[EAGLE][Eagle3DraftLayer][fallback] draft layer weights unavailable; "
             "treating Eagle3 draft as pass-through.");
         output_hidden = input_hidden;
         return;
     }
-
     const bool debug_enabled = isEagleDebugEnabled();
 
     debug_fc_out_          = Tensor{};
@@ -227,39 +226,56 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     Tensor ffn_input{{batch_size, hidden_dim}, dtype, input_hidden.device()};
     invokeRMSNorm(ffn_input, attn_out, weight_->post_attn_norm, rmsnorm_eps_, stream);
 
+    // Ensure output buffer is allocated with the correct shape.
     if (!output_hidden || output_hidden.ndim() != 2 || output_hidden.shape(0) != batch_size
         || output_hidden.shape(1) != hidden_dim || output_hidden.dtype() != dtype
         || output_hidden.device().type != input_hidden.device().type) {
         output_hidden = Tensor{{batch_size, hidden_dim}, dtype, input_hidden.device()};
     }
 
-    LlamaFfnLayer::ForwardParam ffn_param{};
-    ffn_param.input    = ffn_input;
-    ffn_param.output   = output_hidden;
-    ffn_param.weights  = &weight_->ffn;
-    ffn_param.layer_id = 0;
-    ffn_layer_->forward(ffn_param);
-    sync_check_cuda_error();
+    if (ffn_layer_) {
+        // Gated MLP using the prepared Eagle3 FFN weights.
+        LlamaFfnLayer::ForwardParam ffn_param{};
+        ffn_param.input    = ffn_input;
+        ffn_param.output   = output_hidden;
+        ffn_param.weights  = &weight_->ffn;
+        ffn_param.layer_id = 0;
+        ffn_layer_->forward(ffn_param);
+        sync_check_cuda_error();
+        if (debug_enabled) {
+            debug_ffn_out_ = output_hidden;
+        }
 
-    if (debug_enabled) {
-        debug_ffn_out_ = output_hidden;
-    }
+        // Residual + output RMSNorm:
+        invokeResidualBiasRMSNorm(
+            /*hidden_states=*/output_hidden.raw_data(),
+            /*residual=*/const_cast<void*>(input_hidden.raw_data()),
+            /*weights=*/weight_->output_norm.raw_data(),
+            /*bias=*/nullptr,
+            dtype,
+            hidden_dim,
+            batch_size,
+            rmsnorm_eps_,
+            stream);
 
-    invokeResidualBiasRMSNorm(
-        /*hidden_states=*/output_hidden.raw_data(),
-        /*residual=*/const_cast<void*>(input_hidden.raw_data()),
-        /*weights=*/weight_->output_norm.raw_data(),
-        /*bias=*/nullptr,
-        dtype,
-        hidden_dim,
-        batch_size,
-        rmsnorm_eps_,
-        stream);
+        if (debug_enabled) {
+            debug_pre_head_hidden_ = output_hidden;
+        }
+    } else {
+        // No FFN backend available: fall back to a light post-attention norm
+        // over attn_out. This keeps the draft layer structurally active
+        // instead of forcing a full pass-through.
+        TM_LOG_WARNING(
+            "[EAGLE3][Draft][fallback] ffn_layer_ is null; running attention-only draft "
+            "with output RMSNorm.");
 
-    if (debug_enabled) {
-        debug_pre_head_hidden_ = output_hidden;
-        if (used_unified_attention) {
-            TM_LOG_DEBUG("[EAGLE3][Draft] UnifiedAttentionLayer used for Eagle3 draft attention.");
+        // Simple: y = RMSNorm(attn_out, output_norm)
+        invokeRMSNorm(output_hidden, attn_out, weight_->output_norm, rmsnorm_eps_, stream);
+        sync_check_cuda_error();
+
+        if (debug_enabled) {
+            debug_ffn_out_         = Tensor{};
+            debug_pre_head_hidden_ = output_hidden;
         }
     }
 }

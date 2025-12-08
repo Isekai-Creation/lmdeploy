@@ -74,13 +74,22 @@ void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
 {
     eagle3_draft_weight_ = w;
 
-    // We need both attention + FFN backends to run a real Eagle3 draft layer.
-    if (w && attn_layer_ && ffn_layer_) {
+    if (w && attn_layer_) {
+        // FFN backend is optional here; Eagle3DraftLayer will skip the
+        // FFN path when ffn_layer_ is null and behave as an attention-only
+        // draft layer. This is preferable to disabling the draft layer
+        // outright, as it keeps Eagle3 structurally active.
         eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayer>(
             w,
-            attn_layer_.get(),   // real attention backend
-            ffn_layer_.get(),    // GatedMLP backend
+            attn_layer_.get(),
+            ffn_layer_ ? ffn_layer_.get() : nullptr,
             rmsnorm_eps_);
+
+        if (!ffn_layer_) {
+            TM_LOG_WARNING(
+                "[UnifiedDecoder][EAGLE3][fallback] ffn_layer_ is null; "
+                "Eagle3 draft will run without FFN (attention-only).");
+        }
     }
     else {
         TM_LOG_WARNING(
@@ -92,7 +101,6 @@ void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
         eagle3_draft_layer_.reset();
     }
 }
-
 
 void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
                                   Tensor&       output_hidden,
