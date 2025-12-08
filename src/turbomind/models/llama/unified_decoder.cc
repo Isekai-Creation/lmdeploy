@@ -70,6 +70,54 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
     }
 }
 
+void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
+{
+    eagle3_draft_weight_ = w;
+    if (w && ffn_layer_) {
+        eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayer>(w, ffn_layer_.get(), rmsnorm_eps_);
+    }
+    else {
+        eagle3_draft_layer_.reset();
+    }
+}
+
+void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
+                                  Tensor&       output_hidden,
+                                  int           batch_size,
+                                  cudaStream_t  stream)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    if (!eagle3_draft_layer_ || !eagle3_draft_weight_) {
+        TM_LOG_WARNING(
+            "[UnifiedDecoder][EAGLE3][fallback] draft layer unavailable; passing through hidden states.");
+        output_hidden = input_hidden;
+        return;
+    }
+
+    if (!input_hidden || input_hidden.ndim() != 2 || input_hidden.shape(0) != batch_size
+        || input_hidden.shape(1) != static_cast<int>(hidden_units_)) {
+        TM_LOG_WARNING(
+            "[UnifiedDecoder][EAGLE3][fallback] input_hidden shape mismatch in ForwardDraft "
+            "(got=[%d,%d], expected=[%d,%zu]); passing through.",
+            input_hidden ? input_hidden.shape(0) : -1,
+            input_hidden ? input_hidden.shape(1) : -1,
+            batch_size,
+            hidden_units_);
+        output_hidden = input_hidden;
+        return;
+    }
+
+    if (!output_hidden || output_hidden.ndim() != 2 || output_hidden.shape(0) != batch_size
+        || output_hidden.shape(1) != static_cast<int>(hidden_units_)
+        || output_hidden.dtype() != input_hidden.dtype()
+        || output_hidden.device().type != input_hidden.device().type) {
+        output_hidden = Tensor{{batch_size, static_cast<int>(hidden_units_)}, input_hidden.dtype(), kDEVICE};
+    }
+
+    eagle3_draft_layer_->Forward(input_hidden, output_hidden, stream);
+}
+
 void UnifiedDecoder::AllreduceResidualRMSnorm(Tensor&       hidden_states,
                                               Tensor&       residual,
                                               const Tensor& bias,

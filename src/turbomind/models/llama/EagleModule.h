@@ -10,6 +10,7 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/models/llama/LlamaDenseWeight.h"
 #include "src/turbomind/models/llama/LlamaFfnLayer.h"
+#include "src/turbomind/models/llama/EagleDraftLayer.h"
 #include "lmdeploy/turbomind/speculative_decoding_mode.h"
 
 namespace turbomind {
@@ -39,16 +40,6 @@ struct EagleWeight {
     Tensor draft_id_to_target_id;
     
     bool is_initialized = false;
-};
-
-struct Eagle3DraftLayerWeight {
-    LlamaAttentionWeight attn;
-    LlamaFfnWeight       ffn;
-    Tensor               input_norm;
-    Tensor               post_attn_norm;
-    Tensor               output_norm;
-
-    Eagle3DraftLayerWeight() = default;
 };
 
 /**
@@ -221,6 +212,8 @@ private:
     // without changing EagleModule's public surface.
     std::unique_ptr<Eagle3DraftLayerWeight> eagle3_draft_layer_;
 
+    friend class LlamaV2;
+
     // Debug views for eagle_forward_logits_debug / eagle_forward_debug.
     // These alias internal scratch buffers after the most recent forward
     // call when EAGLE debug is enabled.
@@ -239,6 +232,19 @@ public:
     const Tensor& debug_ffn_out() const { return debug_ffn_out_; }
     const Tensor& debug_pre_head_hidden() const { return debug_pre_head_hidden_; }
     const Tensor& debug_logits() const { return debug_logits_; }
+
+    // Tree-aware draft path used from LlamaV2. This is a structural
+    // wrapper around the main Eagle draft forward that also applies
+    // Top-K over the draft / target logits to populate EagleBuffers
+    // draft/target token IDs on device.
+    void forward_draft_tree(const Tensor& last_hidden_states,
+                            const Tensor& captured_hidden_states,
+                            const Tensor& base_logits,
+                            int           tokens_per_seq,
+                            EagleBuffers& buffers,
+                            Tensor&       draft_logits_buffer,
+                            LlamaLinear&  linear,
+                            cudaStream_t  stream);
 
     // Cached model dims / dtype
     int      hidden_units_{0};

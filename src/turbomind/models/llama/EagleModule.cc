@@ -7,6 +7,7 @@
 #include "src/turbomind/kernels/norm/rms_norm.h"
 #include "src/turbomind/kernels/activation.h"
 #include "src/turbomind/core/data_type.h"
+#include "src/turbomind/kernels/sampling_topk_kernels.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/kernels/gpt_kernels.h"
 #include "src/turbomind/utils/logger.h"
@@ -694,6 +695,183 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         "[EAGLE] EagleModule draft model loaded successfully: hidden_units=%d vocab_size=%d", hidden_units_, vocab_size_);
 }
 
+void EagleModule::forward_draft_tree(const Tensor& last_hidden_states,
+                                     const Tensor& captured_hidden_states,
+                                     const Tensor& base_logits,
+                                     int           tokens_per_seq,
+                                     EagleBuffers& buffers,
+                                     Tensor&       draft_logits_buffer,
+                                     LlamaLinear&  linear,
+                                     cudaStream_t  stream)
+{
+    NvtxScope nvtx_scope("EagleModule::forward_draft_tree");
+    if (!enabled_ || !weights_.is_initialized || tokens_per_seq <= 0) {
+        return;
+    }
+
+    const int batch_size = last_hidden_states.shape(0);
+    if (batch_size <= 0) {
+        return;
+    }
+
+    // Reuse the main forward path to obtain per-sequence draft logits
+    // for this step. We ignore input_ids here because the current draft
+    // network derives its inputs from hidden + captured_hidden.
+    Tensor dummy_ids;
+    Tensor draft_hidden;
+    forward(dummy_ids,
+            last_hidden_states,
+            captured_hidden_states,
+            draft_logits_buffer,
+            draft_hidden,
+            linear,
+            stream);
+
+    if (!draft_logits_buffer) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule] forward_draft_tree received empty draft logits; "
+            "leaving EagleBuffers draft_tokens untouched for this step.");
+        return;
+    }
+
+    const int vocab_size_pad = draft_logits_buffer.shape(1);
+    const int vocab_size     = vocab_size_ > 0 ? vocab_size_ : vocab_size_pad;
+    const int total_draft    = batch_size * tokens_per_seq;
+
+    if (total_draft <= 0) {
+        return;
+    }
+
+    // Prepare FP32 draft logits for GPU top-k.
+    Tensor eagle_sampling_logits{core::Layout{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
+    if (draft_logits_buffer.dtype() != kFloat32 && draft_logits_buffer.dtype() != kBfloat16
+        && draft_logits_buffer.dtype() != kFloat16) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule] draft_logits dtype=%s is not f16/bf16/f32 in forward_draft_tree; "
+            "skipping device-side top-k.",
+            to_string(draft_logits_buffer.dtype()));
+        return;
+    }
+    invokeCastFloat2D(draft_logits_buffer, eagle_sampling_logits, stream);
+    sync_check_cuda_error();
+
+    using turbomind::TopKSortFilterParams;
+
+    const int logit_elems = batch_size * vocab_size_pad;
+
+    Buffer_<int> draft_tokens(total_draft, kCPU);
+    Buffer_<int> target_tokens(total_draft, kCPU);
+
+    if (tokens_per_seq > 0 && tokens_per_seq <= vocab_size_pad && tokens_per_seq <= 1024) {
+        Buffer_<int> topk_buf(batch_size, kDEVICE);
+        Buffer_<int> kept_buf(batch_size, kDEVICE);
+
+        std::vector<int> h_topk(batch_size, tokens_per_seq);
+        std::vector<int> h_kept(batch_size, tokens_per_seq);
+
+        core::Copy(h_topk.data(), batch_size, topk_buf.data());
+        core::Copy(h_kept.data(), batch_size, kept_buf.data());
+
+        Buffer_<int> draft_sorted_indices(logit_elems, kDEVICE);
+        Buffer_<int> target_sorted_indices(logit_elems, kDEVICE);
+
+        TopKSortFilterParams draft_params{};
+        draft_params.logits            = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_logits     = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_indices    = draft_sorted_indices.data();
+        draft_params.kept              = kept_buf.data();
+        draft_params.top_ks            = topk_buf.data();
+        draft_params.max_top_k         = tokens_per_seq;
+        draft_params.batch_size        = batch_size;
+        draft_params.vocab_size        = vocab_size;
+        draft_params.vocab_size_padded = vocab_size_pad;
+
+        invokeTopKSortFilter<float>(draft_params, stream);
+
+        TopKSortFilterParams target_params{};
+        if (base_logits) {
+            target_params.logits            = base_logits.buffer().raw_data();
+            target_params.sorted_logits     = base_logits.buffer().raw_data();
+            target_params.sorted_indices    = target_sorted_indices.data();
+            target_params.kept              = kept_buf.data();
+            target_params.top_ks            = topk_buf.data();
+            target_params.max_top_k         = tokens_per_seq;
+            target_params.batch_size        = batch_size;
+            target_params.vocab_size        = vocab_size;
+            target_params.vocab_size_padded = base_logits.shape(1);
+
+            invokeTopKSortFilter<float>(target_params, stream);
+        }
+
+        const size_t idx_width_bytes = sizeof(int) * tokens_per_seq;
+        const size_t idx_src_pitch   = sizeof(int) * vocab_size_pad;
+
+        const size_t dst_pitch_tokens =
+            static_cast<size_t>(max_decoding_tokens_) * sizeof(int);
+
+        // Draft IDs: D→D into EagleBuffers::inputs.draft_tokens.
+        check_cuda_error(cudaMemcpy2DAsync(buffers.inputs.draft_tokens,
+                                           dst_pitch_tokens,
+                                           draft_sorted_indices.data(),
+                                           idx_src_pitch,
+                                           idx_width_bytes,
+                                           batch_size,
+                                           cudaMemcpyDeviceToDevice,
+                                           stream));
+
+        // Target IDs: D→D into EagleBuffers::inputs.target_tokens when
+        // base logits are provided and target-tree decode is not going
+        // to overwrite them. The caller decides when tree decode runs.
+        if (base_logits && buffers.inputs.target_tokens) {
+            const size_t target_pitch = sizeof(int) * base_logits.shape(1);
+            check_cuda_error(cudaMemcpy2DAsync(buffers.inputs.target_tokens,
+                                               dst_pitch_tokens,
+                                               target_sorted_indices.data(),
+                                               target_pitch,
+                                               idx_width_bytes,
+                                               batch_size,
+                                               cudaMemcpyDeviceToDevice,
+                                               stream));
+        }
+
+        // Mirror the compact [batch_size, tokens_per_seq] region back to
+        // host for CPU tree construction. Layout in EagleBuffers is
+        // [batch_size, max_decoding_tokens]; the first tokens_per_seq
+        // entries per row are exactly the IDs we just wrote.
+        check_cuda_error(cudaMemcpyAsync(draft_tokens.data(),
+                                         buffers.inputs.draft_tokens,
+                                         static_cast<size_t>(total_draft) * sizeof(int),
+                                         cudaMemcpyDeviceToHost,
+                                         stream));
+
+        if (base_logits && buffers.inputs.target_tokens) {
+            check_cuda_error(cudaMemcpyAsync(target_tokens.data(),
+                                             buffers.inputs.target_tokens,
+                                             static_cast<size_t>(total_draft) * sizeof(int),
+                                             cudaMemcpyDeviceToHost,
+                                             stream));
+        }
+
+        check_cuda_error(cudaStreamSynchronize(stream));
+    }
+    else {
+        std::fill_n(draft_tokens.data(), total_draft, 0);
+        std::fill_n(target_tokens.data(), total_draft, 0);
+    }
+
+    if (isEagleDebugEnabled()) {
+        TM_LOG_DEBUG("[EAGLE][EagleModule] forward_draft_tree: batch=%d, tokens_per_seq=%d, num_draft_tokens=%d",
+                     last_hidden_states.shape(0),
+                     tokens_per_seq,
+                     total_draft);
+    }
+
+    // The caller (LlamaV2) is responsible for using draft_tokens /
+    // target_tokens to build the tree and mirror them into any host
+    // structures it maintains. Here we only populated the device
+    // buffers and host mirrors.
+}
+
 void EagleModule::forward(const Tensor& input_ids,
                           const Tensor& hidden_states,
                           Tensor&       output_logits,
@@ -1107,32 +1285,24 @@ void EagleModule::forward(const Tensor& input_ids,
             if (isEagleDebugEnabled()) {
                 debug_ffn_out_ = ffn_out;
             }
-
-            // Apply residual + RMSNorm in one step:
+            // Apply FFN residual + RMSNorm in one step:
             //   y = RMSNorm(attn_out + FFN(norm(attn_out)), output_norm)
-            // using the shared residual/norm helper.
-            bool need_norm_scratch =
-                !normed_hidden_scratch_ || normed_hidden_scratch_.dtype() != weight_dtype_
-                || normed_hidden_scratch_.device().type != kDEVICE
-                || normed_hidden_scratch_.shape(0) < batch_size
-                || normed_hidden_scratch_.shape(1) != hidden_dim;
-            if (need_norm_scratch) {
-                normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
-            }
-            Tensor& normed_hidden = normed_hidden_scratch_;
+            // using the shared residual/norm helper. Here `ffn_out`
+            // holds FFN(norm(attn_out)) and `attn_out_scratch_` is the
+            // residual from attention.
             invokeResidualBiasRMSNorm(
-                normed_hidden.raw_data(),
-                attn_out_scratch_.raw_data(),
-                eagle3_draft_layer_->output_norm.raw_data(),
+                /*hidden_states=*/ffn_out.raw_data(),
+                /*residual=*/attn_out_scratch_.raw_data(),
+                /*weights=*/eagle3_draft_layer_->output_norm.raw_data(),
                 /*bias=*/nullptr,
                 weight_dtype_,
                 hidden_dim,
                 batch_size,
                 kEps,
                 stream);
-            output_hidden_states = normed_hidden;
+            output_hidden_states = ffn_out;
             if (isEagleDebugEnabled()) {
-                debug_pre_head_hidden_ = normed_hidden;
+                debug_pre_head_hidden_ = ffn_out;
             }
         }
         else {

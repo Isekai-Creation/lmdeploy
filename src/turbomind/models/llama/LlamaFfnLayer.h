@@ -42,6 +42,16 @@ public:
 
     void forward(ForwardParam param);
 
+    LlamaLinear& linear()
+    {
+        return linear_;
+    }
+
+    const LlamaLinear& linear() const
+    {
+        return linear_;
+    }
+
 private:
     const size_t hidden_units_;
     LlamaLinear& linear_;

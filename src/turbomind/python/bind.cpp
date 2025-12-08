@@ -22,7 +22,10 @@
 #include "src/turbomind/core/context.h"
 #include "src/turbomind/engine/model_request.h"
 #include "src/turbomind/models/llama/EagleModule.h"
+#include "src/turbomind/models/llama/EagleDraftLayer.h"
+#include "src/turbomind/models/llama/LlamaFfnLayer.h"
 #include "src/turbomind/models/llama/LlamaLinear.h"
+#include "src/turbomind/models/llama/context.h"
 #include "src/turbomind/python/dlpack.h"
 #include "src/turbomind/triton_backend/llama/LlamaTritonModel.h"
 #include "src/turbomind/utils/cuda_utils.h"
@@ -1048,43 +1051,113 @@ PYBIND11_MODULE(_turbomind, m)
 
             ft::LlamaLinear linear(stream);
 
-            // Compose a minimal Tensor for input_ids (unused by Eagle3).
-            Tensor input_ids(
-                std::vector<ft::core::ssize_t>{batch_size},
-                ft::data_type_v<int32_t>,
-                ft::kDEVICE);
-            ft::check_cuda_error(
-                cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
-
             Tensor logits;
             Tensor hidden_out;
 
-            // Enable EAGLE debug for this one call so EagleModule
-            // records its intermediate tensors for comparison.
-            ft::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
-            module.forward(
-                input_ids,
-                *hidden_tm,
-                *capture_tm,
-                logits,
-                hidden_out,
-                linear,
-                stream);
-            ft::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
+            bool   use_eagle3_draft_layer = module.hasEagle3DraftLayer();
+            Tensor attn_out_dbg;
+            Tensor ffn_out_dbg;
+            Tensor pre_head_dbg;
+
+            // When an Eagle3 draft layer is available, run the new
+            // Eagle3DraftLayer path instead of the legacy EagleModule
+            // shallow draft so that HF/TRT comparisons exercise the
+            // same backend as UnifiedDecoder::ForwardDraft.
+            if (use_eagle3_draft_layer) {
+                // Minimal model/context wrappers needed for LlamaFfnLayer.
+                ft::ModelParam model_param{};
+                model_param.hidden_units = static_cast<size_t>(hidden_units);
+
+                ft::Context ctx(device_id);
+                ft::LlamaFfnLayer ffn_layer(model_param, ctx);
+
+                const auto* draft_w = module.eagle3_draft_layer_.get();
+                ft::Eagle3DraftLayer draft_layer(draft_w, &ffn_layer, /*rmsnorm_eps=*/1e-5f);
+
+                // Allocate output hidden buffer and run the draft layer.
+                hidden_out = Tensor(
+                    std::vector<ft::core::ssize_t>{batch_size, hidden_units},
+                    hidden_tm->dtype(),
+                    ft::kDEVICE);
+
+                draft_layer.Forward(*hidden_tm, hidden_out, stream);
+                ft::check_cuda_error(cudaStreamSynchronize(stream));
+
+                attn_out_dbg = draft_layer.debug_attn_out();
+                ffn_out_dbg  = draft_layer.debug_ffn_out();
+                pre_head_dbg = draft_layer.debug_pre_head_hidden();
+
+                // Build a temporary LM head weight wrapper and project
+                // to vocab using the same backend as EagleModule.
+                ft::LlamaDenseWeight lm_head_w;
+                const int lm_in  = hidden_units;
+                const int lm_out = vocab_size;
+                lm_head_w.emplace(lm_in, lm_out, weights.lm_head.dtype(), /*bias=*/false, weights.lm_head.dtype(), 1);
+                lm_head_w.weight      = weights.lm_head.borrow();
+                lm_head_w.bias        = {};
+                lm_head_w.data_type   = weights.lm_head.dtype();
+                lm_head_w.weight_type = weights.lm_head.dtype();
+                lm_head_w.input_type  = hidden_out.dtype();
+                lm_head_w.prepare(/*fused_moe=*/false);
+
+                logits = Tensor(
+                    std::vector<ft::core::ssize_t>{batch_size, vocab_size},
+                    hidden_out.dtype(),
+                    ft::kDEVICE);
+                linear.Forward(hidden_out, lm_head_w, logits);
+                ft::check_cuda_error(cudaStreamSynchronize(stream));
+            }
+            else {
+                // Compose a minimal Tensor for input_ids (unused by Eagle3).
+                Tensor input_ids(
+                    std::vector<ft::core::ssize_t>{batch_size},
+                    ft::data_type_v<int32_t>,
+                    ft::kDEVICE);
+                ft::check_cuda_error(
+                    cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
+
+                // Enable EAGLE debug for this one call so EagleModule
+                // records its intermediate tensors for comparison.
+                ft::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
+                module.forward(
+                    input_ids,
+                    *hidden_tm,
+                    *capture_tm,
+                    logits,
+                    hidden_out,
+                    linear,
+                    stream);
+                ft::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
+
+                ft::check_cuda_error(cudaStreamSynchronize(stream));
+            }
 
             ft::check_cuda_error(cudaStreamSynchronize(stream));
 
             // Expose logits plus a small set of intermediate tensors
             // so Python can perform stage-wise HF↔TM comparisons.
-            // All tensors are already on DEVICE and share storage with
-            // EagleModule's internal scratch buffers.
             py::dict out;
-            out["logits"]           = logits;
-            out["fc_out"]           = module.debug_fc_out();
-            out["attn_input"]       = module.debug_attn_input();
-            out["attn_out"]         = module.debug_attn_out();
-            out["ffn_out"]          = module.debug_ffn_out();
-            out["pre_head_hidden"]  = module.debug_pre_head_hidden();
+            out["logits"] = logits;
+
+            if (use_eagle3_draft_layer) {
+                if (attn_out_dbg) {
+                    out["attn_out"] = attn_out_dbg;
+                }
+                if (ffn_out_dbg) {
+                    out["ffn_out"] = ffn_out_dbg;
+                }
+                if (pre_head_dbg) {
+                    out["pre_head_hidden"] = pre_head_dbg;
+                }
+            }
+            else {
+                // Legacy EagleModule debug intermediates.
+                out["fc_out"]          = module.debug_fc_out();
+                out["attn_input"]      = module.debug_attn_input();
+                out["attn_out"]        = module.debug_attn_out();
+                out["ffn_out"]         = module.debug_ffn_out();
+                out["pre_head_hidden"] = module.debug_pre_head_hidden();
+            }
 
             (void)vocab_size;
             return out;

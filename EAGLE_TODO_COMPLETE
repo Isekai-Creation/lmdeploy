@@ -9,6 +9,25 @@ Statuses:
 
 ---
 
+## 0. Progress Snapshot (approximate)
+
+These are coarse‑grained progress estimates for the major areas:
+
+- Target‑tree decode + KV + masks: **~85–90% complete**
+  - All core pieces are implemented and guarded; remaining work is mostly tuning and SpecPV integration.
+- Acceptance logic + KV rewind + multi‑token tails: **~80–90% complete**
+  - Semantics match TensorRT‑LLM (ID‑equality, KV rewind, tail commit); further refinements are around metrics and edge‑cases only.
+- Eagle3 converter + geometry + capture/FC path: **~85–95% complete**
+  - Geometry and weight export are correct; capture layers and FC+norm are structurally aligned with Eagle‑3.
+- Eagle3 draft logits (attention + FFN numerics): **~20–30% complete**
+  - Current draft head is still a shallow “attention‑like” block; logits are far from HF/TRT, and acceptance remains ≈1.
+- SpecPV partial‑KV verification: **~20% complete**
+  - Kernels and scaffolding exist; not yet wired into the production EAGLE3 target‑tree path.
+
+The remaining high‑impact work is concentrated in **Section 4.2** (Eagle3 draft head & numerics) and **Section 5** (SpecPV), which must be completed to reach full TensorRT‑LLM parity and practical performance.
+
+---
+
 ## 1. Target‑Tree Decode & Target Verification (core C++/CUDA)
 
 These tasks make the target model actually verify the EAGLE tree, not just

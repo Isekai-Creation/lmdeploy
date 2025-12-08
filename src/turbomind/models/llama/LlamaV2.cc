@@ -172,6 +172,17 @@ LlamaV2::LlamaV2(DataType                     dtype,
             }
             else {
                 TM_LOG_INFO("[LlamaV2][EAGLE] Draft model loaded and validated");
+                // Share Eagle3 draft-layer weights with the decoder when
+                // available so that future Eagle3 draft paths can run
+                // under UnifiedDecoder instead of the shallow block in
+                // EagleModule.
+                if (engine.spec_method == "eagle3" && eagle_module_->hasEagle3DraftLayer()) {
+                    eagle3_draft_weight_ =
+                        std::make_unique<Eagle3DraftLayerWeight>(*eagle_module_->eagle3_draft_layer_);
+                    if (unified_decoder_) {
+                        unified_decoder_->setEagle3DraftLayer(eagle3_draft_weight_.get());
+                    }
+                }
                 eagle_ok = true;
             }
         }
@@ -374,6 +385,194 @@ bool LlamaV2::shouldUseSpecPV(int seq_len) const noexcept
     const int step_budget = std::max(1, eagle_max_engine_tokens_per_step_);
 
     return current_tokens + step_budget + 1 <= max_tokens;
+}
+
+void LlamaV2::runEagle3DraftTreeDecode(const Tensor& decoder_features,
+                                       const Tensor& base_logits,
+                                       int           batch_size,
+                                       int           tokens_per_seq,
+                                       EagleBuffers& buffers,
+                                       Tensor&       draft_logits,
+                                       cudaStream_t  stream)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    if (!unified_decoder_ || !eagle3_draft_weight_) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] Eagle3 draft layer unavailable in runEagle3DraftTreeDecode; "
+            "skipping speculative draft for this step.");
+        return;
+    }
+
+    if (batch_size <= 0 || tokens_per_seq <= 0) {
+        return;
+    }
+
+    const int hidden_dim = static_cast<int>(hidden_units_);
+
+    if (!decoder_features || decoder_features.ndim() != 2
+        || decoder_features.shape(0) != batch_size
+        || decoder_features.shape(1) != hidden_dim) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] decoder_features shape mismatch in runEagle3DraftTreeDecode; "
+            "skipping speculative draft for this step.");
+        return;
+    }
+
+    // Allocate draft_hidden [batch, hidden_units] with the same dtype as decoder_features.
+    Tensor draft_hidden{{batch_size, hidden_dim}, decoder_features.dtype(), kDEVICE};
+
+    unified_decoder_->ForwardDraft(decoder_features, draft_hidden, batch_size, stream);
+
+    // Project to vocab using the same LM head as the base model.
+    const int vocab_pad = static_cast<int>(vocab_size_padded_);
+    if (vocab_pad <= 0) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE][fallback] invalid vocab_size_padded_=%d; skipping speculative draft.",
+                       vocab_pad);
+        return;
+    }
+
+    Buffer local_draft_logits_buffer(static_cast<ssize_t>(batch_size) * vocab_pad, dtype_, kDEVICE);
+    draft_logits = postDecodeEmbedding(draft_hidden, local_draft_logits_buffer);
+
+    if (!draft_logits) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] postDecodeEmbedding returned empty draft logits; "
+            "skipping speculative draft.");
+        return;
+    }
+
+    // Device top-k over draft logits, mirroring EagleModule::forward_draft_tree.
+    const int vocab_size_pad = draft_logits.shape(1);
+    const int vocab_size     = static_cast<int>(vocab_size_);
+    const int total_draft    = batch_size * tokens_per_seq;
+
+    if (total_draft <= 0) {
+        return;
+    }
+
+    Tensor eagle_sampling_logits{core::Layout{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
+    if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE] draft_logits dtype=%s is not f16/bf16/f32 in runEagle3DraftTreeDecode; "
+            "skipping device-side top-k.",
+            to_string(draft_logits.dtype()));
+        return;
+    }
+    invokeCastFloat2D(draft_logits, eagle_sampling_logits, stream);
+    sync_check_cuda_error();
+
+    using turbomind::TopKSortFilterParams;
+
+    const int logit_elems = batch_size * vocab_size_pad;
+
+    Buffer_<int> draft_tokens(total_draft, kCPU);
+    Buffer_<int> target_tokens(total_draft, kCPU);
+
+    if (tokens_per_seq > 0 && tokens_per_seq <= vocab_size_pad && tokens_per_seq <= 1024) {
+        Buffer_<int> topk_buf(batch_size, kDEVICE);
+        Buffer_<int> kept_buf(batch_size, kDEVICE);
+
+        std::vector<int> h_topk(batch_size, tokens_per_seq);
+        std::vector<int> h_kept(batch_size, tokens_per_seq);
+
+        core::Copy(h_topk.data(), batch_size, topk_buf.data());
+        core::Copy(h_kept.data(), batch_size, kept_buf.data());
+
+        Buffer_<int> draft_sorted_indices(logit_elems, kDEVICE);
+        Buffer_<int> target_sorted_indices(logit_elems, kDEVICE);
+
+        TopKSortFilterParams draft_params{};
+        draft_params.logits            = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_logits     = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_indices    = draft_sorted_indices.data();
+        draft_params.kept              = kept_buf.data();
+        draft_params.top_ks            = topk_buf.data();
+        draft_params.max_top_k         = tokens_per_seq;
+        draft_params.batch_size        = batch_size;
+        draft_params.vocab_size        = vocab_size > 0 ? vocab_size : vocab_size_pad;
+        draft_params.vocab_size_padded = vocab_size_pad;
+
+        invokeTopKSortFilter<float>(draft_params, stream);
+
+        TopKSortFilterParams target_params{};
+        if (base_logits) {
+            target_params.logits            = base_logits.buffer().raw_data();
+            target_params.sorted_logits     = base_logits.buffer().raw_data();
+            target_params.sorted_indices    = target_sorted_indices.data();
+            target_params.kept              = kept_buf.data();
+            target_params.top_ks            = topk_buf.data();
+            target_params.max_top_k         = tokens_per_seq;
+            target_params.batch_size        = batch_size;
+            target_params.vocab_size        = vocab_size > 0 ? vocab_size : base_logits.shape(1);
+            target_params.vocab_size_padded = base_logits.shape(1);
+
+            invokeTopKSortFilter<float>(target_params, stream);
+        }
+
+        const size_t idx_width_bytes = sizeof(int) * tokens_per_seq;
+        const size_t idx_src_pitch   = sizeof(int) * vocab_size_pad;
+
+        const size_t dst_pitch_tokens =
+            static_cast<size_t>(eagle_module_->getMaxDecodingTokens()) * sizeof(int);
+
+        // Draft IDs: D→D into EagleBuffers::inputs.draft_tokens.
+        check_cuda_error(cudaMemcpy2DAsync(buffers.inputs.draft_tokens,
+                                           dst_pitch_tokens,
+                                           draft_sorted_indices.data(),
+                                           idx_src_pitch,
+                                           idx_width_bytes,
+                                           batch_size,
+                                           cudaMemcpyDeviceToDevice,
+                                           stream));
+
+        // Target IDs: D→D into EagleBuffers::inputs.target_tokens when
+        // base logits are provided and target-tree decode is not going
+        // to overwrite them. The caller decides when tree decode runs.
+        if (base_logits && buffers.inputs.target_tokens) {
+            const size_t target_pitch = sizeof(int) * base_logits.shape(1);
+            check_cuda_error(cudaMemcpy2DAsync(buffers.inputs.target_tokens,
+                                               dst_pitch_tokens,
+                                               target_sorted_indices.data(),
+                                               target_pitch,
+                                               idx_width_bytes,
+                                               batch_size,
+                                               cudaMemcpyDeviceToDevice,
+                                               stream));
+        }
+
+        // Mirror the compact [batch_size, tokens_per_seq] region back to
+        // host for CPU tree construction. Layout in EagleBuffers is
+        // [batch_size, max_decoding_tokens]; the first tokens_per_seq
+        // entries per row are exactly the IDs we just wrote.
+        check_cuda_error(cudaMemcpyAsync(draft_tokens.data(),
+                                         buffers.inputs.draft_tokens,
+                                         static_cast<size_t>(total_draft) * sizeof(int),
+                                         cudaMemcpyDeviceToHost,
+                                         stream));
+
+        if (base_logits && buffers.inputs.target_tokens) {
+            check_cuda_error(cudaMemcpyAsync(target_tokens.data(),
+                                             buffers.inputs.target_tokens,
+                                             static_cast<size_t>(total_draft) * sizeof(int),
+                                             cudaMemcpyDeviceToHost,
+                                             stream));
+        }
+
+        check_cuda_error(cudaStreamSynchronize(stream));
+    }
+    else {
+        std::fill_n(draft_tokens.data(), total_draft, 0);
+        std::fill_n(target_tokens.data(), total_draft, 0);
+    }
+
+    if (isEagleDebugEnabled()) {
+        TM_LOG_DEBUG(
+            "[LlamaV2][EAGLE] runEagle3DraftTreeDecode: batch=%d, tokens_per_seq=%d, num_draft_tokens=%d",
+            batch_size,
+            tokens_per_seq,
+            total_draft);
+    }
 }
 
 void LlamaV2::runEagleTargetTreeDecode(int batch_size,
@@ -2308,17 +2507,14 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         return;
     }
 
-    // If the Eagle3 fused draft path is unavailable for this engine
-    // (missing draft layer or capture mismatch), treat this step as a
-    // single-token decode while keeping EAGLE enabled for future steps.
-    const bool eagle3_fused_ok =
-        eagle_module_->hasEagle3DraftLayer()
-        && (!engine_param_.enable_speculative_decoding || engine_param_.spec_method != "eagle3"
-            || (eagle_capture_hidden_ && eagle_capture_hidden_.shape(1) == eagle_module_->getEagleFcInDim()));
-
-    if (!eagle3_fused_ok && engine_param_.spec_method == "eagle3") {
+    // If the Eagle3 draft layer under UnifiedDecoder is unavailable for
+    // this engine, treat this step as a single-token decode while
+    // keeping EAGLE enabled for future steps.
+    if (engine_param_.spec_method == "eagle3"
+        && (!unified_decoder_ || !eagle3_draft_weight_)) {
         TM_LOG_WARNING(
-            "[LlamaV2][EAGLE] Eagle3 fused draft path unavailable; treating this step as single-token decode.");
+            "[LlamaV2][EAGLE][fallback] Eagle3 draft layer unavailable; "
+            "treating this step as single-token decode.");
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -2419,161 +2615,32 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         return;
     }
 
-    // Run EagleNet draft model over last-token hidden states to obtain
-    // per-sequence draft logits for speculative sampling. The token_ids
-    // buffer is [max_seq_len, batch] on device; the current decode step
-    // row is g.step.
+    // Run Eagle draft path + Top-K to populate EagleBuffers draft/target
+    // tokens and host mirrors. For Eagle3 we route this through the
+    // UnifiedDecoder draft layer; legacy Eagle engines continue to use
+    // EagleModule's shallow draft head.
     Tensor draft_logits;
-    Tensor draft_hidden;
-    if (token_ids) {
-        // View the current-step token ids as a flat [batch] device buffer.
-        const int max_seq_len = seq_limit_len.size();
-        TM_CHECK(max_seq_len > 0);
-        const int batch_size_tokens = batch_size;
-        const int offset            = g.step * batch_size_tokens;
-        Buffer step_ids{token_ids.buffer().slice(offset, offset + batch_size_tokens)};
-        eagleDraftForward(step_ids, decoder_features, draft_logits, draft_hidden);
+    if (engine_param_.spec_method == "eagle3") {
+        runEagle3DraftTreeDecode(
+            decoder_features, logits, batch_size, tokens_per_seq, *eagle_buffers_, draft_logits, stream_);
     }
     else {
-        Buffer empty_ids;
-        eagleDraftForward(empty_ids, decoder_features, draft_logits, draft_hidden);
+        eagle_module_->forward_draft_tree(
+            decoder_features,
+            eagle_capture_hidden_,
+            logits,
+            tokens_per_seq,
+            *eagle_buffers_,
+            draft_logits,
+            linear_,
+            stream_);
     }
 
-    if (!draft_logits) {
-        TM_LOG_WARNING(
-            "[LlamaV2][EAGLE][fallback] Draft forward produced empty logits in dynamicDecodeWithSpecMulti; "
-            "treating this step as single-token decode.");
-        dynamicDecodeMultiStep(token_ids,
-                               finished,
-                               sequence_length,
-                               curand_state,
-                               logits,
-                               seq_limit_len,
-                               init_context_length,
-                               context_length,
-                               prompt_length,
-                               sampled_logprobs,
-                               sampled_indexes,
-                               sampled_nums,
-                               g.step,
-                               max_context_len,
-                               nullptr);
-        return;
-    }
-
-    const int vocab_size     = static_cast<int>(vocab_size_);
-    const int vocab_size_pad = logits.shape(1);
-    const int logit_elems    = batch_size * vocab_size_pad;
-    const int total_draft    = batch_size * tokens_per_seq;
-
-    // Prepare FP32 draft logits for GPU top-k.
-    Tensor eagle_sampling_logits{core::Layout{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
-    if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
-        TM_LOG_WARNING(
-            "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32 in dynamicDecodeWithSpecMulti; "
-            "treating this step as single-token decode.",
-            to_string(draft_logits.dtype()));
-        dynamicDecodeMultiStep(token_ids,
-                               finished,
-                               sequence_length,
-                               curand_state,
-                               logits,
-                               seq_limit_len,
-                               init_context_length,
-                               context_length,
-                               prompt_length,
-                               sampled_logprobs,
-                               sampled_indexes,
-                               sampled_nums,
-                               g.step,
-                               max_context_len,
-                               nullptr);
-        return;
-    }
-    invokeCastFloat2D(draft_logits, eagle_sampling_logits, stream_);
-    sync_check_cuda_error();
-
+    const int total_draft = batch_size * tokens_per_seq;
     Buffer_<int> draft_tokens(total_draft, kCPU);
     Buffer_<int> target_tokens(total_draft, kCPU);
 
-    if (tokens_per_seq > 0 && tokens_per_seq <= vocab_size_pad && tokens_per_seq <= 1024) {
-        Buffer_<int> topk_buf(batch_size, kDEVICE);
-        Buffer_<int> kept_buf(batch_size, kDEVICE);
-
-        std::vector<int> h_topk(batch_size, tokens_per_seq);
-        std::vector<int> h_kept(batch_size, tokens_per_seq);
-
-        core::Copy(h_topk.data(), batch_size, topk_buf.data());
-        core::Copy(h_kept.data(), batch_size, kept_buf.data());
-
-        Buffer_<int> draft_sorted_indices(logit_elems, kDEVICE);
-        Buffer_<int> target_sorted_indices(logit_elems, kDEVICE);
-
-        TopKSortFilterParams draft_params{};
-        draft_params.logits            = eagle_sampling_logits.buffer().raw_data();
-        draft_params.sorted_logits     = eagle_sampling_logits.buffer().raw_data();
-        draft_params.sorted_indices    = draft_sorted_indices.data();
-        draft_params.kept              = kept_buf.data();
-        draft_params.top_ks            = topk_buf.data();
-        draft_params.max_top_k         = tokens_per_seq;
-        draft_params.batch_size        = batch_size;
-        draft_params.vocab_size        = vocab_size;
-        draft_params.vocab_size_padded = vocab_size_pad;
-
-        invokeTopKSortFilter<float>(draft_params, stream_);
-
-        TopKSortFilterParams target_params{};
-        target_params.logits            = logits.buffer().raw_data();
-        target_params.sorted_logits     = logits.buffer().raw_data();
-        target_params.sorted_indices    = target_sorted_indices.data();
-        target_params.kept              = kept_buf.data();
-        target_params.top_ks            = topk_buf.data();
-        target_params.max_top_k         = tokens_per_seq;
-        target_params.batch_size        = batch_size;
-        target_params.vocab_size        = vocab_size;
-        target_params.vocab_size_padded = vocab_size_pad;
-
-        invokeTopKSortFilter<float>(target_params, stream_);
-
-        const size_t idx_width_bytes = sizeof(int) * tokens_per_seq;
-        const size_t idx_src_pitch   = sizeof(int) * vocab_size_pad;
-
-        // Device-only top-K write into EagleBuffers inputs: copy the top
-        // tokens_per_seq IDs per row directly into [batch_size,
-        // max_decoding_tokens] draft/target token buffers on device, then
-        // mirror the compact [batch_size, tokens_per_seq] region back to
-        // host for the CPU tree builder.
-        const size_t dst_pitch_tokens =
-            static_cast<size_t>(engine_param_.spec_max_decoding_tokens) * sizeof(int);
-
-        // Draft IDs: D→D into EagleBuffers::inputs.draft_tokens.
-        check_cuda_error(cudaMemcpy2DAsync(eagle_buffers_->inputs.draft_tokens,
-                                           dst_pitch_tokens,
-                                           draft_sorted_indices.data(),
-                                           idx_src_pitch,
-                                           idx_width_bytes,
-                                           batch_size,
-                                           cudaMemcpyDeviceToDevice,
-                                           stream_));
-
-        // Target IDs: D→D into EagleBuffers::inputs.target_tokens when tree
-        // decode is not active; tree decode will overwrite target_tokens on
-        // device when enabled.
-        if (!isTargetTreeDecodeActiveStep()) {
-            check_cuda_error(cudaMemcpy2DAsync(eagle_buffers_->inputs.target_tokens,
-                                               dst_pitch_tokens,
-                                               target_sorted_indices.data(),
-                                               idx_src_pitch,
-                                               idx_width_bytes,
-                                               batch_size,
-                                               cudaMemcpyDeviceToDevice,
-                                               stream_));
-        }
-
-        // Mirror the compact [batch_size, tokens_per_seq] region back to
-        // host for CPU tree construction. Layout in EagleBuffers is
-        // [batch_size, max_decoding_tokens]; the first tokens_per_seq
-        // entries per row are exactly the IDs we just wrote.
+    if (tokens_per_seq > 0 && total_draft > 0) {
         check_cuda_error(cudaMemcpyAsync(draft_tokens.data(),
                                          eagle_buffers_->inputs.draft_tokens,
                                          static_cast<size_t>(total_draft) * sizeof(int),
@@ -2587,7 +2654,6 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                                              cudaMemcpyDeviceToHost,
                                              stream_));
         }
-
         check_cuda_error(cudaStreamSynchronize(stream_));
     }
     else {

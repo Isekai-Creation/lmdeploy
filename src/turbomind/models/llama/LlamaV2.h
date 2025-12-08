@@ -219,6 +219,18 @@ private:
                                   const int*       d_sequence_lengths,
                                   const Sequence** sequences);
 
+    // Eagle3 draft-tree decode entry point. This runs a lightweight
+    // Eagle3 draft layer under UnifiedDecoder to produce per-slot
+    // draft logits and populate EagleBuffers draft/target token IDs
+    // for speculative tree construction.
+    void runEagle3DraftTreeDecode(const Tensor& decoder_features,
+                                  const Tensor& base_logits,
+                                  int           batch_size,
+                                  int           tokens_per_seq,
+                                  EagleBuffers& buffers,
+                                  Tensor&       draft_logits,
+                                  cudaStream_t  stream);
+
     // Seed the SpecPV partial-KV cache from a fully-verified prefix up to
     // `verified_seq_len` tokens. This flattens the live full-KV prefix
     // for each active slot into per-layer [B, H_kv, L, D] tensors and
@@ -298,8 +310,9 @@ private:
     
     // Speculative decoding (EAGLE)
     SpeculativeDecodingMode spec_mode_{SpeculativeDecodingMode::None()};
-    std::unique_ptr<EagleModule>  eagle_module_;
-    std::unique_ptr<EagleBuffers> eagle_buffers_;
+    std::unique_ptr<EagleModule>          eagle_module_;
+    std::unique_ptr<EagleBuffers>         eagle_buffers_;
+    std::unique_ptr<Eagle3DraftLayerWeight> eagle3_draft_weight_;
     // Dedicated hidden-state and logits buffers for target-tree decode.
     // Hidden states follow the base model dtype; logits are kept in FP32
     // to keep argmax numerics stable over MXFP4 / BF16 compute.

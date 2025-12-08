@@ -7,6 +7,7 @@
 #include "src/turbomind/models/llama/llama_params.h"
 #include "src/turbomind/models/llama/moe_ffn_layer.h"
 #include "src/turbomind/models/llama/unified_attention_layer.h"
+#include "src/turbomind/models/llama/EagleDraftLayer.h"
 #include "src/turbomind/utils/cuda_utils.h"
 
 namespace turbomind {
@@ -23,6 +24,13 @@ public:
                    const Context&        ctx);
 
     void Forward(TensorMap& args, const std::vector<WeightType*>& weights);
+
+    void setEagle3DraftLayer(const Eagle3DraftLayerWeight* w);
+
+    void ForwardDraft(const Tensor& input_hidden,
+                      Tensor&       output_hidden,
+                      int           batch_size,
+                      cudaStream_t  stream);
 
 private:
     const size_t layer_num_;
@@ -52,6 +60,13 @@ private:
     // EagleModule to consume.
     std::vector<int> eagle_capture_layers_;
     bool             eagle_capture_enabled_{false};
+
+    // Optional Eagle3 draft-layer weights shared from EagleModule /
+    // LlamaV2. When non-null, UnifiedDecoder can run a dedicated
+    // Eagle3 draft layer using the same attention / FFN primitives as
+    // the main model.
+    const Eagle3DraftLayerWeight* eagle3_draft_weight_{nullptr};
+    std::unique_ptr<Eagle3DraftLayer>      eagle3_draft_layer_;
 
     void AllreduceResidualRMSnorm(Tensor&       hidden_states,
                                   Tensor&       residual,
