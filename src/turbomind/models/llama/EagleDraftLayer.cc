@@ -5,14 +5,31 @@
 #include "src/turbomind/kernels/norm/rms_norm.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 
-Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight, LlamaFfnLayer* ffn_layer, float rmsnorm_eps):
+Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
+                                   UnifiedAttentionLayer*        attn_layer,
+                                   LlamaFfnLayer*                ffn_layer,
+                                   float                         rmsnorm_eps):
     weight_{weight},
     ffn_layer_{ffn_layer},
-    rmsnorm_eps_{rmsnorm_eps}
+    rmsnorm_eps_{rmsnorm_eps},
+    debug_fc_out_{},
+    debug_attn_out_{},
+    debug_ffn_out_{},
+    debug_pre_head_hidden_{},
+    attn_layer_{attn_layer},
+    head_num_{0},
+    kv_head_num_{0},
+    size_per_head_{0}
 {
+    if (weight_) {
+        head_num_      = weight_->attn.head_num;
+        kv_head_num_   = weight_->attn.kv_head_num;
+        size_per_head_ = weight_->attn.size_per_head;
+    }
 }
 
 void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden, cudaStream_t stream)
@@ -29,9 +46,12 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         return;
     }
 
-    debug_attn_out_         = Tensor{};
-    debug_ffn_out_          = Tensor{};
-    debug_pre_head_hidden_  = Tensor{};
+    const bool debug_enabled = isEagleDebugEnabled();
+
+    debug_fc_out_          = Tensor{};
+    debug_attn_out_        = Tensor{};
+    debug_ffn_out_         = Tensor{};
+    debug_pre_head_hidden_ = Tensor{};
 
     const int batch_size = input_hidden.shape(0);
     const int hidden_dim = input_hidden.shape(1);
@@ -98,6 +118,10 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     Tensor hidden_norm{{batch_size, hidden_dim}, dtype, input_hidden.device()};
     invokeRMSNorm(hidden_norm, input_hidden, weight_->input_norm, rmsnorm_eps_, stream);
 
+    if (debug_enabled) {
+        debug_fc_out_ = hidden_norm;
+    }
+
     // 2) Single-step draft "attention" using the fused QKV / Wo weights
     // from Eagle3. The current implementation still follows the
     // simplified EagleModule shallow path (no explicit softmax or KV
@@ -118,8 +142,9 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
 
     const int qkv_out_dim = qkv_w.shape(1);
     const int q_dim       = wo_w.shape(0);
+    const int kv_span     = qkv_out_dim - q_dim;
 
-    if (qkv_out_dim <= 0 || q_dim <= 0 || wo_w.shape(1) != hidden_dim) {
+    if (qkv_out_dim <= 0 || q_dim <= 0 || kv_span <= 0 || (kv_span % 2) != 0 || wo_w.shape(1) != hidden_dim) {
         TM_LOG_WARNING(
             "[EAGLE][Eagle3DraftLayer][fallback] invalid QKV/WO geometry in Forward "
             "(qkv=[%d,%d], wo=[%d,%d], hidden_dim=%d); treating draft as pass-through.",
@@ -132,16 +157,33 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         return;
     }
 
+    const int kv_dim = kv_span / 2;
+    if (kv_dim != q_dim) {
+        TM_LOG_WARNING(
+            "[EAGLE][Eagle3DraftLayer][fallback] unsupported Eagle3 QKV layout in Forward "
+            "(q_dim=%d, kv_dim=%d); treating draft as pass-through.",
+            q_dim,
+            kv_dim);
+        output_hidden = input_hidden;
+        return;
+    }
+
     Tensor qkv{{batch_size, qkv_out_dim}, dtype, input_hidden.device()};
     linear.Forward(hidden_norm, weight_->attn.qkv, qkv);
     sync_check_cuda_error();
 
-    Tensor value = qkv.slice({0, 0}, {batch_size, q_dim});
+    // QKV layout is [Q, K, V] with sizes [q_dim, kv_dim, kv_dim]. For a
+    // single-position attention block, the pre-Wo attention output is
+    // equivalent to V, so we select the final kv_dim slice here.
+    const int v_offset = q_dim + kv_dim;
+    Tensor     value   = qkv.slice({0, v_offset}, {batch_size, kv_dim});
 
     Tensor attn_out{{batch_size, hidden_dim}, dtype, input_hidden.device()};
     linear.Forward(value, weight_->attn.output, attn_out);
     sync_check_cuda_error();
-    debug_attn_out_ = attn_out;
+    if (debug_enabled) {
+        debug_attn_out_ = attn_out;
+    }
 
     // 3) FFN path: post-attention norm, gated MLP, and final residual norm.
     Tensor ffn_input{{batch_size, hidden_dim}, dtype, input_hidden.device()};
@@ -162,7 +204,9 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     ffn_param.layer_id = 0;
     ffn_layer_->forward(ffn_param);
     sync_check_cuda_error();
-    debug_ffn_out_ = output_hidden;
+    if (debug_enabled) {
+        debug_ffn_out_ = output_hidden;
+    }
 
     // Residual + output RMSNorm:
     //   y = RMSNorm(attn_out + FFN(norm(attn_out)), output_norm)
@@ -178,7 +222,10 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         batch_size,
         rmsnorm_eps_,
         stream);
-    debug_pre_head_hidden_ = output_hidden;
+
+    if (debug_enabled) {
+        debug_pre_head_hidden_ = output_hidden;
+    }
 }
 
 }  // namespace turbomind

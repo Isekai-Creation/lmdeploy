@@ -2107,9 +2107,10 @@ void LlamaV2::initSpecPVFromFullKV(int              verified_seq_len,
     TM_LOG_INFO("[LlamaV2][SpecPV] partial KV seeded from full KV (verified_len=%d)", clamped_len);
 }
 
-void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length,
-                                          int           batch_size,
-                                          const Sequence** sequences)
+void LlamaV2::updateSpecPVAfterAcceptance(const Buffer&        sequence_length,
+                                          int                  batch_size,
+                                          const Sequence**     sequences,
+                                          const std::vector<int>* committed_lengths)
 {
     if (!isSpecPVEnabled() || !specpv_kv_cache_ || batch_size <= 0 || !sequences) {
         return;
@@ -2149,16 +2150,38 @@ void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length,
     }
 
     // Lightweight partial-KV safety hook: validate per-slot committed
-    // lengths against the configured total budget. The main SpecPV
-    // logic below still drives seeding and incremental updates via
-    // initSpecPVFromFullKV / PartialKVCache::update; this helper keeps
-    // PartialKVCache fail-safe in isolation.
+    // lengths against the configured speculative buffer budget. The
+    // main SpecPV logic below still drives seeding and incremental
+    // updates via initSpecPVFromFullKV / PartialKVCache::update; this
+    // helper keeps PartialKVCache fail-safe in isolation.
     if (specpv_kv_cache_ && specpv_kv_cache_->is_enabled()) {
         for (int i = 0; i < batch_size; ++i) {
-            const int len_i = h_seq_len[i];
-            if (len_i > 0) {
-                specpv_kv_cache_->update_after_acceptance(i, /*advance_tokens=*/1, len_i);
+            int advance = 0;
+            if (committed_lengths && i < static_cast<int>(committed_lengths->size())) {
+                advance = std::max(0, (*committed_lengths)[i]);
             }
+            else if (h_seq_len[i] > 0) {
+                // Fallback: assume at least one token was committed
+                // for active slots when committed_lengths are not
+                // available (e.g. non-EAGLE or single-token paths).
+                advance = 1;
+            }
+
+            if (advance > 0) {
+                for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
+                    specpv_kv_cache_->update_after_acceptance(layer, i, advance);
+                }
+            }
+        }
+
+        if (!specpv_kv_cache_->is_enabled()) {
+            TM_LOG_WARNING(
+                "[SpecPV][fallback] PartialKVCache update_after_acceptance failed; disabling SpecPV for this engine.");
+            specpv_supported_             = false;
+            specpv_retrieval_initialized_ = false;
+            specpv_partial_steps_         = 0;
+            specpv_kv_cache_.reset();
+            return;
         }
     }
 
@@ -3201,7 +3224,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     // Update SpecPV bookkeeping based on the final committed sequence
     // lengths for this step. This keeps partial-KV length tracking in
     // sync with DynamicDecodeLayer and EAGLE acceptance.
-    updateSpecPVAfterAcceptance(sequence_length, batch_size, spec_ctx.sequences);
+    updateSpecPVAfterAcceptance(sequence_length, batch_size, spec_ctx.sequences, &committed_lengths);
 }
 
 void LlamaV2::getEagleAcceptanceForStep(std::vector<int>& accepted_lens,

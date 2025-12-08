@@ -139,7 +139,6 @@ def run_compare(
     # we treat last_hidden (and a simple [last_hidden, last_hidden] concat)
     # as a baseline for comparison against TurboMind draft stages.
     last_hidden_hf = last_hidden.to(torch.float32)
-    attn_input_ref = torch.cat([last_hidden_hf, last_hidden_hf], dim=-1)
 
     # HF Eagle3 logits on the same positions.
     with torch.no_grad():
@@ -157,7 +156,6 @@ def run_compare(
     logits_tm = torch.from_dlpack(tm_debug["logits"].__dlpack__()).to(torch.float32)
 
     fc_tm = tm_debug.get("fc_out")
-    attn_tm = tm_debug.get("attn_input")
     attn_out_tm = tm_debug.get("attn_out")
     ffn_out_tm = tm_debug.get("ffn_out")
     pre_tm = tm_debug.get("pre_head_hidden")
@@ -167,18 +165,6 @@ def run_compare(
         _stage_stats("FC_OUT", fc_tm_t, last_hidden_hf)
     else:
         print("FC_OUT: not available from TurboMind debug binding.")
-
-    if attn_tm is not None:
-        attn_tm_t = torch.from_dlpack(attn_tm.__dlpack__())
-        _stage_stats("ATTN_INPUT", attn_tm_t, attn_input_ref)
-    else:
-        print("ATTN_INPUT: not available from TurboMind debug binding.")
-
-    if pre_tm is not None:
-        pre_tm_t = torch.from_dlpack(pre_tm.__dlpack__())
-        _stage_stats("PRE_HEAD_HIDDEN", pre_tm_t, last_hidden_hf)
-    else:
-        print("PRE_HEAD_HIDDEN: not available from TurboMind debug binding.")
 
     if attn_out_tm is not None:
         attn_out_tm_t = torch.from_dlpack(attn_out_tm.__dlpack__())
@@ -191,6 +177,12 @@ def run_compare(
         _stage_stats("FFN_OUT", ffn_out_tm_t, last_hidden_hf)
     else:
         print("FFN_OUT: not available from TurboMind debug binding.")
+
+    if pre_tm is not None:
+        pre_tm_t = torch.from_dlpack(pre_tm.__dlpack__())
+        _stage_stats("PRE_HEAD_HIDDEN", pre_tm_t, last_hidden_hf)
+    else:
+        print("PRE_HEAD_HIDDEN: not available from TurboMind debug binding.")
 
     # Compare argmax and top-k overlap.
     top1_hf = logits_hf.argmax(dim=-1)

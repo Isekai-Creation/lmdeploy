@@ -1243,6 +1243,7 @@ PYBIND11_MODULE(_turbomind, m)
             Tensor hidden_out;
 
             bool   use_eagle3_draft_layer = module.hasEagle3DraftLayer();
+            Tensor fc_out_dbg;
             Tensor attn_out_dbg;
             Tensor ffn_out_dbg;
             Tensor pre_head_dbg;
@@ -1260,7 +1261,12 @@ PYBIND11_MODULE(_turbomind, m)
                 ft::LlamaFfnLayer ffn_layer(model_param, ctx);
 
                 const auto* draft_w = module.eagle3_draft_layer_.get();
-                ft::Eagle3DraftLayer draft_layer(draft_w, &ffn_layer, /*rmsnorm_eps=*/1e-5f);
+                // For this standalone debug helper we do not have a
+                // UnifiedDecoder context, so we pass a null
+                // UnifiedAttentionLayer pointer and rely on the
+                // single-position draft attention path.
+                ft::Eagle3DraftLayer draft_layer(
+                    draft_w, /*attn_layer=*/nullptr, &ffn_layer, /*rmsnorm_eps=*/1e-5f);
 
                 // Allocate output hidden buffer and run the draft layer.
                 hidden_out = Tensor(
@@ -1271,6 +1277,7 @@ PYBIND11_MODULE(_turbomind, m)
                 draft_layer.Forward(*hidden_tm, hidden_out, stream);
                 ft::check_cuda_error(cudaStreamSynchronize(stream));
 
+                fc_out_dbg   = draft_layer.debug_fc_out();
                 attn_out_dbg = draft_layer.debug_attn_out();
                 ffn_out_dbg  = draft_layer.debug_ffn_out();
                 pre_head_dbg = draft_layer.debug_pre_head_hidden();
@@ -1328,6 +1335,9 @@ PYBIND11_MODULE(_turbomind, m)
             out["logits"] = logits;
 
             if (use_eagle3_draft_layer) {
+                if (fc_out_dbg) {
+                    out["fc_out"] = fc_out_dbg;
+                }
                 if (attn_out_dbg) {
                     out["attn_out"] = attn_out_dbg;
                 }

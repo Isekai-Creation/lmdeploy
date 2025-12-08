@@ -256,9 +256,10 @@ private:
     // Update SpecPV bookkeeping after a decode step using the committed
     // sequence lengths. This is called from the fused EAGLE path once
     // DynamicDecodeLayer has applied any accepted tail tokens.
-    void updateSpecPVAfterAcceptance(const Buffer& sequence_length,
-                                     int           batch_size,
-                                     const Sequence** sequences);
+    void updateSpecPVAfterAcceptance(const Buffer&        sequence_length,
+                                     int                  batch_size,
+                                     const Sequence**     sequences,
+                                     const std::vector<int>* committed_lengths = nullptr);
 
     // Max engine tokens TurboMind should handle per decode step
     // when running in EAGLE speculative mode.

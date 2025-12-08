@@ -4,12 +4,14 @@
 #pragma once
 
 #include "src/turbomind/models/llama/LlamaFfnLayer.h"
+#include "src/turbomind/models/llama/unified_attention_layer.h"
 
 namespace turbomind {
 
 struct Eagle3DraftLayerWeight {
     LlamaAttentionWeight attn;
     LlamaFfnWeight       ffn;
+    Tensor               fc_weight;
     Tensor               input_norm;
     Tensor               post_attn_norm;
     Tensor               output_norm;
@@ -23,9 +25,16 @@ struct Eagle3DraftLayerWeight {
 // above to run a true Eagle3 decoder layer.
 class Eagle3DraftLayer {
 public:
-    Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight, LlamaFfnLayer* ffn_layer, float rmsnorm_eps);
-
+    Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
+                    UnifiedAttentionLayer*        attn_layer,
+                    LlamaFfnLayer*                ffn_layer,
+                    float                         rmsnorm_eps);
     void Forward(const Tensor& input_hidden, Tensor& output_hidden, cudaStream_t stream);
+
+    const Tensor& debug_fc_out() const
+    {
+        return debug_fc_out_;
+    }
 
     const Tensor& debug_attn_out() const
     {
@@ -47,9 +56,15 @@ private:
     LlamaFfnLayer*                ffn_layer_{nullptr};
     float                         rmsnorm_eps_{1e-5f};
 
+    Tensor debug_fc_out_;
     Tensor debug_attn_out_;
     Tensor debug_ffn_out_;
     Tensor debug_pre_head_hidden_;
+    UnifiedAttentionLayer* attn_layer_{nullptr};
+    int                    head_num_{0};
+    int                    kv_head_num_{0};
+    int                    size_per_head_{0};
+
 };
 
 }  // namespace turbomind

@@ -73,8 +73,9 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
 void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
 {
     eagle3_draft_weight_ = w;
-    if (w && ffn_layer_) {
-        eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayer>(w, ffn_layer_.get(), rmsnorm_eps_);
+    if (w && ffn_layer_ && attn_layer_) {
+        eagle3_draft_layer_ =
+            std::make_unique<Eagle3DraftLayer>(w, attn_layer_.get(), ffn_layer_.get(), rmsnorm_eps_);
     }
     else {
         eagle3_draft_layer_.reset();

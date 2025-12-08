@@ -772,10 +772,8 @@ void PartialKVCache::reset_buffer()
     recompute_global_verified_len();
 }
 
-void PartialKVCache::update_after_acceptance(int slot, int advance_tokens, int current_total_len)
+void PartialKVCache::update_after_acceptance(int layer_idx, int slot, int advance_tokens)
 {
-    (void)slot;
-
     if (!enabled_) {
         return;
     }
@@ -784,27 +782,56 @@ void PartialKVCache::update_after_acceptance(int slot, int advance_tokens, int c
         return;
     }
 
-    if (current_total_len < 0) {
+    if (layer_idx < 0 || layer_idx >= num_layers_) {
         TM_LOG_WARNING(
-            "[SpecPV][fallback] invalid update_after_acceptance current_total_len=%d; "
+            "[SpecPV][fallback] invalid layer_idx=%d in update_after_acceptance; "
             "disabling SpecPV for this engine.",
-            current_total_len);
+            layer_idx);
         enabled_             = false;
         global_verified_len_ = 0;
         return;
     }
 
-    const int max_tokens = cfg_.total_budget();
-    if (max_tokens > 0 && current_total_len > max_tokens) {
+    const int buffer_tokens = cfg_.buffer_size();
+    if (buffer_tokens <= 0) {
         TM_LOG_WARNING(
-            "[SpecPV][fallback] buffer overflow in update_after_acceptance "
-            "(current_total_len=%d, total_budget=%d); disabling SpecPV for this engine.",
-            current_total_len,
-            max_tokens);
+            "[SpecPV][fallback] buffer_size=0 in update_after_acceptance; "
+            "disabling SpecPV for this engine.");
         enabled_             = false;
         global_verified_len_ = 0;
         return;
     }
+
+    const int cur_len = verified_lens_[layer_idx];
+    if (cur_len < 0) {
+        TM_LOG_WARNING(
+            "[SpecPV][fallback] negative verified length in update_after_acceptance "
+            "(layer=%d, len=%d); disabling SpecPV for this engine.",
+            layer_idx,
+            cur_len);
+        enabled_             = false;
+        global_verified_len_ = 0;
+        return;
+    }
+
+    long long next_len = static_cast<long long>(cur_len) + static_cast<long long>(advance_tokens);
+    if (next_len > buffer_tokens) {
+        TM_LOG_WARNING(
+            "[SpecPV][fallback] buffer overflow in update_after_acceptance "
+            "(layer=%d, slot=%d, cur_verified=%d, advance=%d, buffer_tokens=%d); "
+            "disabling SpecPV for this engine.",
+            layer_idx,
+            slot,
+            cur_len,
+            advance_tokens,
+            buffer_tokens);
+        enabled_             = false;
+        global_verified_len_ = 0;
+        return;
+    }
+
+    verified_lens_[layer_idx] = static_cast<int>(next_len);
+    recompute_global_verified_len();
 }
 
 }  // namespace turbomind
