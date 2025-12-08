@@ -628,6 +628,37 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
                 "avg_accepted_per_step": avg_accepted_per_step,
             }
 
+            # Extended per-request EAGLE metrics used by SpeculativeDecodingStats
+            # / EagleMetricsSummary. These are interpreted as per-step averages
+            # over the speculative run.
+            tokens_per_seq = 0.0
+            accepted_len = 0.0
+            max_accepted_len = 0
+            committed_extras = 0.0
+
+            if eagle_steps > 0 and num_draft > 0:
+                # Approximate tokens drafted per speculative step. For the
+                # common single-batch case this equals the planned
+                # tokens_per_seq used by the engine.
+                tokens_per_seq = float(num_draft) / float(eagle_steps)
+
+            if eagle_steps > 0:
+                # Average accepted length per speculative step (without the
+                # "+1 bonus" convention; Python applies that when building
+                # summaries). In v1 we expose this as both accepted_len and
+                # max_accepted_len, and treat committed_extras as
+                # accepted_len - 1 clamped at zero.
+                accepted_len = avg_accepted_per_step
+                max_accepted_len = int(accepted_len)
+                committed_extras = max(0.0, accepted_len - 1.0)
+
+            spec_info.update(
+                tokens_per_seq=int(tokens_per_seq),
+                accepted_len=float(accepted_len),
+                max_accepted_len=int(max_accepted_len),
+                committed_extras=float(committed_extras),
+            )
+
             # Optional target-tree decode metrics. These are only
             # populated by the TurboMind backend when the engine
             # enables the EAGLE3 target-tree path; otherwise they
