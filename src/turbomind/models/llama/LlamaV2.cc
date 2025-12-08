@@ -497,8 +497,11 @@ void LlamaV2::runEagle3DraftTreeDecode(const Tensor& decoder_features,
 
         TopKSortFilterParams target_params{};
         if (base_logits) {
-            target_params.logits            = base_logits.buffer().raw_data();
-            target_params.sorted_logits     = base_logits.buffer().raw_data();
+            // buffer().raw_data() is const in this context; TopKSortFilterParams
+            // expects mutable pointers for in-place sorting, so we cast away
+            // constness here, matching other call sites.
+            target_params.logits            = const_cast<void*>(base_logits.buffer().raw_data());
+            target_params.sorted_logits     = const_cast<void*>(base_logits.buffer().raw_data());
             target_params.sorted_indices    = target_sorted_indices.data();
             target_params.kept              = kept_buf.data();
             target_params.top_ks            = topk_buf.data();
@@ -3247,18 +3250,11 @@ void LlamaV2::eagleDraftForward(const Buffer& input_ids,
         return;
     }
 
-    // EagleModule::forward consumes last-token hidden states together
-    // with an optional concatenation of captured per-layer hidden
-    // states (for Eagle3) and produces normalized hidden_states +
-    // logits via the draft LM head. Input ids are unused for the
-    // minimal draft network, so we pass a default tensor here.
+    // EagleModule::forward currently does not rely on input_ids for the
+    // shallow draft network, so we pass an empty Tensor here. If a future
+    // draft path needs token ids (e.g. for embeddings), this helper can be
+    // extended to materialize them appropriately.
     Tensor input_ids_tensor;
-    if (input_ids.size() > 0) {
-        // Buffer is [S,B]; for draft we only need the current step row.
-        // dynamicDecodeWithSpecMulti passes a view covering exactly the
-        // active batch_size entries for this step in row-major layout.
-        input_ids_tensor = Tensor{{hidden_states.shape(0)}, kInt32, kDEVICE, const_cast<void*>(input_ids.data())};
-    }
     const Tensor& captured_hidden = eagle_capture_hidden_;
     eagle_module_->forward(
         input_ids_tensor,   // per-slot base token ids

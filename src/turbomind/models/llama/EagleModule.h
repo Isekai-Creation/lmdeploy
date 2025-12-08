@@ -15,6 +15,11 @@
 
 namespace turbomind {
 
+// Forward declaration to avoid a hard include cycle between EagleModule
+// and EagleBuffers. The full definition of EagleBuffers lives in
+// src/turbomind/models/llama/EagleBuffers.h.
+struct EagleBuffers;
+
 class LlamaLinear;
 
 struct EagleWeight {
