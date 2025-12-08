@@ -614,7 +614,10 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
     // Derive per-slot prefix (history) lengths from the live sequences when
     // available so that tree decode can reuse prefix KV as read-only. When
     // sequences are not provided or SequenceManager is unavailable we fall
-    // back to a history_len=0 interpretation for this step.
+    // back to a history_len=0 interpretation for this step. When SpecPV is
+    // enabled and has been seeded, we may clamp the effective prefix length
+    // to the partial-KV budget so that tree decode attends only to the
+    // partial view instead of the full prefix.
     const int block_seq_len = attn_param_.cache_block_seq_len;
 
     std::vector<int> h_prefix_len(batch_size, 0);
@@ -626,6 +629,34 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             }
             h_prefix_len[i] = std::max(0, seq->cache_len);
         }
+    }
+
+    // Decide whether to apply a SpecPV-aware clamp on the effective
+    // prefix length used by this tree decode step. This keeps the KV
+    // layout unchanged (we still reuse SequenceManager blocks) but
+    // limits the history span that attention can see to the partial
+    // SpecPV budget when enabled.
+    bool use_specpv_for_tree = false;
+    if (isSpecPVEnabled() && specpv_kv_cache_ && specpv_retrieval_initialized_) {
+        int max_prefix_len = 0;
+        for (int i = 0; i < batch_size; ++i) {
+            max_prefix_len = std::max(max_prefix_len, h_prefix_len[i]);
+        }
+        if (max_prefix_len > 0 && shouldUseSpecPV(max_prefix_len)) {
+            const int partial_tokens = specpv_cache_config_.sink_size()
+                                       + specpv_cache_config_.retrieval_size()
+                                       + specpv_cache_config_.window_size()
+                                       + specpv_kv_cache_->global_verified_len();
+            const int clamp_len = std::max(0, std::min(max_prefix_len, partial_tokens));
+            if (clamp_len > 0) {
+                for (int i = 0; i < batch_size; ++i) {
+                    h_prefix_len[i] = std::min(h_prefix_len[i], clamp_len);
+                }
+                use_specpv_for_tree = true;
+            }
+        }
+    }
+    (void)use_specpv_for_tree;
     }
 
     int max_history_len = 0;
@@ -1261,8 +1292,8 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
     }
 
     // Build block pointer table for the active sequences.
-    std::vector<char*> h_blocks(static_cast<size_t>(total_blocks), nullptr);
-    int                cursor = 0;
+    std::vector<uintptr_t> h_block_ptrs(static_cast<size_t>(total_blocks), 0);
+    int                    cursor = 0;
     for (int i = 0; i < batch_size; ++i) {
         const Sequence* seq = sequences[i];
         if (!seq) {
@@ -1272,7 +1303,8 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
             if (cursor >= total_blocks) {
                 break;
             }
-            h_blocks[cursor++] = static_cast<char*>(sequence_manager_->GetBlockPtr(block_id));
+            void* ptr = sequence_manager_->GetBlockPtr(block_id);
+            h_block_ptrs[cursor++] = reinterpret_cast<uintptr_t>(ptr);
         }
     }
 
@@ -1285,9 +1317,9 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
         return false;
     }
 
-    Buffer_<int>   d_cu_k_len(batch_size + 1, kDEVICE);
-    Buffer_<int>   d_cu_block_num(batch_size + 1, kDEVICE);
-    Buffer_<char*> d_blocks(total_blocks, kDEVICE);
+    Buffer_<int>      d_cu_k_len(batch_size + 1, kDEVICE);
+    Buffer_<int>      d_cu_block_num(batch_size + 1, kDEVICE);
+    Buffer_<uintptr_t> d_block_ptrs(total_blocks, kDEVICE);
 
     check_cuda_error(cudaMemcpyAsync(
         d_cu_k_len.data(), h_cu_k_len.data(), sizeof(int) * (batch_size + 1), cudaMemcpyHostToDevice, stream_));
@@ -1296,8 +1328,11 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                                      sizeof(int) * (batch_size + 1),
                                      cudaMemcpyHostToDevice,
                                      stream_));
-    check_cuda_error(cudaMemcpyAsync(
-        d_blocks.data(), h_blocks.data(), sizeof(char*) * total_blocks, cudaMemcpyHostToDevice, stream_));
+    check_cuda_error(cudaMemcpyAsync(d_block_ptrs.data(),
+                                     h_block_ptrs.data(),
+                                     static_cast<size_t>(total_blocks) * sizeof(uintptr_t),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
 
     // Flatten per-layer KV for this prefix into a temporary fp16/bf16
     // buffer and then convert to float32 for SpecPV.
@@ -1334,7 +1369,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
     if (dtype_ == kFloat16) {
         invokeFlattenKV_v2(reinterpret_cast<half*>(k_ptr),
                            reinterpret_cast<half*>(v_ptr),
-                           d_blocks.data(),
+                           reinterpret_cast<char**>(d_block_ptrs.data()),
                            d_cu_k_len.data(),
                            d_cu_block_num.data(),
                            rope_param,
@@ -1357,7 +1392,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
     else if (dtype_ == kBfloat16) {
         invokeFlattenKV_v2(reinterpret_cast<nv_bfloat16*>(k_ptr),
                            reinterpret_cast<nv_bfloat16*>(v_ptr),
-                           d_blocks.data(),
+                           reinterpret_cast<char**>(d_block_ptrs.data()),
                            d_cu_k_len.data(),
                            d_cu_block_num.data(),
                            rope_param,
