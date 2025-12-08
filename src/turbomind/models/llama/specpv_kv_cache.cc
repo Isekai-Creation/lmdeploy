@@ -257,7 +257,7 @@ void PartialKVCache::summary_key_states(int layer_idx, const Tensor& key_states,
                                max_summary_blocks_,
                                smax,
                                smin,
-                               key_states.stream());
+                               /*stream=*/0);
         summary_block_count_[layer_idx] = expected_blocks;
         return;
     }
@@ -397,7 +397,7 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
                                retrieval_v_t.data<float>(),
                                window_k_t.data<float>(),
                                window_v_t.data<float>(),
-                               query_states.stream());
+                               /*stream=*/0);
         return;
     }
 
