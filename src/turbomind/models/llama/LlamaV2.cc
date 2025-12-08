@@ -1576,16 +1576,21 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
 
         if (eagle_capture_hidden_ && eagle_module_) {
             const int expected_width = eagle_module_->getEagleFcInDim();
-            if (expected_width > 0
-                && (eagle_capture_hidden_.shape(0) != decoder_out.shape(0)
-                    || eagle_capture_hidden_.shape(1) != expected_width)) {
-                TM_LOG_WARNING(
-                    "[LlamaV2][EAGLE] Eagle3 capture buffer has shape [%d, %d], "
-                    "expected [%d, %d]; Eagle3 FC path may be disabled.",
-                    eagle_capture_hidden_.shape(0),
-                    eagle_capture_hidden_.shape(1),
-                    decoder_out.shape(0),
-                    expected_width);
+            if (expected_width > 0) {
+                const int bs  = decoder_out.shape(0);
+                const int got = eagle_capture_hidden_.shape(1);
+                if (eagle_capture_hidden_.shape(0) != bs || got != expected_width) {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][EAGLE][fallback] Eagle3 capture buffer has shape [%d, %d], "
+                        "expected [%d, %d]; Eagle3 FC path disabled for this engine.",
+                        eagle_capture_hidden_.shape(0),
+                        got,
+                        bs,
+                        expected_width);
+                    // Disable Eagle3 FC path by clearing the capture tensor;
+                    // draft will fall back to the legacy shallow path.
+                    eagle_capture_hidden_ = Tensor{};
+                }
             }
         }
     }
@@ -2285,6 +2290,35 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
     // Baseline path when EAGLE is disabled or not fully initialized.
     if (!spec_ctx.enable_eagle || !isEagleEnabled() || !eagle_module_ || !eagle_buffers_) {
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    // If the Eagle3 fused draft path is unavailable for this engine
+    // (missing draft layer or capture mismatch), treat this step as a
+    // single-token decode while keeping EAGLE enabled for future steps.
+    const bool eagle3_fused_ok =
+        eagle_module_->hasEagle3DraftLayer()
+        && (!engine_param_.enable_speculative_decoding || engine_param_.spec_method != "eagle3"
+            || (eagle_capture_hidden_ && eagle_capture_hidden_.shape(1) == eagle_module_->getEagleFcInDim()));
+
+    if (!eagle3_fused_ok && engine_param_.spec_method == "eagle3") {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE] Eagle3 fused draft path unavailable; treating this step as single-token decode.");
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,

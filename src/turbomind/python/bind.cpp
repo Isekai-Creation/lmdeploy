@@ -1082,6 +1082,8 @@ PYBIND11_MODULE(_turbomind, m)
             out["logits"]           = logits;
             out["fc_out"]           = module.debug_fc_out();
             out["attn_input"]       = module.debug_attn_input();
+            out["attn_out"]         = module.debug_attn_out();
+            out["ffn_out"]          = module.debug_ffn_out();
             out["pre_head_hidden"]  = module.debug_pre_head_hidden();
 
             (void)vocab_size;

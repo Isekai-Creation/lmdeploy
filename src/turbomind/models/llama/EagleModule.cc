@@ -481,8 +481,10 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         }
     }
 
-    // For Eagle3 drafts, additionally prepare FFN wrapper and norms for
-    // a more faithful draft layer path using existing LLaMA FFN blocks.
+    // For Eagle3 drafts, additionally prepare FFN wrapper, norms, and
+    // shape checks for a more faithful draft layer path using existing
+    // LLaMA FFN blocks. Attention wiring (LlamaAttentionWeight) is kept
+    // separate and guarded by strict geometry checks.
     if (eagle_mode_ == EagleMode::kEagle3 && mlp_down_ok && weights_.mlp_gate_up && weights_.output_norm) {
         eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayerWeight>();
 
@@ -550,6 +552,76 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         //   mlp_down:    [inter_size, hidden_units]
         check_shape_2d(weights_.mlp_gate_up, inter_size * 2, hidden_units, "mlp_gate_up");
         check_shape_2d(weights_.mlp_down, inter_size, hidden_units, "mlp_down");
+
+        // Attention geometry for Eagle3 shallow block:
+        //   attn_qkv: [2 * hidden_units, eagle_q_size_ + 2 * eagle_kv_size_]
+        //   attn_o:   [eagle_q_size_, hidden_units]
+        if (eagle_q_size_ > 0 && eagle_kv_size_ > 0) {
+            const int qkv_expected_in  = hidden_units * 2;
+            const int qkv_expected_out = eagle_q_size_ + 2 * eagle_kv_size_;
+            check_shape_2d(weights_.attn_qkv, qkv_expected_in, qkv_expected_out, "attn_qkv");
+
+            const int attn_o_expected_in  = eagle_q_size_;
+            const int attn_o_expected_out = hidden_units;
+            check_shape_2d(weights_.attn_o, attn_o_expected_in, attn_o_expected_out, "attn_o");
+
+            // Prepare a draft-layer LlamaAttentionWeight only when the
+            // Eagle3 fused QKV / Wo geometry can be mapped into the
+            // standard attention layout; otherwise we rely on the
+            // existing shallow linearised path.
+            if (draft_ok) {
+                const int kv_head_num = head_num;  // simple single-group KV
+                const bool bias       = false;
+                const bool qk_norm    = false;
+                MLAParam   mla_param{};
+                eagle3_draft_layer_->attn = LlamaAttentionWeight(hidden_units,
+                                                                 head_dim,
+                                                                 head_num,
+                                                                 kv_head_num,
+                                                                 mla_param,
+                                                                 bias,
+                                                                 qk_norm,
+                                                                 /*tp_size=*/1,
+                                                                 /*tp_rank=*/0,
+                                                                 weight_dtype_,
+                                                                 weight_dtype_,
+                                                                 /*group_size=*/1,
+                                                                 /*window_size=*/0,
+                                                                 /*sink=*/false);
+
+                // Only alias Eagle3 QKV / Wo into the attention weight
+                // when shapes are exactly compatible; otherwise mark the
+                // draft layer as unusable.
+                auto& attn_w = eagle3_draft_layer_->attn;
+                if (attn_w.qkv.weight
+                    && attn_w.qkv.weight.shape(0) == weights_.attn_qkv.shape(0)
+                    && attn_w.qkv.weight.shape(1) == weights_.attn_qkv.shape(1)) {
+                    attn_w.qkv.weight = weights_.attn_qkv.borrow();
+                }
+                else {
+                    TM_LOG_WARNING(
+                        "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.qkv shape "
+                        "incompatible with Eagle3 attn_qkv; disabling Eagle3 draft layer.");
+                    draft_ok = false;
+                }
+
+                if (attn_w.output.weight
+                    && attn_w.output.weight.shape(0) == weights_.attn_o.shape(0)
+                    && attn_w.output.weight.shape(1) == weights_.attn_o.shape(1)) {
+                    attn_w.output.weight = weights_.attn_o.borrow();
+                }
+                else {
+                    TM_LOG_WARNING(
+                        "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.output shape "
+                        "incompatible with Eagle3 attn_o; disabling Eagle3 draft layer.");
+                    draft_ok = false;
+                }
+
+                if (draft_ok) {
+                    eagle3_draft_layer_->attn.prepare();
+                }
+            }
+        }
 
         // Norms:
         check_norm(eagle3_draft_layer_->input_norm, "input");
@@ -650,6 +722,8 @@ void EagleModule::forward(const Tensor& input_ids,
         // Clear any stale debug views from previous calls.
         debug_fc_out_          = Tensor{};
         debug_attn_input_      = Tensor{};
+        debug_attn_out_        = Tensor{};
+        debug_ffn_out_         = Tensor{};
         debug_pre_head_hidden_ = Tensor{};
         debug_logits_          = Tensor{};
     }
@@ -980,6 +1054,9 @@ void EagleModule::forward(const Tensor& input_ids,
         }
         Tensor& attn_out = attn_out_scratch_;
         linear.Forward(value, attn_o_weight_, /*output=*/attn_out);
+        if (isEagleDebugEnabled()) {
+            debug_attn_out_ = attn_out;
+        }
 
         // 3) Optional Eagle3 FFN + residual + output norm using
         // LLaMA-style FFN weights when available. When Eagle3
@@ -1027,22 +1104,13 @@ void EagleModule::forward(const Tensor& input_ids,
             Tensor& ffn_out = mlp_out_scratch_;
             linear.Forward(gating, mlp.output, ffn_out);
             sync_check_cuda_error();
-
-            // Add residual from the attention output before the
-            // final Eagle3 output norm, matching the typical
-            // Transformer pattern y = attn_out + FFN(norm(attn_out)).
-            const size_t elem_bytes = byte_size(weight_dtype_, 8) / 8;
-            const size_t row_bytes  = static_cast<size_t>(ffn_out.stride(0)) * elem_bytes;
-            const size_t copy_bytes = static_cast<size_t>(hidden_dim) * elem_bytes;
-            char*        ffn_base   = static_cast<char*>(ffn_out.raw_data());
-            char*        attn_base  = static_cast<char*>(attn_out_scratch_.raw_data());
-            for (int b = 0; b < batch_size; ++b) {
-                char* dst_row = ffn_base + static_cast<size_t>(b) * row_bytes;
-                char* src_row = attn_base + static_cast<size_t>(b) * row_bytes;
-                check_cuda_error(cudaMemcpyAsync(
-                    dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+            if (isEagleDebugEnabled()) {
+                debug_ffn_out_ = ffn_out;
             }
 
+            // Apply residual + RMSNorm in one step:
+            //   y = RMSNorm(attn_out + FFN(norm(attn_out)), output_norm)
+            // using the shared residual/norm helper.
             bool need_norm_scratch =
                 !normed_hidden_scratch_ || normed_hidden_scratch_.dtype() != weight_dtype_
                 || normed_hidden_scratch_.device().type != kDEVICE
@@ -1052,7 +1120,16 @@ void EagleModule::forward(const Tensor& input_ids,
                 normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
             }
             Tensor& normed_hidden = normed_hidden_scratch_;
-            invokeRMSNorm(normed_hidden, ffn_out, eagle3_draft_layer_->output_norm, kEps, stream);
+            invokeResidualBiasRMSNorm(
+                normed_hidden.raw_data(),
+                attn_out_scratch_.raw_data(),
+                eagle3_draft_layer_->output_norm.raw_data(),
+                /*bias=*/nullptr,
+                weight_dtype_,
+                hidden_dim,
+                batch_size,
+                kEps,
+                stream);
             output_hidden_states = normed_hidden;
             if (isEagleDebugEnabled()) {
                 debug_pre_head_hidden_ = normed_hidden;

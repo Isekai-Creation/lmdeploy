@@ -158,6 +158,8 @@ def run_compare(
 
     fc_tm = tm_debug.get("fc_out")
     attn_tm = tm_debug.get("attn_input")
+    attn_out_tm = tm_debug.get("attn_out")
+    ffn_out_tm = tm_debug.get("ffn_out")
     pre_tm = tm_debug.get("pre_head_hidden")
 
     if fc_tm is not None:
@@ -177,6 +179,18 @@ def run_compare(
         _stage_stats("PRE_HEAD_HIDDEN", pre_tm_t, last_hidden_hf)
     else:
         print("PRE_HEAD_HIDDEN: not available from TurboMind debug binding.")
+
+    if attn_out_tm is not None:
+        attn_out_tm_t = torch.from_dlpack(attn_out_tm.__dlpack__())
+        _stage_stats("ATTN_OUT", attn_out_tm_t, last_hidden_hf)
+    else:
+        print("ATTN_OUT: not available from TurboMind debug binding.")
+
+    if ffn_out_tm is not None:
+        ffn_out_tm_t = torch.from_dlpack(ffn_out_tm.__dlpack__())
+        _stage_stats("FFN_OUT", ffn_out_tm_t, last_hidden_hf)
+    else:
+        print("FFN_OUT: not available from TurboMind debug binding.")
 
     # Compare argmax and top-k overlap.
     top1_hf = logits_hf.argmax(dim=-1)

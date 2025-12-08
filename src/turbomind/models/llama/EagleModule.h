@@ -126,6 +126,12 @@ public:
     /// Return the Eagle3 FC input dimension when available (0 otherwise).
     int getEagleFcInDim() const { return eagle_fc_in_dim_; }
 
+    /// Return true when an Eagle3 draft layer has been prepared for this module.
+    bool hasEagle3DraftLayer() const noexcept
+    {
+        return eagle_mode_ == EagleMode::kEagle3 && static_cast<bool>(eagle3_draft_layer_);
+    }
+
     /// Return the vocab size of the draft model loaded from config.yaml.
     int getVocabSize() const { return vocab_size_; }
 
@@ -220,6 +226,8 @@ private:
     // call when EAGLE debug is enabled.
     Tensor debug_fc_out_;
     Tensor debug_attn_input_;
+    Tensor debug_attn_out_;
+    Tensor debug_ffn_out_;
     Tensor debug_pre_head_hidden_;
     Tensor debug_logits_;
 
@@ -227,6 +235,8 @@ public:
     // Lightweight debug accessors; intended for tests / tooling only.
     const Tensor& debug_fc_out() const { return debug_fc_out_; }
     const Tensor& debug_attn_input() const { return debug_attn_input_; }
+    const Tensor& debug_attn_out() const { return debug_attn_out_; }
+    const Tensor& debug_ffn_out() const { return debug_ffn_out_; }
     const Tensor& debug_pre_head_hidden() const { return debug_pre_head_hidden_; }
     const Tensor& debug_logits() const { return debug_logits_; }
 
