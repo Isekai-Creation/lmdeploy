@@ -409,23 +409,45 @@ void LlamaV2::runEagle3DraftTreeDecode(const Tensor& decoder_features,
         return;
     }
 
-    const int hidden_dim = static_cast<int>(hidden_units_);
-
+    // Attention hidden dim (full model space), e.g. 4096 for GPT-OSS-120B.
+    // We derive this from the actual decoder_features tensor instead of
+    // assuming it matches `hidden_units_` (draft hidden).
     if (!decoder_features || decoder_features.ndim() != 2
-        || decoder_features.shape(0) != batch_size
-        || decoder_features.shape(1) != hidden_dim) {
+        || decoder_features.shape(0) != batch_size) {
         TM_LOG_WARNING(
             "[LlamaV2][EAGLE][fallback] decoder_features shape mismatch in runEagle3DraftTreeDecode; "
-            "skipping speculative draft for this step.");
+            "got=[%d,%d], expected batch=%d; skipping speculative draft for this step.",
+            decoder_features ? decoder_features.shape(0) : -1,
+            decoder_features ? decoder_features.shape(1) : -1,
+            batch_size);
         return;
     }
 
-    // Allocate draft_hidden [batch, hidden_units] with the same dtype as decoder_features.
-    Tensor draft_hidden{{batch_size, hidden_dim}, decoder_features.dtype(), kDEVICE};
+    const int attn_hidden_dim  = decoder_features.shape(1);              // attention space
+    const int draft_hidden_dim = static_cast<int>(hidden_units_);        // Eagle3 draft hidden (e.g. 2880)
 
+    if (attn_hidden_dim <= 0 || draft_hidden_dim <= 0) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] invalid dims in runEagle3DraftTreeDecode "
+            "(attn_hidden_dim=%d, draft_hidden_dim=%d); skipping speculative draft.",
+            attn_hidden_dim,
+            draft_hidden_dim);
+        return;
+    }
+
+    // Allocate draft_hidden in *draft* space [batch, draft_hidden_dim] with
+    // the same dtype as decoder_features. Eagle3DraftLayer is responsible
+    // for mapping from attention space (decoder_features) into this space.
+    Tensor draft_hidden{{batch_size, draft_hidden_dim}, decoder_features.dtype(), kDEVICE};
+
+    // ForwardDraft:
+    //   input_hidden:  [B, attn_hidden_dim]   (full model space)
+    //   output_hidden: [B, draft_hidden_dim]  (draft head space)
     unified_decoder_->ForwardDraft(decoder_features, draft_hidden, batch_size, stream);
 
-    // Project to vocab using the same LM head as the base model.
+    // Project to vocab using the same LM head as the base model. The LM
+    // head in this engine is defined over the draft hidden dim
+    // (draft_hidden_dim), so postDecodeEmbedding consumes draft_hidden.
     const int vocab_pad = static_cast<int>(vocab_size_padded_);
     if (vocab_pad <= 0) {
         TM_LOG_WARNING("[LlamaV2][EAGLE][fallback] invalid vocab_size_padded_=%d; skipping speculative draft.",
@@ -3110,11 +3132,16 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         return;
     }
 
+    // Allocate a 2-D tail buffer for DynamicDecodeLayer::ForwardMultiStep.
+    // Layout: [max_tail_len, batch_size]
+    Tensor forced_output_ids{{max_tail_len, batch_size}, kInt32, kDEVICE};
+
     ForcedTailContext forced{};
-    forced.max_tail_len   = max_tail_len;
-    forced.forced_tokens  = forced_tokens.data();
-    forced.forced_lengths = forced_lengths.data();
+    forced.max_tail_len      = max_tail_len;
+    forced.forced_tokens     = forced_tokens.data();
+    forced.forced_lengths    = forced_lengths.data();
     forced.committed_lengths = committed_lengths.data();
+    forced.output_ids        = forced_output_ids;  // 2-D tail buffer
 
     dynamicDecodeMultiStep(token_ids,
                            finished,

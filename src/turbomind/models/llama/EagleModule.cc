@@ -117,6 +117,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     int vocab_size   = model_config["vocab_size"].as<int>();
     int head_num     = model_config["head_num"].as<int>();
     int head_dim     = model_config["size_per_head"].as<int>();
+    const int attn_hidden_units = head_num * head_dim; // 4096 for GPT-OSS-120B
 
     if (hidden_units <= 0 || vocab_size <= 0 || head_num <= 0 || head_dim <= 0) {
         logEagleError("Invalid model_config values in config.yaml (non-positive)");
@@ -596,34 +597,41 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             // standard attention layout; otherwise we rely on the
             // existing shallow linearised path.
             if (draft_ok && attn_ok) {
-                const int  kv_head_num = head_num;  // simple single-group KV
+                const int  kv_head_num = head_num;  // same head count for KV
                 const bool bias        = false;
                 const bool qk_norm     = false;
                 MLAParam   mla_param{};
-                new (&eagle3_draft_layer_->attn) LlamaAttentionWeight(hidden_units,
-                                                                      head_dim,
-                                                                      head_num,
-                                                                      kv_head_num,
-                                                                      mla_param,
-                                                                      bias,
-                                                                      qk_norm,
-                                                                      /*tp_size=*/1,
-                                                                      /*tp_rank=*/0,
-                                                                      weight_dtype_,
-                                                                      weight_dtype_,
-                                                                      /*group_size=*/1,
-                                                                      /*window_size=*/0,
-                                                                      /*sink=*/false);
 
+                const int attn_hidden_units = head_num * head_dim;  // attention space (e.g. 4096)
+
+                new (&eagle3_draft_layer_->attn) LlamaAttentionWeight(attn_hidden_units,
+                                                                    head_dim,
+                                                                    head_num,
+                                                                    kv_head_num,
+                                                                    mla_param,
+                                                                    bias,
+                                                                    qk_norm,
+                                                                    /*tp_size=*/1,
+                                                                    /*tp_rank=*/0,
+                                                                    weight_dtype_,
+                                                                    weight_dtype_,
+                                                                    /*group_size=*/1,
+                                                                    /*window_size=*/0,
+                                                                    /*sink=*/false);
                 auto& attn_w = eagle3_draft_layer_->attn;
                 bool  mapped_ok = true;
 
+                // We want LlamaAttentionWeight.qkv.weight to be [attn_hidden_units, 3 * attn_hidden_units]
+                // but the Eagle3 converter exported attn_qkv as [qkv_in_dim, q_size + 2 * kv_size].
+                // For real MHA, you should export Eagle3 attn_qkv in the same layout as Llama attention:
+                //   qkv: [attn_hidden_units, 3 * attn_hidden_units]
+                //   output: [attn_hidden_units, draft_hidden_units]
+                // Once converter is updated, this mapping becomes a strict shape check:
                 if (attn_w.qkv.weight
                     && attn_w.qkv.weight.shape(0) == weights_.attn_qkv.shape(0)
                     && attn_w.qkv.weight.shape(1) == weights_.attn_qkv.shape(1)) {
                     attn_w.qkv.weight = weights_.attn_qkv.borrow();
-                }
-                else {
+                } else {
                     TM_LOG_WARNING(
                         "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.qkv shape "
                         "incompatible with Eagle3 attn_qkv; Eagle3 draft will use shallow attention.");
@@ -634,8 +642,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                     && attn_w.output.weight.shape(0) == weights_.attn_o.shape(0)
                     && attn_w.output.weight.shape(1) == weights_.attn_o.shape(1)) {
                     attn_w.output.weight = weights_.attn_o.borrow();
-                }
-                else {
+                } else {
                     TM_LOG_WARNING(
                         "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.output shape "
                         "incompatible with Eagle3 attn_o; Eagle3 draft will use shallow attention.");
@@ -645,9 +652,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 if (mapped_ok) {
                     eagle3_draft_layer_->attn.prepare();
                 }
-                // If mapped_ok is false, we simply rely on the runtime
-                // Eagle3DraftLayer to fall back to shallow attention
-                // / pass-through for this step.
+                // If mapped_ok is false, runtime fallback in Eagle3DraftLayer::Forward will
+                // handle this by using shallow QKV / pass-through for the step.
             }
         }
 
