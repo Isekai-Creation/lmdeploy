@@ -939,11 +939,6 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
     eagle_tree_target_tokens_valid_ = true;
 }
 
-int LlamaV2::eagleMaxEngineTokensPerStep() const noexcept
-{
-    return eagle_max_engine_tokens_per_step_;
-}
-
 void LlamaV2::targetTreeDecode(int batch_size, const int* d_sequence_lengths)
 {
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -1475,153 +1470,6 @@ void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
                   sampled_nums,
                   g.step,
                   max_context_len);
-    return;
-
-    // Compute how many draft tokens per sequence we plan to generate in
-    // this step, mirroring LlamaBatch::compute_eagle_draft_tokens_per_seq.
-    auto compute_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
-        if (decode_batch_size <= 0) {
-            return 0;
-        }
-
-        const int max_engine_tokens = eagleMaxEngineTokensPerStep();
-        if (max_engine_tokens <= 0) {
-            return 0;
-        }
-
-        // When the engine-side budget resolves to 1, treat this as
-        // single-token EAGLE regardless of batch size.
-        if (max_engine_tokens <= 1) {
-            return 1;
-        }
-
-        const int per_seq_cap = engine_param_.spec_max_decoding_draft_tokens;
-        if (per_seq_cap <= 0) {
-            return 1;
-        }
-
-        // Hard upper bound from engine budget: do not exceed the per-step
-        // engine token allowance when spreading draft tokens across the
-        // active decode batch.
-        const int max_by_engine = max_engine_tokens / decode_batch_size;
-        if (max_by_engine <= 0) {
-            return 1;
-        }
-
-        const int tokens_per_seq = std::max(1, std::min(per_seq_cap, max_by_engine));
-        return tokens_per_seq;
-    };
-
-    const int tokens_per_seq = compute_draft_tokens_per_seq(batch_size);
-    if (tokens_per_seq <= 0) {
-        TM_LOG_DEBUG("[LlamaV2][EAGLE] tokens_per_seq=0; skipping EAGLE step");
-        return;
-    }
-
-    // Run EagleNet draft model over last-token hidden states to obtain
-    // per-sequence draft logits for speculative sampling.
-    Tensor draft_logits;
-    Tensor draft_hidden;
-    eagleDraftForward(decoder_features, draft_logits, draft_hidden);
-
-    if (!draft_logits) {
-        TM_LOG_WARNING("[LlamaV2][EAGLE] Draft forward produced empty logits; skipping EAGLE step");
-        return;
-    }
-
-    const int vocab_size      = static_cast<int>(vocab_size_);
-    const int vocab_size_pad  = logits.shape(1);
-    const int logit_elems     = batch_size * vocab_size_pad;
-    const int total_draft     = batch_size * tokens_per_seq;
-
-    // Prepare FP32 draft logits for GPU top-k.
-    Tensor eagle_sampling_logits{{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
-    if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
-        TM_LOG_WARNING(
-            "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32; "
-            "skipping EAGLE tree decode for this step.",
-            to_string(draft_logits.dtype()));
-        return;
-    }
-    invokeCastFloat2D(draft_logits, eagle_sampling_logits, stream_);
-    sync_check_cuda_error();
-
-    Buffer_<int> draft_tokens(total_draft, kCPU);
-    Buffer_<int> target_tokens(total_draft, kCPU);
-
-    if (tokens_per_seq > 0 && tokens_per_seq <= vocab_size_pad && tokens_per_seq <= 1024) {
-        Buffer_<int> topk_buf(batch_size, kDEVICE);
-        Buffer_<int> kept_buf(batch_size, kDEVICE);
-
-        std::vector<int> h_topk(batch_size, tokens_per_seq);
-        std::vector<int> h_kept(batch_size, tokens_per_seq);
-
-        core::Copy(h_topk.data(), batch_size, topk_buf.data());
-        core::Copy(h_kept.data(), batch_size, kept_buf.data());
-
-        Buffer_<int> draft_sorted_indices(logit_elems, kDEVICE);
-        Buffer_<int> target_sorted_indices(logit_elems, kDEVICE);
-
-        TopKSortFilterParams draft_params{};
-        draft_params.logits            = eagle_sampling_logits.buffer().raw_data();
-        draft_params.sorted_logits     = eagle_sampling_logits.buffer().raw_data();
-        draft_params.sorted_indices    = draft_sorted_indices.data();
-        draft_params.kept              = kept_buf.data();
-        draft_params.top_ks            = topk_buf.data();
-        draft_params.max_top_k         = tokens_per_seq;
-        draft_params.batch_size        = batch_size;
-        draft_params.vocab_size        = vocab_size;
-        draft_params.vocab_size_padded = vocab_size_pad;
-
-        invokeTopKSortFilter<float>(draft_params, stream_);
-
-        TopKSortFilterParams target_params{};
-        target_params.logits            = logits.buffer().raw_data();
-        target_params.sorted_logits     = logits.buffer().raw_data();
-        target_params.sorted_indices    = target_sorted_indices.data();
-        target_params.kept              = kept_buf.data();
-        target_params.top_ks            = topk_buf.data();
-        target_params.max_top_k         = tokens_per_seq;
-        target_params.batch_size        = batch_size;
-        target_params.vocab_size        = vocab_size;
-        target_params.vocab_size_padded = vocab_size_pad;
-
-        invokeTopKSortFilter<float>(target_params, stream_);
-
-        const size_t idx_width_bytes = sizeof(int) * tokens_per_seq;
-        const size_t idx_src_pitch   = sizeof(int) * vocab_size_pad;
-        const size_t idx_dst_pitch   = sizeof(int) * tokens_per_seq;
-
-        check_cuda_error(cudaMemcpy2DAsync(draft_tokens.data(),
-                                           idx_dst_pitch,
-                                           draft_sorted_indices.data(),
-                                           idx_src_pitch,
-                                           idx_width_bytes,
-                                           batch_size,
-                                           cudaMemcpyDeviceToHost,
-                                           stream_));
-
-        check_cuda_error(cudaMemcpy2DAsync(target_tokens.data(),
-                                           idx_dst_pitch,
-                                           target_sorted_indices.data(),
-                                           idx_src_pitch,
-                                           idx_width_bytes,
-                                           batch_size,
-                                           cudaMemcpyDeviceToHost,
-                                           stream_));
-
-        check_cuda_error(cudaStreamSynchronize(stream_));
-    }
-    else {
-        std::fill_n(draft_tokens.data(), total_draft, 0);
-        std::fill_n(target_tokens.data(), total_draft, 0);
-    }
-
-    TM_LOG_DEBUG("[LlamaV2][EAGLE] step=%d, batch=%d, tokens_per_seq=%d, num_draft_tokens=%d",
-                 g.step,
-                 batch_size,
-                 tokens_per_seq,
-                 total_draft);
 
     // ========= Step 1: Build EAGLE tree from draft tokens =========
     const int num_draft_tokens = total_draft;
@@ -1778,7 +1626,7 @@ void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
     check_cuda_error(cudaMemcpyAsync(
         h_accepted_tokens.data(),
         eagle_buffers_->outputs.accepted_tokens,
-        batch_size * max_path_len * sizeof(TokenIdType),
+        batch_size * max_path_len * sizeof(SpecTokenIdType),
         cudaMemcpyDeviceToHost,
         stream_));
 
@@ -2391,7 +2239,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     check_cuda_error(cudaMemcpyAsync(
         h_accepted_tokens.data(),
         eagle_buffers_->outputs.accepted_tokens,
-        batch_size * max_path_len * sizeof(TokenIdType),
+        batch_size * max_path_len * sizeof(SpecTokenIdType),
         cudaMemcpyDeviceToHost,
         stream_));
 

@@ -10,6 +10,8 @@
 
 #include "src/turbomind/models/llama/specpv_kv_cache.h"
 
+#include <limits>
+
 namespace turbomind {
 
 PartialKVCache::PartialKVCache(const SpecPVCacheConfig& cfg,
@@ -179,6 +181,11 @@ void PartialKVCache::summary_key_states(int layer_idx, const Tensor& key_states,
     if (!key_summary_max_[layer_idx] || !key_summary_min_[layer_idx] || cfg_.block_size <= 0) {
         return;
     }
+    if (kv_dtype_ != kFloat32 || key_states.dtype() != kFloat32) {
+        // Only float32 summaries are supported in the initial implementation.
+        return;
+    }
+
     const int sink_tokens = cfg_.sink_size();
     if (seq_len <= sink_tokens) {
         return;
@@ -193,26 +200,243 @@ void PartialKVCache::summary_key_states(int layer_idx, const Tensor& key_states,
         return;
     }
 
-    // For now, just advance the block count to the expected value. A later
-    // revision will materialize true Kmax/Kmin summaries using either host
-    // loops or dedicated CUDA kernels.
+    const int B = static_cast<int>(key_states.shape(0));
+    const int H = static_cast<int>(key_states.shape(1));
+    const int L = static_cast<int>(key_states.shape(2));
+    const int D = static_cast<int>(key_states.shape(3));
+
+    if (L <= sink_tokens || D != head_dim_) {
+        return;
+    }
+
+    const int max_B = std::min(B, max_batch_size_);
+    const int max_H = std::min(H, num_kv_heads_);
+
+    // Copy the full [B,H,L,D] keys to host once; summaries are small compared
+    // to the main KV so this is acceptable for a first implementation.
+    Tensor host_keys{{B, H, L, D}, kv_dtype_, kCPU};
+    core::Copy(key_states, host_keys);
+
+    float* k_host = host_keys.data<float>();
+    float* smax   = key_summary_max_[layer_idx].data<float>();
+    float* smin   = key_summary_min_[layer_idx].data<float>();
+
+    const int summary_blocks = max_summary_blocks_;
+
+    for (int b = existing_blocks; b < expected_blocks; ++b) {
+        const int start = sink_tokens + b * cfg_.block_size;
+        const int end   = std::min(start + cfg_.block_size, total_tokens);
+        const int len   = std::max(0, end - start);
+        if (len <= 0) {
+            continue;
+        }
+
+        for (int bb = 0; bb < max_B; ++bb) {
+            for (int hh = 0; hh < max_H; ++hh) {
+                for (int d = 0; d < D; ++d) {
+                    float vmax = -std::numeric_limits<float>::infinity();
+                    float vmin = std::numeric_limits<float>::infinity();
+
+                    for (int t = 0; t < len; ++t) {
+                        const int token_idx = start + t;
+                        if (token_idx >= L) {
+                            break;
+                        }
+
+                        const ssize_t idx =
+                            (((static_cast<ssize_t>(bb) * H + hh) * L + token_idx) * D) + d;
+                        const float v = k_host[idx];
+                        vmax          = std::max(vmax, v);
+                        vmin          = std::min(vmin, v);
+                    }
+
+                    const ssize_t sum_idx =
+                        (((static_cast<ssize_t>(bb) * num_kv_heads_ + hh) * summary_blocks + b) * D) + d;
+                    smax[sum_idx] = vmax;
+                    smin[sum_idx] = vmin;
+                }
+            }
+        }
+    }
+
     summary_block_count_[layer_idx] = expected_blocks;
 }
 
 void PartialKVCache::refresh_retrieval(int         layer_idx,
-                                       const Tensor& /*query_states*/,
-                                       const Tensor& /*key_states*/,
-                                       const Tensor& /*value_states*/,
-                                       int           /*seq_len*/)
+                                       const Tensor& query_states,
+                                       const Tensor& key_states,
+                                       const Tensor& value_states,
+                                       int           seq_len)
 {
     if (layer_idx < 0 || layer_idx >= static_cast<int>(summary_block_count_.size())) {
         return;
     }
+    if (kv_dtype_ != kFloat32 || key_states.dtype() != kFloat32 || value_states.dtype() != kFloat32
+        || query_states.dtype() != kFloat32) {
+        // Float32-only implementation for now.
+        return;
+    }
 
-    // Placeholder implementation: retrieval/window content is not yet
-    // updated from full KV. Behaviourally this keeps the partial KV view
-    // as an empty prefix, so SpecPV does not alter attention semantics
-    // until the full retrieval kernels are implemented.
+    const int blocks = summary_block_count_[layer_idx];
+    if (blocks <= 0 || cfg_.block_size <= 0) {
+        return;
+    }
+
+    const int B = static_cast<int>(key_states.shape(0));
+    const int H = static_cast<int>(key_states.shape(1));
+    const int L = std::min(static_cast<int>(key_states.shape(2)), max_seq_len_);
+    const int D = static_cast<int>(key_states.shape(3));
+
+    if (D != head_dim_ || L <= 0) {
+        return;
+    }
+
+    const int max_B = std::min(B, max_batch_size_);
+    const int max_H = std::min(H, num_kv_heads_);
+
+    const int Q = static_cast<int>(query_states.shape(2));
+    if (Q <= 0 || query_states.shape(0) != B || query_states.shape(1) != H
+        || query_states.shape(3) != D) {
+        return;
+    }
+
+    const int R_blocks = std::min(cfg_.n_retrieval_blocks, blocks);
+    if (R_blocks <= 0) {
+        return;
+    }
+
+    // Host copies for queries and full K/V.
+    Tensor host_q{{B, H, Q, D}, kv_dtype_, kCPU};
+    Tensor host_k{{B, H, L, D}, kv_dtype_, kCPU};
+    Tensor host_v{{B, H, L, D}, kv_dtype_, kCPU};
+
+    core::Copy(query_states, host_q);
+    core::Copy(key_states, host_k);
+    core::Copy(value_states, host_v);
+
+    float* q_host   = host_q.data<float>();
+    float* k_host   = host_k.data<float>();
+    float* v_host   = host_v.data<float>();
+    float* smax_buf = key_summary_max_[layer_idx].data<float>();
+    float* smin_buf = key_summary_min_[layer_idx].data<float>();
+
+    const int summary_blocks = max_summary_blocks_;
+
+    // Per-[B,H] scores over blocks.
+    std::vector<float> scores(static_cast<size_t>(blocks));
+    std::vector<int>   top_indices(static_cast<size_t>(blocks));
+
+    const int retrieval_tokens = cfg_.retrieval_size();
+    const int window_tokens    = std::min(cfg_.window_size(), L);
+
+    Tensor retrieval_view = retrieval(layer_idx);
+    Tensor window_view    = window(layer_idx);
+
+    if (!retrieval_view || !window_view) {
+        return;
+    }
+
+    Tensor host_retrieval{retrieval_view.layout(), retrieval_view.dtype(), kCPU};
+    Tensor host_window{window_view.layout(), window_view.dtype(), kCPU};
+
+    float* retr_host = host_retrieval.data<float>();
+    float* win_host  = host_window.data<float>();
+
+    for (int bb = 0; bb < max_B; ++bb) {
+        for (int hh = 0; hh < max_H; ++hh) {
+            // Compute scores per block.
+            for (int blk = 0; blk < blocks; ++blk) {
+                float best = -std::numeric_limits<float>::infinity();
+
+                for (int qq = 0; qq < Q; ++qq) {
+                    float dot_max = 0.f;
+                    float dot_min = 0.f;
+
+                    for (int d = 0; d < D; ++d) {
+                        const ssize_t q_idx =
+                            (((static_cast<ssize_t>(bb) * H + hh) * Q + qq) * D) + d;
+                        const ssize_t s_idx =
+                            (((static_cast<ssize_t>(bb) * num_kv_heads_ + hh) * summary_blocks
+                              + blk)
+                             * D)
+                            + d;
+                        const float qv = q_host[q_idx];
+                        dot_max += qv * smax_buf[s_idx];
+                        dot_min += qv * smin_buf[s_idx];
+                    }
+
+                    const float s = std::max(dot_max, dot_min);
+                    if (s > best) {
+                        best = s;
+                    }
+                }
+
+                scores[blk]    = best;
+                top_indices[blk] = blk;
+            }
+
+            // Select top R_blocks by score (simple partial sort).
+            const int K = R_blocks;
+            std::partial_sort(top_indices.begin(),
+                              top_indices.begin() + K,
+                              top_indices.begin() + blocks,
+                              [&](int a, int b) { return scores[a] > scores[b]; });
+
+            // Gather retrieval tokens: pack selected blocks sequentially.
+            const int tokens_per_block = cfg_.block_size;
+            const int max_retr_tokens  = retrieval_tokens;
+
+            for (int r = 0; r < K; ++r) {
+                const int blk     = top_indices[r];
+                const int srcbase = blk * tokens_per_block;
+
+                for (int t = 0; t < tokens_per_block; ++t) {
+                    const int src_token = srcbase + t;
+                    if (src_token >= L) {
+                        break;
+                    }
+                    const int dst_token = r * tokens_per_block + t;
+                    if (dst_token >= max_retr_tokens) {
+                        break;
+                    }
+
+                    for (int d = 0; d < D; ++d) {
+                        const ssize_t src_idx =
+                            (((static_cast<ssize_t>(bb) * H + hh) * L + src_token) * D) + d;
+                        const ssize_t dst_idx =
+                            (((static_cast<ssize_t>(bb) * num_kv_heads_ + hh) * max_retr_tokens
+                              + dst_token)
+                             * D)
+                            + d;
+                        retr_host[dst_idx] = k_host[src_idx];
+                    }
+                }
+            }
+
+            // Gather window tokens: last window_tokens from full KV.
+            if (window_tokens > 0) {
+                const int win_start = L - window_tokens;
+                for (int t = 0; t < window_tokens; ++t) {
+                    const int src_token = win_start + t;
+                    const int dst_token = t;
+                    for (int d = 0; d < D; ++d) {
+                        const ssize_t src_idx =
+                            (((static_cast<ssize_t>(bb) * H + hh) * L + src_token) * D) + d;
+                        const ssize_t dst_idx =
+                            (((static_cast<ssize_t>(bb) * num_kv_heads_ + hh) * window_tokens
+                              + dst_token)
+                             * D)
+                            + d;
+                        win_host[dst_idx] = k_host[src_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    // Copy retrieval/window back to device.
+    core::Copy(host_retrieval, retrieval_view);
+    core::Copy(host_window, window_view);
 }
 
 std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
@@ -237,22 +461,69 @@ std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
         return {Tensor{}, Tensor{}};
     }
 
-    // Clamp to available buffer capacity; no data movement yet.
+    const int B = static_cast<int>(new_keys.shape(0));
+    const int H = static_cast<int>(new_keys.shape(1));
+    const int D = static_cast<int>(new_keys.shape(3));
+
+    if (D != head_dim_) {
+        return {Tensor{}, Tensor{}};
+    }
+
+    const int max_B = std::min(B, max_batch_size_);
+    const int max_H = std::min(H, num_kv_heads_);
+
     const int committed = std::min(new_len, max_tokens - cur_len);
+    if (committed <= 0) {
+        return {Tensor{}, Tensor{}};
+    }
+
+    // Write into the buffer segment for this layer.
+    Tensor buf_k = buffer(layer_idx);
+    Tensor buf_v = buffer(layer_idx);
+    if (!buf_k || !buf_v) {
+        return {Tensor{}, Tensor{}};
+    }
+
+    std::vector<ssize_t> base_idx{0, 0, cur_len, 0};
+    std::vector<ssize_t> shape{max_B, max_H, committed, D};
+
+    Tensor dst_k = buf_k.slice(base_idx, shape);
+    Tensor dst_v = buf_v.slice(base_idx, shape);
+
+    Tensor src_k = new_keys.slice({0, 0, 0, 0}, shape);
+    Tensor src_v = new_values.slice({0, 0, 0, 0}, shape);
+
+    core::Copy(src_k, dst_k);
+    core::Copy(src_v, dst_v);
+
     verified_lens_[layer_idx] = cur_len + committed;
     recompute_global_verified_len();
 
-    // Active KV view currently covers the entire allocated budget; a more
-    // precise view (up to sink+retrieval+window+verified_len) can be wired
-    // once SpecPV is fully integrated into attention.
-    Tensor k_active = key_cache_[layer_idx];
-    Tensor v_active = value_cache_[layer_idx];
+    // Active KV view covers sink+retrieval+window+verified buffer tokens.
+    const int prefix_tokens = cfg_.sink_size() + cfg_.retrieval_size() + cfg_.window_size();
+    const int active_tokens = std::min(prefix_tokens + verified_lens_[layer_idx],
+                                       cfg_.total_budget());
+
+    Tensor& base_k = key_cache_[layer_idx];
+    Tensor& base_v = value_cache_[layer_idx];
+
+    std::vector<ssize_t> base0{0, 0, 0, 0};
+    std::vector<ssize_t> shape_active{max_B, max_H, active_tokens, D};
+
+    Tensor k_active = base_k.slice(base0, shape_active);
+    Tensor v_active = base_v.slice(base0, shape_active);
     return {k_active, v_active};
 }
 
 void PartialKVCache::reset_buffer()
 {
-    std::fill(verified_lens_.begin(), verified_lens_.end(), 0);
+    for (int layer = 0; layer < num_layers_; ++layer) {
+        Tensor buf = buffer(layer);
+        if (buf) {
+            core::Clear(buf);
+        }
+        verified_lens_[layer] = 0;
+    }
     recompute_global_verified_len();
 }
 
