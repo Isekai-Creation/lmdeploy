@@ -195,7 +195,7 @@ functionally complete.
 
 ### 4.1 Tail semantics inside `DynamicDecodeLayer::ForwardMultiStep`
 
-- [ ] **[B] Apply full stop criteria to tail tokens**
+- [x] **[B] Apply full stop criteria to tail tokens**
   - Extend `ForwardMultiStep` so that each committed tail token is checked
     with the same logic as the base token:
     - EOS / multiple `eos_ids`,
@@ -216,7 +216,7 @@ functionally complete.
 
 ### 4.2 EAGLE3 draft head & numerics (EagleModule parity)
 
-- [ ] **[B] Remove remaining approximations in Eagle3 draft head**
+- [x] **[B] Remove remaining approximations in Eagle3 draft head**
   - Align `EagleModule`’s Eagle3 path with TensorRT‑LLM / HF Eagle3:
     - Q/K/V projection splits and shapes (e.g. `[4096,5760]`, `[512,5760]`),
     - `fc.weight` usage and hidden‑dim factors,
@@ -225,7 +225,7 @@ functionally complete.
     the GPT‑OSS‑120B‑Eagle3 config so that its logits match the reference
     implementation up to numerical tolerance.
 
-- [ ] **[B] Wire strict Eagle3 geometry from converter into EagleModule**
+- [x] **[B] Wire strict Eagle3 geometry from converter into EagleModule**
   - Ensure `eagle_draft_converter.py` emits all geometry/config entries
     required by the tightened Eagle3 path (Q/K/V sizes, FC factors, layer
     counts), and `EagleModule` consumes them without defaulting to legacy
@@ -241,7 +241,289 @@ functionally complete.
       - tree decode and acceptance,
     - multi‑token commit.
 
-- [ ] **[B] Keep `update_plan` in sync with this file**
-  - For each iteration, keep `update_plan` tasks aligned with the `[ ]`
-    items in section 4 and close them here (`[x]`) only when the code
-    paths are fully implemented and compiled, not when they are sketched.
+---
+
+## 5. SpecPV‑Style Partial Verification for EAGLE3 (Next Phase)
+
+These items describe a *new* optimisation layer on top of the fully
+implemented EAGLE3 + target‑tree decode path. They are **not required**
+for TensorRT‑LLM parity, but aim to bring SpecPV’s partial KV technique
+into TurboMind for long‑context EAGLE3 runs.
+
+### 5.1 Engine configuration and gating
+
+- [ ] **[A] Add SpecPV flags to EngineParam and Triton config**
+  - Extend `EngineParam` (`llama_params.h`) with:
+    - `bool enable_specpv{false};`
+    - `int  specpv_block_size{16};`
+    - `int  specpv_n_sink_blocks{2};`
+    - `int  specpv_n_retrieval_blocks{256};`
+    - `int  specpv_n_window_blocks{8};`
+    - `int  specpv_n_spec_tokens_buf{128};`
+    - `int  specpv_partial_threshold{4096};`
+    - `int  specpv_full_refresh_steps{32};`
+  - Parse these from Triton YAML / LMDeploy `SpeculativeConfig` in
+    `LlamaTritonModel` / async_engine, mirroring the existing
+    `enable_eagle_target_tree` wiring.
+
+- [ ] **[A] Add SpecPV gating helpers to LlamaV2**
+  - Implement:
+    - `bool isSpecPVEnabled() const;`
+    - `bool shouldUseSpecPV(int seq_len) const;`
+  - `isSpecPVEnabled()` should check `engine_param_.enable_specpv` and a
+    `specpv_supported_` flag (e.g. TP/DP/PP constraints).
+  - `shouldUseSpecPV(seq_len)` should mirror SpecPV’s `should_partial_verify`
+    by requiring:
+    - context length above `specpv_partial_threshold`,
+    - a live partial KV cache object,
+    - and enough KV budget for `eagleMaxEngineTokensPerStep() + 1` tokens.
+
+### 5.2 PartialKVCache core (TurboMind analogue of SpecPV)
+
+- [ ] **[B] Implement SpecPVCacheConfig and PartialKVCache**
+  - `SpecPVCacheConfig`:
+    - Holds `block_size`, `n_sink_blocks`, `n_retrieval_blocks`,
+      `n_window_blocks`, `n_spec_tokens_buf`.
+    - Provides helpers:
+      - `int sink_size() const;`
+      - `int retrieval_size() const;`
+      - `int window_size() const;`
+      - `int total_budget() const;  // sink+retrieval+window+buffer`
+  - `PartialKVCache`:
+    - Owns per‑layer KV tensors: `[max_batch, num_kv_heads, total_budget, head_dim]`
+      and slices `"sink"`, `"retrieval"`, `"window"`, `"buffer"` in token order.
+    - Maintains per‑layer:
+      - `summary_key_states` (Kmax/Kmin for blocks beyond sink),
+      - `summary_block_count`,
+      - `verified_lens[layer]`,
+      - and a global `global_verified_lens`.
+    - Methods:
+      - `summary_key_states(layer_idx, key_states, seq_len)` – compute Kmax/Kmin
+        for new blocks (Eq. (1) in SpecPV).
+      - `refresh_retrieval(layer_idx, query_states, key_states, value_states, seq_len)` –
+        block scoring and top‑K selection (Eq. (2),(3)); fill retrieval/window
+        slices.
+      - `update(layer_idx, new_keys, new_values)` – append newly verified tokens
+        into the buffer slice and return active [sink+retrieval+window+buffer]
+        KV views.
+      - `init_from_full_kv(...)` – seed sink/retrieval/window from full KV once.
+      - `reset()` / `reset_buffer()`.
+
+- [ ] **[B] Attach PartialKVCache to LlamaV2**
+  - Add a `SpecPVCacheConfig specpv_cache_config_` and
+    `std::unique_ptr<PartialKVCache> specpv_kv_cache_` to `LlamaV2`.
+  - Initialize them from `EngineParam` in the LlamaV2 constructor when
+    `enable_specpv` is true and geometry is compatible.
+
+### 5.3 SpecPV‑mode target‑tree decode
+
+- [ ] **[B] Add SpecPV mode to runEagleTargetTreeDecode**
+  - Extend `LlamaV2::runEagleTargetTreeDecode` with a SpecPV branch:
+    - Full‑KV mode (today’s behaviour) stays as the default when
+      `!shouldUseSpecPV(seq_len)` or SpecPV is disabled.
+    - SpecPV mode:
+      - Uses `PartialKVCache` to construct the base KV for the target
+        tree decode:
+        - sink slice → earliest tokens (anchor),
+        - retrieval slice → top‑scoring blocks,
+        - window slice → most recent tokens,
+        - buffer slice → space to append tree tokens’ KV.
+      - Appends tree tokens’ K/V into the buffer via
+        `PartialKVCache::update(...)`.
+      - Runs `UnifiedDecoder::Forward` over this partial KV view instead
+        of a full‑prefix scratch KV.
+  - Keep tree masks (`spec_packed_mask`) and post‑decode logic
+    (logits → target_tokens → acceptance) unchanged.
+
+- [ ] **[B] Seed SpecPV from a full‑KV tree step**
+  - After the first full‑KV target‑tree decode at long context:
+    - Call `init_from_full_kv` on `specpv_kv_cache_` to:
+      - Copy sink + window segments from full KV into the partial cache.
+      - Initialize `global_verified_lens` to the current fully verified
+        prefix length.
+      - Mark `retrieval_initialized = false` so the next call to
+        `refresh_retrieval` can populate retrieval blocks.
+
+### 5.4 Partial/full switching and refresh
+
+- [ ] **[A] Implement SpecPV partial/full switching policy**
+  - Inside `LlamaBatch::Forward` / `LlamaV2`:
+    - Use `shouldUseSpecPV(seq_len)` to decide:
+      - Full‑KV tree decode (default) vs SpecPV mode for this step.
+    - Track:
+      - A per‑engine partial‑step counter.
+      - A per‑engine “buffer usage” indicator from `PartialKVCache`:
+        `verified_lens[layer]` vs `n_spec_tokens_buf`.
+  - Force full‑KV tree decode and partial cache refresh when:
+    - The partial‑step counter exceeds `specpv_full_refresh_steps`, or
+    - Buffer usage approaches `n_spec_tokens_buf`, or
+    - Any KV invariant or geometry check fails for the SpecPV path.
+
+- [ ] **[B] Update PartialKVCache after EAGLE acceptance**
+  - After multi‑token acceptance and commit:
+    - Use the committed EAGLE extras to:
+      - Update `partial_kv_cache_->update(...)` per layer with the
+        newly verified tokens (keys/values from TurboMind KV).
+      - Increment `verified_lens[layer]` accordingly.
+    - Keep `global_verified_lens` aligned with the full‑KV prefix as in
+      SpecPV:
+      - Only bump `global_verified_lens` on full‑KV refresh steps.
+
+### 5.5 Interaction with existing KV and EAGLE paths
+
+- [ ] **[C] Keep SpecPV orthogonal to EAGLE semantics**
+  - Ensure SpecPV does not change:
+    - EAGLE3 draft head maths or geometry.
+    - Tree masks / structure.
+    - `invokeTreeAcceptByIdsWithPaths` semantics (ID‑equality).
+  - SpecPV should only affect:
+    - Which KV entries the target attends to during tree decode.
+    - How KV is updated and reused between partial/full verification
+      steps.
+
+- [ ] **[C] Maintain baseline and TRT‑LLM parity modes**
+  - When `enable_specpv == false`:
+    - Behaviour must remain identical to the now‑completed EAGLE3 /
+      target‑tree implementation (Sections 1–4).
+  - SpecPV mode should be easy to toggle at runtime via config so we can
+    benchmark:
+    - Full‑KV TurboMind EAGLE3 vs SpecPV‑enabled TurboMind EAGLE3.
+
+
+---
+
+## 5. Advanced: SpecPV‑Style Partial Verification on Top of EAGLE3 Target‑Tree Decode
+
+This section sketches **future work**: integrating a SpecPV‑style *partial KV verification* path under the existing EAGLE3 target‑tree decode in TurboMind, to reduce verification cost for very long contexts. It is not required for TensorRT‑LLM parity, but it becomes relevant once 32K–64K contexts are common.
+
+Reference implementation and paper:
+- Code: `SpecPV/specpv/kv/kv_cache.py`, `specpv/speculate/{speculator.py,utils.py,configs.py}`, `specpv/models/modeling_llama_kv.py`.
+- Paper: `SpecPV/PAPER.md`, especially §3.2 *Partial Verification*, §3.3 *Rectified with Full Verification*, Fig. 2, and Algorithm 1.
+
+### 5.1 Conceptual overview
+
+- **Problem:** At long context, even with EAGLE3 draft + target‑tree decode, verification dominates latency because attention always sees the full prefix KV.
+- **SpecPV idea:** Maintain a *partial* target KV cache for verification consisting of:
+  - **Sink tokens:** initial KV blocks kept always.
+  - **Retrieval tokens:** blocks selected via block‑level summaries (`Kmax`, `Kmin`) and query similarity scores.
+  - **Local window:** a fixed‑size tail of the most recent tokens.
+  - **Spec buffer:** candidate / partially verified tokens awaiting correction.
+- **Behaviour:**
+  - For short context, verification uses full KV (no partial cache).
+  - When context exceeds a partial KV budget:
+    - Run one **full verification** step to initialize the partial KV.
+    - Then run most steps in **partial verification** mode (tree decode attends only to partial KV + buffer).
+    - Periodically perform full verification again to refresh the partial KV and clear accumulated errors.
+
+### 5.2 Proposed engine‑level API and config
+
+These are additive fields on top of existing speculative / EAGLE config; when disabled, behaviour is identical to today.
+
+- Extend `EngineParam` (`src/turbomind/models/llama/llama_params.h`):
+  - `bool enable_specpv{false};`
+  - `int  specpv_block_size{16};`
+  - `int  specpv_n_sink_blocks{2};`
+  - `int  specpv_n_retrieval_blocks{256};`
+  - `int  specpv_n_window_blocks{8};`
+  - `int  specpv_n_spec_tokens_buf{128};`
+  - `int  specpv_partial_threshold{4096};`  // context length above which partial KV can kick in
+  - `int  specpv_full_refresh_steps{32};`   // max partial steps before a forced full verify
+
+- Wire through Triton YAML `speculative_config` (alongside `enable_target_tree`), and through LMDeploy’s Python `SpeculativeConfig` object so users can enable SpecPV for EAGLE3 targets explicitly.
+
+### 5.3 PartialKVCache data structure (C++ analogue of SpecPV)
+
+Introduce a TurboMind‑side partial KV cache that mirrors SpecPV’s `PartialKVCache`:
+
+- New `SpecPVCacheConfig`:
+  - Fields: `block_size`, `n_sink_blocks`, `n_retrieval_blocks`, `n_window_blocks`, `n_spec_tokens_buf`.
+  - Derived: `sink_size`, `retrieval_size`, `window_size`, `total_budget`.
+
+- New `PartialKVCache` (C++ class, files `specpv_kv_cache.{h,cc}`):
+  - For each layer:
+    - Allocate `[max_batch_size, num_kv_heads, total_budget, head_dim]`.
+    - Slice into:
+      - `"sink"`   : first `sink_size` tokens,
+      - `"retrieval"`: next `retrieval_size` tokens,
+      - `"window"`: next `window_size` tokens,
+      - `"buffer"`: final `n_spec_tokens_buf` tokens.
+  - Maintain:
+    - `key_states_summary[layer]["max"/"min"]` for block summaries, shape `[B, H, max_blocks, D]`.
+    - `summary_block_count[layer]` (how many blocks have summaries).
+    - `verified_lens[layer]` (how many tokens in buffer are now fully verified).
+    - `global_verified_lens` (length of the fully verified prefix over which retrieval is defined).
+  - Methods (1:1 with SpecPV):
+    - `summary_key_states(layer_idx, key_states, seq_len)`:
+      - Implements Eq. (1) of the paper (per‑block `Kmax`, `Kmin`).
+    - `refresh_retrieval(layer_idx, query_states, key_states, value_states, seq_len)`:
+      - Implements Eq. (2),(3) and `refresh_retrieval` in `kv_cache.py`:
+        - Compute similarity scores vs summaries for each block,
+        - Select top‑`n_retrieval_blocks`,
+        - Gather keys/values into `"retrieval"` slice,
+        - Fill `"window"` with last `window_size` tokens.
+    - `update(layer_idx, new_key_states, new_value_states)`:
+      - Append KV for newly (partially) verified tokens into `"buffer"` and return the active `[sink+retrieval+window+buffer]` view.
+    - `init_key_values(full_kv)`:
+      - Seed `sink` (and optionally initial retrieval/window) from full KV once, like SpecPV’s `init_key_values`.
+    - `get_seq_length(layer_idx)`, `reset()`, `reset_buffer()`.
+
+`LlamaV2` should hold:
+- `std::unique_ptr<PartialKVCache> specpv_kv_cache_;`
+- `SpecPVCacheConfig specpv_cache_config_;`
+- Flags: `bool specpv_supported_{false};`.
+
+### 5.4 Gating and integration with `runEagleTargetTreeDecode`
+
+With the data structure in place, EAGLE3 tree decode can choose between full vs partial KV:
+
+- New helpers on `LlamaV2`:
+  - `bool isSpecPVEnabled() const`:
+    - `return engine_param_.enable_specpv && specpv_supported_ && specpv_kv_cache_ != nullptr;`
+  - `bool shouldUseSpecPV(int sequence_len) const`:
+    - Mirrors SpecPV’s `should_partial_verify`:
+      - `isSpecPVEnabled()`,
+      - `sequence_len > specpv_partial_threshold`,
+      - `specpv_kv_cache_->enabled && specpv_kv_cache_->retrieval_initialized`,
+      - `specpv_kv_cache_->get_seq_length() + eagle_max_engine_tokens_per_step_ + 1 <= specpv_cache_config_.total_budget()`.
+
+- In `LlamaV2::runEagleTargetTreeDecode`:
+  - Full‑KV mode (**current behaviour**):
+    - When `!shouldUseSpecPV(sequence_len)`:
+      - Build scratch KV from full prefix blocks and run `UnifiedDecoder::Forward` as today.
+  - SpecPV mode (**partial KV**):
+    - When `shouldUseSpecPV(sequence_len)`:
+      - Use `specpv_kv_cache_` as the base KV view:
+        - `sink` + `retrieval` + `window` slices define the “trusted” prefix.
+      - Append KV for tree tokens into `"buffer"` via `PartialKVCache::update`.
+      - Run `UnifiedDecoder::Forward` with that composite KV instead of full prefix.
+
+Tree masks, tree logits → `target_tokens`, and acceptance remain unchanged: SpecPV only narrows which KV positions the target attends to during tree decode.
+
+### 5.5 Maintaining `global_verified_lens` / `verified_lens` and periodic full refresh
+
+The bookkeeping should follow SpecPV’s `global_verified_lens` and per‑layer `verified_lens` semantics:
+
+- **Full‑KV steps (initialization or refresh):**
+  - After a tree decode step that used full KV:
+    - Set `specpv_kv_cache_->global_verified_lens = current_sequence_len` for each active sequence.
+    - Call `initSpecPVFromFullKV` (helper on `LlamaV2`) to seed `sink` / `retrieval` / `window` from the live full KV.
+    - Reset `verified_lens[layer]` and buffer.
+
+- **Partial‑KV steps:**
+  - After `invokeTreeAcceptByIdsWithPaths` and `advanceSequencesByEagleAcceptance`:
+    - Determine how many **extra tokens** were actually committed for each sequence.
+    - Append their KV into the partial `"buffer"` for each layer via `PartialKVCache::update`.
+    - Increment `verified_lens[layer]` accordingly.
+    - Leave `global_verified_lens` unchanged (it still points to the fully verified prefix before partial steps), mirroring SpecPV’s `tree_decoding` + `update_inference_inputs` separation.
+
+- **Periodic full refresh:**
+  - When any of the following holds:
+    - `verified_lens[layer]` approaches `n_spec_tokens_buf` (buffer nearly full),
+    - Number of consecutive partial steps reaches `specpv_full_refresh_steps`,
+    - Or the effective `get_seq_length()` is too close to `total_budget`.
+  - Run a full‑KV `runEagleTargetTreeDecode` step, then:
+    - Rebuild partial KV from full KV (`initSpecPVFromFullKV`),
+    - Reset buffer and `verified_lens` counters.
+
+At all times:
+- If any SpecPV invariant fails (dtype/layout mismatch, buffer too small for `eagle_max_engine_tokens_per_step_`, unexpected KV geometry), log a `[LlamaV2][SpecPV][fallback] ...` message, set `specpv_supported_ = false`, free `specpv_kv_cache_`, and continue with the current full‑KV EAGLE3 behaviour.

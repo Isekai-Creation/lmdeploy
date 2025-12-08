@@ -304,7 +304,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     bool fc_ok = load_with_variants(weights_.fc, "fc.weight");
     if (!fc_ok) {
         TM_LOG_WARNING(
-            "[EAGLE][EagleModule::load] fc.weight missing; shallow EagleNet block will fall back to RMSNorm+LM head");
+            "[EAGLE][EagleModule::load] fc.weight missing; shallow Eagle block disabled for this engine");
     }
 
     bool eagle_fc_ok = true;
@@ -324,10 +324,12 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     if (!load_with_variants(weights_.hidden_norm, "layers.0.hidden_norm.weight")) {
         TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.hidden_norm.weight missing");
     }
-    if (!load_with_variants(weights_.attn_qkv, "layers.0.attention.w_qkv.weight")) {
+    bool attn_qkv_ok = load_with_variants(weights_.attn_qkv, "layers.0.attention.w_qkv.weight");
+    if (!attn_qkv_ok) {
         TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention.w_qkv.weight missing");
     }
-    if (!load_with_variants(weights_.attn_o, "layers.0.attention.wo.weight")) {
+    bool attn_o_ok = load_with_variants(weights_.attn_o, "layers.0.attention.wo.weight");
+    if (!attn_o_ok) {
         TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention.wo.weight missing");
     }
     if (!load_with_variants(weights_.attn_norm, "layers.0.ffn_norm.weight")) {
@@ -361,7 +363,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             "[EAGLE][EagleModule::load] feed_forward w1/w3 weights missing; skipping draft MLP gate/up block");
     }
 
-    if (!load_with_variants(weights_.mlp_down, "layers.0.feed_forward.w2.weight")) {
+    bool mlp_down_ok = load_with_variants(weights_.mlp_down, "layers.0.feed_forward.w2.weight");
+    if (!mlp_down_ok) {
         TM_LOG_WARNING(
             "[EAGLE][EagleModule::load] layers.0.feed_forward.w2.weight missing; draft MLP down block disabled");
     }
@@ -481,6 +484,20 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             TM_LOG_WARNING("[EAGLE] Failed to parse eagle_tree.yaml at %s: %s",
                            tree_path.c_str(),
                            e.what());
+        }
+    }
+
+    // For Eagle3 drafts, require the full shallow block geometry to be
+    // present. When critical weights are missing, we treat the draft
+    // model as unusable instead of silently falling back to identity/
+    // minimal paths, so behaviour stays aligned with the exported
+    // Eagle3 config.
+    if (eagle_mode_ == EagleMode::kEagle3) {
+        const bool block_ok = fc_ok && attn_qkv_ok && attn_o_ok && mlp_down_ok;
+        if (!block_ok) {
+            logEagleError(
+                "Eagle3 draft block weights incomplete (fc/attn_qkv/attn_o/mlp_down); disabling EAGLE for this engine");
+            success = false;
         }
     }
 
