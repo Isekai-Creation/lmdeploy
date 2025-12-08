@@ -1214,7 +1214,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
     // layout; quantized caches are not supported in SpecPV mode.
     if (dtype_ != kFloat16
 #if ENABLE_BF16
-        && dtype_ != kBFloat16
+        && dtype_ != kBfloat16
 #endif
     ) {
         TM_LOG_WARNING(
@@ -1354,7 +1354,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                            stream_);
     }
 #if ENABLE_BF16
-    else if (dtype_ == kBFloat16) {
+    else if (dtype_ == kBfloat16) {
         invokeFlattenKV_v2(reinterpret_cast<nv_bfloat16*>(k_ptr),
                            reinterpret_cast<nv_bfloat16*>(v_ptr),
                            d_blocks.data(),
