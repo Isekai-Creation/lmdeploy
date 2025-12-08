@@ -230,6 +230,13 @@ private:
     Tensor debug_logits_;
 
 public:
+    // Accessor for Eagle3 draft-layer weights; returns nullptr when
+    // no Eagle3 draft layer has been prepared.
+    const Eagle3DraftLayerWeight* eagle3_draft_layer() const noexcept
+    {
+        return eagle3_draft_layer_.get();
+    }
+
     // Lightweight debug accessors; intended for tests / tooling only.
     const Tensor& debug_fc_out() const { return debug_fc_out_; }
     const Tensor& debug_attn_input() const { return debug_attn_input_; }

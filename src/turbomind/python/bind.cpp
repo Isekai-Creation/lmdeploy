@@ -396,7 +396,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         model_param.hidden_units = static_cast<size_t>(hidden_units);
         ft::Context ctx(device_id);
         ft::LlamaFfnLayer ffn_layer(model_param, ctx);
-        const auto* draft_w = module.eagle3_draft_layer_.get();
+        const auto* draft_w = module.eagle3_draft_layer();
 
         // In this offline helper we don't have a full UnifiedAttentionLayer
         // instance, so we pass nullptr for attn_layer. Eagle3DraftLayer will
@@ -1271,7 +1271,7 @@ PYBIND11_MODULE(_turbomind, m)
                 ft::Context ctx(device_id);
                 ft::LlamaFfnLayer ffn_layer(model_param, ctx);
 
-                const auto* draft_w = module.eagle3_draft_layer_.get();
+                const auto* draft_w = module.eagle3_draft_layer();
                 // For this standalone debug helper we do not have a
                 // UnifiedDecoder context, so we pass a null
                 // UnifiedAttentionLayer pointer and rely on the
