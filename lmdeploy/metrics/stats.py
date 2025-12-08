@@ -240,6 +240,14 @@ class SpeculativeDecodingStats:
     tree_num_draft_tokens: int = 0
     tree_num_target_tokens: int = 0
     tree_num_accepted_tokens: int = 0
+    # Extended EAGLE3 metrics aggregated over drafts/steps.
+    total_steps: int = 0
+    total_tokens_per_seq: int = 0
+    max_tokens_per_seq: int = 0
+    total_accepted_len: int = 0
+    max_accepted_len: int = 0
+    steps_with_accept_ge2: int = 0
+    total_committed_extras: int = 0
 
     def __post_init__(self):
         assert self.num_spec_tokens > 0
@@ -248,10 +256,28 @@ class SpeculativeDecodingStats:
     def update_from_output(self, outputs: EngineOutput):
         """Update from engine output."""
         if spec_info := getattr(outputs.req_metrics, 'spec_info', None):
+            # Basic draft/accept counts.
             self.num_drafts += 1
             self.num_draft_tokens += spec_info['num_draft_tokens']
             self.num_accepted_tokens += spec_info['num_accepted_tokens']
             self.num_accepted_tokens_per_pos[:spec_info['num_accepted_tokens']] += 1
+
+            # Per-step EAGLE3 step-level metrics, when present.
+            tokens_per_seq = int(spec_info.get("tokens_per_seq", 0))
+            accepted_len_step = int(spec_info.get("accepted_len", 0))
+            max_accepted_len_step = int(spec_info.get("max_accepted_len", 0))
+            committed_extras_step = int(spec_info.get("committed_extras", 0))
+
+            self.total_steps += 1
+            self.total_tokens_per_seq += tokens_per_seq
+            self.max_tokens_per_seq = max(self.max_tokens_per_seq, tokens_per_seq)
+
+            self.total_accepted_len += accepted_len_step
+            self.max_accepted_len = max(self.max_accepted_len, max_accepted_len_step)
+            if max_accepted_len_step >= 2:
+                self.steps_with_accept_ge2 += 1
+
+            self.total_committed_extras += committed_extras_step
 
             # Optional tree-aware metrics.
             tree_info = spec_info.get("tree_decode") if isinstance(spec_info, dict) else None
@@ -305,6 +331,12 @@ class EagleMetricsSummary:
     num_accepted_tokens: int
     draft_acceptance_rate: float
     mean_acceptance_length: float
+    # Extended summary fields derived from SpeculativeDecodingStats.
+    mean_tokens_per_seq: float | None = None
+    max_tokens_per_seq: int | None = None
+    max_acceptance_length: int | None = None
+    fraction_steps_accept_ge2: float | None = None
+    mean_committed_extras: float | None = None
     # Optional tree-aware aggregates derived from SpeculativeDecodingStats.
     tree_num_draft_tokens: int | None = None
     tree_num_target_tokens: int | None = None
@@ -328,6 +360,20 @@ class EagleMetricsSummary:
         else:
             mean_acceptance_length = float("nan")
 
+        # Extended fields: averaged over speculative steps.
+        if stats.total_steps > 0:
+            mean_tokens_per_seq = stats.total_tokens_per_seq / stats.total_steps
+            max_tokens_per_seq = stats.max_tokens_per_seq
+            max_acceptance_length = stats.max_accepted_len
+            fraction_steps_accept_ge2 = stats.steps_with_accept_ge2 / stats.total_steps
+            mean_committed_extras = stats.total_committed_extras / stats.total_steps
+        else:
+            mean_tokens_per_seq = float("nan")
+            max_tokens_per_seq = 0
+            max_acceptance_length = 0
+            fraction_steps_accept_ge2 = float("nan")
+            mean_committed_extras = float("nan")
+
         tree_num_draft_tokens = stats.tree_num_draft_tokens or 0
         tree_num_target_tokens = stats.tree_num_target_tokens or 0
         tree_num_accepted_tokens = stats.tree_num_accepted_tokens or 0
@@ -338,6 +384,11 @@ class EagleMetricsSummary:
             num_accepted_tokens=num_accepted_tokens,
             draft_acceptance_rate=draft_acceptance_rate,
             mean_acceptance_length=mean_acceptance_length,
+            mean_tokens_per_seq=mean_tokens_per_seq,
+            max_tokens_per_seq=max_tokens_per_seq,
+            max_acceptance_length=max_acceptance_length,
+            fraction_steps_accept_ge2=fraction_steps_accept_ge2,
+            mean_committed_extras=mean_committed_extras,
             tree_num_draft_tokens=tree_num_draft_tokens or None,
             tree_num_target_tokens=tree_num_target_tokens or None,
             tree_num_accepted_tokens=tree_num_accepted_tokens or None,
@@ -352,6 +403,17 @@ class EagleMetricsSummary:
             "mean_acceptance_rate": float(self.draft_acceptance_rate),
             "mean_acceptance_length": float(self.mean_acceptance_length),
         }
+        # Extended fields are optional; include them when present.
+        if self.mean_tokens_per_seq is not None:
+            out["mean_tokens_per_seq"] = float(self.mean_tokens_per_seq)
+        if self.max_tokens_per_seq is not None:
+            out["max_tokens_per_seq"] = int(self.max_tokens_per_seq)
+        if self.max_acceptance_length is not None:
+            out["max_acceptance_length"] = int(self.max_acceptance_length)
+        if self.fraction_steps_accept_ge2 is not None:
+            out["fraction_steps_accept_ge2"] = float(self.fraction_steps_accept_ge2)
+        if self.mean_committed_extras is not None:
+            out["mean_committed_extras"] = float(self.mean_committed_extras)
         # Preserve the original schema and, when tree-aware metrics are
         # available, attach them under a nested ``tree_decode`` block.
         if self.tree_num_draft_tokens is not None or self.tree_num_target_tokens is not None \
