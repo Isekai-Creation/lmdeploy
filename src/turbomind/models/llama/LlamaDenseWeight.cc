@@ -279,7 +279,11 @@ LlamaAttentionWeight::LlamaAttentionWeight(int      hidden_dim,
                                            int      window_size,
                                            bool     sink)
 {
-    this->window_size = window_size;
+    // Cache basic attention geometry for downstream helpers.
+    this->head_num      = head_num;
+    this->kv_head_num   = kv_head_num;
+    this->size_per_head = head_dim;
+    this->window_size   = window_size;
 
     if (mla.kv_lora_rank == 0) {
         qkv.emplace(

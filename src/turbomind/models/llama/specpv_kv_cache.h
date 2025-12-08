@@ -176,6 +176,13 @@ public:
     // does not yet move real KV data.
     std::pair<Tensor, Tensor> update(int layer_idx, const Tensor& new_keys, const Tensor& new_values);
 
+    // Lightweight bookkeeping hook invoked after each EAGLE multi-token
+    // acceptance step. This API is intentionally conservative: it only
+    // validates basic invariants (non-negative lengths, staying within
+    // the configured total budget) and can disable the cache on any
+    // mismatch without touching device-side KV contents.
+    void update_after_acceptance(int layer_idx, int slot, int advance_tokens);
+
     // Lightweight helper to expose a contiguous prefix view over the
     // partial KV cache for a given layer. This returns a pair of
     // [B, H_kv, prefix_tokens, D] tensors for keys and values,
@@ -183,17 +190,6 @@ public:
     std::pair<Tensor, Tensor> active_prefix(int layer_idx, int prefix_tokens);
 
     void reset_buffer();
-
-    // Lightweight bookkeeping hook invoked after each EAGLE multi-token
-    // acceptance step. This API is intentionally conservative: it only
-    // validates basic invariants (non-negative lengths, staying within
-    // the configured total budget) and can disable the cache on any
-    // mismatch without touching device-side KV contents.
-    // Lightweight bookkeeping hook invoked after each EAGLE multi-token
-    // acceptance step. This variant tracks verified lengths per layer
-    // in a conservative way and can disable the cache on any overflow
-    // without touching device-side KV contents.
-    void update_after_acceptance(int layer_idx, int slot, int advance_tokens);
 
 private:
     void recompute_global_verified_len() noexcept;

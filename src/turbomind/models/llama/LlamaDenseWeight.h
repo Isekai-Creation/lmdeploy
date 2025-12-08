@@ -133,6 +133,14 @@ struct LlamaAttentionWeight: public core::Module {
     Tensor q_a_layernorm;
     Tensor kv_a_layernorm;
 
+    // Attention geometry for this weight shard. These are lightweight
+    // mirrors of the model config and are useful for auxiliary paths
+    // (e.g. Eagle3 draft layer) that need head metadata without
+    // re-parsing ModelParam.
+    int head_num{0};
+    int kv_head_num{0};
+    int size_per_head{0};
+
     int window_size{};
 };
 

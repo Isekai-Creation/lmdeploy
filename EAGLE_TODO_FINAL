@@ -52,8 +52,9 @@ Status markers:
   - **[x]** Seeding from full KV (`initSpecPVFromFullKV`) and partial/full
            switching policy in `LlamaV2`.
   - **[x]** Tree decode can run against partial KV in SpecPV mode.
-  - **[ ]** Post‑acceptance partial KV update is still basic and not fully aligned
-           with accepted tail semantics per layer/slot.
+  - **[x]** Post‑acceptance partial KV update wired to EAGLE committed tail
+           lengths via `PartialKVCache::update_after_acceptance` and
+           `LlamaV2::updateSpecPVAfterAcceptance`, with per‑layer/slot guards.
 
 ---
 
@@ -123,14 +124,14 @@ Status markers:
 - [x] `eagle3_compare.py` already consumes a debug dict and computes stage metrics.
 
 **TODO:**
-- [ ] In `Eagle3DraftLayer`, add optional debug tensors (only when a global
+- [x] In `Eagle3DraftLayer`, add optional debug tensors (only when a global
       eagle‑debug flag is on) for:
   - `attn_out` – attention output before FFN.
   - `ffn_out` – GatedMLP output before final norm.
   - `pre_head_hidden` – post‑`output_norm` hidden.
-- [ ] In `_turbomind.eagle3_forward_debug`:
+- [x] In `_turbomind.eagle3_forward_debug`:
   - When Eagle‑3 draft layer is present, return:
-    - `logits` (already),
+    - `logits`,
     - `attn_out`, `ffn_out`, `pre_head_hidden` pulled from `Eagle3DraftLayer`.
 - [ ] In `eagle3_compare.py`:
   - For each stage (ATTN_OUT, FFN_OUT, PRE_HEAD, LOGITS):
@@ -179,20 +180,14 @@ Status markers:
   - K/V segments (sink, retrieval, window, buffer),
   - summary Kmax/Kmin, retrieval scoring, update/refresh/reset.
 
-**TODO:**
-- [ ] Add:
-
-  ```cpp
-  void PartialKVCache::update_after_acceptance(
-      int layer_idx, int slot, int advance_tokens);
-  ```
-
-  which:
-  - Increments `verified_lens_[layer_idx][slot] += advance_tokens`.
-  - Extends buffer segment indices to include the new tokens.
-  - If this would overflow the configured `n_spec_tokens_buf`:
-    - Logs `[SpecPV][fallback] buffer overflow in update_after_acceptance; disabling SpecPV`.
-    - Marks SpecPV disabled for this engine (internal flag checked by `isSpecPVEnabled()`).
+**Status / behaviour (implemented):**
+- **[x]** `PartialKVCache::update_after_acceptance(int layer_idx,
+       int slot, int advance_tokens)` is implemented and used to advance
+       `verified_lens_[layer_idx]` and recompute `global_verified_len_`.
+  - On invalid `layer_idx`, zero `buffer_size()`, negative current length,
+    or buffer overflow, it logs a `[SpecPV][fallback] ...` message,
+    disables SpecPV for the engine (`enabled_ = false`) and resets
+    `global_verified_len_` to 0.
 
 ### 2.2 Wire `update_after_acceptance` into the EAGLE multi‑token path
 
@@ -200,43 +195,36 @@ Status markers:
 - `src/turbomind/models/llama/LlamaV2.cc`
 - `src/turbomind/layers/DynamicDecodeLayer.cc` (for `committed_lengths`)
 
-**TODO:**
-- [ ] After `dynamicDecodeWithSpecMulti` commits tails and before returning:
-  - Using per‑slot `committed_lengths[i]` from `ForcedTailContext` as the
-    number of extra tokens actually written for slot `i`:
-
-    ```cpp
-    if (specpv_kv_cache_ && isSpecPVEnabled()) {
-        for (int i = 0; i < batch_size; ++i) {
-            int advance = committed_lengths[i];
-            if (advance > 0) {
-                for (int layer = 0; layer < num_layers; ++layer) {
-                    specpv_kv_cache_->update_after_acceptance(layer, i, advance);
-                }
-            }
-        }
-    }
-    ```
-
-- [ ] On any fatal error inside `update_after_acceptance`:
-  - Log `[SpecPV][fallback] PartialKVCache update_after_acceptance failed; disabling SpecPV`.
-  - Disable SpecPV for this engine only; do not interfere with EAGLE or baseline KV.
+**Status / behaviour (implemented):**
+- **[x]** After `dynamicDecodeWithSpecMulti` commits tails, `LlamaV2`
+  calls `updateSpecPVAfterAcceptance`, which:
+  - Reads per‑slot committed tail lengths (when available) or falls back
+    to `advance = 1` for active single‑token steps.
+  - For each slot and each layer, calls
+    `specpv_kv_cache_->update_after_acceptance(layer, i, advance)` when
+    SpecPV is enabled.
+  - If the cache disables itself during these updates, logs
+    `[SpecPV][fallback] PartialKVCache update_after_acceptance failed; disabling SpecPV for this engine.`
+    and clears `specpv_kv_cache_` / related flags without affecting
+    EAGLE or baseline KV.
 
 ### 2.3 Keep partial/full switching disciplined
 
 **Where:**
 - `LlamaV2` SpecPV helpers (`isSpecPVEnabled`, `shouldUseSpecPV`, `initSpecPVFromFullKV`, refresh logic)
 
-**TODO:**
-- [ ] Verify that:
-  - `shouldUseSpecPV(seq_len)`, `specpv_partial_steps_`, and headroom thresholds still:
-    - force full‑KV tree decode periodically,
-    - reseed partial KV from full KV via `initSpecPVFromFullKV`,
-    - only bump `global_verified_len` on full‑KV refresh, while
-      `verified_lens[layer]` tracks buffer‑local tails.
-- No EAGLE semantics (tree structure, acceptance, EOS/stop handling) are
-  changed by SpecPV – it must only change which KV entries the target
-  attends to during target‑tree decode.
+**Status / remaining checks:**
+- **[x]** `shouldUseSpecPV`, `specpv_partial_steps_`, and headroom thresholds
+  already:
+  - Gate entry into SpecPV based on sequence length,
+  - Force full‑KV tree decode when partial steps or buffer headroom are
+    exhausted,
+  - Reseed the partial KV from full KV via `initSpecPVFromFullKV`,
+    and use `update_after_acceptance` to track buffer‑local tails.
+- **[ ]** When tuning SpecPV further, keep verifying that no EAGLE semantics
+  (tree structure, acceptance, EOS/stop handling) are changed – SpecPV
+  must only affect which KV entries the target attends to during
+  target‑tree decode.
 
 ---
 
@@ -262,4 +250,3 @@ Once the items above are implemented, the final validation loop should be:
 At that point, TurboMind’s Eagle‑3 speculative decoding is structurally and
 numerically aligned as far as is reasonable with TensorRT‑LLM, with SpecPV
 providing an additional, optional verification optimisation on top.
-

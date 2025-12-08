@@ -559,7 +559,6 @@ std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
 
     const int cur_len   = verified_lens_[layer_idx];
     const int new_len   = new_keys.shape(2);  // tokens dimension
-    const int next_len  = cur_len + new_len;
     const int max_tokens = buffer_tokens;
 
     if (new_len <= 0 || cur_len >= max_tokens) {
