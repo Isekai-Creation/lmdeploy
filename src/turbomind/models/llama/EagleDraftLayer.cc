@@ -41,6 +41,32 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         return;
     }
 
+    auto geom_mismatch = [&]() -> bool {
+        // Require basic availability and 2D shape for attention and FFN
+        // weights. We keep the checks intentionally light here and rely
+        // on EagleModule::load for stricter geometry validation.
+        if (!weight_->attn.qkv.weight || !weight_->attn.output.weight) {
+            return true;
+        }
+        if (weight_->attn.qkv.weight.ndim() != 2 || weight_->attn.output.weight.ndim() != 2) {
+            return true;
+        }
+
+        const int wo_out = weight_->attn.output.weight.shape(1);
+        if (wo_out != hidden_dim) {
+            return true;
+        }
+
+        return false;
+    };
+
+    if (geom_mismatch()) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Draft] invalid geometry; skipping Eagle3DraftLayer::Forward");
+        output_hidden = input_hidden;
+        return;
+    }
+
     const auto dtype = input_hidden.dtype();
 
     auto norm_mismatch = [&](const Tensor& w, const char* name) -> bool {
@@ -72,13 +98,39 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     Tensor hidden_norm{{batch_size, hidden_dim}, dtype, input_hidden.device()};
     invokeRMSNorm(hidden_norm, input_hidden, weight_->input_norm, rmsnorm_eps_, stream);
 
-    // 2) Single-step "self-attention" using the fused QKV / Wo weights
-    // from Eagle3. For v1 we follow the existing EagleModule shallow
-    // path and treat the Q slice as the value projected by Wo.
+    // 2) Single-step draft "attention" using the fused QKV / Wo weights
+    // from Eagle3. The current implementation still follows the
+    // simplified EagleModule shallow path (no explicit softmax or KV
+    // cache) but guards QKV / Wo geometry so any unexpected layout
+    // falls back to pass-through.
     LlamaLinear& linear = ffn_layer_->linear();
 
-    const int qkv_out_dim = weight_->attn.qkv.weight.shape(1);
-    const int q_dim       = weight_->attn.output.weight.shape(0);
+    const Tensor& qkv_w = weight_->attn.qkv.weight;
+    const Tensor& wo_w  = weight_->attn.output.weight;
+
+    if (!qkv_w || !wo_w || qkv_w.ndim() != 2 || wo_w.ndim() != 2) {
+        TM_LOG_WARNING(
+            "[EAGLE][Eagle3DraftLayer][fallback] invalid QKV/WO tensors in Forward; "
+            "treating Eagle3 draft as pass-through.");
+        output_hidden = input_hidden;
+        return;
+    }
+
+    const int qkv_out_dim = qkv_w.shape(1);
+    const int q_dim       = wo_w.shape(0);
+
+    if (qkv_out_dim <= 0 || q_dim <= 0 || wo_w.shape(1) != hidden_dim) {
+        TM_LOG_WARNING(
+            "[EAGLE][Eagle3DraftLayer][fallback] invalid QKV/WO geometry in Forward "
+            "(qkv=[%d,%d], wo=[%d,%d], hidden_dim=%d); treating draft as pass-through.",
+            qkv_w.shape(0),
+            qkv_w.shape(1),
+            wo_w.shape(0),
+            wo_w.shape(1),
+            hidden_dim);
+        output_hidden = input_hidden;
+        return;
+    }
 
     Tensor qkv{{batch_size, qkv_out_dim}, dtype, input_hidden.device()};
     linear.Forward(hidden_norm, weight_->attn.qkv, qkv);

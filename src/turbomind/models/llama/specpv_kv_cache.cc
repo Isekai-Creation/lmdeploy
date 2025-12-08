@@ -13,6 +13,7 @@
 #include <limits>
 
 #include "lmdeploy/turbomind/kernels/speculative_decoding/specpv_kv_kernels.h"
+#include "src/turbomind/utils/logger.h"
 
 namespace turbomind {
 
@@ -44,6 +45,7 @@ PartialKVCache::PartialKVCache(const SpecPVCacheConfig& cfg,
     key_summary_max_.reserve(num_layers_);
     key_summary_min_.reserve(num_layers_);
     verified_lens_.assign(num_layers_, 0);
+    candidate_lens_.assign(num_layers_, 0);
     summary_block_count_.assign(num_layers_, 0);
 
     // A conservative upper bound on the number of summary blocks we may
@@ -94,6 +96,7 @@ void PartialKVCache::set_verified_length(int layer_idx, int len) noexcept
 void PartialKVCache::reset() noexcept
 {
     std::fill(verified_lens_.begin(), verified_lens_.end(), 0);
+    std::fill(candidate_lens_.begin(), candidate_lens_.end(), 0);
     std::fill(summary_block_count_.begin(), summary_block_count_.end(), 0);
     global_verified_len_ = 0;
 }
@@ -105,6 +108,14 @@ void PartialKVCache::recompute_global_verified_len() noexcept
         v = std::max(v, len);
     }
     global_verified_len_ = v;
+}
+
+int PartialKVCache::candidate_length(int layer_idx) const noexcept
+{
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(candidate_lens_.size())) {
+        return 0;
+    }
+    return candidate_lens_[layer_idx];
 }
 
 Tensor PartialKVCache::slice_tokens(std::vector<Tensor>& cache, int layer_idx, int token_start, int token_count)
@@ -609,6 +620,121 @@ std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
     return {k_active, v_active};
 }
 
+bool PartialKVCache::stage_candidates(int layer_idx,
+                                      const Tensor& cand_keys,
+                                      const Tensor& cand_values)
+{
+    if (!enabled_) {
+        return false;
+    }
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(key_cache_.size())) {
+        return false;
+    }
+
+    const int buffer_tokens = cfg_.buffer_size();
+    if (buffer_tokens <= 0) {
+        return false;
+    }
+
+    if (!cand_keys || !cand_values) {
+        candidate_lens_[layer_idx] = 0;
+        return false;
+    }
+
+    if (cand_keys.dtype() != kv_dtype_ || cand_values.dtype() != kv_dtype_) {
+        // Candidate KV must match the internal cache dtype (float32 in v1).
+        return false;
+    }
+
+    const int B = static_cast<int>(cand_keys.shape(0));
+    const int H = static_cast<int>(cand_keys.shape(1));
+    const int S = static_cast<int>(cand_keys.shape(2));
+    const int D = static_cast<int>(cand_keys.shape(3));
+
+    if (S <= 0 || D != head_dim_ || cand_values.shape(0) != B || cand_values.shape(1) != H
+        || cand_values.shape(2) != S || cand_values.shape(3) != D) {
+        return false;
+    }
+
+    const int max_B = std::min(B, max_batch_size_);
+    const int max_H = std::min(H, num_kv_heads_);
+
+    const int cur_verified = verified_lens_[layer_idx];
+    const int max_capacity = std::max(0, buffer_tokens - cur_verified);
+    const int staged       = std::min(S, max_capacity);
+
+    candidate_lens_[layer_idx] = staged;
+
+    if (staged <= 0) {
+        return false;
+    }
+
+    Tensor buf_k = buffer(layer_idx);
+    Tensor buf_v = buffer_v(layer_idx);
+    if (!buf_k || !buf_v) {
+        candidate_lens_[layer_idx] = 0;
+        return false;
+    }
+
+    std::vector<ssize_t> base_idx{0, 0, cur_verified, 0};
+    std::vector<ssize_t> shape{max_B, max_H, staged, D};
+
+    Tensor dst_k = buf_k.slice(base_idx, shape);
+    Tensor dst_v = buf_v.slice(base_idx, shape);
+
+    Tensor src_k = cand_keys.slice({0, 0, 0, 0}, shape);
+    Tensor src_v = cand_values.slice({0, 0, 0, 0}, shape);
+
+    core::Copy(src_k, dst_k);
+    core::Copy(src_v, dst_v);
+
+    // Note: verified_lens_ and global_verified_len_ are intentionally
+    // untouched here; promotion occurs explicitly via
+    // promote_candidates().
+    return true;
+}
+
+bool PartialKVCache::promote_candidates(int layer_idx, int accepted_tokens)
+{
+    if (!enabled_) {
+        return false;
+    }
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(candidate_lens_.size())) {
+        return false;
+    }
+
+    const int cand_len = candidate_lens_[layer_idx];
+    if (cand_len <= 0 || accepted_tokens <= 0) {
+        // Nothing to promote.
+        candidate_lens_[layer_idx] = 0;
+        return false;
+    }
+
+    const int buffer_tokens = cfg_.buffer_size();
+    if (buffer_tokens <= 0) {
+        candidate_lens_[layer_idx] = 0;
+        return false;
+    }
+
+    const int cur_verified = verified_lens_[layer_idx];
+    const int promotable   = std::min(accepted_tokens, cand_len);
+
+    // Clamp to buffer capacity to avoid overruns.
+    const int new_verified = std::min(cur_verified + promotable, buffer_tokens);
+    verified_lens_[layer_idx] = new_verified;
+
+    // For v1 we discard any remaining candidates; they will be
+    // overwritten on the next stage_candidates() call.
+    candidate_lens_[layer_idx] = 0;
+    recompute_global_verified_len();
+    return true;
+}
+
+void PartialKVCache::clear_candidates() noexcept
+{
+    std::fill(candidate_lens_.begin(), candidate_lens_.end(), 0);
+}
+
 std::pair<Tensor, Tensor> PartialKVCache::active_prefix(int layer_idx, int prefix_tokens)
 {
     if (layer_idx < 0 || layer_idx >= static_cast<int>(key_cache_.size())) {
@@ -641,8 +767,44 @@ void PartialKVCache::reset_buffer()
             core::Clear(buf_v);
         }
         verified_lens_[layer] = 0;
+        candidate_lens_[layer] = 0;
     }
     recompute_global_verified_len();
+}
+
+void PartialKVCache::update_after_acceptance(int slot, int advance_tokens, int current_total_len)
+{
+    (void)slot;
+
+    if (!enabled_) {
+        return;
+    }
+
+    if (advance_tokens <= 0) {
+        return;
+    }
+
+    if (current_total_len < 0) {
+        TM_LOG_WARNING(
+            "[SpecPV][fallback] invalid update_after_acceptance current_total_len=%d; "
+            "disabling SpecPV for this engine.",
+            current_total_len);
+        enabled_             = false;
+        global_verified_len_ = 0;
+        return;
+    }
+
+    const int max_tokens = cfg_.total_budget();
+    if (max_tokens > 0 && current_total_len > max_tokens) {
+        TM_LOG_WARNING(
+            "[SpecPV][fallback] buffer overflow in update_after_acceptance "
+            "(current_total_len=%d, total_budget=%d); disabling SpecPV for this engine.",
+            current_total_len,
+            max_tokens);
+        enabled_             = false;
+        global_verified_len_ = 0;
+        return;
+    }
 }
 
 }  // namespace turbomind

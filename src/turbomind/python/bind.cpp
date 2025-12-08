@@ -301,6 +301,194 @@ struct ScopedGIL {
     PyGILState_STATE state;
 };
 
+// Shared implementation for EagleModule / Eagle3 draft debug path. This
+// helper is exposed to Python via both `eagle_forward_logits_debug` and
+// `eagle3_forward_debug` so that tests can exercise the same C++ logic
+// under different entry-point names.
+static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
+                                            py::object         hidden_states_obj,
+                                            py::object         captured_hidden_obj)
+{
+    int device_id = 0;
+    ft::CudaDeviceGuard device_guard(device_id);
+
+    // Set up a TurboMind core context with a DEVICE allocator and
+    // stream so that Tensor allocations inside EagleModule and
+    // core::Tensor use a valid DEVICE allocator. This mirrors the
+    // pattern used by LlamaTritonModel / LlamaBatch.
+    ft::core::Stream    core_stream = ft::core::Stream::create();
+    ft::core::Allocator host_alloc{ft::kCPU};
+    ft::core::Allocator device_alloc{core_stream, /*use_default_pool=*/true};
+    ft::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
+
+    // Import hidden_states and captured_hidden via DLPack so we
+    // can treat them as TurboMind Tensors on the current device.
+    py::capsule hidden_cap = hidden_states_obj.attr("__dlpack__")();
+    DLManagedTensor* hidden_dlmt =
+        static_cast<DLManagedTensor*>(PyCapsule_GetPointer(hidden_cap.ptr(), kDlTensorCapsuleName));
+    auto hidden_tm = DLManagedTensorToTritonTensor(hidden_dlmt);
+    hidden_cap.set_name("used_dltensor");
+
+    py::capsule capture_cap = captured_hidden_obj.attr("__dlpack__")();
+    DLManagedTensor* capture_dlmt =
+        static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capture_cap.ptr(), kDlTensorCapsuleName));
+    auto capture_tm = DLManagedTensorToTritonTensor(capture_dlmt);
+    capture_cap.set_name("used_dltensor");
+
+    const auto& h_shape = hidden_tm->shape();
+    if (h_shape.size() != 2) {
+        throw std::invalid_argument("hidden_states must be rank-2 [batch, hidden]");
+    }
+    const int batch_size   = static_cast<int>(h_shape[0]);
+    const int hidden_units = static_cast<int>(h_shape[1]);
+
+    // Use the core Stream handle as the CUDA stream for this helper.
+    cudaStream_t stream = core_stream.handle();
+
+    constexpr ft::EagleModule::SizeType kMaxDraftPathLen        = 16;
+    constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+    constexpr ft::EagleModule::SizeType kMaxDecodingTokens      = 16;
+    constexpr ft::EagleModule::SizeType kMaxNonLeafNodes        = 32;
+
+    ft::EagleModule module(
+        kMaxDraftPathLen,
+        kMaxDecodingDraftTokens,
+        kMaxDecodingTokens,
+        kMaxNonLeafNodes);
+
+    module.load(model_dir, device_id, stream);
+
+    auto const& weights = module.getWeights();
+    if (!weights.embed_tokens || !weights.lm_head) {
+        cudaStreamDestroy(stream);
+        throw std::runtime_error(
+            "EagleModule weights not initialized; check draft model directory");
+    }
+
+    if (hidden_units != static_cast<int>(weights.embed_tokens.shape(1))) {
+        TM_LOG_WARNING(
+            "[EAGLE][debug] hidden_units mismatch in eagle_forward_logits_debug: "
+            "provided=%d, model=%d",
+            hidden_units,
+            static_cast<int>(weights.embed_tokens.shape(1)));
+    }
+
+    const int vocab_size = static_cast<int>(weights.lm_head.shape(1));
+
+    ft::LlamaLinear linear(stream);
+
+    Tensor logits;
+    Tensor hidden_out;
+
+    bool   use_eagle3_draft_layer = module.hasEagle3DraftLayer();
+    Tensor attn_out_dbg;
+    Tensor ffn_out_dbg;
+    Tensor pre_head_dbg;
+
+    // When an Eagle3 draft layer is available, run the new
+    // Eagle3DraftLayer path instead of the legacy EagleModule
+    // shallow draft so that HF/TRT comparisons exercise the
+    // same backend as UnifiedDecoder::ForwardDraft.
+    if (use_eagle3_draft_layer) {
+        // Minimal model/context wrappers needed for LlamaFfnLayer.
+        ft::ModelParam model_param{};
+        model_param.hidden_units = static_cast<size_t>(hidden_units);
+
+        ft::Context ctx(device_id);
+        ft::LlamaFfnLayer ffn_layer(model_param, ctx);
+
+        const auto* draft_w = module.eagle3_draft_layer_.get();
+        ft::Eagle3DraftLayer draft_layer(draft_w, &ffn_layer, /*rmsnorm_eps=*/1e-5f);
+
+        // Allocate output hidden buffer and run the draft layer.
+        hidden_out = Tensor(
+            std::vector<ft::core::ssize_t>{batch_size, hidden_units},
+            hidden_tm->dtype(),
+            ft::kDEVICE);
+
+        draft_layer.Forward(*hidden_tm, hidden_out, stream);
+        ft::check_cuda_error(cudaStreamSynchronize(stream));
+
+        attn_out_dbg = draft_layer.debug_attn_out();
+        ffn_out_dbg  = draft_layer.debug_ffn_out();
+        pre_head_dbg = draft_layer.debug_pre_head_hidden();
+
+        // Build a temporary LM head weight wrapper and project
+        // to vocab using the same backend as EagleModule.
+        ft::LlamaDenseWeight lm_head_w;
+        const int lm_in  = hidden_units;
+        const int lm_out = vocab_size;
+        lm_head_w.emplace(lm_in, lm_out, weights.lm_head.dtype(), /*bias=*/false, weights.lm_head.dtype(), 1);
+        lm_head_w.weight      = weights.lm_head.borrow();
+        lm_head_w.bias        = {};
+        lm_head_w.data_type   = weights.lm_head.dtype();
+        lm_head_w.weight_type = weights.lm_head.dtype();
+        lm_head_w.input_type  = hidden_out.dtype();
+        lm_head_w.prepare(/*fused_moe=*/false);
+
+        logits = Tensor(
+            std::vector<ft::core::ssize_t>{batch_size, vocab_size},
+            hidden_out.dtype(),
+            ft::kDEVICE);
+        linear.Forward(hidden_out, lm_head_w, logits);
+        ft::check_cuda_error(cudaStreamSynchronize(stream));
+    }
+    else {
+        // Compose a minimal Tensor for input_ids (unused by Eagle3).
+        Tensor input_ids(
+            std::vector<ft::core::ssize_t>{batch_size},
+            ft::data_type_v<int32_t>,
+            ft::kDEVICE);
+        ft::check_cuda_error(
+            cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
+
+        // Enable EAGLE debug for this one call so EagleModule
+        // records its intermediate tensors for comparison.
+        ft::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
+        module.forward(
+            input_ids,
+            *hidden_tm,
+            *capture_tm,
+            logits,
+            hidden_out,
+            linear,
+            stream);
+        ft::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
+
+        ft::check_cuda_error(cudaStreamSynchronize(stream));
+    }
+
+    ft::check_cuda_error(cudaStreamSynchronize(stream));
+
+    // Expose logits plus a small set of intermediate tensors
+    // so Python can perform stage-wise HF↔TM comparisons.
+    py::dict out;
+    out["logits"] = logits;
+
+    if (use_eagle3_draft_layer) {
+        if (attn_out_dbg) {
+            out["attn_out"] = attn_out_dbg;
+        }
+        if (ffn_out_dbg) {
+            out["ffn_out"] = ffn_out_dbg;
+        }
+        if (pre_head_dbg) {
+            out["pre_head_hidden"] = pre_head_dbg;
+        }
+    }
+    else {
+        // Legacy EagleModule debug intermediates.
+        out["fc_out"]          = module.debug_fc_out();
+        out["attn_input"]      = module.debug_attn_input();
+        out["attn_out"]        = module.debug_attn_out();
+        out["ffn_out"]         = module.debug_ffn_out();
+        out["pre_head_hidden"] = module.debug_pre_head_hidden();
+    }
+
+    // Clean up the core stream before returning.
+    cudaStreamDestroy(stream);
+    return out;
+}
 }  // namespace
 
 PYBIND11_MODULE(_turbomind, m)
@@ -1162,6 +1350,29 @@ PYBIND11_MODULE(_turbomind, m)
             (void)vocab_size;
             return out;
         },
+        "model_dir"_a,
+        "hidden_states"_a,
+        "captured_hidden"_a);
+
+    // Eagle3-specific alias that shares the same implementation as
+    // `eagle_forward_logits_debug`. This entry point exists so that
+    // HF/TRT comparison tooling can target a dedicated Eagle3 name
+    // while still exercising the Eagle3DraftLayer-based path in C++.
+    m.def(
+        "eagle3_forward_debug",
+        [](const std::string& model_dir, py::object hidden_states_obj, py::object captured_hidden_obj) {
+            return EagleForwardLogitsDebugImpl(model_dir, hidden_states_obj, captured_hidden_obj);
+        },
+        "model_dir"_a,
+        "hidden_states"_a,
+        "captured_hidden"_a);
+
+    // Alias specifically for Eagle3 draft debug. This uses the same
+    // implementation as `eagle_forward_logits_debug` but provides a
+    // dedicated entry point for Eagle3 comparison tooling.
+    m.def(
+        "eagle3_forward_debug",
+        &EagleForwardLogitsDebugImpl,
         "model_dir"_a,
         "hidden_states"_a,
         "captured_hidden"_a);

@@ -930,6 +930,15 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             specpv_kv_cache_.reset();
             use_specpv = false;
         }
+        else {
+            // Clear any stale candidate bookkeeping at the start of a
+            // new tree decode step. Candidate KV rows for the current
+            // step, when implemented, will be staged explicitly after
+            // decode based on the tree tokens for this step.
+            if (specpv_kv_cache_) {
+                specpv_kv_cache_->clear_candidates();
+            }
+        }
     }
 
     for (int i = 0; i < batch_size; ++i) {
@@ -2137,6 +2146,20 @@ void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length,
 
     if (max_len <= 0 || !shouldUseSpecPV(max_len)) {
         return;
+    }
+
+    // Lightweight partial-KV safety hook: validate per-slot committed
+    // lengths against the configured total budget. The main SpecPV
+    // logic below still drives seeding and incremental updates via
+    // initSpecPVFromFullKV / PartialKVCache::update; this helper keeps
+    // PartialKVCache fail-safe in isolation.
+    if (specpv_kv_cache_ && specpv_kv_cache_->is_enabled()) {
+        for (int i = 0; i < batch_size; ++i) {
+            const int len_i = h_seq_len[i];
+            if (len_i > 0) {
+                specpv_kv_cache_->update_after_acceptance(i, /*advance_tokens=*/1, len_i);
+            }
+        }
     }
 
     // When SpecPV has not yet been seeded (or after a full-refresh),

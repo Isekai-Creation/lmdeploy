@@ -103,6 +103,49 @@ public:
 
     void reset() noexcept;
 
+    // Candidate-region helpers.
+    //
+    // In addition to the verified tail tracked via verified_lens_, the
+    // SpecPV buffer can temporarily hold "candidate" KV rows for the
+    // current step's tree tokens. The candidate region is always placed
+    // immediately after the verified region within the buffer segment
+    // for a given layer:
+    //
+    //   [0 .. verified_len)          -> verified tokens
+    //   [verified_len .. verified_len + candidate_len) -> candidates
+    //
+    // stage_candidates writes candidate KV into this region without
+    // changing verified_lens_; promote_candidates converts some or all
+    // of the staged candidates into verified tokens by bumping
+    // verified_lens_ and clearing the candidate count.
+    //
+    // For v1, these helpers provide the data-structure hooks needed by
+    // SpecPV S4.1; the tree path remains free to call them or ignore
+    // them depending on how much of the full SpecPV algorithm is
+    // implemented.
+
+    // Return the number of staged candidate tokens for the given layer.
+    int candidate_length(int layer_idx = 0) const noexcept;
+
+    // Stage candidate KV rows for this layer. The candidate keys/values
+    // are assumed to have shape [B, H, S, D] matching the cache
+    // geometry (B <= max_batch_size(), H <= num_kv_heads(), D ==
+    // head_dim()). On success, up to S tokens are written into the
+    // candidate region and candidate_length(layer_idx) is updated;
+    // verified_lens_ and global_verified_len_ are left unchanged.
+    bool stage_candidates(int layer_idx, const Tensor& cand_keys, const Tensor& cand_values);
+
+    // Promote up to `accepted_tokens` candidates for this layer into
+    // the verified region by bumping verified_lens_. Any remaining
+    // candidates are logically dropped (their KV will be overwritten on
+    // the next stage_candidates call). Returns false when there are no
+    // candidates to promote.
+    bool promote_candidates(int layer_idx, int accepted_tokens);
+
+    // Clear all staged candidates for every layer without touching
+    // verified lengths.
+    void clear_candidates() noexcept;
+
     // Segment views over the per-layer KV buffers. These are lightweight
     // Tensor slices; they do not allocate or copy.
     Tensor sink(int layer_idx);     // K view
@@ -141,6 +184,13 @@ public:
 
     void reset_buffer();
 
+    // Lightweight bookkeeping hook invoked after each EAGLE multi-token
+    // acceptance step. This API is intentionally conservative: it only
+    // validates basic invariants (non-negative lengths, staying within
+    // the configured total budget) and can disable the cache on any
+    // mismatch without touching device-side KV contents.
+    void update_after_acceptance(int slot, int advance_tokens, int current_total_len);
+
 private:
     void recompute_global_verified_len() noexcept;
 
@@ -166,6 +216,10 @@ private:
 
     std::vector<int> verified_lens_;
     int              global_verified_len_{0};
+
+    // Number of staged candidate tokens per layer, as described above.
+    std::vector<int> candidate_lens_;
+
     bool             enabled_{false};
 };
 

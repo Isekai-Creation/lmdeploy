@@ -259,63 +259,62 @@ functionally complete.
         `post_attention_layernorm`).
       - Runs `LlamaFfnLayer` (GatedMLP) and then applies `output_norm` to
         produce the draft hidden before LM head.
-    - Wire this into `EagleModule::load`:
+    - Wire this into `EagleModule::load` / `UnifiedDecoder`:
       - Parse Eagle3 geometry (`eagle_q_size`, `eagle_kv_size`,
         `head_num`, `kv_head_num`, `size_per_head`, `intermediate_size`,
         `num_capture_layers`) from config.yaml produced by the converter.
       - Construct `Eagle3DraftLayerWeight` and ensure all shapes match the
-        exported Eagle3 tensors.
+        exported Eagle3 tensors (QKV/WO/MLP/norms).
+      - In `LlamaV2` constructor, copy the prepared
+        `Eagle3DraftLayerWeight` into a decoder‑side
+        `eagle3_draft_weight_` and call
+        `UnifiedDecoder::setEagle3DraftLayer(eagle3_draft_weight_.get())`.
       - On any mismatch, log
         `[EAGLE][Eagle3DraftLayer][fallback] ...`, reset the draft layer,
         but keep EAGLE enabled for non‑Eagle3 paths.
 
-- [ ] **[B] Add `EagleModule::forward_draft_tree` using the new draft layer**
-  - Replace the current “linearised” QKV+Wo draft head with a proper
-    Eagle3 draft tree forward:
-    - Input:
-      - `last_hidden` [B, H] from target decode step,
-      - `eagle_capture_hidden` [B, num_capture_layers * H_in] from
-        `UnifiedDecoder`,
-      - `EagleBuffers::inputs.draft_tokens`,
-      - `EagleBuffers::inputs.draft_paths`,
-      - tree masks/leaf masks and packed masks already wired in.
-    - Steps (v1):
-      - Compute `fc_out = captured_hidden @ eagle_fc.weight` [B, H].
-      - For each tree node, build a single‑token draft sequence:
-        - `hidden_in[n] = fc_out` (or a per‑node variant later),
-        - `embeds[n]` from tok_embeddings for that node’s draft ID,
-        - `position_ids[n]` consistent with target tree decode.
-      - Flatten to `hidden_in_flat` / `embeds_flat` /
-        `position_ids_flat` with `N = num_tree_tokens`.
-      - Build `AttentionParams` for draft:
-        - Q/K/V head layout matches target; for v1, KV can be
-          “self‑only” (no prefix), i.e. `q_len = 1`, `k_len = 1`.
-        - Later, extend to use prefix KV if needed for better parity.
-      - Call `Eagle3DraftLayer::Forward` on this flattened batch to get
-        `hidden_out_flat` [N, 1, H].
-      - Apply LM head (shared or separate) to last timestep per node and
-        write logits into `tree_logits_buffer_` or a dedicated draft
-        logits buffer `[N, vocab_size_padded]`.
-      - Derive per‑node draft IDs by reusing a device argmax helper
-        (similar to `invokeTreeLogitsToTargetIds`) and write them into
-        `EagleBuffers::inputs.draft_tokens` for acceptance.
+- [ ] **[B] Make `runEagle3DraftTreeDecode` use real Eagle3DraftLayer attention+FFN for tree drafting**
+  - Replace any remaining “linearised” QKV+Wo draft head usage with the
+    real Eagle3 draft layer under `UnifiedDecoder`:
+    - Input to `runEagle3DraftTreeDecode`:
+      - `decoder_features` [B, H] (last‑token hidden from target decoder),
+      - `logits` [B, V] (base model logits for target Top‑K),
+      - `tokens_per_seq` from `SpecContext` / engine budget,
+      - `EagleBuffers` (to write draft/target IDs).
+    - Steps (v1, per step):
+      - Use `UnifiedDecoder::ForwardDraft(decoder_features, draft_hidden,
+        B, stream)` to run `Eagle3DraftLayer::Forward` (attention+FFN)
+        and produce draft hidden states [B, H].
+      - Apply LM head via `postDecodeEmbedding(draft_hidden, ...)` to
+        get `draft_logits [B,V]`.
+      - Run GPU Top‑K over `draft_logits` to fill
+        `EagleBuffers::inputs.draft_tokens` with
+        `[batch, tokens_per_seq]` draft IDs.
+      - Run GPU Top‑K over `logits` to fill
+        `EagleBuffers::inputs.target_tokens` for the same positions.
+      - Mirror the compact `[batch * tokens_per_seq]` IDs back to host
+        only for `eagle::SpeculationTree` construction.
+  - Ensure that for `spec_method == "eagle3"`:
+    - `dynamicDecodeWithSpecMulti` always calls
+      `runEagle3DraftTreeDecode` (not any EagleModule draft path),
+    - Legacy `EagleModule::forward_draft_tree` is used only for non‑Eagle3
+      draft modes (EagleNet), guarded by `eagle_mode_`.
 
-- [ ] **[A/B] Integrate `forward_draft_tree` into `dynamicDecodeWithSpecMulti`**
+- [ ] **[A/B] Integrate the full Eagle3 draft layer cleanly into `dynamicDecodeWithSpecMulti`**
   - In `LlamaV2::dynamicDecodeWithSpecMulti`’s EAGLE branch:
-    - Remove the GPU Top‑K sampling over shallow `draft_logits` and the
-      host logic that fabricates `draft_tokens` from those logits.
-    - Instead call:
-      ```cpp
-      eagle_module_->forward_draft_tree(
-          decoder_features,
-          eagle_capture_hidden_,
-          *eagle_buffers_,
-          tree_logits_buffer_,
-          stream_);
-      ```
-    - Leave target tree decode and `invokeTreeAcceptByIdsWithPaths`
-      unchanged: only the source of draft IDs becomes the full Eagle3
-      draft layer, not the approximate linear head.
+    - Keep the flow:
+      - base `dynamicDecodeMultiStep` (single‑token),
+      - `runEagle3DraftTreeDecode` (draft logits + Top‑K via
+        `ForwardDraft`),
+      - tree build + masks,
+      - target tree decode,
+      - device acceptance,
+      - `ForwardMultiStep` tails.
+    - Remove any leftover GPU Top‑K or host draft sampling logic that
+      bypasses `UnifiedDecoder::ForwardDraft` or Eagle3DraftLayer.
+  - Leave target tree decode and `invokeTreeAcceptByIdsWithPaths`
+    unchanged: only the source of draft IDs for Eagle3 is the full draft
+    layer under `UnifiedDecoder`, not the approximate linear head.
 
 - [ ] **[B/C] Expose Eagle3 draft intermediates via Python for HF/TRT comparison**
   - Extend the `_turbomind.eagle_forward_logits_debug` binding so that it
@@ -444,6 +443,42 @@ into TurboMind for long‑context EAGLE3 runs.
       prefix KV into `[B,H,L,D]` tensors (fp16/bf16 → float32) and calls `summary_key_states` / `refresh_retrieval` per layer. PartialKVCache
       and its CUDA helpers operate on float32 K/V internally, while the tree decode scratch KV is kept in fp16 or bf16 to match the base
       model KV dtype. Quantized KV caches (int8/int4) explicitly disable SpecPV and fall back to full-KV EAGLE3.
+
+- [ ] **[B] Update PartialKVCache after EAGLE acceptance**
+  - Introduce an explicit API to append newly accepted tokens into the
+    partial KV buffer and advance its notion of “verified prefix”:
+    - In `PartialKVCache`:
+      - Add a method like:
+        ```cpp
+        void update_after_acceptance(
+            int           layer_idx,
+            const Tensor& new_k,
+            const Tensor& new_v,
+            int           accepted_len);
+        ```
+      - Inside, append `accepted_len` tokens into the buffer slice for
+        `layer_idx`, and increment `verified_lens[layer_idx]` by
+        `accepted_len`. Optionally bump `global_verified_lens` when all
+        layers share the same verified prefix length.
+  - Wire this into the EAGLE acceptance path:
+    - After `dynamicDecodeWithSpecMulti` and KV rewind have committed
+      accepted tokens for the step:
+      - For each layer `l` and each slot:
+        - Extract K/V for the `accepted_len` new tokens from the full KV
+          cache or scratch KV used by tree decode.
+        - Call `specpv_kv_cache_->update_after_acceptance(l, new_k_l,
+          new_v_l, accepted_len)`.
+    - Maintain SpecPV’s partial/full switching policy:
+      - If buffer headroom is exhausted or partial steps exceed
+        `specpv_full_refresh_steps`, trigger a full refresh by:
+        - Running one full‑KV tree decode,
+        - Reseeding SpecPV via `initSpecPVFromFullKV`,
+        - Resetting partial step counters.
+  - On any geometry/dtype mismatch in this update path:
+    - Log `[SpecPV][fallback] PartialKVCache update_after_acceptance
+      failed; disabling SpecPV for this engine.`.
+    - Disable SpecPV for the engine and fall back to full‑KV tree
+      decode; do **not** affect EAGLE correctness.
 
 - [x] **[B] Attach PartialKVCache to LlamaV2**
   - Add a `SpecPVCacheConfig specpv_cache_config_` and
