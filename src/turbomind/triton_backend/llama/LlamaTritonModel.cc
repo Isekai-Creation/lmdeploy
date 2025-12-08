@@ -396,6 +396,19 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
         // to rely on the current single-step target logits path.
         engine_param_.enable_eagle_target_tree            = spec_reader["enable_target_tree"].as<bool>(false);
 
+        // SpecPV partial KV config (EAGLE3-only). These fields mirror the
+        // SpeculativeConfig attributes and control when TurboMind is allowed
+        // to run target-tree decode against a partial KV cache instead of
+        // the full prefix KV.
+        engine_param_.enable_specpv             = spec_reader["enable_specpv"].as<bool>(false);
+        engine_param_.specpv_block_size         = spec_reader["specpv_block_size"].as<int>(16);
+        engine_param_.specpv_n_sink_blocks      = spec_reader["specpv_n_sink_blocks"].as<int>(2);
+        engine_param_.specpv_n_retrieval_blocks = spec_reader["specpv_n_retrieval_blocks"].as<int>(256);
+        engine_param_.specpv_n_window_blocks    = spec_reader["specpv_n_window_blocks"].as<int>(8);
+        engine_param_.specpv_n_spec_tokens_buf  = spec_reader["specpv_n_spec_tokens_buf"].as<int>(128);
+        engine_param_.specpv_partial_threshold  = spec_reader["specpv_partial_threshold"].as<int>(4096);
+        engine_param_.specpv_full_refresh_steps = spec_reader["specpv_full_refresh_steps"].as<int>(32);
+
         TM_LOG_INFO("[LlamaTritonModel] Speculative decoding enabled: method=%s, "
                     "max_path_len=%d, num_speculative_tokens=%d, max_decoding_tokens=%d",
                     engine_param_.spec_method.c_str(),
@@ -413,6 +426,14 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
         engine_param_.eagle_debug                    = false;
         engine_param_.eagle_metrics_debug            = false;
         engine_param_.enable_eagle_target_tree       = false;
+        engine_param_.enable_specpv                  = false;
+        engine_param_.specpv_block_size              = 16;
+        engine_param_.specpv_n_sink_blocks           = 2;
+        engine_param_.specpv_n_retrieval_blocks      = 256;
+        engine_param_.specpv_n_window_blocks         = 8;
+        engine_param_.specpv_n_spec_tokens_buf       = 128;
+        engine_param_.specpv_partial_threshold       = 4096;
+        engine_param_.specpv_full_refresh_steps      = 32;
     }
 
     {

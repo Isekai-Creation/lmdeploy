@@ -132,6 +132,17 @@ struct EngineParam {
     // speculation tree to produce per-node target token ids. When false,
     // TurboMind will continue to rely on host-fabricated target_tokens.
     bool enable_eagle_target_tree{false};
+
+    // SpecPV partial KV config (EAGLE3-only). When disabled, TurboMind
+    // must behave exactly like the full-KV EAGLE3 pipeline.
+    bool enable_specpv{false};
+    int  specpv_block_size{16};
+    int  specpv_n_sink_blocks{2};
+    int  specpv_n_retrieval_blocks{256};
+    int  specpv_n_window_blocks{8};
+    int  specpv_n_spec_tokens_buf{128};
+    int  specpv_partial_threshold{4096};
+    int  specpv_full_refresh_steps{32};
 };
 
 enum class LoraPolicy : int

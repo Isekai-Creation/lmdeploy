@@ -252,7 +252,7 @@ into TurboMind for long‑context EAGLE3 runs.
 
 ### 5.1 Engine configuration and gating
 
-- [ ] **[A] Add SpecPV flags to EngineParam and Triton config**
+- [x] **[A] Add SpecPV flags to EngineParam and Triton config**
   - Extend `EngineParam` (`llama_params.h`) with:
     - `bool enable_specpv{false};`
     - `int  specpv_block_size{16};`
@@ -266,7 +266,7 @@ into TurboMind for long‑context EAGLE3 runs.
     `LlamaTritonModel` / async_engine, mirroring the existing
     `enable_eagle_target_tree` wiring.
 
-- [ ] **[A] Add SpecPV gating helpers to LlamaV2**
+- [x] **[A] Add SpecPV gating helpers to LlamaV2**
   - Implement:
     - `bool isSpecPVEnabled() const;`
     - `bool shouldUseSpecPV(int seq_len) const;`

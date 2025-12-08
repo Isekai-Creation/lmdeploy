@@ -243,6 +243,29 @@ LlamaV2::LlamaV2(DataType                     dtype,
     }
 }
 
+bool LlamaV2::isSpecPVEnabled() const noexcept
+{
+    // Until the SpecPV partial-KV cache is implemented and wired, keep this
+    // gate effectively disabled so that enabling SpecPV in configuration
+    // cannot change runtime behaviour.
+    return engine_param_.enable_specpv && specpv_supported_;
+}
+
+bool LlamaV2::shouldUseSpecPV(int seq_len) const noexcept
+{
+    if (!isSpecPVEnabled()) {
+        return false;
+    }
+
+    // Simple length-based gate for now; more detailed capacity checks will
+    // be added once the PartialKVCache is in place.
+    if (seq_len <= engine_param_.specpv_partial_threshold) {
+        return false;
+    }
+
+    return true;
+}
+
 void LlamaV2::runEagleTargetTreeDecode(int batch_size,
                                        const int*       d_sequence_lengths,
                                        const Sequence** sequences)

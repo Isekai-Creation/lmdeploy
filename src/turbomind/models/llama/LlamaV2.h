@@ -81,6 +81,12 @@ public:
         return isTargetTreeDecodeEnabled() && eagle_tree_target_tokens_valid_;
     }
 
+    // SpecPV partial-KV helpers. For now these only expose engine-side
+    // configuration and a coarse sequence-length threshold; the actual
+    // partial KV cache wiring will be added in a later iteration.
+    bool isSpecPVEnabled() const noexcept;
+    bool shouldUseSpecPV(int seq_len) const noexcept;
+
 private:
     void updateEmbedding(char*            decoder_input,
                          const int        bsz,
@@ -279,6 +285,11 @@ private:
     // dtypes or shapes are incompatible with the current engine).
     bool target_tree_supported_{false};
     bool eagle_tree_target_tokens_valid_{false};
+
+    // SpecPV support flag. Until the partial KV cache is implemented and
+    // wired, this remains false so that SpecPV gating never enables a
+    // partial-KV path.
+    bool specpv_supported_{false};
 
     // Cached per-step acceptance summary for EAGLE. These vectors live on
     // host and are updated once per decode step on the TP leader rank.

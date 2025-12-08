@@ -11,7 +11,7 @@
 
 #include "target_tree_decode.h"
 
-#include <cfloat>
+#include <cuda_runtime.h>
 
 namespace turbomind {
 namespace kernels {

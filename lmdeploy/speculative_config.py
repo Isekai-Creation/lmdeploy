@@ -88,6 +88,20 @@ class SpeculativeConfig:
     # on single-step target logits to fabricate target_tokens.
     enable_target_tree: bool = False
 
+    # SpecPV partial KV verification (TurboMind EAGLE3 only). When enabled,
+    # TurboMind may verify EAGLE trees against a partial KV cache (sink +
+    # retrieval + window + speculative buffer) instead of the full prefix
+    # KV at long context. These fields mirror the EngineParam specpv_*
+    # members and Triton speculative_config entries.
+    enable_specpv: bool = False
+    specpv_block_size: int = 16
+    specpv_n_sink_blocks: int = 2
+    specpv_n_retrieval_blocks: int = 256
+    specpv_n_window_blocks: int = 8
+    specpv_n_spec_tokens_buf: int = 128
+    specpv_partial_threshold: int = 4096
+    specpv_full_refresh_steps: int = 32
+
     # NGram options (TurboMind only)
     max_matching_ngram_size: int = 4
     is_public_pool: bool = True
@@ -194,9 +208,11 @@ class SpeculativeConfig:
 
         This dict uses the same keys that the C++ Triton backend reads in
         ``LlamaTritonModel.cc`` (``method``, ``model``, ``num_speculative_tokens``,
-        ``max_path_len``, ``max_decoding_tokens``, ``max_non_leaves_per_layer``),
-        so it can be used when constructing engine configs or sanity-checking
-        YAML-based configs for TurboMind.
+        ``max_path_len``, ``max_decoding_tokens``, ``max_non_leaves_per_layer``,
+        plus advanced EAGLE flags like ``eagle_debug``, ``eagle_metrics_debug``,
+        ``enable_target_tree`` and optional SpecPV fields), so it can be used
+        when constructing engine configs or sanity-checking YAML-based configs
+        for TurboMind.
         """
         d: Dict[str, object] = {
             "method": self.method,
@@ -220,6 +236,18 @@ class SpeculativeConfig:
         # Target-tree decode flag is always explicit as well so that
         # the Triton backend can gate the advanced EAGLE3 path.
         d["enable_target_tree"] = bool(self.enable_target_tree)
+
+        # SpecPV flags are included explicitly so that TurboMind can see
+        # the partial-KV configuration when present. Engines that do not
+        # support SpecPV will simply ignore these fields.
+        d["enable_specpv"] = bool(self.enable_specpv)
+        d["specpv_block_size"] = int(self.specpv_block_size)
+        d["specpv_n_sink_blocks"] = int(self.specpv_n_sink_blocks)
+        d["specpv_n_retrieval_blocks"] = int(self.specpv_n_retrieval_blocks)
+        d["specpv_n_window_blocks"] = int(self.specpv_n_window_blocks)
+        d["specpv_n_spec_tokens_buf"] = int(self.specpv_n_spec_tokens_buf)
+        d["specpv_partial_threshold"] = int(self.specpv_partial_threshold)
+        d["specpv_full_refresh_steps"] = int(self.specpv_full_refresh_steps)
         return d
 
 
