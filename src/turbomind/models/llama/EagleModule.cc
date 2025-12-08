@@ -790,8 +790,11 @@ void EagleModule::forward_draft_tree(const Tensor& last_hidden_states,
 
         TopKSortFilterParams target_params{};
         if (base_logits) {
-            target_params.logits            = base_logits.buffer().raw_data();
-            target_params.sorted_logits     = base_logits.buffer().raw_data();
+            // buffer().raw_data() is const in this context; TopKSortFilterParams
+            // expects mutable pointers for in-place sorting, so we cast away
+            // constness here, matching other call sites.
+            target_params.logits            = const_cast<void*>(base_logits.buffer().raw_data());
+            target_params.sorted_logits     = const_cast<void*>(base_logits.buffer().raw_data());
             target_params.sorted_indices    = target_sorted_indices.data();
             target_params.kept              = kept_buf.data();
             target_params.top_ks            = topk_buf.data();
