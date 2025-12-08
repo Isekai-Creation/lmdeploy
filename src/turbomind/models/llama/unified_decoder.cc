@@ -46,15 +46,24 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
     }
 
     // Enable multi-layer hidden capture for Eagle3 when requested by the
-    // engine. For GPT‑OSS Eagle3 we capture the last 3 layers when
-    // available, otherwise fall back to the last layer only.
+    // engine. For Eagle3 we follow the TensorRT-LLM convention and capture
+    // three spread-out layers when there are enough layers; otherwise we
+    // fall back to the last few layers.
     if (engine.enable_speculative_decoding && engine.spec_method == "eagle3") {
         const int L = static_cast<int>(layer_num_);
-        if (L >= 3) {
+        if (L > 5) {
+            // Match Eagle3OneModelSpecMetadata default:
+            //   (1, num_layers // 2 - 1, num_layers - 4)
+            eagle_capture_layers_ = {1, L / 2 - 1, L - 4};
+            eagle_capture_enabled_ = true;
+        }
+        else if (L >= 3) {
+            // Shallow models: capture the last three layers.
             eagle_capture_layers_ = {L - 3, L - 2, L - 1};
             eagle_capture_enabled_ = true;
         }
         else if (L > 0) {
+            // Degenerate case: single capture layer at the top.
             eagle_capture_layers_ = {L - 1};
             eagle_capture_enabled_ = true;
         }

@@ -23,6 +23,16 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from lmdeploy.turbomind.turbomind import _tm as _turbomind
 
+try:
+    # Optional: LMDeploy PyTorchEngine comparison path.
+    from lmdeploy import pipeline as lm_pipeline
+    from lmdeploy import PytorchEngineConfig, GenerationConfig as LMGenerationConfig
+    from lmdeploy.speculative_config import SpeculativeConfig
+
+    _HAVE_LMDEPLOY = True
+except Exception:  # pragma: no cover - LMDeploy may not be importable in some envs
+    _HAVE_LMDEPLOY = False
+
 
 def _build_hidden_and_capture_from_ids(
     model: AutoModelForCausalLM,
@@ -124,9 +134,76 @@ def run_compare(
     print(f"TM top1 IDs: {top1_tm.tolist()}")
 
 
+def run_lmdeploy_pytorch_compare(
+    target_model_name: str,
+    spec_model_name: str | None,
+    prompt: str,
+) -> None:
+    """Optionally compare LMDeploy PyTorchEngine+Eagle3 behaviour to HF.
+
+    Note: some GPT-OSS checkpoints (for example GPT-OSS-120B with MXFP4
+    weights) use quantization methods that LMDeploy's PyTorch backend
+    does not yet support. In that case we catch the RuntimeError and
+    skip this comparison instead of aborting the HF↔TurboMind path.
+    """
+    if not _HAVE_LMDEPLOY:
+        print("LMDeploy not importable; skipping LMDeploy PyTorchEngine comparison.")
+        return
+    if spec_model_name is None:
+        print("No --spec-model provided; skipping LMDeploy PyTorchEngine comparison.")
+        return
+
+    print("\n===== LMDeploy PyTorchEngine + Eagle3 comparison =====")
+
+    engine_cfg = PytorchEngineConfig(max_batch_size=1)
+    spec_cfg = SpeculativeConfig(
+        method="eagle3",
+        num_speculative_tokens=3,
+        model=spec_model_name,
+        eagle_debug=True,
+    )
+
+    try:
+        pipe = lm_pipeline(
+            target_model_name,
+            backend_config=engine_cfg,
+            speculative_config=spec_cfg,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "Unsupported quant method" in msg or "mxfp4" in msg.lower():
+            print(
+                f"LMDeploy PyTorchEngine cannot be used for target={target_model_name!r} "
+                f"with draft={spec_model_name!r}: {msg}. "
+                "Skipping PyTorchEngine comparison; HF vs TurboMind EagleModule "
+                "comparison above is still valid."
+            )
+            return
+        raise
+
+    gen_cfg = LMGenerationConfig(
+        max_new_tokens=1,
+        temperature=0.0,
+        top_k=20,
+        top_p=0.8,
+    )
+
+    outputs = pipe([prompt], gen_config=[gen_cfg])
+    out = outputs[0]
+    token_ids = out.token_ids
+    print(f"LMDeploy PyTorchEngine first new token id: {token_ids[-1] if token_ids else 'N/A'}")
+
+    spec_info = getattr(getattr(out, "req_metrics", None), "spec_info", None)
+    if spec_info is not None:
+        print("LMDeploy PyTorchEngine EAGLE spec_info:", spec_info)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare HF Eagle3 vs TurboMind EagleModule logits on a simple prompt."
+        description=(
+            "Compare HF Eagle3 vs TurboMind EagleModule logits on a simple prompt, "
+            "and optionally LMDeploy PyTorchEngine+Eagle3 behaviour."
+        )
     )
     parser.add_argument(
         "--draft-dir",
@@ -142,6 +219,15 @@ def main() -> None:
         "--prompt",
         default="Hello, Eagle3.",
         help="Prompt to run through the models.",
+    )
+    parser.add_argument(
+        "--spec-model",
+        default=None,
+        help=(
+            "Optional HF Eagle3 draft model id/path for LMDeploy PyTorchEngine "
+            "(e.g. nvidia/gpt-oss-120b-Eagle3). When provided, the script will "
+            "also run a one-step LMDeploy PyTorchEngine+Eagle3 decode for comparison."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -163,6 +249,15 @@ def main() -> None:
         device=args.device,
         num_capture_layers=args.num_capture_layers,
     )
+
+    # Optional LMDeploy PyTorchEngine comparison: compares the first new token
+    # and spec_info metrics for a one-step Eagle3 decode on the same prompt.
+    if args.spec_model is not None:
+        run_lmdeploy_pytorch_compare(
+            target_model_name=args.target_model,
+            spec_model_name=args.spec_model,
+            prompt=args.prompt,
+        )
 
 
 if __name__ == "__main__":
