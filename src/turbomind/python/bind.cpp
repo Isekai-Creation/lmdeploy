@@ -19,6 +19,7 @@
 #include "lmdeploy/turbomind/kernels/speculative_decoding/tree_accept_kernels.h"
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/core/tensor.h"
+#include "src/turbomind/core/context.h"
 #include "src/turbomind/engine/model_request.h"
 #include "src/turbomind/models/llama/EagleModule.h"
 #include "src/turbomind/models/llama/LlamaLinear.h"
@@ -980,6 +981,15 @@ PYBIND11_MODULE(_turbomind, m)
             int device_id = 0;
             ft::CudaDeviceGuard device_guard(device_id);
 
+            // Set up a TurboMind core context with a DEVICE allocator and
+            // stream so that Tensor allocations inside EagleModule and
+            // core::Tensor use a valid DEVICE allocator. This mirrors the
+            // pattern used by LlamaTritonModel / LlamaBatch.
+            ft::core::Stream    core_stream = ft::core::Stream::create();
+            ft::core::Allocator host_alloc{ft::kCPU};
+            ft::core::Allocator device_alloc{core_stream, /*use_default_pool=*/true};
+            ft::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
+
             // Import hidden_states and captured_hidden via DLPack so we
             // can treat them as TurboMind Tensors on the current device.
             py::capsule hidden_cap = hidden_states_obj.attr("__dlpack__")();
@@ -1001,8 +1011,8 @@ PYBIND11_MODULE(_turbomind, m)
             const int batch_size   = static_cast<int>(h_shape[0]);
             const int hidden_units = static_cast<int>(h_shape[1]);
 
-            cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
+            // Use the core Stream handle as the CUDA stream for this helper.
+            cudaStream_t stream = core_stream.handle();
 
             constexpr ft::EagleModule::SizeType kMaxDraftPathLen       = 16;
             constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
@@ -1057,7 +1067,6 @@ PYBIND11_MODULE(_turbomind, m)
                 stream);
 
             ft::check_cuda_error(cudaStreamSynchronize(stream));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
 
             // Return logits as a TurboMind Tensor; callers can convert to
             // torch via __dlpack__ for detailed comparison.

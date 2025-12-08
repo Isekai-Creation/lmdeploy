@@ -19,33 +19,28 @@ import argparse
 from typing import Tuple
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from lmdeploy.turbomind.turbomind import _tm as _turbomind
 
 
-def _build_hidden_and_capture(
+def _build_hidden_and_capture_from_ids(
     model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    prompt: str,
+    input_ids: torch.Tensor,
     device: torch.device,
     num_capture_layers: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run the HF target model and extract last-layer + capture features.
+    """Run the HF target model on given ids and extract hidden/capture.
 
     Returns:
         last_hidden: [B, H]
         capture:     [B, H * num_capture_layers]
     """
     model.eval()
+    input_ids = input_ids.to(device)
     with torch.no_grad():
-        toks = tokenizer(
-            [prompt],
-            return_tensors="pt",
-        ).to(device)
-        out = model(**toks, output_hidden_states=True)
+        out = model(input_ids=input_ids, output_hidden_states=True)
 
-    # Use the last generated position for comparison.
     hidden_states = out.hidden_states
     last_hidden = hidden_states[-1][:, -1, :]  # [B, H]
 
@@ -71,26 +66,33 @@ def run_compare(
     """Load HF Eagle3 + TurboMind draft and print basic alignment stats."""
     dev = torch.device(device)
 
-    tokenizer = AutoTokenizer.from_pretrained(target_model_name)
+    # We only need hidden states / logits, so avoid loading the tokenizer
+    # and instead run on a small synthetic batch of ids. This keeps the
+    # helper usable even when tokenizer files are missing or non-standard.
+    cfg = AutoConfig.from_pretrained(target_model_name)
+    vocab_size = int(getattr(cfg, "vocab_size", 0) or 0)
+    if vocab_size <= 0:
+        raise RuntimeError(f"Could not resolve vocab_size from config for {target_model_name!r}")
+
     target = AutoModelForCausalLM.from_pretrained(
         target_model_name,
         torch_dtype=torch.bfloat16,
         device_map={"": dev},
     )
 
-    last_hidden, capture = _build_hidden_and_capture(
-        target,
-        tokenizer,
-        prompt,
-        dev,
-        num_capture_layers=num_capture_layers,
+    # Build a simple synthetic batch: one sequence of modest length.
+    seq_len = 16
+    batch_size = 1
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=dev)
+
+    last_hidden, capture = _build_hidden_and_capture_from_ids(
+        target, input_ids, dev, num_capture_layers=num_capture_layers
     )
 
     # HF Eagle3 logits on the same positions.
     with torch.no_grad():
-        # Re-run to get logits for the final position only.
-        toks = tokenizer([prompt], return_tensors="pt").to(dev)
-        out = target(**toks)
+        out = target(input_ids=input_ids)
         logits_hf = out.logits[:, -1, :].to(torch.float32)
 
     # TurboMind EagleModule logits via debug binding.
@@ -165,4 +167,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
