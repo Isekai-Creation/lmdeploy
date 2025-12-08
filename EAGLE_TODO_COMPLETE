@@ -200,18 +200,18 @@ functionally complete.
     with the same logic as the base token:
     - EOS / multiple `eos_ids`,
     - stop‑words / bad‑words,
-    - `max_new_tokens` / per‑slot length limits,
-    - guidance / repetition‑penalty related state if present.
+      - `max_new_tokens` / per‑slot length limits,
+      - guidance / repetition‑penalty related state if present.
   - When a tail token triggers EOS/stop for a slot:
     - Mark that slot as finished,
     - Stop committing further tail tokens for that slot.
 
-- [ ] **[B] Drive KV/metrics strictly from committed tail lengths**
+- [x] **[B] Drive KV/metrics strictly from committed tail lengths**
   - Use `ForcedTailContext::committed_lengths[i]` as the *only* source of
     truth for how many extras were actually written for slot `i`.
   - Ensure `updateEagleMetricsAndKVLengths` and `runEagleKVRewind` derive
     `kv_draft_lengths` / `kv_accepted_lengths` and all EAGLE metrics from:
-    - `1 + committed_lengths[i]` (base + committed extras),
+      - `1 + committed_lengths[i]` (base + committed extras),
     - not from planned lengths or raw accepted lens before tail clamping.
 
 ### 4.2 EAGLE3 draft head & numerics (EagleModule parity)
@@ -233,12 +233,12 @@ functionally complete.
 
 ### 4.3 Final clean‑up for B (no scaffolding)
 
-- [ ] **[B] Remove dead EAGLE glue and duplication**
+- [x] **[B] Remove dead EAGLE glue and duplication**
   - Delete any unused EAGLE helper paths that were superseded by the fused
     `dynamicDecodeWithSpecMulti` + `ForwardMultiStep` implementation, so
     there is a single source of truth for:
-    - draft sampling,
-    - tree decode and acceptance,
+      - draft sampling,
+      - tree decode and acceptance,
     - multi‑token commit.
 
 - [ ] **[B] Keep `update_plan` in sync with this file**

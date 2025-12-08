@@ -38,11 +38,18 @@ DynamicDecodeLayer::DynamicDecodeLayer(DataType              dtype,
     TM_CHECK(dtype == kFloat32);
     stream_ = stream;
     BaseDynamicDecodeLayer::BaseParam param{max_batch_size, vocab_size, vocab_size_padded, stream, device_prop};
+
+    // Core decode stack (logits processing, guided decode, sampling, stop).
     layers_.emplace_back(new LogitsProcessorLayer<float>{param});
     layers_.emplace_back(new GuidedDecodeMaskLayer<float>{param});
     layers_.emplace_back(new SamplingLayer<float>{param});
     layers_.emplace_back(new GuidedDecodeUpdateLayer<float>{param});
     layers_.emplace_back(new StopCriteriaLayer<float>{param});
+
+    // Stop-words buffers for tail stop-criteria. Layout matches
+    // StopCriteriaLayer: [batch, 2, kMaxStopBadWordsLen].
+    stop_words_     = {max_batch_size * 2 * kMaxStopBadWordsLen, kCPUpinned};
+    stop_words_buf_ = {max_batch_size * 2 * kMaxStopBadWordsLen, kDEVICE};
 }
 
 DynamicDecodeLayer::~DynamicDecodeLayer() {}
@@ -50,9 +57,19 @@ DynamicDecodeLayer::~DynamicDecodeLayer() {}
 void DynamicDecodeLayer::Setup(const std::vector<const Request*>& rs, const TensorMap& args)
 {
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    requests_ = rs;
     for (const auto& layer : layers_) {
         layer->Setup(rs, args);
     }
+
+     // Initialize stop-words tensor for tail steps from GenerationConfig::stop_ids.
+    stop_words_ten_ = {};
+    init_stop_bad_words(&GenerationConfig::stop_ids,  //
+                        "stop_words",
+                        rs,
+                        stop_words_.data(),
+                        stop_words_buf_.data(),
+                        stop_words_ten_);
 }
 
 void DynamicDecodeLayer::Forward(TensorMap& args)
@@ -144,57 +161,177 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
 
     int* d_output_ids = output_ids.data<int>();
 
+    // Pre-compute per-slot tail lengths (clamped by max_tail_len) and
+    // the global maximum tail depth so we can emulate sequential decode
+    // steps: for each t, append one token across all slots and then run
+    // stop-criteria on the updated sequences.
+    std::vector<int> tail_len(batch_size, 0);
+    int              max_len = 0;
     for (int i = 0; i < batch_size; ++i) {
         if (h_finished[i]) {
+            tail_len[i] = 0;
             continue;
         }
-
-        int committed_i = 0;
-
         int len = forced_lengths[i];
         if (len <= 0) {
+            tail_len[i] = 0;
             continue;
         }
         if (len > max_tail_len) {
             len = max_tail_len;
         }
+        tail_len[i] = len;
+        max_len     = std::max(max_len, len);
+    }
 
-        const int token_offset = i * max_tail_len;
+    // Optional stop-words configuration (may be empty).
+    const bool   have_stop_words = static_cast<bool>(stop_words_ten_);
+    const int    stop_words_len  = have_stop_words ? stop_words_ten_.shape(2) : 0;
+    const int*   h_stop_words    = have_stop_words ? stop_words_.data() : nullptr;
 
-        for (int t = 0; t < len; ++t) {
-            const int pos = step + 1 + t;
-            if (pos < 0 || pos >= max_seq_len) {
-                break;
+    // Per-slot committed tail counts.
+    std::vector<int> committed_host(batch_size, 0);
+
+    // Temporary buffer for stop-words window when checking tails.
+    int window_buf[kMaxStopBadWordsLen];
+
+    for (int t = 0; t < max_len; ++t) {
+        const int pos = step + 1 + t;
+        if (pos < 0 || pos >= max_seq_len) {
+            break;
+        }
+
+        // Append one tail token (at depth t) for all eligible slots.
+        for (int i = 0; i < batch_size; ++i) {
+            if (h_finished[i]) {
+                continue;
+            }
+            if (t >= tail_len[i]) {
+                continue;
             }
 
             if (!h_seq_limit.empty()) {
                 const int limit = h_seq_limit[i];
                 if (limit > 0 && pos >= limit) {
-                    break;
+                    h_finished[i] = true;
+                    continue;
                 }
             }
 
-            const int value = forced_tokens[token_offset + t];
+            const int value = forced_tokens[i * max_tail_len + t];
             int*      dst   = d_output_ids + pos * batch_size + i;
             check_cuda_error(cudaMemcpyAsync(dst, &value, sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-            // Increment host-side sequence length view so subsequent tokens
-            // for this slot are appended after the newly committed ones.
             ++h_seq_len[i];
-            ++committed_i;
+            ++committed_host[i];
+
+            // If this commit consumes the remaining per-request length
+            // budget, mark the slot finished and skip further tails.
+            if (!h_seq_limit.empty()) {
+                const int limit = h_seq_limit[i];
+                if (limit > 0 && h_seq_len[i] >= limit) {
+                    h_finished[i] = true;
+                    continue;
+                }
+            }
+
+            // EOS stop: if this tail token hits EOS, mark finished and
+            // prevent further tails for this slot.
+            if (i < static_cast<int>(requests_.size()) && requests_[i]) {
+                const auto& gen_cfg = requests_[i]->gen_cfg;
+                if (!gen_cfg.eos_ids.empty()) {
+                    for (int eos : gen_cfg.eos_ids) {
+                        if (value == eos) {
+                            h_finished[i] = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
-        if (committed) {
-            committed[i] = committed_i;
+        check_cuda_error(cudaStreamSynchronize(stream_));
+
+        // Stop-words criterion: emulate the single-step behaviour for
+        // the synthetic step `pos` by scanning the tail suffix for each
+        // slot using the same token patterns as StopCriteriaLayer.
+        if (have_stop_words && stop_words_len > 0) {
+            for (int i = 0; i < batch_size; ++i) {
+                if (h_finished[i]) {
+                    continue;
+                }
+
+                const int* base_tokens  = h_stop_words + i * 2 * stop_words_len;
+                const int* base_offsets = base_tokens + stop_words_len;
+
+                for (int id = 0; id < stop_words_len; ++id) {
+                    const int item_end = base_offsets[id];
+                    if (item_end < 0) {
+                        continue;
+                    }
+                    const int item_start = (id > 0) ? base_offsets[id - 1] : 0;
+                    const int item_size  = item_end - item_start;
+                    if (item_size <= 0 || item_size > kMaxStopBadWordsLen) {
+                        continue;
+                    }
+
+                    if (pos + 1 < item_size) {
+                        continue;
+                    }
+                    const int start_time = pos - (item_size - 1);
+                    if (start_time < 0) {
+                        continue;
+                    }
+
+                    // Gather the candidate window from device for this slot.
+                    bool window_ok = true;
+                    for (int k = 0; k < item_size; ++k) {
+                        const int time_idx = start_time + k;
+                        const int idx      = time_idx * batch_size + i;
+                        check_cuda_error(cudaMemcpyAsync(&window_buf[k],
+                                                         d_output_ids + idx,
+                                                         sizeof(int),
+                                                         cudaMemcpyDeviceToHost,
+                                                         stream_));
+                    }
+                    check_cuda_error(cudaStreamSynchronize(stream_));
+
+                    for (int k = 0; k < item_size; ++k) {
+                        if (window_buf[k] != base_tokens[item_start + k]) {
+                            window_ok = false;
+                            break;
+                        }
+                    }
+
+                    if (window_ok) {
+                        h_finished[i] = true;
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    check_cuda_error(cudaStreamSynchronize(stream_));
+    if (committed) {
+        std::copy(committed_host.begin(), committed_host.end(), committed);
+    }
 
     // Write back updated sequence lengths for all batch slots.
     check_cuda_error(cudaMemcpyAsync(
         sequence_length.data<int>(), h_seq_len.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice, stream_));
     check_cuda_error(cudaStreamSynchronize(stream_));
+
+    // Propagate updated finished flags (including EOS-triggered tails) back
+    // to device so subsequent decode steps see the correct termination state.
+    {
+        std::vector<uint8_t> h_finished_bytes(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            h_finished_bytes[i] = static_cast<uint8_t>(h_finished[i] ? 1 : 0);
+        }
+        check_cuda_error(cudaMemcpyAsync(
+            finished.data<bool>(), h_finished_bytes.data(), batch_size * sizeof(bool), cudaMemcpyHostToDevice, stream_));
+        check_cuda_error(cudaStreamSynchronize(stream_));
+    }
 
     TM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }

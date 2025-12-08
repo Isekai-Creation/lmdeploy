@@ -1472,20 +1472,7 @@ void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
                  num_paths,
                  max_path_len);
 
-    // ========= Step 2: Mirror tokens and paths into EagleBuffers =========
-    cudaMemcpyAsync(eagle_buffers_->inputs.draft_tokens,
-                    draft_tokens.data(),
-                    num_draft_tokens * sizeof(int),
-                    cudaMemcpyHostToDevice,
-                    stream_);
-    if (!isTargetTreeDecodeActiveStep()) {
-        cudaMemcpyAsync(eagle_buffers_->inputs.target_tokens,
-                        target_tokens.data(),
-                        num_draft_tokens * sizeof(int),
-                        cudaMemcpyHostToDevice,
-                        stream_);
-    }
-
+    // ========= Step 2: Mirror paths into EagleBuffers =========
     // Prepare per-sequence path buffers. The current tree is single-sequence,
     // so we replicate its paths across all batch slots.
     std::vector<int> host_paths(batch_size * max_decoding_tokens * max_path_len, -1);
@@ -1581,12 +1568,14 @@ void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
 
     sync_check_cuda_error();
 
-    check_cuda_error(cudaMemcpyAsync(
-        host_best_path_ids.data(),
-        eagle_buffers_->outputs.best_path_ids,
-        batch_size * sizeof(SpecSizeType),
-        cudaMemcpyDeviceToHost,
-        stream_));
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        check_cuda_error(cudaMemcpyAsync(
+            host_best_path_ids.data(),
+            eagle_buffers_->outputs.best_path_ids,
+            batch_size * sizeof(SpecSizeType),
+            cudaMemcpyDeviceToHost,
+            stream_));
+    }
 
     check_cuda_error(cudaMemcpyAsync(
         h_accepted_lens.data(),
@@ -1835,7 +1824,10 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
     const int tokens_per_seq = compute_draft_tokens_per_seq(batch_size);
     if (tokens_per_seq <= 0) {
-        TM_LOG_DEBUG("[LlamaV2][EAGLE] tokens_per_seq=0; skipping EAGLE step");
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] tokens_per_seq resolved to 0 in dynamicDecodeWithSpecMulti; "
+            "disabling speculative decoding for this engine.");
+        spec_mode_ = SpeculativeDecodingMode::None();
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -1861,7 +1853,10 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     eagleDraftForward(decoder_features, draft_logits, draft_hidden);
 
     if (!draft_logits) {
-        TM_LOG_WARNING("[LlamaV2][EAGLE] Draft forward produced empty logits; skipping EAGLE step");
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] Draft forward produced empty logits in dynamicDecodeWithSpecMulti; "
+            "disabling speculative decoding for this engine.");
+        spec_mode_ = SpeculativeDecodingMode::None();
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -1889,10 +1884,10 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     Tensor eagle_sampling_logits{{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
     if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
         TM_LOG_WARNING(
-            "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32; "
-            "skipping EAGLE tree decode for this step.",
+            "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32 in dynamicDecodeWithSpecMulti; "
+            "disabling speculative decoding for this engine.",
             to_string(draft_logits.dtype()));
-
+        spec_mode_ = SpeculativeDecodingMode::None();
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -1957,29 +1952,56 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
         const size_t idx_width_bytes = sizeof(int) * tokens_per_seq;
         const size_t idx_src_pitch   = sizeof(int) * vocab_size_pad;
-        const size_t idx_dst_pitch   = sizeof(int) * tokens_per_seq;
 
-        // Copy draft IDs and target IDs for the top tokens_per_seq indices per row from device to host.
-        //
-        // We treat the sorted indices as a [batch_size, vocab_size_padded] 2D matrix and copy the
-        // leading [batch_size, tokens_per_seq] rectangle to host with custom pitch.
-        check_cuda_error(cudaMemcpy2DAsync(draft_tokens.data(),
-                                           idx_dst_pitch,
+        // Device-only top-K write into EagleBuffers inputs: copy the top
+        // tokens_per_seq IDs per row directly into [batch_size,
+        // max_decoding_tokens] draft/target token buffers on device, then
+        // mirror the compact [batch_size, tokens_per_seq] region back to
+        // host for the CPU tree builder.
+        const size_t dst_pitch_tokens =
+            static_cast<size_t>(engine_param_.spec_max_decoding_tokens) * sizeof(int);
+
+        // Draft IDs: D→D into EagleBuffers::inputs.draft_tokens.
+        check_cuda_error(cudaMemcpy2DAsync(eagle_buffers_->inputs.draft_tokens,
+                                           dst_pitch_tokens,
                                            draft_sorted_indices.data(),
                                            idx_src_pitch,
                                            idx_width_bytes,
                                            batch_size,
-                                           cudaMemcpyDeviceToHost,
+                                           cudaMemcpyDeviceToDevice,
                                            stream_));
 
-        check_cuda_error(cudaMemcpy2DAsync(target_tokens.data(),
-                                           idx_dst_pitch,
-                                           target_sorted_indices.data(),
-                                           idx_src_pitch,
-                                           idx_width_bytes,
-                                           batch_size,
-                                           cudaMemcpyDeviceToHost,
-                                           stream_));
+        // Target IDs: D→D into EagleBuffers::inputs.target_tokens when tree
+        // decode is not active; tree decode will overwrite target_tokens on
+        // device when enabled.
+        if (!isTargetTreeDecodeActiveStep()) {
+            check_cuda_error(cudaMemcpy2DAsync(eagle_buffers_->inputs.target_tokens,
+                                               dst_pitch_tokens,
+                                               target_sorted_indices.data(),
+                                               idx_src_pitch,
+                                               idx_width_bytes,
+                                               batch_size,
+                                               cudaMemcpyDeviceToDevice,
+                                               stream_));
+        }
+
+        // Mirror the compact [batch_size, tokens_per_seq] region back to
+        // host for CPU tree construction. Layout in EagleBuffers is
+        // [batch_size, max_decoding_tokens]; the first tokens_per_seq
+        // entries per row are exactly the IDs we just wrote.
+        check_cuda_error(cudaMemcpyAsync(draft_tokens.data(),
+                                         eagle_buffers_->inputs.draft_tokens,
+                                         static_cast<size_t>(total_draft) * sizeof(int),
+                                         cudaMemcpyDeviceToHost,
+                                         stream_));
+
+        if (!isTargetTreeDecodeActiveStep()) {
+            check_cuda_error(cudaMemcpyAsync(target_tokens.data(),
+                                             eagle_buffers_->inputs.target_tokens,
+                                             static_cast<size_t>(total_draft) * sizeof(int),
+                                             cudaMemcpyDeviceToHost,
+                                             stream_));
+        }
 
         check_cuda_error(cudaStreamSynchronize(stream_));
     }
@@ -2026,7 +2048,10 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     const int  max_decoding_tokens = engine_param_.spec_max_decoding_tokens;
 
     if (num_paths == 0) {
-        TM_LOG_WARNING("[LlamaV2][EAGLE] No valid paths in tree");
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] No valid paths in speculative tree in dynamicDecodeWithSpecMulti; "
+            "disabling speculative decoding for this engine.");
+        spec_mode_ = SpeculativeDecodingMode::None();
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,

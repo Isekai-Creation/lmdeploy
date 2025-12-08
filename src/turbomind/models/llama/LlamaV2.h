@@ -210,11 +210,6 @@ private:
                                   const int*       d_sequence_lengths,
                                   const Sequence** sequences);
 
-    void runEagleDraftTreeAccept(GenerationState&   g,
-                                 const Tensor&      decoder_features,
-                                 Tensor             logits,
-                                 const SpecContext& spec_ctx);
-
     // Max engine tokens TurboMind should handle per decode step
     // when running in EAGLE speculative mode.
     int eagleMaxEngineTokensPerStep() const noexcept
