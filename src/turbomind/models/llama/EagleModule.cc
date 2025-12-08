@@ -5,6 +5,7 @@
 #include "src/turbomind/models/llama/LlamaLinear.h"
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/kernels/norm/rms_norm.h"
+#include "src/turbomind/kernels/activation.h"
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/kernels/gpt_kernels.h"
@@ -480,6 +481,88 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         }
     }
 
+    // For Eagle3 drafts, additionally prepare FFN wrapper and norms for
+    // a more faithful draft layer path using existing LLaMA FFN blocks.
+    if (eagle_mode_ == EagleMode::kEagle3 && mlp_down_ok && weights_.mlp_gate_up && weights_.output_norm) {
+        eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayerWeight>();
+
+        // Attach norms.
+        eagle3_draft_layer_->input_norm     = weights_.input_norm.borrow();
+        eagle3_draft_layer_->post_attn_norm = weights_.attn_norm.borrow();
+        eagle3_draft_layer_->output_norm    = weights_.output_norm.borrow();
+
+        // Minimal FFN wrapper: treat mlp_gate_up as a fused gating
+        // projection and mlp_down as the output projection. We rely on
+        // the same LlamaLinear backend used elsewhere in EagleModule.
+        const int inter_size = intermediate_size;
+        const int tp_size    = 1;
+        const int tp_rank    = 0;
+        const int group_size = 1;
+
+        eagle3_draft_layer_->ffn = LlamaFfnWeight(hidden_units,
+                                                  inter_size,
+                                                  /*bias=*/false,
+                                                  tp_size,
+                                                  tp_rank,
+                                                  weight_dtype_,
+                                                  weight_dtype_,
+                                                  group_size,
+                                                  ActivationType::Silu,
+                                                  /*fuse_silu_act=*/true);
+
+        eagle3_draft_layer_->ffn.fused_gating_intermediate.weight = weights_.mlp_gate_up.borrow();
+        eagle3_draft_layer_->ffn.output.weight                    = weights_.mlp_down.borrow();
+        eagle3_draft_layer_->ffn.prepare(/*fused_moe=*/false);
+
+        // Hard geometry checks for Eagle3 draft layer. When any of these
+        // invariants fail we disable the Eagle3 draft layer only and fall
+        // back to the legacy shallow block, without disabling EAGLE.
+        bool draft_ok = true;
+
+        auto check_shape_2d = [&](const Tensor& t, int dim0, int dim1, const char* name) {
+            if (!t || t.ndim() != 2 || t.shape(0) != dim0 || t.shape(1) != dim1) {
+                TM_LOG_WARNING(
+                    "[EAGLE][Eagle3DraftLayer][fallback] %s has shape [%d,%d], expected [%d,%d]; "
+                    "disabling Eagle3 draft layer.",
+                    name,
+                    t ? t.shape(0) : -1,
+                    t ? t.shape(1) : -1,
+                    dim0,
+                    dim1);
+                draft_ok = false;
+            }
+        };
+
+        auto check_norm = [&](const Tensor& t, const char* name) {
+            if (!t || t.ndim() != 1 || t.shape(0) != hidden_units) {
+                TM_LOG_WARNING(
+                    "[EAGLE][Eagle3DraftLayer][fallback] %s norm has shape [%d], expected [%d]; "
+                    "disabling Eagle3 draft layer.",
+                    name,
+                    t ? t.shape(0) : -1,
+                    hidden_units);
+                draft_ok = false;
+            }
+        };
+
+        // FFN geometry:
+        //   mlp_gate_up: [2 * inter_size, hidden_units]
+        //   mlp_down:    [inter_size, hidden_units]
+        check_shape_2d(weights_.mlp_gate_up, inter_size * 2, hidden_units, "mlp_gate_up");
+        check_shape_2d(weights_.mlp_down, inter_size, hidden_units, "mlp_down");
+
+        // Norms:
+        check_norm(eagle3_draft_layer_->input_norm, "input");
+        check_norm(eagle3_draft_layer_->post_attn_norm, "post_attn");
+        check_norm(eagle3_draft_layer_->output_norm, "output");
+
+        if (!draft_ok) {
+            // Disable only the Eagle3 draft layer; keep EAGLE enabled and
+            // fall back to the legacy shallow block + output_norm path.
+            eagle3_draft_layer_.reset();
+        }
+    }
+
     // Optionally load a model-specific EAGLE tree definition.
     const std::string tree_path = model_dir + "/eagle_tree.yaml";
     std::ifstream     tree_stream(tree_path);
@@ -564,6 +647,11 @@ void EagleModule::forward(const Tensor& input_ids,
     NvtxScope nvtx_scope("EagleModule::forward");
     if (isEagleDebugEnabled()) {
         TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+        // Clear any stale debug views from previous calls.
+        debug_fc_out_          = Tensor{};
+        debug_attn_input_      = Tensor{};
+        debug_pre_head_hidden_ = Tensor{};
+        debug_logits_          = Tensor{};
     }
 
     if (!enabled_) {
@@ -693,6 +781,11 @@ void EagleModule::forward(const Tensor& input_ids,
             // weight, mirroring the midlayer.hidden_norm behaviour.
             invokeRMSNorm(attn_input, fc_out, weights_.hidden_norm, kEps, stream);
 
+            if (isEagleDebugEnabled()) {
+                debug_fc_out_     = fc_out;
+                debug_attn_input_ = attn_input;
+            }
+
             can_use_eagle_fc = true;
 
             if (isEagleDebugEnabled()) {
@@ -707,6 +800,10 @@ void EagleModule::forward(const Tensor& input_ids,
             // Legacy / non-Eagle3 path: fall back to normalizing the
             // last-layer hidden state with the draft input norm.
             invokeRMSNorm(attn_input, hidden_states, weights_.input_norm, kEps, stream);
+
+            if (isEagleDebugEnabled()) {
+                debug_attn_input_ = attn_input;
+            }
 
             if (eagle3 && isEagleDebugEnabled()) {
                 TM_LOG_WARNING(
@@ -884,20 +981,85 @@ void EagleModule::forward(const Tensor& input_ids,
         Tensor& attn_out = attn_out_scratch_;
         linear.Forward(value, attn_o_weight_, /*output=*/attn_out);
 
-        // 3) Final RMSNorm for the shallow Eagle block output. For now
-        // we omit the auxiliary FC “MLP” stage and treat the attention
-        // output as the draft hidden state before LM head, normalized
-        // by the draft output norm.
-        bool need_norm_scratch =
-            !normed_hidden_scratch_ || normed_hidden_scratch_.dtype() != weight_dtype_
-            || normed_hidden_scratch_.device().type != kDEVICE || normed_hidden_scratch_.shape(0) < batch_size
-            || normed_hidden_scratch_.shape(1) != hidden_dim;
-        if (need_norm_scratch) {
-            normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+        // 3) Optional Eagle3 FFN + output norm using LLaMA-style FFN
+        // weights when available. When Eagle3 draft-layer weights are
+        // not prepared we fall back to the original RMSNorm-only path.
+        if (eagle3 && eagle3_draft_layer_) {
+            const auto& mlp       = eagle3_draft_layer_->ffn;
+            const int   token_num = attn_out.shape(0);
+            const int   inter_sz  = mlp.inter_size;
+
+            // Post-attention norm before FFN, mirroring the
+            // layers.0.ffn_norm behaviour.
+            bool need_ffn_in =
+                !mlp_input_scratch_ || mlp_input_scratch_.dtype() != weight_dtype_
+                || mlp_input_scratch_.device().type != kDEVICE
+                || mlp_input_scratch_.shape(0) < batch_size
+                || mlp_input_scratch_.shape(1) != hidden_dim;
+            if (need_ffn_in) {
+                mlp_input_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+            }
+            Tensor& ffn_input = mlp_input_scratch_;
+            invokeRMSNorm(ffn_input, attn_out, eagle3_draft_layer_->post_attn_norm, kEps, stream);
+
+            // Fused gating projection: [B, 2 * inter_sz]
+            Tensor mix = linear.Forward(ffn_input, mlp.fused_gating_intermediate);
+            sync_check_cuda_error();
+
+            // Take the first inter_sz columns as gating activations and
+            // the second inter_sz columns as the "up" projection.
+            Tensor gating = mix.slice({0, 0}, {token_num, inter_sz});
+            Tensor up     = mix.slice({0, inter_sz}, {token_num, inter_sz});
+
+            // gate' = silu(gate) * up (or Eagle3-specific variant).
+            Activation(gating, up, mlp.act_type, stream);
+
+            // Output projection: [B, hidden_dim]
+            bool need_mlp_out =
+                !mlp_out_scratch_ || mlp_out_scratch_.dtype() != weight_dtype_
+                || mlp_out_scratch_.device().type != kDEVICE
+                || mlp_out_scratch_.shape(0) < batch_size
+                || mlp_out_scratch_.shape(1) != hidden_dim;
+            if (need_mlp_out) {
+                mlp_out_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+            }
+            Tensor& ffn_out = mlp_out_scratch_;
+            linear.Forward(gating, mlp.output, ffn_out);
+            sync_check_cuda_error();
+
+            bool need_norm_scratch =
+                !normed_hidden_scratch_ || normed_hidden_scratch_.dtype() != weight_dtype_
+                || normed_hidden_scratch_.device().type != kDEVICE
+                || normed_hidden_scratch_.shape(0) < batch_size
+                || normed_hidden_scratch_.shape(1) != hidden_dim;
+            if (need_norm_scratch) {
+                normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+            }
+            Tensor& normed_hidden = normed_hidden_scratch_;
+            invokeRMSNorm(normed_hidden, ffn_out, eagle3_draft_layer_->output_norm, kEps, stream);
+            output_hidden_states = normed_hidden;
+            if (isEagleDebugEnabled()) {
+                debug_pre_head_hidden_ = normed_hidden;
+            }
         }
-        Tensor& normed_hidden = normed_hidden_scratch_;
-        invokeRMSNorm(normed_hidden, attn_out_scratch_, weights_.output_norm, kEps, stream);
-        output_hidden_states = normed_hidden;
+        else {
+            // Fallback: original shallow path – normalize attention
+            // output with the draft output norm.
+            bool need_norm_scratch =
+                !normed_hidden_scratch_ || normed_hidden_scratch_.dtype() != weight_dtype_
+                || normed_hidden_scratch_.device().type != kDEVICE
+                || normed_hidden_scratch_.shape(0) < batch_size
+                || normed_hidden_scratch_.shape(1) != hidden_dim;
+            if (need_norm_scratch) {
+                normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+            }
+            Tensor& normed_hidden = normed_hidden_scratch_;
+            invokeRMSNorm(normed_hidden, attn_out_scratch_, weights_.output_norm, kEps, stream);
+            output_hidden_states = normed_hidden;
+            if (isEagleDebugEnabled()) {
+                debug_pre_head_hidden_ = normed_hidden;
+            }
+        }
     }
     else {
         // Fallback: original minimal path – normalize with the output norm
@@ -941,6 +1103,10 @@ void EagleModule::forward(const Tensor& input_ids,
 
     linear.Forward(output_hidden_states, lm_head_weight_, /*output=*/logits);
     output_logits = logits;
+
+    if (isEagleDebugEnabled()) {
+        debug_logits_ = logits;
+    }
 }
 
 }  // namespace turbomind

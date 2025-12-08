@@ -27,6 +27,7 @@
 #include "src/turbomind/triton_backend/llama/LlamaTritonModel.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/metrics.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace py = pybind11;
 namespace ft = turbomind;
@@ -973,8 +974,9 @@ PYBIND11_MODULE(_turbomind, m)
         "iters"_a = 50);
 
     // Debug helper: run EagleModule::forward on user-provided hidden
-    // states and captured hidden (for Eagle3) and return logits as a
-    // TurboMind Tensor suitable for comparison against HF Eagle3.
+    // states and captured hidden (for Eagle3) and return a dict of
+    // intermediate tensors (fc_out, attn_input, pre_head_hidden, logits)
+    // as TurboMind Tensors suitable for comparison against HF Eagle3.
     m.def(
         "eagle_forward_logits_debug",
         [](const std::string& model_dir, py::object hidden_states_obj, py::object captured_hidden_obj) {
@@ -1057,6 +1059,9 @@ PYBIND11_MODULE(_turbomind, m)
             Tensor logits;
             Tensor hidden_out;
 
+            // Enable EAGLE debug for this one call so EagleModule
+            // records its intermediate tensors for comparison.
+            ft::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
             module.forward(
                 input_ids,
                 *hidden_tm,
@@ -1065,13 +1070,22 @@ PYBIND11_MODULE(_turbomind, m)
                 hidden_out,
                 linear,
                 stream);
+            ft::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
 
             ft::check_cuda_error(cudaStreamSynchronize(stream));
 
-            // Return logits as a TurboMind Tensor; callers can convert to
-            // torch via __dlpack__ for detailed comparison.
+            // Expose logits plus a small set of intermediate tensors
+            // so Python can perform stage-wise HF↔TM comparisons.
+            // All tensors are already on DEVICE and share storage with
+            // EagleModule's internal scratch buffers.
+            py::dict out;
+            out["logits"]           = logits;
+            out["fc_out"]           = module.debug_fc_out();
+            out["attn_input"]       = module.debug_attn_input();
+            out["pre_head_hidden"]  = module.debug_pre_head_hidden();
+
             (void)vocab_size;
-            return logits;
+            return out;
         },
         "model_dir"_a,
         "hidden_states"_a,

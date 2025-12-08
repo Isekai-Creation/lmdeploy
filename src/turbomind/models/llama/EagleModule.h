@@ -9,6 +9,7 @@
 #include "src/turbomind/core/core.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/models/llama/LlamaDenseWeight.h"
+#include "src/turbomind/models/llama/LlamaFfnLayer.h"
 #include "lmdeploy/turbomind/speculative_decoding_mode.h"
 
 namespace turbomind {
@@ -38,6 +39,16 @@ struct EagleWeight {
     Tensor draft_id_to_target_id;
     
     bool is_initialized = false;
+};
+
+struct Eagle3DraftLayerWeight {
+    LlamaAttentionWeight attn;
+    LlamaFfnWeight       ffn;
+    Tensor               input_norm;
+    Tensor               post_attn_norm;
+    Tensor               output_norm;
+
+    Eagle3DraftLayerWeight() = default;
 };
 
 /**
@@ -197,6 +208,27 @@ private:
     Tensor embed_input_scratch_;       // [batch, hidden] draft token embeddings
     Tensor embed_norm_scratch_;        // [batch, hidden] normalized embeddings
     Tensor logits_scratch_;
+
+    // Optional Eagle3 draft layer weights. When present, this structurally
+    // groups the fused QKV / Wo and MLP weights into LlamaAttentionWeight /
+    // LlamaFfnWeight so a future, more faithful attention path can be wired
+    // without changing EagleModule's public surface.
+    std::unique_ptr<Eagle3DraftLayerWeight> eagle3_draft_layer_;
+
+    // Debug views for eagle_forward_logits_debug / eagle_forward_debug.
+    // These alias internal scratch buffers after the most recent forward
+    // call when EAGLE debug is enabled.
+    Tensor debug_fc_out_;
+    Tensor debug_attn_input_;
+    Tensor debug_pre_head_hidden_;
+    Tensor debug_logits_;
+
+public:
+    // Lightweight debug accessors; intended for tests / tooling only.
+    const Tensor& debug_fc_out() const { return debug_fc_out_; }
+    const Tensor& debug_attn_input() const { return debug_attn_input_; }
+    const Tensor& debug_pre_head_hidden() const { return debug_pre_head_hidden_; }
+    const Tensor& debug_logits() const { return debug_logits_; }
 
     // Cached model dims / dtype
     int      hidden_units_{0};

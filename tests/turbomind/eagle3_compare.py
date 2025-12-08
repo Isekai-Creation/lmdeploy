@@ -34,6 +34,40 @@ except Exception:  # pragma: no cover - LMDeploy may not be importable in some e
     _HAVE_LMDEPLOY = False
 
 
+def _stage_stats(name: str, a: torch.Tensor, b: torch.Tensor | None) -> None:
+    """Print simple per-stage alignment metrics between TM and HF tensors."""
+    a = a.to(torch.float32)
+    if b is None:
+        print(
+            f"{name}: only TM tensor available; "
+            f"shape={tuple(a.shape)}, mean={a.mean().item():.4f}, std={a.std().item():.4f}"
+        )
+        return
+
+    b = b.to(torch.float32)
+    if a.shape != b.shape:
+        print(
+            f"{name}: shape mismatch TM {tuple(a.shape)} vs HF {tuple(b.shape)}; "
+            "skipping direct diff/cosine."
+        )
+        return
+
+    diff = (a - b).abs()
+    mean_abs = diff.mean().item()
+    max_abs = diff.max().item()
+
+    a_flat = a.view(a.shape[0], -1)
+    b_flat = b.view(b.shape[0], -1)
+    num = (a_flat * b_flat).sum(dim=-1)
+    denom = a_flat.norm(dim=-1) * b_flat.norm(dim=-1) + 1e-8
+    cos = (num / denom).mean().item()
+
+    print(
+        f"{name}: mean_abs_diff={mean_abs:.4e}, "
+        f"max_abs_diff={max_abs:.4e}, cosine={cos:.4f}"
+    )
+
+
 def _build_hidden_and_capture_from_ids(
     model: AutoModelForCausalLM,
     input_ids: torch.Tensor,
@@ -100,6 +134,13 @@ def run_compare(
         target, input_ids, dev, num_capture_layers=num_capture_layers
     )
 
+    # HF-side reference hidden used for crude stage alignment. We do not
+    # attempt to reconstruct HF's internal Eagle3 draft head here; instead
+    # we treat last_hidden (and a simple [last_hidden, last_hidden] concat)
+    # as a baseline for comparison against TurboMind draft stages.
+    last_hidden_hf = last_hidden.to(torch.float32)
+    attn_input_ref = torch.cat([last_hidden_hf, last_hidden_hf], dim=-1)
+
     # HF Eagle3 logits on the same positions.
     with torch.no_grad():
         out = target(input_ids=input_ids)
@@ -110,10 +151,32 @@ def run_compare(
     last_hidden_tm = last_hidden.to(dtype=torch.bfloat16, device=dev)
     capture_tm = capture.to(dtype=torch.bfloat16, device=dev)
 
-    logits_tm_tm = _turbomind.eagle_forward_logits_debug(
+    tm_debug = _turbomind.eagle_forward_logits_debug(
         draft_dir, last_hidden_tm, capture_tm
     )
-    logits_tm = torch.from_dlpack(logits_tm_tm.__dlpack__()).to(torch.float32)
+    logits_tm = torch.from_dlpack(tm_debug["logits"].__dlpack__()).to(torch.float32)
+
+    fc_tm = tm_debug.get("fc_out")
+    attn_tm = tm_debug.get("attn_input")
+    pre_tm = tm_debug.get("pre_head_hidden")
+
+    if fc_tm is not None:
+        fc_tm_t = torch.from_dlpack(fc_tm.__dlpack__())
+        _stage_stats("FC_OUT", fc_tm_t, last_hidden_hf)
+    else:
+        print("FC_OUT: not available from TurboMind debug binding.")
+
+    if attn_tm is not None:
+        attn_tm_t = torch.from_dlpack(attn_tm.__dlpack__())
+        _stage_stats("ATTN_INPUT", attn_tm_t, attn_input_ref)
+    else:
+        print("ATTN_INPUT: not available from TurboMind debug binding.")
+
+    if pre_tm is not None:
+        pre_tm_t = torch.from_dlpack(pre_tm.__dlpack__())
+        _stage_stats("PRE_HEAD_HIDDEN", pre_tm_t, last_hidden_hf)
+    else:
+        print("PRE_HEAD_HIDDEN: not available from TurboMind debug binding.")
 
     # Compare argmax and top-k overlap.
     top1_hf = logits_hf.argmax(dim=-1)
@@ -126,6 +189,8 @@ def run_compare(
     # Any overlap in top-k per position.
     overlap = (topk_hf[..., None] == topk_tm[..., None, :]).any(dim=-1)
     topk_overlap = overlap.float().mean().item()
+
+    _stage_stats("LOGITS", logits_tm, logits_hf)
 
     print(f"Prompt: {prompt!r}")
     print(f"argmax_match_rate={match_rate:.3f}")
