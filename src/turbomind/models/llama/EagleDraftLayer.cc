@@ -15,22 +15,14 @@ Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
                                    LlamaFfnLayer*                ffn_layer,
                                    float                         rmsnorm_eps):
     weight_{weight},
+    attn_layer_{attn_layer},
     ffn_layer_{ffn_layer},
     rmsnorm_eps_{rmsnorm_eps},
     debug_fc_out_{},
     debug_attn_out_{},
     debug_ffn_out_{},
-    debug_pre_head_hidden_{},
-    attn_layer_{attn_layer},
-    head_num_{0},
-    kv_head_num_{0},
-    size_per_head_{0}
+    debug_pre_head_hidden_{}
 {
-    if (weight_) {
-        head_num_      = weight_->attn.head_num;
-        kv_head_num_   = weight_->attn.kv_head_num;
-        size_per_head_ = weight_->attn.size_per_head;
-    }
 }
 
 void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden, cudaStream_t stream)
@@ -101,101 +93,63 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     //    otherwise fall back to the shallow QKV+V→Wo path.
     Tensor attn_out{{batch_size, hidden_dim}, dtype, input_hidden.device()};
 
-    const bool has_attn_layer = (attn_layer_ != nullptr);
+    // For now we always use the shallow QKV path that mirrors the
+    // existing Eagle3 attention approximation. Once UnifiedAttentionLayer
+    // is fully wired for the draft layer we can switch over to the real
+    // attention backend here.
+    LlamaLinear& linear = ffn_layer_->linear();
 
-    auto attn_geom_ok = [&]() -> bool {
-        if (head_num_ <= 0 || size_per_head_ <= 0) {
-            return false;
-        }
-        // For standard MHA we expect hidden_dim == head_num_ * size_per_head_.
-        if (hidden_dim != head_num_ * size_per_head_) {
-            return false;
-        }
-        return true;
-    };
+    const Tensor& qkv_w = weight_->attn.qkv.weight;
+    const Tensor& wo_w  = weight_->attn.output.weight;
 
-    bool used_unified_attention = false;
-
-    if (has_attn_layer && attn_geom_ok()) {
-        // --- Real attention path via UnifiedAttentionLayer ---
-        UnifiedAttentionLayer::ForwardParam param{};
-        param.input    = hidden_norm;
-        param.output   = attn_out;
-        param.weights  = &weight_->attn;
-        // For Eagle3 draft we don't use per-layer ID inside UnifiedAttentionLayer
-        // at the moment, so 0 is fine here.
-        param.layer_id = 0;
-
-        attn_layer_->Forward(param);
-        sync_check_cuda_error();
-
-        used_unified_attention = true;
+    if (!qkv_w || !wo_w || qkv_w.ndim() != 2 || wo_w.ndim() != 2) {
+        TM_LOG_WARNING(
+            "[EAGLE][Eagle3DraftLayer][fallback] invalid QKV/WO tensors in Forward; "
+            "treating Eagle3 draft as pass-through.");
+        output_hidden = input_hidden;
+        return;
     }
-    else {
-        // --- Fallback: shallow QKV path (existing behaviour) ---
-        if (has_attn_layer && !attn_geom_ok()) {
-            TM_LOG_WARNING(
-                "[EAGLE3][Draft] invalid attention geometry (head_num=%d, size_per_head=%d, hidden_dim=%d); "
-                "falling back to shallow QKV path.",
-                head_num_,
-                size_per_head_,
-                hidden_dim);
-        }
 
-        LlamaLinear& linear = ffn_layer_->linear();
+    const int qkv_out_dim = qkv_w.shape(1);
+    const int q_dim       = wo_w.shape(0);
+    const int kv_span     = qkv_out_dim - q_dim;
 
-        const Tensor& qkv_w = weight_->attn.qkv.weight;
-        const Tensor& wo_w  = weight_->attn.output.weight;
-
-        if (!qkv_w || !wo_w || qkv_w.ndim() != 2 || wo_w.ndim() != 2) {
-            TM_LOG_WARNING(
-                "[EAGLE][Eagle3DraftLayer][fallback] invalid QKV/WO tensors in Forward; "
-                "treating Eagle3 draft as pass-through.");
-            output_hidden = input_hidden;
-            return;
-        }
-
-        const int qkv_out_dim = qkv_w.shape(1);
-        const int q_dim       = wo_w.shape(0);
-        const int kv_span     = qkv_out_dim - q_dim;
-
-        if (qkv_out_dim <= 0 || q_dim <= 0 || kv_span <= 0 || (kv_span % 2) != 0 || wo_w.shape(1) != hidden_dim) {
-            TM_LOG_WARNING(
-                "[EAGLE][Eagle3DraftLayer][fallback] invalid QKV/WO geometry in Forward "
-                "(qkv=[%d,%d], wo=[%d,%d], hidden_dim=%d); treating draft as pass-through.",
-                qkv_w.shape(0),
-                qkv_w.shape(1),
-                wo_w.shape(0),
-                wo_w.shape(1),
-                hidden_dim);
-            output_hidden = input_hidden;
-            return;
-        }
-
-        const int kv_dim = kv_span / 2;
-        if (kv_dim != q_dim) {
-            TM_LOG_WARNING(
-                "[EAGLE][Eagle3DraftLayer][fallback] unsupported Eagle3 QKV layout in Forward "
-                "(q_dim=%d, kv_dim=%d); treating draft as pass-through.",
-                q_dim,
-                kv_dim);
-            output_hidden = input_hidden;
-            return;
-        }
-
-        Tensor qkv{{batch_size, qkv_out_dim}, dtype, input_hidden.device()};
-        linear.Forward(hidden_norm, weight_->attn.qkv, qkv);
-        sync_check_cuda_error();
-
-        // QKV layout is [Q, K, V] with sizes [q_dim, kv_dim, kv_dim]. For a
-        // single-position attention block, the pre-Wo attention output is
-        // equivalent to V, so we select the final kv_dim slice here.
-        const int v_offset = q_dim + kv_dim;
-        Tensor     value   = qkv.slice({0, v_offset}, {batch_size, kv_dim});
-
-        linear.Forward(value, weight_->attn.output, attn_out);
-        sync_check_cuda_error();
+    if (qkv_out_dim <= 0 || q_dim <= 0 || kv_span <= 0 || (kv_span % 2) != 0 || wo_w.shape(1) != hidden_dim) {
+        TM_LOG_WARNING(
+            "[EAGLE][Eagle3DraftLayer][fallback] invalid QKV/WO geometry in Forward "
+            "(qkv=[%d,%d], wo=[%d,%d], hidden_dim=%d); treating draft as pass-through.",
+            qkv_w.shape(0),
+            qkv_w.shape(1),
+            wo_w.shape(0),
+            wo_w.shape(1),
+            hidden_dim);
+        output_hidden = input_hidden;
+        return;
     }
+
+    const int kv_dim = kv_span / 2;
+    if (kv_dim != q_dim) {
+        TM_LOG_WARNING(
+            "[EAGLE][Eagle3DraftLayer][fallback] unsupported Eagle3 QKV layout in Forward "
+            "(q_dim=%d, kv_dim=%d); treating draft as pass-through.",
+            q_dim,
+            kv_dim);
+        output_hidden = input_hidden;
+        return;
+    }
+
+    Tensor qkv{{batch_size, qkv_out_dim}, dtype, input_hidden.device()};
+    linear.Forward(hidden_norm, weight_->attn.qkv, qkv);
+    sync_check_cuda_error();
+
+    // QKV layout is [Q, K, V] with sizes [q_dim, kv_dim, kv_dim]. For a
+    // single-position attention block, the pre-Wo attention output is
+    // equivalent to V, so we select the final kv_dim slice here.
+    const int v_offset = q_dim + kv_dim;
+    Tensor     value   = qkv.slice({0, v_offset}, {batch_size, kv_dim});
+
+    linear.Forward(value, weight_->attn.output, attn_out);
+    sync_check_cuda_error();
 
     if (debug_enabled) {
         debug_attn_out_ = attn_out;
@@ -228,9 +182,10 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     //   y = RMSNorm(attn_out + FFN(norm(attn_out)), output_norm)
     // Here `output_hidden` holds FFN(norm(attn_out)) and `input_hidden` is
     // the residual from attention.
+    void* residual_ptr = const_cast<void*>(input_hidden.raw_data());
     invokeResidualBiasRMSNorm(
         /*hidden_states=*/output_hidden.raw_data(),
-        /*residual=*/input_hidden.raw_data(),
+        /*residual=*/residual_ptr,
         /*weights=*/weight_->output_norm.raw_data(),
         /*bias=*/nullptr,
         dtype,
@@ -241,10 +196,6 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
 
     if (debug_enabled) {
         debug_pre_head_hidden_ = output_hidden;
-    }
-
-    if (debug_enabled && used_unified_attention) {
-        TM_LOG_DEBUG("[EAGLE3][Draft] UnifiedAttentionLayer used for Eagle3 draft attention.");
     }
 }
 
