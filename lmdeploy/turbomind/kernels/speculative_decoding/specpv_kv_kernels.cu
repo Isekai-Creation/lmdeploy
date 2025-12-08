@@ -10,6 +10,7 @@
 #include "specpv_kv_kernels.h"
 
 #include <cuda_runtime_api.h>
+#include <cfloat>
 
 namespace turbomind {
 namespace kernels {
@@ -50,8 +51,8 @@ __global__ void summaryKeyStatesKernel(const float* __restrict__ key_states,
     }
     const int end = min(start + block_size, L);
 
-    float vmax = -CUDART_INF_F;
-    float vmin = CUDART_INF_F;
+    float vmax = -FLT_MAX;
+    float vmin = FLT_MAX;
 
     for (int t = start; t < end; ++t) {
         const size_t idx = (((size_t)b * H + h) * L + static_cast<size_t>(t)) * D + dim;
@@ -99,7 +100,7 @@ __global__ void refreshRetrievalKernel(const float* __restrict__ query_states,  
 
     // Compute scores for each block.
     for (int blk = threadIdx.x; blk < N; blk += blockDim.x) {
-        float best = -CUDART_INF_F;
+        float best = -FLT_MAX;
 
         for (int q = 0; q < Q; ++q) {
             float dot_max = 0.f;
