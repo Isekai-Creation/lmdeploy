@@ -2162,12 +2162,11 @@ bool LlamaBatch::Forward(GenerationState& g)
         if (sampling_logits.dtype() != kFloat32) {
             TM_LOG_WARNING(
                 "[LlamaBatch][EAGLE][fallback] sampling_logits_ dtype=%s is not FP32; "
-                "disabling EAGLE for this engine to preserve logits numerics.",
+                "treating this step as single-token decode while preserving EAGLE mode.",
                 to_string(sampling_logits.dtype()));
-            // Drop speculative decoding for this engine; baseline decode
-            // remains intact and DynamicDecode continues to use the logits
-            // buffer directly.
-            model_->spec_mode_ = SpeculativeDecodingMode::None();
+            // In this rare case we skip the speculative path for this step
+            // but keep EAGLE enabled for the engine so subsequent steps can
+            // still use speculative decoding once logits numerics are valid.
         }
         else {
             invokeCastFloat2D(logits, sampling_logits, stream_);

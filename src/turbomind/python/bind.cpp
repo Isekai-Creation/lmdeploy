@@ -971,6 +971,103 @@ PYBIND11_MODULE(_turbomind, m)
         "batch_size"_a = 2,
         "iters"_a = 50);
 
+    // Debug helper: run EagleModule::forward on user-provided hidden
+    // states and captured hidden (for Eagle3) and return logits as a
+    // TurboMind Tensor suitable for comparison against HF Eagle3.
+    m.def(
+        "eagle_forward_logits_debug",
+        [](const std::string& model_dir, py::object hidden_states_obj, py::object captured_hidden_obj) {
+            int device_id = 0;
+            ft::CudaDeviceGuard device_guard(device_id);
+
+            // Import hidden_states and captured_hidden via DLPack so we
+            // can treat them as TurboMind Tensors on the current device.
+            py::capsule hidden_cap = hidden_states_obj.attr("__dlpack__")();
+            DLManagedTensor* hidden_dlmt =
+                static_cast<DLManagedTensor*>(PyCapsule_GetPointer(hidden_cap.ptr(), kDlTensorCapsuleName));
+            auto hidden_tm = DLManagedTensorToTritonTensor(hidden_dlmt);
+            hidden_cap.set_name("used_dltensor");
+
+            py::capsule capture_cap = captured_hidden_obj.attr("__dlpack__")();
+            DLManagedTensor* capture_dlmt =
+                static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capture_cap.ptr(), kDlTensorCapsuleName));
+            auto capture_tm = DLManagedTensorToTritonTensor(capture_dlmt);
+            capture_cap.set_name("used_dltensor");
+
+            const auto& h_shape = hidden_tm->shape();
+            if (h_shape.size() != 2) {
+                throw std::invalid_argument("hidden_states must be rank-2 [batch, hidden]");
+            }
+            const int batch_size   = static_cast<int>(h_shape[0]);
+            const int hidden_units = static_cast<int>(h_shape[1]);
+
+            cudaStream_t stream{};
+            ft::check_cuda_error(cudaStreamCreate(&stream));
+
+            constexpr ft::EagleModule::SizeType kMaxDraftPathLen       = 16;
+            constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+            constexpr ft::EagleModule::SizeType kMaxDecodingTokens     = 16;
+            constexpr ft::EagleModule::SizeType kMaxNonLeafNodes       = 32;
+
+            ft::EagleModule module(
+                kMaxDraftPathLen,
+                kMaxDecodingDraftTokens,
+                kMaxDecodingTokens,
+                kMaxNonLeafNodes);
+
+            module.load(model_dir, device_id, stream);
+
+            auto const& weights = module.getWeights();
+            if (!weights.embed_tokens || !weights.lm_head) {
+                cudaStreamDestroy(stream);
+                throw std::runtime_error(
+                    "EagleModule weights not initialized; check draft model directory");
+            }
+
+            if (hidden_units != static_cast<int>(weights.embed_tokens.shape(1))) {
+                TM_LOG_WARNING(
+                    "[EAGLE][debug] hidden_units mismatch in eagle_forward_logits_debug: "
+                    "provided=%d, model=%d",
+                    hidden_units,
+                    static_cast<int>(weights.embed_tokens.shape(1)));
+            }
+
+            const int vocab_size = static_cast<int>(weights.lm_head.shape(1));
+
+            ft::LlamaLinear linear(stream);
+
+            // Compose a minimal Tensor for input_ids (unused by Eagle3).
+            Tensor input_ids(
+                std::vector<ft::core::ssize_t>{batch_size},
+                ft::data_type_v<int32_t>,
+                ft::kDEVICE);
+            ft::check_cuda_error(
+                cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
+
+            Tensor logits;
+            Tensor hidden_out;
+
+            module.forward(
+                input_ids,
+                *hidden_tm,
+                *capture_tm,
+                logits,
+                hidden_out,
+                linear,
+                stream);
+
+            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            ft::check_cuda_error(cudaStreamDestroy(stream));
+
+            // Return logits as a TurboMind Tensor; callers can convert to
+            // torch via __dlpack__ for detailed comparison.
+            (void)vocab_size;
+            return logits;
+        },
+        "model_dir"_a,
+        "hidden_states"_a,
+        "captured_hidden"_a);
+
     // tensor
     //
     // Expose core::Tensor so it can be used as the value type in

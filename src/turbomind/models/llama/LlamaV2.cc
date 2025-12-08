@@ -2305,45 +2305,68 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
     // ========= EAGLE draft + tree decode + acceptance (copied from dynamicDecodeWithSpec) =========
 
-    auto compute_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
-        if (decode_batch_size <= 0) {
-            return 0;
+    // Prefer the per-slot plan from LlamaBatch when available so that
+    // tokens_per_seq reflects SpeculativeConfig.num_speculative_tokens
+    // and per-request clamping. Fall back to a simple engine-budget
+    // computation only when no plan was provided.
+    int tokens_per_seq = 0;
+    if (spec_ctx.planned_tokens_per_seq) {
+        // planned_tokens_per_seq[i] already includes per-slot clamping;
+        // here we use the maximum over the active decode batch as the
+        // effective tokens_per_seq for logging and tree construction.
+        int max_planned = 0;
+        for (int i = 0; i < batch_size; ++i) {
+            const int planned = spec_ctx.planned_tokens_per_seq[i];
+            if (planned > max_planned) {
+                max_planned = planned;
+            }
         }
+        tokens_per_seq = max_planned;
+    }
+    else {
+        auto compute_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
+            if (decode_batch_size <= 0) {
+                return 0;
+            }
 
-        const int max_engine_tokens = eagleMaxEngineTokensPerStep();
-        if (max_engine_tokens <= 0) {
-            return 0;
-        }
+            const int max_engine_tokens = eagleMaxEngineTokensPerStep();
+            if (max_engine_tokens <= 0) {
+                return 0;
+            }
 
-        // When the engine-side budget resolves to 1, treat this as
-        // single-token EAGLE regardless of batch size.
-        if (max_engine_tokens <= 1) {
-            return 1;
-        }
+            // When the engine-side budget resolves to 1, treat this as
+            // single-token EAGLE regardless of batch size.
+            if (max_engine_tokens <= 1) {
+                return 1;
+            }
 
-        const int per_seq_cap = engine_param_.spec_max_decoding_draft_tokens;
-        if (per_seq_cap <= 0) {
-            return 1;
-        }
+            const int per_seq_cap = engine_param_.spec_max_decoding_draft_tokens;
+            if (per_seq_cap <= 0) {
+                return 1;
+            }
 
-        // Hard upper bound from engine budget: do not exceed the per-step
-        // engine token allowance when spreading draft tokens across the
-        // active decode batch.
-        const int max_by_engine = max_engine_tokens / decode_batch_size;
-        if (max_by_engine <= 0) {
-            return 1;
-        }
+            // Hard upper bound from engine budget: do not exceed the per-step
+            // engine token allowance when spreading draft tokens across the
+            // active decode batch.
+            const int max_by_engine = max_engine_tokens / decode_batch_size;
+            if (max_by_engine <= 0) {
+                return 1;
+            }
 
-        const int tokens_per_seq = std::max(1, std::min(per_seq_cap, max_by_engine));
-        return tokens_per_seq;
-    };
+            const int tps = std::max(1, std::min(per_seq_cap, max_by_engine));
+            return tps;
+        };
 
-    const int tokens_per_seq = compute_draft_tokens_per_seq(batch_size);
+        tokens_per_seq = compute_draft_tokens_per_seq(batch_size);
+    }
+
     if (tokens_per_seq <= 0) {
+        // No speculative tokens planned for this step; fall back to
+        // single-token decode without disabling EAGLE for the engine.
         TM_LOG_WARNING(
-            "[LlamaV2][EAGLE][fallback] tokens_per_seq resolved to 0 in dynamicDecodeWithSpecMulti; "
-            "disabling speculative decoding for this engine.");
-        spec_mode_ = SpeculativeDecodingMode::None();
+            "[LlamaV2][EAGLE] tokens_per_seq resolved to %d in dynamicDecodeWithSpecMulti; "
+            "treating this step as single-token.",
+            tokens_per_seq);
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -2371,8 +2394,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     if (!draft_logits) {
         TM_LOG_WARNING(
             "[LlamaV2][EAGLE][fallback] Draft forward produced empty logits in dynamicDecodeWithSpecMulti; "
-            "disabling speculative decoding for this engine.");
-        spec_mode_ = SpeculativeDecodingMode::None();
+            "treating this step as single-token decode.");
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -2401,9 +2423,8 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
         TM_LOG_WARNING(
             "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32 in dynamicDecodeWithSpecMulti; "
-            "disabling speculative decoding for this engine.",
+            "treating this step as single-token decode.",
             to_string(draft_logits.dtype()));
-        spec_mode_ = SpeculativeDecodingMode::None();
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -2566,8 +2587,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     if (num_paths == 0) {
         TM_LOG_WARNING(
             "[LlamaV2][EAGLE][fallback] No valid paths in speculative tree in dynamicDecodeWithSpecMulti; "
-            "disabling speculative decoding for this engine.");
-        spec_mode_ = SpeculativeDecodingMode::None();
+            "treating this step as single-token decode.");
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
