@@ -393,7 +393,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     if (use_eagle3_draft_layer) {
         // Minimal model/context wrappers needed for LlamaFfnLayer.
         ft::ModelParam model_param{};
-        model_param.hidden_units = static_cast(hidden_units);
+        model_param.hidden_units = static_cast<size_t>(hidden_units);
         ft::Context ctx(device_id);
         ft::LlamaFfnLayer ffn_layer(model_param, ctx);
         const auto* draft_w = module.eagle3_draft_layer_.get();

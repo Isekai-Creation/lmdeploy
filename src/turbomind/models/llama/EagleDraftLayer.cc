@@ -217,9 +217,10 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         debug_ffn_out_ = output_hidden;
     }
 
+    void* residual_ptr = const_cast<void*>(input_hidden.raw_data());
     invokeResidualBiasRMSNorm(
         /*hidden_states=*/output_hidden.raw_data(),
-        /*residual=*/input_hidden.raw_data(),
+        /*residual=*/residual_ptr,
         /*weights=*/weight_->output_norm.raw_data(),
         /*bias=*/nullptr,
         dtype,

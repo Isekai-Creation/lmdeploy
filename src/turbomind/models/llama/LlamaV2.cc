@@ -177,10 +177,11 @@ LlamaV2::LlamaV2(DataType                     dtype,
                 // under UnifiedDecoder instead of the shallow block in
                 // EagleModule.
                 if (engine.spec_method == "eagle3" && eagle_module_->hasEagle3DraftLayer()) {
-                    eagle3_draft_weight_ =
-                        std::make_unique<Eagle3DraftLayerWeight>(*eagle_module_->eagle3_draft_layer_);
+                    // Share Eagle3 draft-layer weights by aliasing the
+                    // EagleModule-owned struct; no deep copy needed.
+                    eagle3_draft_weight_ = eagle_module_->eagle3_draft_layer_.get();
                     if (unified_decoder_) {
-                        unified_decoder_->setEagle3DraftLayer(eagle3_draft_weight_.get());
+                        unified_decoder_->setEagle3DraftLayer(eagle3_draft_weight_);
                     }
                 }
                 eagle_ok = true;
