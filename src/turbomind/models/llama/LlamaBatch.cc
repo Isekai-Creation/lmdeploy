@@ -2179,6 +2179,26 @@ bool LlamaBatch::Forward(GenerationState& g)
             InitializeSampling(g);
         }
 
+        // Detect a strictly greedy-decoding batch so that EAGLE's view
+        // of target tokens can be aligned with DynamicDecode's commit
+        // token in offline validation scenarios. Behaviour for non-greedy
+        // configs remains unchanged.
+        auto is_greedy_batch = [&]() -> bool {
+            for (int i = 0; i < bsz; ++i) {
+                const auto& cfg = state_->requests[i]->gen_cfg;
+                if (cfg.temperature != 0.0f) {
+                    return false;
+                }
+                if (cfg.top_k > 1) {
+                    return false;
+                }
+                if (cfg.top_p < 1.0f) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
         bool output_logprobs = [&] {
             for (int i = 0; i < bsz; ++i) {
                 if (state_->requests[i]->gen_cfg.output_logprobs) {

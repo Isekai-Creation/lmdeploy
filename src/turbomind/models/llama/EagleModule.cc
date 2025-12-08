@@ -645,9 +645,9 @@ void EagleModule::forward(const Tensor& input_ids,
     constexpr float kEps = 1e-5f;
 
     // When we have a prepared shallow EagleNet / Eagle3 block, run a
-    // single self-attention + FC “MLP” block followed by a final RMSNorm.
-    // This uses the draft model’s attention and FC weights while keeping
-    // the network lightweight. If the block is not prepared (e.g., older
+    // single self-attention block followed by a lightweight MLP / norm.
+    // This uses the draft model’s attention weights while keeping the
+    // network shallow. If the block is not prepared (e.g., older
     // checkpoints), fall back to the original RMSNorm + LM head path.
     if (draft_block_prepared_) {
         const bool eagle3 = eagle_mode_ == EagleMode::kEagle3;
@@ -660,7 +660,10 @@ void EagleModule::forward(const Tensor& input_ids,
         Tensor fc_out;
         bool   can_use_eagle_fc = false;
 
-        // 1) Pre-attention RMSNorm with the draft input norm.
+        // 1) Pre-attention RMSNorm. For Eagle3 we prefer to drive the
+        // attention from the FC‑reduced multi-layer hidden when it is
+        // available; otherwise we fall back to the normalized last-layer
+        // hidden state as before.
         bool need_attn_in =
             !attn_input_scratch_ || attn_input_scratch_.dtype() != hidden_dtype
             || attn_input_scratch_.device().type != kDEVICE || attn_input_scratch_.shape(0) < batch_size
@@ -669,14 +672,7 @@ void EagleModule::forward(const Tensor& input_ids,
             attn_input_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
         }
         Tensor& attn_input = attn_input_scratch_;
-        invokeRMSNorm(attn_input, hidden_states, weights_.input_norm, kEps, stream);
 
-        // If we have a full Eagle3 FC and a captured multi-layer hidden
-        // buffer whose width matches eagle_fc_in_dim_, run the pre-FC
-        // to obtain an additional set of features. For Eagle3, we then
-        // re-normalize these FC features to drive the attention input,
-        // so the shallow block sees the same representation as the
-        // intended Eagle3 head.
         if (eagle3 && eagle_fc_weight_ && weights_.eagle_fc && eagle_fc_in_dim_ > 0
             && captured_hidden_states && captured_hidden_states.shape(0) == batch_size
             && captured_hidden_states.shape(1) == eagle_fc_in_dim_
@@ -692,9 +688,9 @@ void EagleModule::forward(const Tensor& input_ids,
             fc_out = eagle_fc_out_scratch_;
             linear.Forward(captured_hidden_states, eagle_fc_weight_, /*output=*/fc_out);
 
-            // Eagle3: use the FC output as the input to the draft
-            // attention block, normalized by the draft input norm.
-            invokeRMSNorm(attn_input, fc_out, weights_.input_norm, kEps, stream);
+            // Eagle3: normalize the FC output with the hidden_norm
+            // weight, mirroring the midlayer.hidden_norm behaviour.
+            invokeRMSNorm(attn_input, fc_out, weights_.hidden_norm, kEps, stream);
 
             can_use_eagle_fc = true;
 
@@ -706,10 +702,16 @@ void EagleModule::forward(const Tensor& input_ids,
                     hidden_dim);
             }
         }
-        else if (eagle3 && isEagleDebugEnabled()) {
-            TM_LOG_WARNING(
-                "[EAGLE][EagleModule] Eagle3 FC path disabled for this step "
-                "(capture missing or shape/dtype mismatch)");
+        else {
+            // Legacy / non-Eagle3 path: fall back to normalizing the
+            // last-layer hidden state with the draft input norm.
+            invokeRMSNorm(attn_input, hidden_states, weights_.input_norm, kEps, stream);
+
+            if (eagle3 && isEagleDebugEnabled()) {
+                TM_LOG_WARNING(
+                    "[EAGLE][EagleModule] Eagle3 FC path disabled for this step "
+                    "(capture missing or shape/dtype mismatch)");
+            }
         }
 
         // 2) Single-token self-attention (degenerates to a learned projection
@@ -745,31 +747,29 @@ void EagleModule::forward(const Tensor& input_ids,
             char*        dst_base      = static_cast<char*>(qkv_input.raw_data());
 
             // When we have a valid Eagle3 pre-FC output and a 2×hidden
-            // QKV input, build the input as [attn_input, fc_out]. This
-            // lets the shallow Eagle3 block see both the normalized
-            // last-layer hidden state and the transformed multi-layer
-            // features from eagle_fc.
+            // QKV input, build the input from the normalized FC features.
+            // We currently replicate the normalized FC output in both
+            // halves [fc_norm, fc_norm]; this keeps the geometry aligned
+            // with TensorRT‑LLM’s 2×hidden layout while we do not yet
+            // consume target token embeddings inside EagleModule.
             if (can_use_eagle_fc && qkv_in_dim >= 2 * hidden_dim) {
                 const size_t src_row_bytes_attn = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
-                const size_t src_row_bytes_fc   = static_cast<size_t>(fc_out.stride(0)) * elem_bytes;
                 const size_t copy_bytes         = static_cast<size_t>(hidden_dim) * elem_bytes;
                 char*        attn_base          = static_cast<char*>(attn_input.raw_data());
-                char*        fc_base            = static_cast<char*>(fc_out.raw_data());
 
                 for (int b = 0; b < batch_size; ++b) {
                     char* dst_row   = dst_base + static_cast<size_t>(b) * dst_row_bytes;
                     char* attn_row = attn_base + static_cast<size_t>(b) * src_row_bytes_attn;
-                    char* fc_row   = fc_base + static_cast<size_t>(b) * src_row_bytes_fc;
 
-                    // First hidden_dim features from attn_input
+                    // First hidden_dim features from normalized FC output.
                     check_cuda_error(cudaMemcpyAsync(dst_row,
                                                      attn_row,
                                                      copy_bytes,
                                                      cudaMemcpyDeviceToDevice,
                                                      stream));
-                    // Second hidden_dim features from fc_out
+                    // Second hidden_dim features: reuse the same normalized FC.
                     check_cuda_error(cudaMemcpyAsync(dst_row + static_cast<size_t>(hidden_dim) * elem_bytes,
-                                                     fc_row,
+                                                     attn_row,
                                                      copy_bytes,
                                                      cudaMemcpyDeviceToDevice,
                                                      stream));
@@ -852,48 +852,10 @@ void EagleModule::forward(const Tensor& input_ids,
         Tensor& attn_out = attn_out_scratch_;
         linear.Forward(value, attn_o_weight_, /*output=*/attn_out);
 
-        // 3) Lightweight FC “MLP” block using the EagleNet fc weight.
-        const int mlp_in_dim = hidden_dim * 2;
-        bool      need_mlp_in =
-            !mlp_input_scratch_ || mlp_input_scratch_.dtype() != weight_dtype_
-            || mlp_input_scratch_.device().type != kDEVICE || mlp_input_scratch_.shape(0) < batch_size
-            || mlp_input_scratch_.shape(1) != mlp_in_dim;
-        if (need_mlp_in) {
-            mlp_input_scratch_ = Tensor{{batch_size, mlp_in_dim}, weight_dtype_, kDEVICE};
-        }
-        Tensor& mlp_input = mlp_input_scratch_;
-
-        // Zero the FC input, then copy the attention output into the first
-        // hidden_dim channels, leaving the second half as zeros. This keeps
-        // the math simple while still exercising the learned fc weights.
-        check_cuda_error(cudaMemsetAsync(mlp_input.raw_data(), 0, mlp_input.byte_size(), stream));
-
-        const size_t elem_bytes    = byte_size(weight_dtype_, 8) / 8;
-        const size_t copy_bytes    = static_cast<size_t>(hidden_dim) * elem_bytes;
-        const size_t src_row_bytes = static_cast<size_t>(attn_out.stride(0)) * elem_bytes;
-        const size_t dst_row_bytes = static_cast<size_t>(mlp_input.stride(0)) * elem_bytes;
-        char*        src_base      = static_cast<char*>(attn_out.raw_data());
-        char*        dst_base      = static_cast<char*>(mlp_input.raw_data());
-
-        for (int b = 0; b < batch_size; ++b) {
-            check_cuda_error(cudaMemcpyAsync(dst_base + static_cast<size_t>(b) * dst_row_bytes,
-                                             src_base + static_cast<size_t>(b) * src_row_bytes,
-                                             copy_bytes,
-                                             cudaMemcpyDeviceToDevice,
-                                             stream));
-        }
-
-        bool need_mlp_out =
-            !mlp_out_scratch_ || mlp_out_scratch_.dtype() != weight_dtype_
-            || mlp_out_scratch_.device().type != kDEVICE || mlp_out_scratch_.shape(0) < batch_size
-            || mlp_out_scratch_.shape(1) != hidden_dim;
-        if (need_mlp_out) {
-            mlp_out_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
-        }
-        Tensor& mlp_out = mlp_out_scratch_;
-        linear.Forward(mlp_input, fc_weight_, /*output=*/mlp_out);
-
-        // 4) Final RMSNorm for the shallow EagleNet block output.
+        // 3) Final RMSNorm for the shallow Eagle block output. For now
+        // we omit the auxiliary FC “MLP” stage and treat the attention
+        // output as the draft hidden state before LM head, normalized
+        // by the draft output norm.
         bool need_norm_scratch =
             !normed_hidden_scratch_ || normed_hidden_scratch_.dtype() != weight_dtype_
             || normed_hidden_scratch_.device().type != kDEVICE || normed_hidden_scratch_.shape(0) < batch_size
@@ -902,7 +864,7 @@ void EagleModule::forward(const Tensor& input_ids,
             normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
         }
         Tensor& normed_hidden = normed_hidden_scratch_;
-        invokeRMSNorm(normed_hidden, mlp_out_scratch_, weights_.output_norm, kEps, stream);
+        invokeRMSNorm(normed_hidden, attn_out_scratch_, weights_.output_norm, kEps, stream);
         output_hidden_states = normed_hidden;
     }
     else {

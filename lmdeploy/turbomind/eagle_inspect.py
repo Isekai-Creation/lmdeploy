@@ -62,6 +62,7 @@ def inspect_offline_eagle(
         method="eagle3",
         model=spec_model_path,
         num_speculative_tokens=num_spec_tokens,
+        enable_target_tree=True,
         eagle_debug=False,
         eagle_metrics_debug=True,
     )
@@ -82,8 +83,8 @@ def inspect_offline_eagle(
     gen_cfg = GenerationConfig(
         max_new_tokens=max_new_tokens,
         temperature=0.0,
-        top_k=20,
-        top_p=0.8,
+        top_k=1,
+        top_p=1.0,
     )
     responses = pipe(prompts, gen_config=[gen_cfg for _ in prompts])
 
@@ -139,6 +140,7 @@ def eagle3_multitoken_smoke(
         method="eagle3",
         model=spec_model_path,
         num_speculative_tokens=num_spec_tokens,
+        enable_target_tree=True,
         eagle_debug=False,
         eagle_metrics_debug=True,
     )
