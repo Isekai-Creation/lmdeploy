@@ -8,6 +8,7 @@ find_package(CUDAToolkit REQUIRED)
 add_library(Llama STATIC
         LlamaV2.cc
         LlamaBatch.cc
+        specpv_kv_cache.cc
         LlamaLinear.cu
         BlockManager.cc
         BlockTrie.cc

@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <vector>
+
 #include "src/turbomind/core/core.h"
 
 namespace turbomind {

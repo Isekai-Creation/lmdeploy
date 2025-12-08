@@ -233,6 +233,78 @@ LlamaV2::LlamaV2(DataType                     dtype,
                     }
                 }
             }
+
+            // Initialize SpecPV partial-KV cache when requested and when
+            // target-tree decode is available. This keeps SpecPV strictly
+            // opt-in and ensures that misconfigured geometry falls back to
+            // the baseline full-KV EAGLE3 pipeline.
+            if (engine.enable_specpv && engine.spec_method == "eagle3" && target_tree_supported_) {
+                specpv_cache_config_.block_size        = engine.specpv_block_size > 0
+                                                             ? engine.specpv_block_size
+                                                             : attn_param_.cache_block_seq_len;
+                specpv_cache_config_.n_sink_blocks     = engine.specpv_n_sink_blocks;
+                specpv_cache_config_.n_retrieval_blocks = engine.specpv_n_retrieval_blocks;
+                specpv_cache_config_.n_window_blocks   = engine.specpv_n_window_blocks;
+                specpv_cache_config_.n_spec_tokens_buf = engine.specpv_n_spec_tokens_buf;
+
+                const int kv_block_len = attn_param_.cache_block_seq_len;
+
+                bool geometry_ok = kv_block_len > 0
+                                   && specpv_cache_config_.block_size == kv_block_len
+                                   && specpv_cache_config_.total_budget() > 0
+                                   && local_kv_head_num_ > 0
+                                   && hidden_units_ > 0;
+
+                if (!geometry_ok) {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][SpecPV][fallback] partial KV disabled due to geometry mismatch "
+                        "(cache_block_seq_len=%d, specpv_block_size=%d, total_budget=%d, local_kv_heads=%zu, "
+                        "hidden_units=%zu)",
+                        kv_block_len,
+                        specpv_cache_config_.block_size,
+                        specpv_cache_config_.total_budget(),
+                        local_kv_head_num_,
+                        hidden_units_);
+                    specpv_cache_config_ = SpecPVCacheConfig{};
+                    specpv_supported_    = false;
+                }
+                else {
+                    const int kv_head_dim = static_cast<int>(size_per_head_);
+                    specpv_kv_cache_      = std::make_unique<PartialKVCache>(specpv_cache_config_,
+                                                                        max_batch_size,
+                                                                        static_cast<int>(layer_num_),
+                                                                        static_cast<int>(local_kv_head_num_),
+                                                                        kv_head_dim,
+                                                                        dtype_);
+
+                    if (!specpv_kv_cache_ || !specpv_kv_cache_->is_enabled()) {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][SpecPV][fallback] partial KV disabled due to allocation failure "
+                            "(max_batch_size=%d, layers=%zu, local_kv_heads=%zu, head_dim=%d, total_budget=%d)",
+                            max_batch_size,
+                            layer_num_,
+                            local_kv_head_num_,
+                            kv_head_dim,
+                            specpv_cache_config_.total_budget());
+                        specpv_kv_cache_.reset();
+                        specpv_cache_config_ = SpecPVCacheConfig{};
+                        specpv_supported_    = false;
+                    }
+                    else {
+                        specpv_supported_ = true;
+                        TM_LOG_INFO(
+                            "[LlamaV2][SpecPV] partial KV cache initialized "
+                            "(block_size=%d, sink_blocks=%d, retrieval_blocks=%d, window_blocks=%d, "
+                            "spec_tokens_buf=%d, total_budget=%d)",
+                            specpv_cache_config_.block_size,
+                            specpv_cache_config_.n_sink_blocks,
+                            specpv_cache_config_.n_retrieval_blocks,
+                            specpv_cache_config_.n_window_blocks,
+                            specpv_cache_config_.n_spec_tokens_buf,
+                            specpv_cache_config_.total_budget());
+                    }
+                }
+            }
         }
         else {
             spec_mode_ = SpeculativeDecodingMode::None();
@@ -245,25 +317,35 @@ LlamaV2::LlamaV2(DataType                     dtype,
 
 bool LlamaV2::isSpecPVEnabled() const noexcept
 {
-    // Until the SpecPV partial-KV cache is implemented and wired, keep this
-    // gate effectively disabled so that enabling SpecPV in configuration
-    // cannot change runtime behaviour.
-    return engine_param_.enable_specpv && specpv_supported_;
+    return engine_param_.enable_specpv && specpv_supported_ && isTargetTreeDecodeEnabled()
+           && static_cast<bool>(specpv_kv_cache_);
 }
 
 bool LlamaV2::shouldUseSpecPV(int seq_len) const noexcept
 {
-    if (!isSpecPVEnabled()) {
+    if (!isSpecPVEnabled() || !specpv_kv_cache_) {
         return false;
     }
 
-    // Simple length-based gate for now; more detailed capacity checks will
-    // be added once the PartialKVCache is in place.
+    // Basic length- and capacity-based gate mirroring SpecPV's
+    // `should_partial_verify` helper: only enable partial verification
+    // beyond a configurable context length, and ensure we have enough
+    // headroom in the partial cache budget for this step's speculative
+    // tokens.
     if (seq_len <= engine_param_.specpv_partial_threshold) {
         return false;
     }
 
-    return true;
+    const int current_tokens = specpv_kv_cache_->get_seq_length();
+    const int max_tokens     = specpv_cache_config_.total_budget();
+
+    if (max_tokens <= 0) {
+        return false;
+    }
+
+    const int step_budget = std::max(1, eagle_max_engine_tokens_per_step_);
+
+    return current_tokens + step_budget + 1 <= max_tokens;
 }
 
 void LlamaV2::runEagleTargetTreeDecode(int batch_size,
@@ -541,6 +623,7 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         }
     }
 
+    int max_history_len = 0;
     for (int i = 0; i < batch_size; ++i) {
         const int tree_len   = h_tree_lens[i];
         const int prefix_len = h_prefix_len[i];
@@ -576,8 +659,37 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             }
         }
 
+        const int seq_len_i = prefix_len + tree_len;
+        max_history_len     = std::max(max_history_len, seq_len_i);
+
         h_q_len[i] = tree_len;
-        h_k_len[i] = prefix_len + tree_len;
+        h_k_len[i] = seq_len_i;
+    }
+
+    // For SpecPV, decide whether this step should be treated as a
+    // candidate for partial verification based on the maximum history
+    // length across active slots. The current implementation only tracks
+    // logical verified lengths and a simple partial-step counter; it does
+    // not yet alter the KV layout used by UnifiedDecoder, so behaviour
+    // remains identical to the full-KV target-tree path when SpecPV is
+    // enabled.
+    if (isSpecPVEnabled() && max_history_len > 0 && shouldUseSpecPV(max_history_len)) {
+        initSpecPVFromFullKV(max_history_len);
+
+        if (engine_param_.specpv_full_refresh_steps > 0) {
+            ++specpv_partial_steps_;
+            if (specpv_partial_steps_ > engine_param_.specpv_full_refresh_steps) {
+                TM_LOG_INFO(
+                    "[LlamaV2][SpecPV] partial-step budget exceeded for this engine "
+                    "(steps=%d, refresh_steps=%d); resetting partial KV lengths.",
+                    specpv_partial_steps_,
+                    engine_param_.specpv_full_refresh_steps);
+                if (specpv_kv_cache_) {
+                    specpv_kv_cache_->reset();
+                }
+                specpv_partial_steps_ = 0;
+            }
+        }
     }
 
     // Build a per-slot block table that reuses existing prefix KV blocks as
@@ -1107,6 +1219,21 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
             eagle_capture_hidden_ = Tensor{};
         }
     }
+}
+
+void LlamaV2::initSpecPVFromFullKV(int verified_seq_len)
+{
+    if (!specpv_kv_cache_ || !specpv_kv_cache_->is_enabled()) {
+        return;
+    }
+
+    const int clamped_len = std::max(0, std::min(verified_seq_len, specpv_cache_config_.total_budget()));
+
+    for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
+        specpv_kv_cache_->set_verified_length(layer, clamped_len);
+    }
+
+    TM_LOG_INFO("[LlamaV2][SpecPV] initialized partial KV verified_len=%d", clamped_len);
 }
 
 Tensor LlamaV2::postDecodeEmbedding(const Tensor& features, Buffer local_logits)

@@ -33,6 +33,7 @@
 #include "src/turbomind/models/llama/unified_decoder.h"
 #include "src/turbomind/models/llama/EagleModule.h"
 #include "src/turbomind/models/llama/EagleBuffers.h"
+#include "src/turbomind/models/llama/specpv_kv_cache.h"
 #include "lmdeploy/turbomind/speculative_decoding_mode.h"
 
 namespace turbomind {
@@ -216,6 +217,12 @@ private:
                                   const int*       d_sequence_lengths,
                                   const Sequence** sequences);
 
+    // Seed the SpecPV partial-KV cache from a fully-verified prefix up to
+    // `verified_seq_len` tokens. The current implementation only tracks
+    // logical lengths; KV contents remain managed by SequenceManager and
+    // the full-KV path until the partial-KV decode path is wired.
+    void initSpecPVFromFullKV(int verified_seq_len);
+
     // Max engine tokens TurboMind should handle per decode step
     // when running in EAGLE speculative mode.
     int eagleMaxEngineTokensPerStep() const noexcept
@@ -286,10 +293,12 @@ private:
     bool target_tree_supported_{false};
     bool eagle_tree_target_tokens_valid_{false};
 
-    // SpecPV support flag. Until the partial KV cache is implemented and
-    // wired, this remains false so that SpecPV gating never enables a
-    // partial-KV path.
+    // SpecPV partial-KV cache configuration and state. The cache is
+    // provisioned lazily based on engine parameters and KV geometry.
+    SpecPVCacheConfig                    specpv_cache_config_{};
+    std::unique_ptr<PartialKVCache>      specpv_kv_cache_;
     bool specpv_supported_{false};
+    int  specpv_partial_steps_{0};
 
     // Cached per-step acceptance summary for EAGLE. These vectors live on
     // host and are updated once per decode step on the TP leader rank.

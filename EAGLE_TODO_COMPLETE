@@ -308,6 +308,11 @@ into TurboMind for long‑context EAGLE3 runs.
         KV views.
       - `init_from_full_kv(...)` – seed sink/retrieval/window from full KV once.
       - `reset()` / `reset_buffer()`.
+  - Implementation status:
+    - `SpecPVCacheConfig` and a minimal `PartialKVCache` (owning per-layer KV buffers and tracking per-layer/global verified lengths) are now
+      present in `specpv_kv_cache.{h,cc}` and wired into `LlamaV2` construction and SpecPV gating.
+    - Summary/retrieval/buffer operations (`summary_key_states`, `refresh_retrieval`, `update`, `init_from_full_kv` data movement) are still
+      TODO and the current SpecPV path is bookkeeping-only (no change to the KV layout used by target-tree decode yet).
 
 - [ ] **[B] Attach PartialKVCache to LlamaV2**
   - Add a `SpecPVCacheConfig specpv_cache_config_` and

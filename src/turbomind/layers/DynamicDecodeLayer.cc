@@ -156,7 +156,7 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
     check_cuda_error(cudaMemcpyAsync(
         h_seq_len.data(), sequence_length.data<int>(), batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream_));
     check_cuda_error(cudaMemcpyAsync(
-        h_finished.data(), finished.data<bool>(), batch_size * sizeof(bool), cudaMemcpyDeviceToHost, stream_));
+        h_finished.data(), finished.buffer().raw_data(), batch_size * sizeof(bool), cudaMemcpyDeviceToHost, stream_));
     check_cuda_error(cudaStreamSynchronize(stream_));
 
     int* d_output_ids = output_ids.data<int>();
@@ -329,7 +329,7 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
             h_finished_bytes[i] = static_cast<uint8_t>(h_finished[i] ? 1 : 0);
         }
         check_cuda_error(cudaMemcpyAsync(
-            finished.data<bool>(), h_finished_bytes.data(), batch_size * sizeof(bool), cudaMemcpyHostToDevice, stream_));
+            finished.buffer().raw_data(), h_finished_bytes.data(), batch_size * sizeof(bool), cudaMemcpyHostToDevice, stream_));
         check_cuda_error(cudaStreamSynchronize(stream_));
     }
 
