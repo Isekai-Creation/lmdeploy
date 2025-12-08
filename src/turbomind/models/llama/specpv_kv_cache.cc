@@ -352,19 +352,19 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
     const int retrieval_tokens = cfg_.retrieval_size();
     const int window_tokens    = std::min(cfg_.window_size(), L);
 
-    Tensor retrieval_k = retrieval(layer_idx);
-    Tensor retrieval_v = retrieval_v(layer_idx);
-    Tensor window_k    = window(layer_idx);
-    Tensor window_v    = window_v(layer_idx);
+    Tensor retrieval_k_t = retrieval(layer_idx);
+    Tensor retrieval_v_t = retrieval_v(layer_idx);
+    Tensor window_k_t    = window(layer_idx);
+    Tensor window_v_t    = window_v(layer_idx);
 
-    if (!retrieval_k || !retrieval_v || !window_k || !window_v) {
+    if (!retrieval_k_t || !retrieval_v_t || !window_k_t || !window_v_t) {
         return;
     }
 
-    Tensor host_retrieval_k{retrieval_k.layout(), retrieval_k.dtype(), kCPU};
-    Tensor host_retrieval_v{retrieval_v.layout(), retrieval_v.dtype(), kCPU};
-    Tensor host_window_k{window_k.layout(), window_k.dtype(), kCPU};
-    Tensor host_window_v{window_v.layout(), window_v.dtype(), kCPU};
+    Tensor host_retrieval_k{retrieval_k_t.layout(), retrieval_k_t.dtype(), kCPU};
+    Tensor host_retrieval_v{retrieval_v_t.layout(), retrieval_v_t.dtype(), kCPU};
+    Tensor host_window_k{window_k_t.layout(), window_k_t.dtype(), kCPU};
+    Tensor host_window_v{window_v_t.layout(), window_v_t.dtype(), kCPU};
 
     float* retr_k_host = host_retrieval_k.data<float>();
     float* retr_v_host = host_retrieval_v.data<float>();
