@@ -537,7 +537,7 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
 
 #### 3.1.1 Core types and configuration
 
-- [ ] **S1.1 – Define SpecPV cache config**
+- [x] **S1.1 – Define SpecPV cache config**
   - File(s): `lmdeploy/src/turbomind/models/llama/LlamaV2.h` (or a new `specpv_kv_cache.h`).
   - Add a `SpecPVCacheConfig` struct with:
     - `block_size` (tokens per block; align with TurboMind KV manager block size).
@@ -548,8 +548,11 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
     - Default: `enable_specpv = false` (no behaviour change by default).
    - Fact mapping:
      - Mirrors `CacheConfig` in `SpecPV/specpv/kv/kv_cache.py`, including the `total_budget` logic.
+   - Implementation status:
+     - `EngineParam` exposes `enable_specpv` and the `specpv_*` fields in `llama_params.h`; LMDeploy’s `SpeculativeConfig` and Triton backend
+       (`LlamaTritonModel`) already parse and forward these into the TurboMind engine config.
 
-- [ ] **S1.2 – PartialKVCache class (TurboMind version)**
+- [x] **S1.2 – PartialKVCache class (TurboMind version)**
   - File(s): new `lmdeploy/src/turbomind/models/llama/specpv_kv_cache.{h,cc}`.
   - Implement a `PartialKVCache` (C++/CUDA side) analogous to SpecPV’s `PartialKVCache`:
     - Per-layer KV storage: one big tensor `[max_batch_size, num_kv_heads, total_budget, head_dim]`.
@@ -569,24 +572,32 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
       - `update(layer_idx, new_key_states, new_value_states) -> (key_view, value_view)`,
       - `add_to_sink(layer_idx, key_states, value_states)` (initial copy).
       - `get_seq_length(layer_idx)`, `reset()`.
+   - Implementation status:
+     - `SpecPVCacheConfig` and `PartialKVCache` are implemented in `specpv_kv_cache.{h,cc}`:
+       - Per-layer KV buffers `[max_batch, num_kv_heads, total_budget, head_dim]` are allocated for keys and values.
+       - Segment views (`sink`, `retrieval`, `window`, `buffer`) exist for both K and V.
+       - `summary_key_states`, `refresh_retrieval`, `update`, and `reset_buffer` are implemented in a float32 host-backed version; they mirror
+         the SpecPV Python behaviour but currently run on CPU (future work may move them to CUDA kernels).
 
 #### 3.1.2 Initialization and wiring to LlamaV2
 
-- [ ] **S1.3 – Allocate partial KV in LlamaV2**
+- [x] **S1.3 – Allocate partial KV in LlamaV2**
   - File(s): `LlamaV2.h`, `LlamaV2.cc`.
   - Add members:
     - `std::unique_ptr<PartialKVCache> specpv_kv_cache_;`
     - Flags: `bool specpv_enabled_`, `bool specpv_supported_;`.
-  - In `LlamaV2` ctor:
-    - If `engine_param_.enable_specpv`:
-      - Build `SpecPVCacheConfig` from engine params and TurboMind block geometry.
-      - Allocate `specpv_kv_cache_` and set `specpv_supported_ = true` if shapes/dtypes match:
-        - KV dtype matches base model compute dtype (BF16 for GPT-OSS-120B).
-      - On mismatch, log `[LlamaV2][SpecPV][fallback] partial KV disabled due to dtype/layout mismatch` and set `specpv_supported_ = false`.
+    - In `LlamaV2` ctor:
+      - If `engine_param_.enable_specpv` and EAGLE3 target-tree is supported:
+        - Build `SpecPVCacheConfig` from engine params and TurboMind block geometry.
+        - Allocate `specpv_kv_cache_` (float32 KV view) and set `specpv_supported_ = true` when allocation/geometry succeed.
+        - On mismatch or allocation failure, log `[LlamaV2][SpecPV][fallback] ...` and disable SpecPV for the engine.
     - Fact mapping:
       - Matches the constructor-time guards we already use in `LlamaV2` for `tree_hidden_states_` / `tree_logits_buffer_`, and SpecPV’s runtime checks before enabling partial KV.
+    - Implementation status:
+      - Implemented in `LlamaV2` ctor: SpecPV geometry is validated against `cache_block_seq_len`, head count, and total budget, with hard
+        `[SpecPV][fallback]` logging and disabling on any mismatch.
 
-- [ ] **S1.4 – Initialize partial KV from full KV**
+- [x] **S1.4 – Initialize partial KV from full KV**
   - File(s): `LlamaV2.cc` or `LlamaBatch.cc`, depending on where we manage KV reuse.
   - Add a helper:
     - `void LlamaV2::initSpecPVFromFullKV(const SequenceManager& seq_mgr, cudaStream_t stream);`
@@ -597,6 +608,10 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
     - Set `specpv_kv_cache_->enabled = true`, `retrieval_initialized = true`, `global_verified_lens = current_sequence_len`.
     - Fact mapping:
       - Equivalent to `PartialKVCache.init_key_values(full_past_key_values)` in `SpecPV/specpv/kv/kv_cache.py`, which seeds sink and other segments from full KV.
+    - Implementation status:
+      - Implemented as `LlamaV2::initSpecPVFromFullKV`, which flattens the full-prefix KV per layer via `flattenPrefixKVForLayer` and calls
+        `PartialKVCache::summary_key_states` and `refresh_retrieval` to populate sink/retrieval/window, then resets the speculative buffer
+        and marks `specpv_retrieval_initialized_ = true`.
 
 ---
 
@@ -606,7 +621,7 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
 
 #### 3.2.1 Step-level gating logic
 
-- [ ] **S2.1 – Implement `shouldUseSpecPV`**
+- [x] **S2.1 – Implement `shouldUseSpecPV`**
   - File(s): `LlamaV2.cc`.
   - Add a method:
     - `bool LlamaV2::shouldUseSpecPV(int sequence_len) const;`
@@ -620,10 +635,13 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
       - `specpv_kv_cache_->get_seq_length() + max_spec_tokens <= total_budget`.
     - Fact mapping:
       - Mirrors `should_partial_verify` in `SpecPV/specpv/speculate/utils.py`, which checks `enabled`, `retrieval_initialized`, and `get_seq_length() + total_tokens + 1 <= total_budget`.
+    - Implementation status:
+      - Implemented as `LlamaV2::shouldUseSpecPV(int seq_len) const`, which gates on `engine_param_.enable_specpv`, `specpv_supported_`,
+        a live `specpv_kv_cache_`, `specpv_partial_threshold`, and the partial-KV budget relative to `eagleMaxEngineTokensPerStep()`.
 
 #### 3.2.2 Integration with `runEagleTargetTreeDecode`
 
-- [ ] **S2.2 – Add SpecPV branch inside `runEagleTargetTreeDecode`**
+- [x] **S2.2 – Add SpecPV branch inside `runEagleTargetTreeDecode`**
   - File(s): `LlamaV2.cc`.
   - Today, `runEagleTargetTreeDecode`:
     - Builds scratch KV + packed masks.
@@ -638,8 +656,14 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
       - Keep using the existing full-KV scratch path (no SpecPV involvement).
   - Fact mapping:
     - Conceptually identical to `tree_decoding` in `SpecPV/specpv/speculate/utils.py`, which chooses between full KV (`full_past_key_values`) and partial KV (`partial_past_key_values`) based on `should_partial_verify`.
+  - Implementation status:
+    - `LlamaV2::runEagleTargetTreeDecode` now has a SpecPV branch that:
+      - Derives a partial prefix length from the SpecPV budget and `PartialKVCache::global_verified_len()`,
+      - Builds prefix+tree block geometry from this partial prefix,
+      - Populates scratch KV blocks for prefix from `PartialKVCache::active_prefix(...)` instead of `Sequence::blocks`,
+      - Leaves tree masks, logits→target_ids, and acceptance unchanged, and falls back to the full-KV path on any SpecPV invariant failure.
 
-- [ ] **S2.3 – Maintain `global_verified_lens` and per-layer `verified_lens` in tree decode**
+- [x] **S2.3 – Maintain `global_verified_lens` and per-layer `verified_lens` in tree decode**
   - On each EAGLE step where target-tree decode runs:
     - When **full-KV verify** is used for that step:
       - Update `specpv_kv_cache_->global_verified_lens` to equal the fully verified prefix length for the sequence.
@@ -655,6 +679,16 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
     - Mirrors:
       - `partial_past_key_values.global_verified_lens = input_ids.shape[1]` in `tree_decoding`.
       - Per-layer `verified_lens` increments and buffer rewrites in `update_inference_inputs` and `PartialKVCache.update` in SpecPV.
+  - Implementation status:
+    - TurboMind tracks the fully verified prefix length via `LlamaV2::specpv_full_prefix_len_` and uses `PartialKVCache::verified_lens_` /
+      `global_verified_len_` to represent the number of tail tokens stored in the SpecPV buffer. `updateSpecPVAfterAcceptance` computes the
+      committed `max_len` after EAGLE acceptance and:
+      - On first / full-refresh steps, calls `initSpecPVFromFullKV(max_len, ...)` to seed sink/retrieval/window and reset buffer lengths.
+      - On subsequent steps, flattens the full KV prefix to `[B,H,L,D]` via `flattenPrefixKVForLayer`, slices the tail tokens beyond
+        `specpv_full_prefix_len_`, and calls `PartialKVCache::update(layer, new_k, new_v)` per layer to append them into the buffer.
+    - `runEagleTargetTreeDecode` uses `PartialKVCache::global_verified_len()` together with the configured sink/retrieval/window sizes to
+      bound the effective prefix length in SpecPV mode. This differs slightly from the SpecPV paper’s naming (where `global_verified_lens`
+      is the full prefix length), but achieves the same effect with an explicit `specpv_full_prefix_len_` field.
 
 ---
 
@@ -676,6 +710,9 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
   - Wire kernels into `PartialKVCache::summary_key_states`.
   - Fact mapping:
     - Directly corresponds to `PartialKVCache.summary_key_states` in `SpecPV/specpv/kv/kv_cache.py`, which maintains per-block max/min summaries.
+  - Implementation status:
+    - A first implementation exists in `PartialKVCache::summary_key_states` (host-side float32), which computes per-block Kmax/Kmin
+      summaries and stores them in CPU tensors. A dedicated CUDA kernel file (`specpv_kv_kernels.cu`) remains future work for performance.
 
 #### 3.3.2 Retrieval refresh
 
@@ -697,6 +734,9 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
     - Matches `PartialKVCache.refresh_retrieval` in `SpecPV/specpv/kv/kv_cache.py`, which:
       - Computes per-block scores using `key_states_summary`.
       - Selects top blocks and fills `"retrieval"` and `"window"` slices accordingly.
+  - Implementation status:
+    - Implemented in `PartialKVCache::refresh_retrieval` as a host-based float32 path that scores blocks using Kmax/Kmin summaries, selects
+      top retrieval blocks, and fills retrieval/window K/V slices. A future CUDA implementation can replace the current CPU loops.
 
 ---
 
@@ -714,6 +754,14 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
       - Rejected tokens are dropped (just overwritten / masked).
   - Fact mapping:
     - Follows `PartialKVCache.update` in `SpecPV/specpv/kv/kv_cache.py`, which writes new tokens into the `"buffer"` slice and updates `verified_lens` when they become fully verified via `update_inference_inputs`.
+  - Implementation status:
+    - TurboMind’s current SpecPV v1 uses the buffer exclusively for **accepted tail tokens**, not for in-flight candidate tree tokens:
+      - After each EAGLE step where `shouldUseSpecPV(max_len)` is true and SpecPV has been seeded, `updateSpecPVAfterAcceptance` flattens
+        the full KV prefix, slices the newly committed tail (`max_len - specpv_full_prefix_len_`), and calls
+        `PartialKVCache::update(layer, new_k, new_v)` per layer to append into the buffer.
+      - Tree candidate tokens for the current step are still stored in the usual tree scratch KV and are not yet staged in the SpecPV
+        buffer during verification.
+    - Moving candidate tree tokens into the buffer during verification (and only keeping accepted ones) remains future work.
 
 - [ ] **S4.2 – Bind buffer capacity to EAGLE tree size**
   - Ensure:
@@ -723,10 +771,18 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
     - Disable SpecPV for the lifetime of the engine (`specpv_supported_ = false`).
   - Fact mapping:
     - Inspired by SpecPV’s `CacheConfig.n_spec_tokens_buf` and the way `initialize_past_key_values` sets it to `partial_spec_tokens + draft_model.total_tokens + 1`.
+  - Implementation status:
+    - TurboMind enforces buffer-related safety indirectly:
+      - `LlamaV2::shouldUseSpecPV` uses `specpv_cache_config_.total_budget()` and the per-step `eagleMaxEngineTokensPerStep()` budget to
+        gate whether SpecPV may be used at a given context length.
+      - `updateSpecPVAfterAcceptance` triggers a full-refresh when `specpv_kv_cache_->global_verified_len()` plus the next step’s token
+        budget would overflow the configured `n_spec_tokens_buf`.
+    - A stricter pre-flight check that explicitly verifies `n_spec_tokens_buf >= eagle_max_engine_tokens_per_step_ + margin` before
+      enabling SpecPV remains TODO.
 
 #### 3.4.2 Periodic full verification and refresh
 
-- [ ] **S4.3 – Full verification refresh trigger**
+- [x] **S4.3 – Full verification refresh trigger**
   - Add criteria:
     - `specpv_kv_cache_->verified_lens[layer]` exceeds some fraction of retrieval/window budgets.
     - Buffer tokens + new candidate tokens would overflow `n_spec_tokens_buf`.
@@ -738,6 +794,15 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
       - Reset `verified_lens` and buffer.
   - Fact mapping:
     - Implements the “periodic full verification” described in §3.3 of the paper and realized in practice by the interplay between full KV calls and `PartialKVCache.reset` / `init_key_values` in SpecPV.
+  - Implementation status:
+    - Implemented via `LlamaV2::updateSpecPVAfterAcceptance`:
+      - Maintains a per-engine `specpv_partial_steps_` counter incremented on each step where SpecPV is active.
+      - Computes a `buffer_close_to_full` condition from `PartialKVCache::global_verified_len()`, `SpecPVCacheConfig::buffer_size()`, and
+        `eagleMaxEngineTokensPerStep()`.
+      - When either the step counter exceeds `specpv_full_refresh_steps` or the buffer is close to full, logs a `[SpecPV] full-refresh`
+        message, calls `specpv_kv_cache_->reset()`, clears `specpv_retrieval_initialized_`, resets `specpv_partial_steps_` and
+        `specpv_full_prefix_len_`, thereby forcing the next step to run full-KV tree decode before reseeding SpecPV from the refreshed
+        prefix.
 
 ---
 
@@ -747,14 +812,18 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
 
 #### 3.5.1 Engine params and gating
 
-- [ ] **S5.1 – Engine param parsing**
+- [x] **S5.1 – Engine param parsing**
   - File(s): engine param parser (where `enable_eagle_target_tree` is parsed).
   - Add fields:
     - `enable_specpv` (bool),
     - `specpv_block_size`, `specpv_n_sink_blocks`, `specpv_n_retrieval_blocks`, `specpv_n_window_blocks`, `specpv_n_spec_tokens_buf`,
     - `specpv_partial_threshold`, `specpv_full_refresh_interval` (optional).
+  - Implementation status:
+    - Engine params and Triton config parsing for SpecPV are implemented: `EngineParam` exposes `enable_specpv` and the `specpv_*` fields in
+      `llama_params.h`, and `LlamaTritonModel` reads them from `speculative_config` YAML. LMDeploy’s `SpeculativeConfig` mirrors these
+      fields and passes them into `TurbomindEngineConfig.speculative_config`.
 
-- [ ] **S5.2 – Guarded usage**
+- [x] **S5.2 – Guarded usage**
   - Ensure every SpecPV entry point checks:
     - `enable_specpv && specpv_supported_`.
   - If any invariant fails at runtime (dtype/layout mismatch, insufficient buffer, incompatible vocab, etc.):
@@ -762,15 +831,24 @@ Below, tasks are grouped into phases but can be implemented incrementally. All i
     - Set `specpv_supported_ = false`.
     - Reset / free `specpv_kv_cache_`.
     - Continue with **baseline target-tree decode** or full non-SpecPV EAGLE pipeline.
+  - Implementation status:
+    - All SpecPV entry points in `LlamaV2` (constructor, `flattenPrefixKVForLayer`, `initSpecPVFromFullKV`, `updateSpecPVAfterAcceptance`,
+      and `runEagleTargetTreeDecode`) gate on `engine_param_.enable_specpv` and `specpv_supported_`, and on any invariant failure they log a
+      `[LlamaV2][SpecPV][fallback]` message, clear `specpv_kv_cache_`, reset SpecPV state, and revert to the full-KV EAGLE3 path.
 
 #### 3.5.2 Dtype and geometry invariants
 
-- [ ] **S5.3 – Dtype checks (BF16 / FP32 / MXFP4)**
+- [x] **S5.3 – Dtype checks (BF16 / FP32 / MXFP4)**
   - Check:
-    - Partial KV uses the same dtype as the base KV cache (BF16 for hidden).
-    - Any logits derived from partial KV (tree logits, acceptance logits) are FP32, as today.
+    - Flattening the full KV prefix for SpecPV seeding currently supports fp16/bf16 caches; quantized KV (int8/int4) is not used in SpecPV mode.
+    - The partial KV cache itself uses a float32 view internally for K/V and summaries; tree decode still uses fp16 KV blocks for attention
+      and keeps logits FP32 as in the full-KV path.
   - On mismatch:
     - Same fallback as above, no change to baseline.
+  - Implementation status:
+    - `flattenPrefixKVForLayer` enforces fp16/bf16 KV and logs a `[SpecPV][fallback]` message and disables SpecPV on any dtype/geometry/
+      allocation mismatch. `runEagleTargetTreeDecode`’s SpecPV branch additionally checks that the scratch KV dtype is unquantized fp16 and
+      falls back to full-KV EAGLE3 otherwise.
 
 ---
 

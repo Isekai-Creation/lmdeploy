@@ -280,7 +280,7 @@ into TurboMind for long‑context EAGLE3 runs.
 
 ### 5.2 PartialKVCache core (TurboMind analogue of SpecPV)
 
-- [ ] **[B] Implement SpecPVCacheConfig and PartialKVCache**
+- [x] **[B] Implement SpecPVCacheConfig and PartialKVCache**
   - `SpecPVCacheConfig`:
     - Holds `block_size`, `n_sink_blocks`, `n_retrieval_blocks`,
       `n_window_blocks`, `n_spec_tokens_buf`.
@@ -309,18 +309,18 @@ into TurboMind for long‑context EAGLE3 runs.
       - `init_from_full_kv(...)` – seed sink/retrieval/window from full KV once.
       - `reset()` / `reset_buffer()`.
   - Implementation status:
-    - `SpecPVCacheConfig` and `PartialKVCache` now exist in `specpv_kv_cache.{h,cc}` and are wired into `LlamaV2` construction and SpecPV
+    - `SpecPVCacheConfig` and `PartialKVCache` are implemented in `specpv_kv_cache.{h,cc}` and wired into `LlamaV2` construction and SpecPV
       gating:
       - Per-layer KV buffers `[max_batch, num_kv_heads, total_budget, head_dim]` are allocated on device for both keys and values.
       - Segment views (`sink`, `retrieval`, `window`, `buffer`) are implemented for K and V.
       - `summary_key_states` computes real Kmax/Kmin block summaries (float32) on host; `refresh_retrieval` uses those summaries to select
         top blocks and fills retrieval/window K/V slices from full KV; `update` writes new K/V into the buffer and returns active
         `[sink+retrieval+window+buffer]` views; `reset_buffer` clears buffer K/V and resets verified lengths.
-    - What remains at this level is seeding from the full TurboMind KV cache (`init_from_full_kv` behaviour), which is handled by
-      `LlamaV2::initSpecPVFromFullKV` in Section 5.3; until that wiring is complete, partial KV is not yet populated from live prefix KV
-      and tree decode still uses the full‑KV layout.
+    - Seeding from the live TurboMind full-KV cache is now provided by `LlamaV2::initSpecPVFromFullKV` (Section 5.3), which flattens the
+      prefix KV into `[B,H,L,D]` tensors and calls `summary_key_states` / `refresh_retrieval` per layer. The remaining work at this level is
+      purely performance-oriented (moving some host logic to CUDA) and extending dtype coverage beyond the current fp16/bf16→fp32 path.
 
-- [ ] **[B] Attach PartialKVCache to LlamaV2**
+- [x] **[B] Attach PartialKVCache to LlamaV2**
   - Add a `SpecPVCacheConfig specpv_cache_config_` and
     `std::unique_ptr<PartialKVCache> specpv_kv_cache_` to `LlamaV2`.
   - Initialize them from `EngineParam` in the LlamaV2 constructor when
@@ -328,7 +328,7 @@ into TurboMind for long‑context EAGLE3 runs.
 
 ### 5.3 SpecPV‑mode target‑tree decode
 
-- [ ] **[B] Add SpecPV mode to runEagleTargetTreeDecode**
+- [x] **[B] Add SpecPV mode to runEagleTargetTreeDecode**
   - Extend `LlamaV2::runEagleTargetTreeDecode` with a SpecPV branch:
     - Full‑KV mode (today’s behaviour) stays as the default when
       `!shouldUseSpecPV(seq_len)` or SpecPV is disabled.
@@ -352,10 +352,16 @@ into TurboMind for long‑context EAGLE3 runs.
   - Keep tree masks (`spec_packed_mask`) and post‑decode logic
     (logits → target_tokens → acceptance) unchanged.
   - Implementation status:
-    - `runEagleTargetTreeDecode` still uses the full‑KV scratch path for all modes; SpecPV currently only tracks verified lengths and step
-      counters and does not yet alter the KV layout or attention cost.
+    - `runEagleTargetTreeDecode` now has a SpecPV branch guarded by `isSpecPVEnabled()`, `specpv_retrieval_initialized_` and
+      `shouldUseSpecPV(seq_len)`:
+      - In SpecPV mode it computes a partial prefix length from the SpecPV budget and `PartialKVCache::global_verified_len()`, derives
+        prefix block geometry from that, and allocates scratch blocks for all prefix+tree tokens.
+      - Prefix K/V blocks for tree decode are populated from `PartialKVCache::active_prefix` into `scratch_kv_blocks` using the same block
+        layout as the full-KV path; tree K/V and masks, logits→target_ids, and acceptance remain unchanged.
+      - On any geometry/dtype/layout mismatch in this path, the code logs `[LlamaV2][SpecPV][fallback]`, disables SpecPV for the engine, and
+        falls back to the full-KV EAGLE3 tree decode.
 
-- [ ] **[B] Seed SpecPV from a full‑KV tree step**
+- [x] **[B] Seed SpecPV from a full‑KV tree step**
   - After the first full‑KV target‑tree decode at long context:
     - Call `LlamaV2::initSpecPVFromFullKV(committed_prefix_len)` to:
       - Flatten the full prefix KV cache per layer into contiguous
@@ -368,18 +374,18 @@ into TurboMind for long‑context EAGLE3 runs.
         `specpv_retrieval_initialized_` flag on `LlamaV2` so subsequent
         tree decodes can safely use the partial KV view.
   - Implementation status:
-    - `LlamaV2::initSpecPVFromFullKV` and `updateSpecPVAfterAcceptance` currently keep `PartialKVCache`’s verified lengths in sync with
-      committed sequence lengths after DynamicDecode+EAGLE acceptance, and `specpv_partial_steps_` / buffer capacity drive a simple
-      full‑refresh reset.
-    - Actual KV flattening from full KV into `[B,H,L,D]`, and
-      retrieval/window population inside `PartialKVCache`, remain TODO;
-      until these are implemented, SpecPV is length/bookkeeping only and
-      the tree decode path behaves identically to the full‑KV
-      implementation.
+    - `LlamaV2::initSpecPVFromFullKV` now flattens the full-prefix KV cache per layer into `[B,H,L,D]` tensors via
+      `flattenPrefixKVForLayer` (which reuses `invokeFlattenKV_v2`), then calls `PartialKVCache::summary_key_states` and
+      `PartialKVCache::refresh_retrieval` to populate sink/retrieval/window slices. The speculative buffer is reset so verified prefix
+      tokens are represented only via these slices.
+    - `updateSpecPVAfterAcceptance` drives seeding and refresh after DynamicDecode+EAGLE acceptance: it computes `max_len` from committed
+      `sequence_length`, calls `initSpecPVFromFullKV(max_len, ...)` when `shouldUseSpecPV(max_len)` is true, and uses
+      `specpv_partial_steps_` plus buffer headroom to trigger a full-refresh reset (dropping back to full-KV tree decode for the next
+      step and reseeding SpecPV from the new full prefix).
 
 ### 5.4 Partial/full switching and refresh
 
-- [ ] **[A] Implement SpecPV partial/full switching policy**
+- [x] **[A] Implement SpecPV partial/full switching policy**
   - Inside `LlamaBatch::Forward` / `LlamaV2`:
     - Use `shouldUseSpecPV(seq_len)` to decide:
       - Full‑KV tree decode (default) vs SpecPV mode for this step.
@@ -391,6 +397,13 @@ into TurboMind for long‑context EAGLE3 runs.
     - The partial‑step counter exceeds `specpv_full_refresh_steps`, or
     - Buffer usage approaches `n_spec_tokens_buf`, or
     - Any KV invariant or geometry check fails for the SpecPV path.
+  - Implementation status:
+    - `LlamaV2::shouldUseSpecPV(seq_len)` gates SpecPV based on context length and partial KV budget; `updateSpecPVAfterAcceptance`
+      increments `specpv_partial_steps_` when partial mode is active and computes a buffer-close-to-full condition from
+      `PartialKVCache::global_verified_len()` and `SpecPVCacheConfig::buffer_size()`.
+    - When either threshold is exceeded, `updateSpecPVAfterAcceptance` logs a full-refresh trigger, calls `specpv_kv_cache_->reset()`,
+      clears `specpv_retrieval_initialized_` and `specpv_partial_steps_`, ensuring the next step uses the full-KV tree decode path before
+      reseeding SpecPV from the refreshed prefix.
 
 - [ ] **[B] Update PartialKVCache after EAGLE acceptance**
   - After multi‑token acceptance and commit:
@@ -401,10 +414,19 @@ into TurboMind for long‑context EAGLE3 runs.
     - Keep `global_verified_lens` aligned with the full‑KV prefix as in
       SpecPV:
       - Only bump `global_verified_lens` on full‑KV refresh steps.
+  - Implementation status:
+    - V1 is now **incremental**:
+      - `LlamaV2::updateSpecPVAfterAcceptance` seeds SpecPV from the live full‑KV prefix via `initSpecPVFromFullKV` the first time (or
+        after a full‑refresh), and on subsequent steps uses `flattenPrefixKVForLayer` + `PartialKVCache::update(...)` to append newly
+        committed tail tokens into the SpecPV buffer per layer.
+      - `PartialKVCache::verified_lens_` / `global_verified_len_` track the number of buffered tail tokens, and `runEagleTargetTreeDecode`
+        uses this to bound the effective history length seen by tree decode in SpecPV mode.
+    - Full‑refresh policy remains in place: when `specpv_partial_steps_` or buffer headroom thresholds are exceeded, SpecPV is reset and
+      the next step runs full‑KV tree decode before reseeding the partial cache from the new prefix.
 
 ### 5.5 Interaction with existing KV and EAGLE paths
 
-- [ ] **[C] Keep SpecPV orthogonal to EAGLE semantics**
+- [x] **[C] Keep SpecPV orthogonal to EAGLE semantics**
   - Ensure SpecPV does not change:
     - EAGLE3 draft head maths or geometry.
     - Tree masks / structure.
@@ -413,14 +435,22 @@ into TurboMind for long‑context EAGLE3 runs.
     - Which KV entries the target attends to during tree decode.
     - How KV is updated and reused between partial/full verification
       steps.
+  - Implementation status:
+    - SpecPV only changes which KV entries the target attends to during target-tree decode (by replacing prefix K/V with the partial
+      cache in `runEagleTargetTreeDecode`). Tree structure, masks, EAGLE draft/acceptance kernels, and EOS/stop/max_new_tokens semantics
+      remain unchanged.
 
-- [ ] **[C] Maintain baseline and TRT‑LLM parity modes**
+- [x] **[C] Maintain baseline and TRT‑LLM parity modes**
   - When `enable_specpv == false`:
     - Behaviour must remain identical to the now‑completed EAGLE3 /
       target‑tree implementation (Sections 1–4).
   - SpecPV mode should be easy to toggle at runtime via config so we can
     benchmark:
     - Full‑KV TurboMind EAGLE3 vs SpecPV‑enabled TurboMind EAGLE3.
+  - Implementation status:
+    - When `enable_specpv == false` or SpecPV fails any invariant, `isSpecPVEnabled()` is false and the engine follows the completed
+      full-KV EAGLE3 target-tree implementation (Sections 1–4). When enabled and supported, SpecPV is confined to the target-tree decode
+      KV layout, and can be toggled per-engine via `EngineParam.enable_specpv` and related fields without affecting non-EAGLE paths.
 
 
 ---

@@ -512,7 +512,7 @@ std::pair<Tensor, Tensor> PartialKVCache::update(int layer_idx,
 
     // Write into the buffer segment for this layer.
     Tensor buf_k = buffer(layer_idx);
-    Tensor buf_v = buffer(layer_idx);
+    Tensor buf_v = buffer_v(layer_idx);
     if (!buf_k || !buf_v) {
         return {Tensor{}, Tensor{}};
     }

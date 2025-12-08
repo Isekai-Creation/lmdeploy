@@ -524,4 +524,59 @@ INSTANTIATE_invokeFlattenKV_v2(half);
 INSTANTIATE_invokeFlattenKV_v2(nv_bfloat16);
 #endif
 
+size_t get_cache_block_size(DataType dtype,
+                            DataType kvtype,
+                            int      layer_num,
+                            int      head_num,
+                            int      head_dim,
+                            int      block_seq_len)
+{
+    // Mirror the block::Layout math in block.h:
+    //   token_data_size = q_bits * head_dim / 8
+    //   token_param_size = t_bits * 2 / 8
+    //   head_data_size  = block_len * token_data_size
+    //   head_param_size = block_len * token_param_size
+    //   layer_size      = head_num * 2 * head_data_size
+    //                   + head_num * 2 * head_param_size
+    //   block_size      = layer_size * layer_num
+
+    auto bits_for = [](DataType dt) -> int {
+        switch (dt) {
+            case kFloat16:
+            case kBfloat16:
+                return 16;
+            case kFloat32:
+                return 32;
+            case kUint8:
+                return 8;
+            case kUint4:
+                return 4;
+            case kUint2:
+                return 2;
+            default:
+                return 8;
+        }
+    };
+
+    const int q_bits = bits_for(kvtype);
+    int       t_bits = 0;
+    if (kvtype != dtype) {
+        t_bits = bits_for(dtype);
+    }
+
+    const int token_data_bits   = q_bits * head_dim;
+    const int token_param_bits  = t_bits * 2;
+    const int token_data_bytes  = token_data_bits / 8;
+    const int token_param_bytes = token_param_bits / 8;
+
+    const size_t head_data_bytes  = static_cast<size_t>(block_seq_len) * token_data_bytes;
+    const size_t head_param_bytes = static_cast<size_t>(block_seq_len) * token_param_bytes;
+
+    const size_t layer_size =
+        static_cast<size_t>(head_num) * 2 * head_data_bytes
+        + static_cast<size_t>(head_num) * 2 * head_param_bytes;
+
+    return layer_size * static_cast<size_t>(layer_num);
+}
+
 }  // namespace turbomind

@@ -267,8 +267,10 @@ LlamaV2::LlamaV2(DataType                     dtype,
                         specpv_cache_config_.total_budget(),
                         local_kv_head_num_,
                         hidden_units_);
-                    specpv_cache_config_ = SpecPVCacheConfig{};
-                    specpv_supported_    = false;
+                    specpv_cache_config_        = SpecPVCacheConfig{};
+                    specpv_supported_           = false;
+                    specpv_retrieval_initialized_ = false;
+                    specpv_partial_steps_       = 0;
                 }
                 else {
                     const int kv_head_dim = static_cast<int>(size_per_head_);
@@ -292,8 +294,10 @@ LlamaV2::LlamaV2(DataType                     dtype,
                             kv_head_dim,
                             specpv_cache_config_.total_budget());
                         specpv_kv_cache_.reset();
-                        specpv_cache_config_ = SpecPVCacheConfig{};
-                        specpv_supported_    = false;
+                        specpv_cache_config_        = SpecPVCacheConfig{};
+                        specpv_supported_           = false;
+                        specpv_retrieval_initialized_ = false;
+                        specpv_partial_steps_       = 0;
                     }
                     else {
                         specpv_supported_ = true;
@@ -693,12 +697,22 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
 
     // In SpecPV mode we override the prefix geometry based on the
     // partial KV budget; otherwise we keep the existing full-KV path.
-    const int partial_prefix_tokens = use_specpv
-        ? specpv_cache_config_.sink_size()
-              + specpv_cache_config_.retrieval_size()
-              + specpv_cache_config_.window_size()
-              + specpv_kv_cache_->global_verified_len()
-        : 0;
+    int partial_prefix_tokens = 0;
+    if (use_specpv) {
+        partial_prefix_tokens = specpv_cache_config_.sink_size()
+                                + specpv_cache_config_.retrieval_size()
+                                + specpv_cache_config_.window_size()
+                                + specpv_kv_cache_->global_verified_len();
+        if (partial_prefix_tokens <= 0) {
+            TM_LOG_WARNING(
+                "[LlamaV2][SpecPV][fallback] partial prefix tokens <= 0 in tree decode; disabling SpecPV.");
+            specpv_supported_             = false;
+            specpv_retrieval_initialized_ = false;
+            specpv_partial_steps_         = 0;
+            specpv_kv_cache_.reset();
+            use_specpv = false;
+        }
+    }
 
     for (int i = 0; i < batch_size; ++i) {
         const int tree_len   = h_tree_lens[i];
@@ -710,7 +724,8 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             const int prefix_len_i = std::min(prefix_len, partial_prefix_tokens);
             const int total_len    = prefix_len_i + tree_len;
 
-            h_k_len[i] = total_len;
+            h_prefix_len[i] = prefix_len_i;
+            h_k_len[i]      = total_len;
 
             prefix_blocks = (prefix_len_i > 0)
                                 ? (prefix_len_i + block_seq_len - 1) / block_seq_len
@@ -759,6 +774,22 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         kv_dtype = kUint4;
     }
 
+    // SpecPV integration currently supports only unquantized fp16 KV
+    // for the tree decode path. On any other KV dtype we fall back to
+    // the full-KV EAGLE3 pipeline.
+    if (use_specpv && (dtype_ != kFloat16 || kv_dtype != kFloat16)) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] partial KV tree decode only supports fp16 KV "
+            "(model_dtype=%s, kv_dtype=%s); disabling SpecPV for this engine.",
+            to_string(dtype_),
+            to_string(kv_dtype));
+        use_specpv                     = false;
+        specpv_supported_              = false;
+        specpv_retrieval_initialized_  = false;
+        specpv_partial_steps_          = 0;
+        specpv_kv_cache_.reset();
+    }
+
     const size_t kv_block_bytes = get_cache_block_size(dtype_,
                                                        kv_dtype,
                                                        static_cast<int>(layer_num_),
@@ -799,10 +830,10 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             for (int j = 0; j < blocks_i; ++j) {
                 const int global_idx = base_index + j;
                 h_block_ptrs[static_cast<size_t>(global_idx)] =
-                    reinterpret_cast<uintptr_t>(kv_base
-                                                + static_cast<size_t>(scratch_block_cursor + j) * kv_block_bytes);
+                    reinterpret_cast<uintptr_t>(
+                        kv_base + static_cast<size_t>(global_idx) * kv_block_bytes);
             }
-            scratch_block_cursor += blocks_i;
+            (void)scratch_block_cursor;
         }
         else {
             // Prefix KV: reuse existing block pointers from SequenceManager as
@@ -844,6 +875,145 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
             }
 
             scratch_block_cursor += extra_blocks;
+        }
+    }
+
+    // In SpecPV mode, populate the scratch prefix blocks with K/V taken
+    // from the partial KV cache so that tree decode attention runs over
+    // the SpecPV-compressed history instead of the full prefix KV.
+    if (use_specpv) {
+        if (!specpv_kv_cache_) {
+            TM_LOG_WARNING(
+                "[LlamaV2][SpecPV][fallback] partial KV cache missing in tree decode; disabling SpecPV.");
+            specpv_supported_             = false;
+            specpv_retrieval_initialized_ = false;
+            specpv_partial_steps_         = 0;
+            specpv_kv_cache_.reset();
+            use_specpv = false;
+        }
+        else {
+            const int head_dim  = static_cast<int>(size_per_head_);
+            const int kv_heads  = static_cast<int>(local_kv_head_num_);
+            bool      specpv_ok = true;
+
+            auto fill_layer = [&](auto head_dim_tag) {
+                constexpr int kHeadDim = decltype(head_dim_tag)::value;
+
+                block::Config<half, half, kHeadDim> cfg{kv_heads, block_seq_len};
+                block::Layout<block::Config<half, half, kHeadDim>> layout{cfg};
+
+                const int prefix_tokens = partial_prefix_tokens;
+
+                for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
+                    auto [k_prefix, v_prefix] = specpv_kv_cache_->active_prefix(layer, prefix_tokens);
+                    if (!k_prefix || !v_prefix || k_prefix.dtype() != kFloat32 || v_prefix.dtype() != kFloat32) {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][SpecPV][fallback] invalid active_prefix for layer=%d in tree decode; "
+                            "disabling SpecPV.",
+                            layer);
+                        specpv_ok = false;
+                        return;
+                    }
+
+                    const int B = static_cast<int>(k_prefix.shape(0));
+                    const int H = static_cast<int>(k_prefix.shape(1));
+                    const int S = static_cast<int>(k_prefix.shape(2));
+                    const int D = static_cast<int>(k_prefix.shape(3));
+
+                    if (B < batch_size || H < kv_heads || D != kHeadDim || S <= 0) {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][SpecPV][fallback] active_prefix shape mismatch for layer=%d "
+                            "(B=%d,H=%d,S=%d,D=%d, batch=%d, kv_heads=%d, head_dim=%d); disabling SpecPV.",
+                            layer,
+                            B,
+                            H,
+                            S,
+                            D,
+                            batch_size,
+                            kv_heads,
+                            kHeadDim);
+                        specpv_ok = false;
+                        return;
+                    }
+
+                    const float* k_src = k_prefix.data<float>();
+                    const float* v_src = v_prefix.data<float>();
+
+                    for (int slot = 0; slot < batch_size && specpv_ok; ++slot) {
+                        const int prefix_len_i = std::min(h_prefix_len[slot], prefix_tokens);
+                        const int prefix_blocks = h_prefix_blocks[slot];
+                        const int base_index    = h_cu_block_nums[slot];
+
+                        for (int b = 0; b < prefix_blocks; ++b) {
+                            const int global_block = base_index + b;
+                            char*     block_ptr    = kv_base
+                                                  + static_cast<size_t>(global_block) * kv_block_bytes;
+
+                            std::vector<uint8_t> host_block(static_cast<size_t>(kv_block_bytes), 0);
+
+                            for (int head = 0; head < kv_heads; ++head) {
+                                for (int t = 0; t < block_seq_len; ++t) {
+                                    const int global_t = b * block_seq_len + t;
+                                    if (global_t >= prefix_len_i || global_t >= S) {
+                                        break;
+                                    }
+
+                                    const ssize_t src_base =
+                                        (((static_cast<ssize_t>(slot) * H + head) * S + global_t)
+                                         * D);
+
+                                    const float* k_row = k_src + src_base;
+                                    const float* v_row = v_src + src_base;
+
+                                    const int k_off = layout.k_data(layer, head, t);
+                                    const int v_off = layout.v_data(layer, head, t);
+
+                                    auto* k_dst = reinterpret_cast<half*>(host_block.data() + k_off);
+                                    auto* v_dst = reinterpret_cast<half*>(host_block.data() + v_off);
+
+                                    for (int d = 0; d < D; ++d) {
+                                        k_dst[d] = __float2half(k_row[d]);
+                                        v_dst[d] = __float2half(v_row[d]);
+                                    }
+                                }
+                            }
+
+                            check_cuda_error(cudaMemcpyAsync(block_ptr,
+                                                             host_block.data(),
+                                                             kv_block_bytes,
+                                                             cudaMemcpyHostToDevice,
+                                                             stream_));
+                        }
+                    }
+                }
+            };
+
+            if (specpv_ok) {
+                if (head_dim == 64) {
+                    fill_layer(std::integral_constant<int, 64>{});
+                }
+                else if (head_dim == 128) {
+                    fill_layer(std::integral_constant<int, 128>{});
+                }
+                else if (head_dim == 192) {
+                    fill_layer(std::integral_constant<int, 192>{});
+                }
+                else {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][SpecPV][fallback] unsupported head_dim=%d for partial KV tree decode; "
+                        "disabling SpecPV.",
+                        head_dim);
+                    specpv_ok = false;
+                }
+            }
+
+            if (!specpv_ok) {
+                specpv_supported_             = false;
+                specpv_retrieval_initialized_ = false;
+                specpv_partial_steps_         = 0;
+                specpv_kv_cache_.reset();
+                use_specpv = false;
+            }
         }
     }
 
@@ -1280,6 +1450,10 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
             "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer only supports fp16/bf16 KV "
             "(dtype=%s); disabling SpecPV for this engine.",
             to_string(dtype_));
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
         return false;
     }
 
@@ -1342,6 +1516,10 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
             "(cursor=%d, total_blocks=%d); disabling SpecPV.",
             cursor,
             total_blocks);
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
         return false;
     }
 
@@ -1378,6 +1556,10 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                        head_num,
                        max_seq_len,
                        head_dim);
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
         return false;
     }
 
@@ -1456,6 +1638,10 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                        head_num,
                        max_seq_len,
                        head_dim);
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
         return false;
     }
 
@@ -1478,7 +1664,9 @@ void LlamaV2::initSpecPVFromFullKV(int              verified_seq_len,
         TM_LOG_WARNING(
             "[LlamaV2][SpecPV][fallback] initSpecPVFromFullKV missing SequenceManager or sequences; "
             "disabling SpecPV for this engine.");
-        specpv_supported_ = false;
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
         specpv_kv_cache_.reset();
         return;
     }
@@ -1492,6 +1680,7 @@ void LlamaV2::initSpecPVFromFullKV(int              verified_seq_len,
             specpv_kv_cache_->set_verified_length(layer, 0);
         }
         specpv_retrieval_initialized_ = false;
+        specpv_full_prefix_len_       = 0;
         TM_LOG_INFO("[LlamaV2][SpecPV] initialized partial KV with empty prefix (verified_len=0)");
         return;
     }
@@ -1507,9 +1696,10 @@ void LlamaV2::initSpecPVFromFullKV(int              verified_seq_len,
             TM_LOG_WARNING(
                 "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer failed for layer=%d; disabling SpecPV.",
                 layer);
-            specpv_supported_ = false;
-            specpv_kv_cache_.reset();
+            specpv_supported_             = false;
             specpv_retrieval_initialized_ = false;
+            specpv_partial_steps_         = 0;
+            specpv_kv_cache_.reset();
             return;
         }
 
@@ -1531,6 +1721,7 @@ void LlamaV2::initSpecPVFromFullKV(int              verified_seq_len,
     }
 
     specpv_retrieval_initialized_ = true;
+    specpv_full_prefix_len_       = clamped_len;
     TM_LOG_INFO("[LlamaV2][SpecPV] partial KV seeded from full KV (verified_len=%d)", clamped_len);
 }
 
@@ -1546,7 +1737,9 @@ void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length,
         TM_LOG_WARNING(
             "[LlamaV2][SpecPV][fallback] sequence_length buffer has unexpected device/dtype; "
             "disabling SpecPV for this engine.");
-        specpv_supported_ = false;
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
         specpv_kv_cache_.reset();
         return;
     }
@@ -1573,10 +1766,80 @@ void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length,
         return;
     }
 
-    // Seed or refresh the partial KV view from the fully committed
-    // prefix. KV contents are flattened from the live full-KV cache
-    // into SpecPV's partial cache.
-    initSpecPVFromFullKV(max_len, sequences, batch_size, h_seq_len.data());
+    // When SpecPV has not yet been seeded (or after a full-refresh),
+    // build the partial KV view from the live full-KV prefix.
+    if (!specpv_retrieval_initialized_) {
+        initSpecPVFromFullKV(max_len, sequences, batch_size, h_seq_len.data());
+
+        // initSpecPVFromFullKV may disable SpecPV on failure; in that
+        // case we stop here and leave the engine on the full-KV path.
+        if (!specpv_retrieval_initialized_ || !specpv_supported_ || !specpv_kv_cache_) {
+            return;
+        }
+    }
+    else {
+        // Incremental partial KV update: append newly committed tail
+        // tokens beyond the last full-prefix length into the SpecPV
+        // buffer via PartialKVCache::update(...). This keeps sink /
+        // retrieval / window as seeded, while the buffer tracks recent
+        // verified tokens between full-refreshes.
+
+        const int prev_full_len = std::max(0, specpv_full_prefix_len_);
+        const int tail_len      = std::max(0, max_len - prev_full_len);
+
+        if (tail_len > 0) {
+            const int tail_start = max_len - tail_len;
+
+            for (int layer = 0; layer < static_cast<int>(layer_num_); ++layer) {
+                Tensor full_k;
+                Tensor full_v;
+
+                // Flatten the current full-prefix KV for this layer. On
+                // any failure this helper will log and disable SpecPV.
+                if (!flattenPrefixKVForLayer(layer,
+                                             max_len,
+                                             sequences,
+                                             batch_size,
+                                             h_seq_len.data(),
+                                             full_k,
+                                             full_v)) {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][SpecPV][fallback] incremental flattenPrefixKVForLayer failed for "
+                        "layer=%d; disabling SpecPV.",
+                        layer);
+                    specpv_supported_             = false;
+                    specpv_retrieval_initialized_ = false;
+                    specpv_partial_steps_         = 0;
+                    specpv_kv_cache_.reset();
+                    return;
+                }
+
+                if (!full_k || !full_v || full_k.shape(2) <= tail_start) {
+                    continue;
+                }
+
+                const int D = static_cast<int>(full_k.shape(3));
+                std::vector<ssize_t> tail_idx{0, 0, tail_start, 0};
+                std::vector<ssize_t> tail_shape{
+                    full_k.shape(0), full_k.shape(1), tail_len, D};
+
+                // Clamp the tail view to the available tokens in case
+                // some sequences are shorter than max_len.
+                const int available_tokens = static_cast<int>(full_k.shape(2)) - tail_start;
+                if (available_tokens <= 0) {
+                    continue;
+                }
+                tail_shape[2] = std::min(tail_len, available_tokens);
+
+                Tensor new_k = full_k.slice(tail_idx, tail_shape);
+                Tensor new_v = full_v.slice(tail_idx, tail_shape);
+
+                specpv_kv_cache_->update(layer, new_k, new_v);
+            }
+
+            specpv_full_prefix_len_ = max_len;
+        }
+    }
 
     if (engine_param_.specpv_full_refresh_steps > 0) {
         ++specpv_partial_steps_;
@@ -1598,7 +1861,9 @@ void LlamaV2::updateSpecPVAfterAcceptance(const Buffer& sequence_length,
                 step_budget);
 
             specpv_kv_cache_->reset();
-            specpv_partial_steps_ = 0;
+            specpv_retrieval_initialized_ = false;
+            specpv_partial_steps_         = 0;
+            specpv_full_prefix_len_       = 0;
         }
     }
 }

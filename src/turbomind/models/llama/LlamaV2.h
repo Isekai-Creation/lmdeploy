@@ -318,11 +318,16 @@ private:
 
     // SpecPV partial-KV cache configuration and state. The cache is
     // provisioned lazily based on engine parameters and KV geometry.
-    SpecPVCacheConfig                    specpv_cache_config_{};
-    std::unique_ptr<PartialKVCache>      specpv_kv_cache_;
-    bool specpv_supported_{false};
-    int  specpv_partial_steps_{0};
-    bool specpv_retrieval_initialized_{false};
+    SpecPVCacheConfig               specpv_cache_config_{};
+    std::unique_ptr<PartialKVCache> specpv_kv_cache_;
+    bool                            specpv_supported_{false};
+    int                             specpv_partial_steps_{0};
+    bool                            specpv_retrieval_initialized_{false};
+    // Full committed prefix length (in tokens) at the last time we
+    // seeded or fully refreshed the SpecPV partial KV cache from the
+    // live TurboMind KV. Incremental updates append tokens beyond this
+    // length into the SpecPV buffer via PartialKVCache::update().
+    int specpv_full_prefix_len_{0};
 
     // Cached per-step acceptance summary for EAGLE. These vectors live on
     // host and are updated once per decode step on the TP leader rank.

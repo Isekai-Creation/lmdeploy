@@ -385,3 +385,110 @@ do not affect normal decode behaviour:
 These helpers stay strictly within Engineer-A scope (kernels,
 EagleModule, metrics, and offline tooling) and are safe to use without
 modifying LlamaBatch, LlamaV2_eagle, or DynamicDecodeLayer.
+
+## SpecPV partial-KV verification for EAGLE3 target-tree decode (advanced)
+
+TurboMind includes an optional SpecPV-style *partial KV verification* path for EAGLE3 target-tree decode. When enabled, the target model
+verifies EAGLE trees against a compressed KV view (sink + retrieval + window + speculative buffer) instead of the full prefix KV at long
+context. When disabled or unsupported, behaviour is identical to the full-KV EAGLE3 pipeline described above.
+
+### Enabling SpecPV from Python
+
+SpecPV is configured entirely via `SpeculativeConfig` and only applies to TurboMind EAGLE3:
+
+- `method="eagle3"` (SpecPV is EAGLE3-only).
+- `enable_target_tree=True` (SpecPV only affects target-tree decode).
+- `enable_specpv=True` plus optional geometry fields:
+  - `specpv_block_size` (defaults to 16, must match TurboMind KV block size),
+  - `specpv_n_sink_blocks` (fixed number of initial “sink” blocks),
+  - `specpv_n_retrieval_blocks` (number of retrieved blocks),
+  - `specpv_n_window_blocks` (tail window blocks),
+  - `specpv_n_spec_tokens_buf` (buffer tokens for partially verified KV),
+  - `specpv_partial_threshold` (min context length before partial KV can kick in),
+  - `specpv_full_refresh_steps` (max partial steps between full-KV refreshes).
+
+Example (single-GPU, offline TurboMind pipeline):
+
+```python
+from lmdeploy import pipeline as lm_pipeline
+from lmdeploy.messages import TurbomindEngineConfig
+from lmdeploy.speculative_config import SpeculativeConfig, validate_eagle_runtime_config
+
+spec_cfg = SpeculativeConfig(
+    method="eagle3",
+    model="/path/to/draft_model",
+    num_speculative_tokens=4,
+    enable_target_tree=True,
+    enable_specpv=True,
+    # Optional: override SpecPV geometry; these defaults mirror EngineParam
+    specpv_block_size=16,
+    specpv_n_sink_blocks=2,
+    specpv_n_retrieval_blocks=256,
+    specpv_n_window_blocks=8,
+    specpv_n_spec_tokens_buf=128,
+    specpv_partial_threshold=4096,
+    specpv_full_refresh_steps=32,
+)
+
+engine_cfg = TurbomindEngineConfig(
+    tp=1,
+    session_len=32768,
+    max_batch_size=8,
+    speculative_config=spec_cfg,
+)
+
+validate_eagle_runtime_config(engine_cfg, spec_cfg)
+
+pipe = lm_pipeline(
+    model_path="/path/to/turbomind_model",
+    backend_config=engine_cfg,
+    speculative_config=spec_cfg,
+)
+```
+
+On the C++ side, these fields are carried into `EngineParam` as `enable_specpv` and the `specpv_*` members. `LlamaV2` then:
+
+- Allocates a `PartialKVCache` with a per-layer KV budget:
+  `sink_size + retrieval_size + window_size + n_spec_tokens_buf`.
+- Seeds the partial KV cache from the live full-KV prefix via `initSpecPVFromFullKV(...)`:
+  - Flattens full prefix KV into `[B, H_kv, L, D]` tensors,
+  - Computes block-level Kmax/Kmin summaries,
+  - Fills sink / retrieval / window slices.
+- Decides per step whether to use SpecPV via `shouldUseSpecPV(seq_len)`:
+  - Requires `seq_len > specpv_partial_threshold`,
+  - Requires enough partial-KV headroom for the current step,
+  - Is further gated by `enable_specpv`, geometry checks, and target-tree support.
+
+When SpecPV is active for a tree decode step:
+
+- `runEagleTargetTreeDecode` builds KV for tree attention from `PartialKVCache` instead of `Sequence::blocks`:
+  - Prefix KV blocks (sink + retrieval + window + any verified buffer) are written into scratch blocks from `PartialKVCache::active_prefix`.
+  - Tree tokens’ KV remain in per-step scratch as before.
+  - Tree masks, logits→target_ids, and acceptance remain unchanged.
+- After DynamicDecode+EAGLE acceptance, `updateSpecPVAfterAcceptance`:
+  - Reads committed `sequence_length` from device,
+  - Calls `initSpecPVFromFullKV(max_len, ...)` when `shouldUseSpecPV(max_len)` is true to reseed the partial KV from the fully verified prefix,
+  - Tracks a `specpv_partial_steps_` counter and buffer usage; when either exceeds thresholds, it logs a full-refresh trigger, resets the
+    partial KV cache, and forces the next step back to full-KV tree decode before reseeding.
+
+### Safety and fallbacks
+
+SpecPV is strictly opt-in and designed to fail safe:
+
+- Gating: `isSpecPVEnabled()` requires `enable_specpv`, target-tree support, a successfully allocated `PartialKVCache`, and no prior
+  SpecPV fallback.
+- Dtype/geometry constraints:
+  - Flattening the full KV prefix for seeding only supports fp16/bf16 KV caches; quantized KV (int8/int4) is not used in SpecPV mode.
+  - The SpecPV tree decode path currently assumes unquantized fp16 KV for scratch blocks.
+- On any invariant failure (dtype/layout/geometry mismatch, allocation failure, invalid partial prefix length, unsupported head_dim, etc.)
+  the engine logs a `[LlamaV2][SpecPV][fallback] ...` message and:
+  - Sets `specpv_supported_ = false`,
+  - Clears `specpv_retrieval_initialized_` and `specpv_partial_steps_`,
+  - Resets `specpv_kv_cache_`.
+
+After a fallback, `isSpecPVEnabled()` is permanently false for that engine instance and TurboMind uses the full-KV EAGLE3 target-tree path for
+all subsequent steps. From the Python side:
+
+- Turning `enable_specpv=False` or hitting a fallback yields the same token streams and metrics as the full-KV EAGLE3 implementation.
+- SpecPV does not change draft head geometry, EAGLE acceptance semantics, EOS/stop/max_new_tokens handling, or the shape/schema of
+  `eagle_speculation` metrics; it only affects which KV entries the target attends to during the tree decode pass.**
