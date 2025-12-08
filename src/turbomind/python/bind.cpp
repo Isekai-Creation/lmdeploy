@@ -381,6 +381,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     Tensor hidden_out;
 
     bool   use_eagle3_draft_layer = module.hasEagle3DraftLayer();
+    Tensor fc_out_dbg;
     Tensor attn_out_dbg;
     Tensor ffn_out_dbg;
     Tensor pre_head_dbg;
@@ -392,13 +393,19 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     if (use_eagle3_draft_layer) {
         // Minimal model/context wrappers needed for LlamaFfnLayer.
         ft::ModelParam model_param{};
-        model_param.hidden_units = static_cast<size_t>(hidden_units);
-
+        model_param.hidden_units = static_cast(hidden_units);
         ft::Context ctx(device_id);
         ft::LlamaFfnLayer ffn_layer(model_param, ctx);
-
         const auto* draft_w = module.eagle3_draft_layer_.get();
-        ft::Eagle3DraftLayer draft_layer(draft_w, &ffn_layer, /*rmsnorm_eps=*/1e-5f);
+
+        // In this offline helper we don't have a full UnifiedAttentionLayer
+        // instance, so we pass nullptr for attn_layer. Eagle3DraftLayer will
+        // fall back to its guarded shallow path when attn_layer_ is null.
+        ft::Eagle3DraftLayer draft_layer(
+            draft_w,
+            /*attn_layer=*/nullptr,
+            &ffn_layer,
+            /*rmsnorm_eps=*/1e-5f);
 
         // Allocate output hidden buffer and run the draft layer.
         hidden_out = Tensor(
@@ -409,6 +416,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         draft_layer.Forward(*hidden_tm, hidden_out, stream);
         ft::check_cuda_error(cudaStreamSynchronize(stream));
 
+        fc_out_dbg   = draft_layer.debug_fc_out();
         attn_out_dbg = draft_layer.debug_attn_out();
         ffn_out_dbg  = draft_layer.debug_ffn_out();
         pre_head_dbg = draft_layer.debug_pre_head_hidden();
@@ -466,6 +474,9 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     out["logits"] = logits;
 
     if (use_eagle3_draft_layer) {
+        if (fc_out_dbg) {
+            out["fc_out"] = fc_out_dbg;
+        }
         if (attn_out_dbg) {
             out["attn_out"] = attn_out_dbg;
         }

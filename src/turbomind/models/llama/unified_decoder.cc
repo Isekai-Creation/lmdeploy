@@ -73,14 +73,26 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
 void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
 {
     eagle3_draft_weight_ = w;
-    if (w && ffn_layer_ && attn_layer_) {
-        eagle3_draft_layer_ =
-            std::make_unique<Eagle3DraftLayer>(w, attn_layer_.get(), ffn_layer_.get(), rmsnorm_eps_);
+
+    // We need both attention + FFN backends to run a real Eagle3 draft layer.
+    if (w && attn_layer_ && ffn_layer_) {
+        eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayer>(
+            w,
+            attn_layer_.get(),   // real attention backend
+            ffn_layer_.get(),    // GatedMLP backend
+            rmsnorm_eps_);
     }
     else {
+        TM_LOG_WARNING(
+            "[UnifiedDecoder][EAGLE3][fallback] draft layer disabled "
+            "(weights=%p, attn_layer=%p, ffn_layer=%p)",
+            static_cast<const void*>(w),
+            static_cast<void*>(attn_layer_.get()),
+            static_cast<void*>(ffn_layer_.get()));
         eagle3_draft_layer_.reset();
     }
 }
+
 
 void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
                                   Tensor&       output_hidden,

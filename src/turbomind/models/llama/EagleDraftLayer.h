@@ -69,11 +69,6 @@ private:
     LlamaFfnLayer*                ffn_layer_{nullptr};
     float                         rmsnorm_eps_{1e-5f};
 
-    // Cached geometry (from weight_->attn)
-    int head_num_{0};
-    int kv_head_num_{0};
-    int size_per_head_{0};
-
     // Debug / inspection tensors
     Tensor debug_fc_out_;          // post input_norm
     Tensor debug_attn_out_;        // attention output
