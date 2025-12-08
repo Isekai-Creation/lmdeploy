@@ -1660,8 +1660,10 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
         return false;
     }
 
-    // Build block pointer table for the active sequences.
-    std::vector<uintptr_t> h_block_ptrs(static_cast<size_t>(total_blocks), 0);
+    // Build block pointer table for the active sequences, storing device
+    // pointers as 64-bit integers so we can reinterpret them as `char**`
+    // when launching the flatten kernel.
+    std::vector<uint64_t> h_block_ptrs(static_cast<size_t>(total_blocks), 0);
     int                    cursor = 0;
     for (int i = 0; i < batch_size; ++i) {
         const Sequence* seq = sequences[i];
@@ -1673,7 +1675,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                 break;
             }
             void* ptr = sequence_manager_->GetBlockPtr(block_id);
-            h_block_ptrs[cursor++] = reinterpret_cast<uintptr_t>(ptr);
+            h_block_ptrs[cursor++] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
         }
     }
 
@@ -1692,7 +1694,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
 
     Buffer_<int>      d_cu_k_len(batch_size + 1, kDEVICE);
     Buffer_<int>      d_cu_block_num(batch_size + 1, kDEVICE);
-    Buffer_<uintptr_t> d_block_ptrs(total_blocks, kDEVICE);
+    Buffer_<uint64_t> d_block_ptrs(total_blocks, kDEVICE);
 
     check_cuda_error(cudaMemcpyAsync(
         d_cu_k_len.data(), h_cu_k_len.data(), sizeof(int) * (batch_size + 1), cudaMemcpyHostToDevice, stream_));
@@ -1703,7 +1705,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                                      stream_));
     check_cuda_error(cudaMemcpyAsync(d_block_ptrs.data(),
                                      h_block_ptrs.data(),
-                                     static_cast<size_t>(total_blocks) * sizeof(uintptr_t),
+                                     static_cast<size_t>(total_blocks) * sizeof(uint64_t),
                                      cudaMemcpyHostToDevice,
                                      stream_));
 
@@ -2974,8 +2976,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     // actually committed by DynamicDecodeLayer, and instrument tail depth
     // statistics. This keeps accepted_tokens[0] aligned with the true
     // decode base while still using extras (indices >= 1) for tails.
-    const int max_path_len = engine_param_.spec_max_draft_path_len;
-    if (max_path_len > 0 && !eagle_step_accepted_lens_.empty() && !eagle_step_accepted_tokens_.empty()) {
+    if (max_tail_len > 0 && !eagle_step_accepted_lens_.empty() && !eagle_step_accepted_tokens_.empty()) {
         // Host view of the base token committed at time index g.step for
         // each slot in this decode batch.
         std::vector<int> h_base_tokens(batch_size, -1);
@@ -3007,7 +3008,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                 ++slots_ge2;
             }
 
-            const int token_offset = i * max_path_len;
+            const int token_offset = i * max_tail_len;
             if (token_offset >= static_cast<int>(eagle_step_accepted_tokens_.size())) {
                 continue;
             }
