@@ -12,6 +12,8 @@
 #include "target_tree_decode.h"
 
 #include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#include <cfloat>
 
 namespace turbomind {
 namespace kernels {
@@ -212,7 +214,7 @@ __global__ void treeLogitsToTargetIdsKernel(TreeLogitsToTargetsParams params)
 
     const float* row = params.logits + static_cast<size_t>(idx) * params.vocab_size;
 
-    float   best_val = -CUDART_INF_F;
+    float   best_val = -FLT_MAX;
     SizeType best_id = 0;
 
     for (SizeType j = 0; j < params.vocab_size; ++j) {
