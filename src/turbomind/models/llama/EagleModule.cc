@@ -136,7 +136,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         return;
     }
 
-    // Some EAGLE draft checkpoints (e.g. NVIDIA's GPT‑OSS EAGLE3 models)
+    // Some EAGLE draft checkpoints (e.g. NVIDIA's GPT-OSS EAGLE3 models)
     // intentionally use hidden_size that does NOT equal
     // num_attention_heads * head_dim. The rest of EagleModule only relies
     // on `hidden_units` and `intermediate_size` for buffer and weight
@@ -287,7 +287,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     const std::string base = model_dir + "/";
 
-    // Helper that tries both canonical and TP‑split names (e.g.
+    // Helper that tries both canonical and TP-split names (e.g.
     // `tok_embeddings.weight` and `tok_embeddings.0.weight`) when
     // loading weights from a TurboMind export directory.
     auto load_with_variants = [&](Tensor& tensor, const std::string& canonical) -> bool {
@@ -304,7 +304,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             }
         }
 
-        // Fallback: TP‑split layout (".0" before the last extension).
+        // Fallback: TP-split layout (".0" before the last extension).
         auto pos = canonical.rfind('.');
         if (pos != std::string::npos) {
             std::string split_name = canonical.substr(0, pos) + ".0" + canonical.substr(pos);
@@ -488,7 +488,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     // For Eagle3 drafts, additionally prepare FFN wrapper, norms, and
     // shape checks for a more faithful draft layer path using existing
     // LLaMA FFN blocks. Attention wiring (LlamaAttentionWeight) is kept
-    // separate and guarded by strict geometry checks.
+    // separate and guarded by geometry checks.
     if (eagle_mode_ == EagleMode::kEagle3 && mlp_down_ok && weights_.mlp_gate_up && weights_.output_norm) {
         eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayerWeight>();
 
@@ -539,6 +539,27 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             }
         };
 
+        // Non-fatal attention shape check: for attention we can fall back
+        // to the shallow QKV path instead of disabling the Eagle3 draft
+        // layer globally.
+        auto check_shape_2d_attn = [&](const Tensor& t,
+                                       int dim0,
+                                       int dim1,
+                                       const char* name,
+                                       bool& ok_flag) {
+            if (!t || t.ndim() != 2 || t.shape(0) != dim0 || t.shape(1) != dim1) {
+                TM_LOG_WARNING(
+                    "[EAGLE][Eagle3DraftLayer][fallback] %s has shape [%d,%d], expected [%d,%d]; "
+                    "Eagle3 draft will fall back to shallow attention.",
+                    name,
+                    t ? t.shape(0) : -1,
+                    t ? t.shape(1) : -1,
+                    dim0,
+                    dim1);
+                ok_flag = false;
+            }
+        };
+
         auto check_norm = [&](const Tensor& t, const char* name) {
             if (!t || t.ndim() != 1 || t.shape(0) != hidden_units) {
                 TM_LOG_WARNING(
@@ -560,20 +581,21 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         // Attention geometry for Eagle3 shallow block:
         //   attn_qkv: [2 * hidden_units, eagle_q_size_ + 2 * eagle_kv_size_]
         //   attn_o:   [eagle_q_size_, hidden_units]
+        bool attn_ok = true;
         if (eagle_q_size_ > 0 && eagle_kv_size_ > 0) {
             const int qkv_expected_in  = hidden_units * 2;
             const int qkv_expected_out = eagle_q_size_ + 2 * eagle_kv_size_;
-            check_shape_2d(weights_.attn_qkv, qkv_expected_in, qkv_expected_out, "attn_qkv");
+            check_shape_2d_attn(weights_.attn_qkv, qkv_expected_in, qkv_expected_out, "attn_qkv", attn_ok);
 
             const int attn_o_expected_in  = eagle_q_size_;
             const int attn_o_expected_out = hidden_units;
-            check_shape_2d(weights_.attn_o, attn_o_expected_in, attn_o_expected_out, "attn_o");
+            check_shape_2d_attn(weights_.attn_o, attn_o_expected_in, attn_o_expected_out, "attn_o", attn_ok);
 
             // Prepare a draft-layer LlamaAttentionWeight only when the
             // Eagle3 fused QKV / Wo geometry can be mapped into the
             // standard attention layout; otherwise we rely on the
             // existing shallow linearised path.
-            if (draft_ok) {
+            if (draft_ok && attn_ok) {
                 const int  kv_head_num = head_num;  // simple single-group KV
                 const bool bias        = false;
                 const bool qk_norm     = false;
@@ -593,10 +615,9 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                                                                       /*window_size=*/0,
                                                                       /*sink=*/false);
 
-                // Only alias Eagle3 QKV / Wo into the attention weight
-                // when shapes are exactly compatible; otherwise mark the
-                // draft layer as unusable.
                 auto& attn_w = eagle3_draft_layer_->attn;
+                bool  mapped_ok = true;
+
                 if (attn_w.qkv.weight
                     && attn_w.qkv.weight.shape(0) == weights_.attn_qkv.shape(0)
                     && attn_w.qkv.weight.shape(1) == weights_.attn_qkv.shape(1)) {
@@ -605,8 +626,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 else {
                     TM_LOG_WARNING(
                         "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.qkv shape "
-                        "incompatible with Eagle3 attn_qkv; disabling Eagle3 draft layer.");
-                    draft_ok = false;
+                        "incompatible with Eagle3 attn_qkv; Eagle3 draft will use shallow attention.");
+                    mapped_ok = false;
                 }
 
                 if (attn_w.output.weight
@@ -617,13 +638,16 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 else {
                     TM_LOG_WARNING(
                         "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.output shape "
-                        "incompatible with Eagle3 attn_o; disabling Eagle3 draft layer.");
-                    draft_ok = false;
+                        "incompatible with Eagle3 attn_o; Eagle3 draft will use shallow attention.");
+                    mapped_ok = false;
                 }
 
-                if (draft_ok) {
+                if (mapped_ok) {
                     eagle3_draft_layer_->attn.prepare();
                 }
+                // If mapped_ok is false, we simply rely on the runtime
+                // Eagle3DraftLayer to fall back to shallow attention
+                // / pass-through for this step.
             }
         }
 
@@ -939,7 +963,7 @@ void EagleModule::forward(const Tensor& input_ids,
     // RMSNorm kernels require that the norm weights and activations
     // share the same dtype. Draft weights are currently stored in
     // weight_dtype_ (typically FP16), while some target models (e.g.
-    // GPT‑OSS) run with BF16 activations. If we detect a mismatch
+    // GPT-OSS) run with BF16 activations. If we detect a mismatch
     // here, conservatively disable EAGLE for this engine and fall
     // back to baseline decoding instead of triggering a hard check
     // failure inside invokeRMSNorm.
@@ -1008,7 +1032,7 @@ void EagleModule::forward(const Tensor& input_ids,
         bool   have_embed = false;
 
         // 1) Pre-attention RMSNorm. For Eagle3 we prefer to derive the
-        // attention input from the FC‑reduced multi-layer hidden when it
+        // attention input from the FC-reduced multi-layer hidden when it
         // is available; otherwise we fall back to the normalized last-layer
         // hidden state as before.
         bool need_attn_in =
@@ -1222,8 +1246,8 @@ void EagleModule::forward(const Tensor& input_ids,
         // for legacy EagleNet we keep using V as before.
         Tensor value;
         if (eagle3 && eagle_q_size_ > 0) {
-            const int q_size = eagle_q_size_;
-            value            = qkv.slice({0, 0}, {batch_size, q_size});
+            const int q_size_local = eagle_q_size_;
+            value                  = qkv.slice({0, 0}, {batch_size, q_size_local});
         }
         else {
             value = qkv.slice({0, 2 * hidden_dim}, {batch_size, hidden_dim});
@@ -1297,15 +1321,16 @@ void EagleModule::forward(const Tensor& input_ids,
             // holds FFN(norm(attn_out)) and `attn_out_scratch_` is the
             // residual from attention.
             invokeResidualBiasRMSNorm(
-                /*hidden_states=*/ffn_out.raw_data(),
-                /*residual=*/attn_out_scratch_.raw_data(),
-                /*weights=*/eagle3_draft_layer_->output_norm.raw_data(),
+                /*hidden_states=*/output_hidden.raw_data(),
+                /*residual=*/const_cast<void*>(input_hidden.raw_data()),
+                /*weights=*/weight_->output_norm.raw_data(),
                 /*bias=*/nullptr,
-                weight_dtype_,
+                dtype,
                 hidden_dim,
                 batch_size,
-                kEps,
+                rmsnorm_eps_,
                 stream);
+
             output_hidden_states = ffn_out;
             if (isEagleDebugEnabled()) {
                 debug_pre_head_hidden_ = ffn_out;

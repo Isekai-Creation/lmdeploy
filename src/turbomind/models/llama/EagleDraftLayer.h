@@ -49,6 +49,7 @@ private:
     int                    head_num_{0};
     int                    kv_head_num_{0};
     int                    size_per_head_{0};
+    bool is_qkv_compatible_() const;   // <--- add this
 };
 
 }  // namespace turbomind

@@ -33,6 +33,22 @@ Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
     }
 }
 
+bool Eagle3DraftLayer::is_qkv_compatible_() const
+{
+    // v1: keep checks very simple; rely on LlamaAttentionWeight itself.
+    const Tensor& qkv_w = weight_->attn.qkv.weight;
+    const Tensor& wo_w  = weight_->attn.output.weight;
+
+    if (!qkv_w || !wo_w || qkv_w.ndim() != 2 || wo_w.ndim() != 2) {
+        return false;
+    }
+    // Basic sanity only: don't try to match draft-exported attn_qkv here.
+    if (qkv_w.shape(0) != wo_w.shape(1)) {
+        return false;
+    }
+    return true;
+}
+
 void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden, cudaStream_t stream)
 {
     if (!input_hidden) {
@@ -97,6 +113,21 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         debug_fc_out_ = hidden_norm;
     }
 
+    // If QKV is totally incompatible, treat this step as pass-through instead
+    // of disabling the whole layer.
+    if (!is_qkv_compatible_()) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Draft][fallback] LlamaAttentionWeight.qkv shape incompatible with Eagle3 "
+            "attn_qkv; treating Eagle3 draft as pass-through for this step.");
+        output_hidden = input_hidden;
+        if (debug_enabled) {
+            debug_attn_out_        = Tensor{};
+            debug_ffn_out_         = Tensor{};
+            debug_pre_head_hidden_ = input_hidden;
+        }
+        return;
+    }
+
     // 2) Attention: prefer real UnifiedAttentionLayer if available and geometry is sane;
     //    otherwise fall back to the shallow QKV+V→Wo path.
     Tensor attn_out{{batch_size, hidden_dim}, dtype, input_hidden.device()};
@@ -108,10 +139,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
             return false;
         }
         // For standard MHA we expect hidden_dim == head_num_ * size_per_head_.
-        if (hidden_dim != head_num_ * size_per_head_) {
-            return false;
-        }
-        return true;
+        return hidden_dim == head_num_ * size_per_head_;
     };
 
     bool used_unified_attention = false;
@@ -127,7 +155,8 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         sync_check_cuda_error();
 
         used_unified_attention = true;
-    } else {
+    }
+    else {
         if (has_attn_layer && !attn_geom_ok()) {
             TM_LOG_WARNING(
                 "[EAGLE3][Draft] invalid attention geometry (head_num=%d, size_per_head=%d, hidden_dim=%d); "
@@ -182,6 +211,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         linear.Forward(hidden_norm, weight_->attn.qkv, qkv);
         sync_check_cuda_error();
 
+        // QKV layout is [Q, K, V] with sizes [q_dim, kv_dim, kv_dim].
         const int v_offset = q_dim + kv_dim;
         Tensor     value   = qkv.slice({0, v_offset}, {batch_size, kv_dim});
 
@@ -210,6 +240,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     ffn_param.layer_id = 0;
     ffn_layer_->forward(ffn_param);
     sync_check_cuda_error();
+
     if (debug_enabled) {
         debug_ffn_out_ = output_hidden;
     }
