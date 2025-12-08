@@ -103,6 +103,33 @@ public:
 
     void reset() noexcept;
 
+    // Segment views over the per-layer KV buffer. These are lightweight
+    // Tensor slices; they do not allocate or copy.
+    Tensor sink(int layer_idx);
+    Tensor retrieval(int layer_idx);
+    Tensor window(int layer_idx);
+    Tensor buffer(int layer_idx);
+
+    // Summary and retrieval helpers modelled after SpecPV. The initial
+    // implementation focuses on maintaining block counts and placeholders
+    // for future CUDA kernels; they do not yet drive any change in the
+    // attention layout.
+    void summary_key_states(int layer_idx, const Tensor& key_states, int seq_len);
+
+    void refresh_retrieval(int         layer_idx,
+                           const Tensor& query_states,
+                           const Tensor& key_states,
+                           const Tensor& value_states,
+                           int           seq_len);
+
+    // Append newly verified tokens into the speculative buffer slice and
+    // return the active KV views [sink+retrieval+window+buffer] for this
+    // layer. The current implementation only updates verified lengths; it
+    // does not yet move real KV data.
+    std::pair<Tensor, Tensor> update(int layer_idx, const Tensor& new_keys, const Tensor& new_values);
+
+    void reset_buffer();
+
 private:
     void recompute_global_verified_len() noexcept;
 
@@ -114,8 +141,15 @@ private:
     int               head_dim_{0};
     DataType          kv_dtype_{kFloat32};
 
+    int max_seq_len_{0};
+    int max_summary_blocks_{0};
+
     std::vector<Tensor> key_cache_;
     std::vector<Tensor> value_cache_;
+
+    std::vector<Tensor> key_summary_max_;
+    std::vector<Tensor> key_summary_min_;
+    std::vector<int>    summary_block_count_;
 
     std::vector<int> verified_lens_;
     int              global_verified_len_{0};
