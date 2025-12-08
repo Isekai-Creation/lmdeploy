@@ -383,13 +383,49 @@ def _convert_eagle3_midlayer(
 
     # Token embeddings: the Eagle3 midlayer checkpoint for GPT‑OSS does
     # not ship its own input token embedding table, but EagleModule's
-    # on‑disk layout includes a `tok_embeddings.weight` slot. Populate it
-    # with a zero‑initialised BF16 matrix so that EagleModule::load does
-    # not emit hard errors about missing files. The current draft
-    # forward path does not consume these embeddings directly.
+    # on‑disk layout includes a `tok_embeddings.weight` slot. Prefer to
+    # populate this from the *base* model so the draft head can consume
+    # real embeddings; if that fails, fall back to zeros as before.
     tok_emb_path = os.path.join(out_dir, "tok_embeddings.weight")
     if not os.path.exists(tok_emb_path):
-        tok_emb = torch.zeros(vocab_size, hidden_size, dtype=w_dtype)
+        tok_emb: Optional[torch.Tensor] = None
+
+        if base_model_dir:
+            base_shards = _find_safetensor_shards(base_model_dir)
+            if base_shards:
+                try:
+                    emb = _load_tensor_from_shards(
+                        base_shards,
+                        "model.embed_tokens.weight",
+                        optional=True,
+                    )
+                except Exception:
+                    emb = None
+                if emb is not None:
+                    if emb.shape == (vocab_size, hidden_size):
+                        tok_emb = emb.to(w_dtype)
+                    elif emb.shape == (hidden_size, vocab_size):
+                        # Transpose if layout is [hidden, vocab].
+                        tok_emb = emb.to(w_dtype).transpose(0, 1)
+                    elif log:
+                        log.warning(
+                            "Base model embed_tokens.weight shape %s does not match "
+                            "(%d, %d) or (%d, %d); using zero-init tok_embeddings.",
+                            tuple(emb.shape),
+                            vocab_size,
+                            hidden_size,
+                            hidden_size,
+                            vocab_size,
+                        )
+
+        if tok_emb is None:
+            if log:
+                log.warning(
+                    "Falling back to zero-initialised tok_embeddings for Eagle3 draft "
+                    "(base model embeddings not found or incompatible)."
+                )
+            tok_emb = torch.zeros(vocab_size, hidden_size, dtype=w_dtype)
+
         _write_tensor(tok_emb, tok_emb_path, w_dtype)
 
     # Midlayer norms.

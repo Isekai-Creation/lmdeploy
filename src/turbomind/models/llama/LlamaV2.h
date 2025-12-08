@@ -192,7 +192,9 @@ private:
     // produce draft logits / hidden states for speculative decoding.
     // This is a thin wrapper around EagleModule::forward so that
     // LlamaBatch does not need to access EagleModule directly.
-    void eagleDraftForward(const Tensor& hidden_states,
+    // `input_ids` is the per-slot base token committed at this step.
+    void eagleDraftForward(const Buffer& input_ids,
+                           const Tensor& hidden_states,
                            Tensor&       draft_logits,
                            Tensor&       draft_hidden);
 

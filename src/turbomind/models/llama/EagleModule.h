@@ -83,7 +83,7 @@ public:
     void load(const std::string& model_dir, int device_id, cudaStream_t stream);
     
     // Run draft model forward pass
-    // input_ids: [batch_size]
+    // input_ids: [batch_size] (per-slot draft tokens for this step)
     // last_hidden_states: [batch_size, hidden_units] (from target model)
     // captured_hidden_states: [batch_size, hidden_units * N] (optional,
     //   concatenated per-layer hidden states for Eagle3; may be empty)
@@ -190,10 +190,12 @@ private:
     Tensor attn_qkv_input_scratch_;    // [batch, qkv_in_dim] for Eagle3
     Tensor qkv_scratch_;               // [batch, q_size + 2 * kv_size]
     Tensor attn_out_scratch_;          // [batch, hidden]
-    Tensor mlp_input_scratch_;    // [batch, 2 * hidden]
-    Tensor mlp_out_scratch_;      // [batch, hidden]
-    Tensor eagle_fc_out_scratch_; // [batch, hidden] for Eagle3 pre-FC
+    Tensor mlp_input_scratch_;         // unused after Eagle3 cleanup
+    Tensor mlp_out_scratch_;           // unused after Eagle3 cleanup
+    Tensor eagle_fc_out_scratch_;      // [batch, hidden] for Eagle3 pre-FC
     Tensor normed_hidden_scratch_;
+    Tensor embed_input_scratch_;       // [batch, hidden] draft token embeddings
+    Tensor embed_norm_scratch_;        // [batch, hidden] normalized embeddings
     Tensor logits_scratch_;
 
     // Cached model dims / dtype

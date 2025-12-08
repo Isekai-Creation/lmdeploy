@@ -7,6 +7,7 @@
 #include "src/turbomind/kernels/norm/rms_norm.h"
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/kernels/gpt_kernels.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/eagle_debug.h"
 
@@ -565,8 +566,6 @@ void EagleModule::forward(const Tensor& input_ids,
         TM_LOG_DEBUG(__PRETTY_FUNCTION__);
     }
 
-    (void) input_ids;  // currently unused, reserved for future tree-aware draft nets
-
     if (!enabled_) {
         TM_LOG_WARNING("[EAGLE] forward() called while module is disabled; "
                        "passing through hidden states without draft logits");
@@ -654,15 +653,17 @@ void EagleModule::forward(const Tensor& input_ids,
 
         // Optional Eagle3 pre-FC over concatenated multi-layer hidden
         // states captured from UnifiedDecoder. When available and the
-        // geometry matches, we use the resulting features together
-        // with the normalized last-layer hidden states to build the
-        // QKV input for Eagle3 attention.
+        // geometry matches, we use the resulting features and, when
+        // possible, token embeddings to build the QKV input for Eagle3
+        // attention.
         Tensor fc_out;
         bool   can_use_eagle_fc = false;
+        Tensor embed_norm;
+        bool   have_embed = false;
 
-        // 1) Pre-attention RMSNorm. For Eagle3 we prefer to drive the
-        // attention from the FC‑reduced multi-layer hidden when it is
-        // available; otherwise we fall back to the normalized last-layer
+        // 1) Pre-attention RMSNorm. For Eagle3 we prefer to derive the
+        // attention input from the FC‑reduced multi-layer hidden when it
+        // is available; otherwise we fall back to the normalized last-layer
         // hidden state as before.
         bool need_attn_in =
             !attn_input_scratch_ || attn_input_scratch_.dtype() != hidden_dtype
@@ -746,46 +747,78 @@ void EagleModule::forward(const Tensor& input_ids,
             const size_t dst_row_bytes = static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
             char*        dst_base      = static_cast<char*>(qkv_input.raw_data());
 
-            // When we have a valid Eagle3 pre-FC output and a 2×hidden
-            // QKV input, build the input from the normalized FC features.
-            // We currently replicate the normalized FC output in both
-            // halves [fc_norm, fc_norm]; this keeps the geometry aligned
-            // with TensorRT‑LLM’s 2×hidden layout while we do not yet
-            // consume target token embeddings inside EagleModule.
-            if (can_use_eagle_fc && qkv_in_dim >= 2 * hidden_dim) {
+            // Optional embedding path: if we have valid input_ids and an
+            // embedding table, build the first half of the QKV input from
+            // normalized embeddings and the second half from the normalized
+            // FC-reduced hidden. This mirrors the Eagle3 2×hidden input
+            // layout more closely.
+            if (eagle3 && input_ids && weights_.embed_tokens && qkv_in_dim >= 2 * hidden_dim) {
+                // Build normalized embeddings.
+                bool need_embed_in =
+                    !embed_input_scratch_ || embed_input_scratch_.dtype() != hidden_dtype
+                    || embed_input_scratch_.device().type != kDEVICE || embed_input_scratch_.shape(0) < batch_size
+                    || embed_input_scratch_.shape(1) != hidden_dim;
+                if (need_embed_in) {
+                    embed_input_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+                }
+                core::Buffer raw_ids(const_cast<void*>(input_ids.raw_data()),
+                                     batch_size,
+                                     kInt32,
+                                     kDEVICE);
+                core::Buffer_<int> token_ids(raw_ids);
+                core::Ref<Tensor>  embed_out(embed_input_scratch_);
+                invokeEmbeddingLookup(embed_out, token_ids, weights_.embed_tokens, stream);
+
+                bool need_embed_norm =
+                    !embed_norm_scratch_ || embed_norm_scratch_.dtype() != hidden_dtype
+                    || embed_norm_scratch_.device().type != kDEVICE || embed_norm_scratch_.shape(0) < batch_size
+                    || embed_norm_scratch_.shape(1) != hidden_dim;
+                if (need_embed_norm) {
+                    embed_norm_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+                }
+                embed_norm = embed_norm_scratch_;
+                invokeRMSNorm(embed_norm, embed_input_scratch_, weights_.input_norm, kEps, stream);
+                have_embed = true;
+            }
+
+            if (qkv_in_dim >= 2 * hidden_dim && (can_use_eagle_fc || have_embed)) {
                 const size_t src_row_bytes_attn = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
                 const size_t copy_bytes         = static_cast<size_t>(hidden_dim) * elem_bytes;
                 char*        attn_base          = static_cast<char*>(attn_input.raw_data());
 
+                const size_t src_row_bytes_emb = have_embed
+                                                     ? static_cast<size_t>(embed_norm.stride(0)) * elem_bytes
+                                                     : src_row_bytes_attn;
+                char*        emb_base          = have_embed
+                                                     ? static_cast<char*>(embed_norm.raw_data())
+                                                     : attn_base;
+
                 for (int b = 0; b < batch_size; ++b) {
                     char* dst_row   = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-                    char* attn_row = attn_base + static_cast<size_t>(b) * src_row_bytes_attn;
+                    char* emb_row   = emb_base + static_cast<size_t>(b) * src_row_bytes_emb;
+                    char* attn_row  = attn_base + static_cast<size_t>(b) * src_row_bytes_attn;
 
-                    // First hidden_dim features from normalized FC output.
-                    check_cuda_error(cudaMemcpyAsync(dst_row,
-                                                     attn_row,
-                                                     copy_bytes,
-                                                     cudaMemcpyDeviceToDevice,
-                                                     stream));
-                    // Second hidden_dim features: reuse the same normalized FC.
-                    check_cuda_error(cudaMemcpyAsync(dst_row + static_cast<size_t>(hidden_dim) * elem_bytes,
-                                                     attn_row,
-                                                     copy_bytes,
-                                                     cudaMemcpyDeviceToDevice,
-                                                     stream));
+                    // First hidden_dim features from normalized embeddings
+                    // when available; otherwise fall back to normalized FC.
+                    check_cuda_error(cudaMemcpyAsync(
+                        dst_row, emb_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+                    // Second hidden_dim features from normalized FC / hidden.
+                    check_cuda_error(cudaMemcpyAsync(
+                        dst_row + static_cast<size_t>(hidden_dim) * elem_bytes,
+                        attn_row,
+                        copy_bytes,
+                        cudaMemcpyDeviceToDevice,
+                        stream));
                 }
             }
             else {
-                // Fallback: previous behaviour – either consume the
-                // concatenated multi-layer hidden directly (when
-                // available) or repeat the normalized last-layer
-                // hidden state `factor` times.
-                bool use_captured = false;
-                if (captured_hidden_states && captured_hidden_states.shape(0) == batch_size
-                    && captured_hidden_states.shape(1) >= qkv_in_dim
-                    && captured_hidden_states.dtype() == hidden_dtype) {
-                    use_captured = true;
-                }
+                // Fallback: either consume the concatenated multi-layer
+                // hidden directly (when available) or repeat the normalized
+                // last-layer hidden state `factor` times.
+                const size_t copy_hidden = static_cast<size_t>(hidden_dim) * elem_bytes;
+                bool         use_captured =
+                    captured_hidden_states && captured_hidden_states.shape(0) == batch_size
+                    && captured_hidden_states.shape(1) >= qkv_in_dim && captured_hidden_states.dtype() == hidden_dtype;
 
                 if (use_captured) {
                     const size_t   src_row_bytes = static_cast<size_t>(captured_hidden_states.stride(0)) * elem_bytes;
@@ -800,7 +833,6 @@ void EagleModule::forward(const Tensor& input_ids,
                 }
                 else {
                     const size_t src_row_bytes = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
-                    const size_t copy_hidden   = static_cast<size_t>(hidden_dim) * elem_bytes;
                     char*        src_base      = static_cast<char*>(attn_input.raw_data());
                     for (int b = 0; b < batch_size; ++b) {
                         char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;

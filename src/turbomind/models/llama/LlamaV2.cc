@@ -2386,10 +2386,24 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     }
 
     // Run EagleNet draft model over last-token hidden states to obtain
-    // per-sequence draft logits for speculative sampling.
+    // per-sequence draft logits for speculative sampling. The token_ids
+    // buffer is [max_seq_len, batch] on device; the current decode step
+    // row is g.step.
     Tensor draft_logits;
     Tensor draft_hidden;
-    eagleDraftForward(decoder_features, draft_logits, draft_hidden);
+    if (token_ids) {
+        // View the current-step token ids as a flat [batch] device buffer.
+        const int max_seq_len = seq_limit_len.size();
+        TM_CHECK(max_seq_len > 0);
+        const int batch_size_tokens = batch_size;
+        const int offset            = g.step * batch_size_tokens;
+        Buffer step_ids{token_ids.buffer().slice(offset, offset + batch_size_tokens)};
+        eagleDraftForward(step_ids, decoder_features, draft_logits, draft_hidden);
+    }
+    else {
+        Buffer empty_ids;
+        eagleDraftForward(empty_ids, decoder_features, draft_logits, draft_hidden);
+    }
 
     if (!draft_logits) {
         TM_LOG_WARNING(
@@ -3076,7 +3090,8 @@ void LlamaV2::getEagleAcceptanceForStep(std::vector<int>& accepted_lens,
     tokens_per_seq  = eagle_step_tokens_per_seq_;
 }
 
-void LlamaV2::eagleDraftForward(const Tensor& hidden_states,
+void LlamaV2::eagleDraftForward(const Buffer& input_ids,
+                                const Tensor& hidden_states,
                                 Tensor&       draft_logits,
                                 Tensor&       draft_hidden)
 {
@@ -3091,10 +3106,16 @@ void LlamaV2::eagleDraftForward(const Tensor& hidden_states,
     // states (for Eagle3) and produces normalized hidden_states +
     // logits via the draft LM head. Input ids are unused for the
     // minimal draft network, so we pass a default tensor here.
-    Tensor dummy_input_ids;
+    Tensor input_ids_tensor;
+    if (input_ids.size() > 0) {
+        // Buffer is [S,B]; for draft we only need the current step row.
+        // dynamicDecodeWithSpecMulti passes a view covering exactly the
+        // active batch_size entries for this step in row-major layout.
+        input_ids_tensor = Tensor{{hidden_states.shape(0)}, kInt32, kDEVICE, const_cast<void*>(input_ids.data())};
+    }
     const Tensor& captured_hidden = eagle_capture_hidden_;
     eagle_module_->forward(
-        dummy_input_ids,    // input_ids (unused in current implementation)
+        input_ids_tensor,   // per-slot base token ids
         hidden_states,      // last-token hidden states from target model
         captured_hidden,    // optional multi-layer capture buffer
         draft_logits,       // [batch, vocab_size_padded]
