@@ -981,9 +981,10 @@ void EagleModule::forward(const Tensor& input_ids,
         Tensor& attn_out = attn_out_scratch_;
         linear.Forward(value, attn_o_weight_, /*output=*/attn_out);
 
-        // 3) Optional Eagle3 FFN + output norm using LLaMA-style FFN
-        // weights when available. When Eagle3 draft-layer weights are
-        // not prepared we fall back to the original RMSNorm-only path.
+        // 3) Optional Eagle3 FFN + residual + output norm using
+        // LLaMA-style FFN weights when available. When Eagle3
+        // draft-layer weights are not prepared we fall back to the
+        // original RMSNorm-only path.
         if (eagle3 && eagle3_draft_layer_) {
             const auto& mlp       = eagle3_draft_layer_->ffn;
             const int   token_num = attn_out.shape(0);
@@ -1026,6 +1027,21 @@ void EagleModule::forward(const Tensor& input_ids,
             Tensor& ffn_out = mlp_out_scratch_;
             linear.Forward(gating, mlp.output, ffn_out);
             sync_check_cuda_error();
+
+            // Add residual from the attention output before the
+            // final Eagle3 output norm, matching the typical
+            // Transformer pattern y = attn_out + FFN(norm(attn_out)).
+            const size_t elem_bytes = byte_size(weight_dtype_, 8) / 8;
+            const size_t row_bytes  = static_cast<size_t>(ffn_out.stride(0)) * elem_bytes;
+            const size_t copy_bytes = static_cast<size_t>(hidden_dim) * elem_bytes;
+            char*        ffn_base   = static_cast<char*>(ffn_out.raw_data());
+            char*        attn_base  = static_cast<char*>(attn_out_scratch_.raw_data());
+            for (int b = 0; b < batch_size; ++b) {
+                char* dst_row = ffn_base + static_cast<size_t>(b) * row_bytes;
+                char* src_row = attn_base + static_cast<size_t>(b) * row_bytes;
+                check_cuda_error(cudaMemcpyAsync(
+                    dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+            }
 
             bool need_norm_scratch =
                 !normed_hidden_scratch_ || normed_hidden_scratch_.dtype() != weight_dtype_
