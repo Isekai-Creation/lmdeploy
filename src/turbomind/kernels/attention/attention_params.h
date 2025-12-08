@@ -59,6 +59,14 @@ struct AttentionParams {
     int max_q_len;
     int max_k_len;
 
+    // Optional packed masks for speculative/tree decoding.
+    //
+    // Layout is conceptually [num_tokens, packed_mask_dim], where the
+    // caller flattens the batch/time axes as needed. When null or the
+    // stride is zero, no tree/speculative masking is applied.
+    const int32_t* spec_decoding_packed_mask{nullptr};
+    int            spec_decoding_packed_mask_stride{0};
+
     // instance-level params
     int   num_heads;
     int   num_kv_heads;

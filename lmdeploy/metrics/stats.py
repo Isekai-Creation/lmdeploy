@@ -235,6 +235,11 @@ class SpeculativeDecodingStats:
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: np.ndarray = None
+    # Optional EAGLE3 target-tree metrics, populated when the backend
+    # reports a nested ``tree_decode`` block in ``spec_info``.
+    tree_num_draft_tokens: int = 0
+    tree_num_target_tokens: int = 0
+    tree_num_accepted_tokens: int = 0
 
     def __post_init__(self):
         assert self.num_spec_tokens > 0
@@ -247,6 +252,13 @@ class SpeculativeDecodingStats:
             self.num_draft_tokens += spec_info['num_draft_tokens']
             self.num_accepted_tokens += spec_info['num_accepted_tokens']
             self.num_accepted_tokens_per_pos[:spec_info['num_accepted_tokens']] += 1
+
+            # Optional tree-aware metrics.
+            tree_info = spec_info.get("tree_decode") if isinstance(spec_info, dict) else None
+            if tree_info:
+                self.tree_num_draft_tokens += int(tree_info.get("num_tree_draft_tokens", 0))
+                self.tree_num_target_tokens += int(tree_info.get("num_tree_target_tokens", 0))
+                self.tree_num_accepted_tokens += int(tree_info.get("num_tree_accepted_tokens", 0))
 
     def update_per_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
         """Update with per draft stats."""
@@ -293,6 +305,10 @@ class EagleMetricsSummary:
     num_accepted_tokens: int
     draft_acceptance_rate: float
     mean_acceptance_length: float
+    # Optional tree-aware aggregates derived from SpeculativeDecodingStats.
+    tree_num_draft_tokens: int | None = None
+    tree_num_target_tokens: int | None = None
+    tree_num_accepted_tokens: int | None = None
 
     @classmethod
     def from_stats(cls, stats: SpeculativeDecodingStats) -> "EagleMetricsSummary":
@@ -312,20 +328,37 @@ class EagleMetricsSummary:
         else:
             mean_acceptance_length = float("nan")
 
+        tree_num_draft_tokens = stats.tree_num_draft_tokens or 0
+        tree_num_target_tokens = stats.tree_num_target_tokens or 0
+        tree_num_accepted_tokens = stats.tree_num_accepted_tokens or 0
+
         return cls(
             num_drafts=num_drafts,
             num_draft_tokens=num_draft_tokens,
             num_accepted_tokens=num_accepted_tokens,
             draft_acceptance_rate=draft_acceptance_rate,
             mean_acceptance_length=mean_acceptance_length,
+            tree_num_draft_tokens=tree_num_draft_tokens or None,
+            tree_num_target_tokens=tree_num_target_tokens or None,
+            tree_num_accepted_tokens=tree_num_accepted_tokens or None,
         )
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable representation of the summary."""
-        return {
+        out = {
             "num_drafts": int(self.num_drafts),
             "total_draft_tokens": int(self.num_draft_tokens),
             "total_accepted_tokens": int(self.num_accepted_tokens),
             "mean_acceptance_rate": float(self.draft_acceptance_rate),
             "mean_acceptance_length": float(self.mean_acceptance_length),
         }
+        # Preserve the original schema and, when tree-aware metrics are
+        # available, attach them under a nested ``tree_decode`` block.
+        if self.tree_num_draft_tokens is not None or self.tree_num_target_tokens is not None \
+                or self.tree_num_accepted_tokens is not None:
+            out["tree_decode"] = {
+                "total_tree_draft_tokens": int(self.tree_num_draft_tokens or 0),
+                "total_tree_target_tokens": int(self.tree_num_target_tokens or 0),
+                "total_tree_accepted_tokens": int(self.tree_num_accepted_tokens or 0),
+            }
+        return out

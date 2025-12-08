@@ -1,0 +1,247 @@
+# TurboMind EAGLE3 – Remaining Coding Tasks for TensorRT‑LLM‑Style Multi‑Token Speculative Decoding
+
+This file lists **only implementation / wiring tasks** still required for
+TurboMind’s multi‑token EAGLE/EAGLE3 to behave like TensorRT‑LLM. There are
+no test or documentation items here.
+
+Statuses:
+- `[ ]` pending / not implemented yet
+
+---
+
+## 1. Target‑Tree Decode & Target Verification (core C++/CUDA)
+
+These tasks make the target model actually verify the EAGLE tree, not just
+the next token. They are the main blockers for TensorRT‑LLM parity.
+
+### 1.1 Base‑model target‑tree decode
+
+- [x] **[A] Add explicit tree‑decode entry point**
+  - Introduce a `runEagleTargetTreeDecode(int batch_size)` (or similarly
+    named) method on `LlamaV2` that:
+    - Assumes `EagleBuffers::inputs.eagle_net_input_ids`,
+      `.eagle_net_position_ids`, `.eagle_net_hidden_indices`,
+      `.eagle_net_gen_lens` are already filled by `targetTreeDecode()`.
+    - Executes a dedicated tree decode pass and leaves logits / IDs in
+      EAGLE buffers for acceptance.
+  - Call this from `LlamaBatch::Forward` / `LlamaV2_eagle::eagleSpeculativeStep`
+    after tree + masks + `targetTreeDecode()` and before calling the
+    acceptance kernel.
+
+- [x] **[B] Implement scratch‑KV tree decode pass**
+  - Reuse prefix KV from `SequenceManager` as read‑only:
+    - Use the same `kv_block_ptrs_`, `cu_block_nums_`, and
+      `sequence_lengths_` inputs as baseline decode.
+  - Allocate a scratch KV region for tree tokens:
+    - Either by reserving blocks per sequence in `BlockManager`, or by
+      extending existing KV helpers with a “scratch blocks” table that is
+      never attached to `Sequence::blocks`.
+  - Drive `UnifiedDecoder` on the flattened tree tokens:
+    - Use `eagle_net_input_ids` / `eagle_net_position_ids` instead of
+      `input_ids_buf_`.
+    - Use `eagle_net_gen_lens` and `sequence_lengths_` to build the
+      equivalent of `h_input_length_buf_` / `h_context_length_buf_` for the
+      tree pass.
+  - Ensure all K/V writes during this pass go to the scratch KV blocks and
+    are discarded after acceptance (no mutation of live `Sequence::blocks`).
+
+- [x] **[C] Add tree‑decode logits buffer and call `postDecodeEmbedding`**
+  - Extend `EagleBuffers` or `LlamaV2` to hold a dedicated logits buffer for
+    tree tokens, e.g. `Tensor eagle_tree_logits` or a raw
+    `[num_tree_tokens, vocab_size_padded]` buffer.
+  - After the scratch tree decode `Forward`, call `LlamaV2::postDecodeEmbedding`
+    with the tree hidden states to fill this logits buffer, just like the
+    main decode path does for the current step.
+
+### 1.2 Tree masks in attention
+
+- [x] **[C] Integrate packed tree masks into `UnifiedAttentionLayer`**
+  - Add optional arguments / state so that `UnifiedAttentionLayer` can
+    consume a per‑token packed mask derived from
+    `EagleBuffers::inputs.packed_masks` when running the tree decode pass.
+  - For the tree decode path:
+    - Ensure Q/K/V computation uses these masks so that tree nodes attend
+      only to allowed ancestors / branches (similar to TRT‑LLM’s
+      `eagleDecodingKernels` behaviour).
+  - Keep the baseline decode path unchanged when no mask is provided.
+
+### 1.3 Logits → per‑node `target_tokens`
+
+- [x] **[B] Implement device‑side argmax → `target_tokens` scatter**
+  - Given tree logits `[num_tree_tokens, vocab_size_padded]` and
+    `eagle_net_hidden_indices` `[num_tree_tokens, 2]` (slot, token_idx):
+    - Launch a kernel that:
+      - Computes `argmax_vocabulary` per row,
+      - Maps row index → `(slot, token_idx)`,
+      - Writes the resulting ID into
+        `EagleBuffers::inputs.target_tokens[slot * max_decoding_tokens + token_idx]`.
+  - Keep layout and dtype consistent with
+    `invokeTreeAcceptByIdsWithPaths` expectations (`int32` IDs, flattened
+    `[max_batch_size, max_decoding_tokens]`).
+
+### 1.4 Wire acceptance to real per‑node target IDs
+
+- [x] **[A] Swap acceptance over to tree‑decoded `target_tokens`**
+  - Update `LlamaV2::eagleSpeculativeStep` so that, when
+    `enable_eagle_target_tree == true`:
+    - It assumes `inputs.target_tokens` has been filled by the tree decode
+      argmax path (not by host‑fabricated next‑step IDs).
+    - It calls `invokeTreeAcceptByIdsWithPaths` using:
+      - `draft_ids  = inputs.draft_tokens`,
+      - `target_ids = inputs.target_tokens`,
+      - `paths      = inputs.draft_paths`,
+      - `batch_slots` as currently wired.
+  - Keep the old host‑fabricated `target_tokens` path as a fallback when
+    tree decode fails a runtime check or is disabled.
+
+### 1.5 BF16 / MXFP4 correctness for tree decode
+
+- [x] **[C] Enforce BF16 compute and MXFP4 weight usage**
+  - Ensure the tree decode path:
+    - Uses BF16 activations (matching GPT‑OSS compute) and MXFP4 weights for
+      GPT‑OSS‑120B just like the baseline decode path.
+    - Allocates the tree logits buffer with a float type appropriate for
+      stable argmax (e.g. FP32).
+  - Audit dtype usage in:
+    - Tree hidden‑state buffers passed into `postDecodeEmbedding`,
+    - Tree logits → `target_tokens` scatter kernel,
+    - Any new scratch KV structures introduced for tree decode.
+
+---
+
+## 2. Multi‑Token Engine & DynamicDecode Parity
+
+These tasks close behavioural gaps between multi‑token EAGLE3 and baseline
+`DynamicDecode` semantics so that multi‑token steps are “first‑class citizens”
+instead of bolted‑on.
+
+- [x] **[B] Finalize integration with `DynamicDecodeLayer`**
+  - Current state:
+    - `LlamaV2::dynamicDecodeWithSpec` is wired and receives `decoder_features`
+      and a populated `SpecContext` (per‑slot sequences, device sequence
+      lengths, planned draft tokens, EAGLE flags).
+    - It still delegates all speculative work to the existing EAGLE glue in
+      `LlamaBatch::Forward` / `LlamaV2_eagle::eagleSpeculativeStep`; EAGLE
+      draft, tree decode, acceptance, multi‑token commit, and KV rewind all
+      happen outside `dynamicDecodeWithSpec`.
+  - Final integration strategy (to be implemented in a later iteration):
+    - Keep `DynamicDecodeLayer` as the single‑token base decode.
+    - Use `dynamicDecodeWithSpec` only to fuse *target‑tree decode* and
+      *acceptance* around that base step:
+        - Run `dynamicDecode(...)` for the base token.
+        - Inside `dynamicDecodeWithSpec`, use `decoder_features`,
+          `SpecContext` and existing helpers to:
+            - run EAGLE draft + target‑tree decode on device,
+            - call `invokeTreeAcceptByIdsWithPaths`,
+            - expose per‑step acceptance results to `LlamaBatch`.
+    - Leave multi‑token append (`advanceSequencesByEagleAcceptance`) and KV
+      rewind (`runEagleKVRewind`) in `LlamaBatch`, which already has access
+      to `Request` / EOS / `max_new_tokens` state.
+  - Ensure that in multi‑token EAGLE mode:
+    - `output_ids`, `finished`, `sequence_length` seen by callers reflect
+      the accepted tokens (base + extras), not just the first token.
+
+- [x] **[A] Clean up multi‑token advancement and `g.step` handling**
+  - Tighten `advanceSequencesByEagleAcceptance` and
+    `runEagleMultiTokenAdvance` so that:
+    - The step counter `g.step` and the time axis in `token_ids_buf_` are
+      updated consistently for multi‑token steps.
+    - No sequence can get out of sync between:
+      - The committed dynamic token for the step, and
+      - The extra tokens appended via EAGLE acceptance.
+
+- [x] **[C] Align EOS / stop / `max_new_tokens` semantics**
+  - Refine the logic in multi‑token advancement and per‑slot kill switches
+    so that:
+    - EOS is never “skipped over” by extra accepted tokens.
+    - Per‑request stop conditions (EOS, `max_new_tokens`, other stop
+      criteria) match baseline behaviour even when multiple tokens are
+      accepted in one step.
+  - Keep the implementation conceptually aligned with TensorRT‑LLM’s
+    `EagleDecodingLayer` stop/accept logic wherever possible.
+
+---
+
+## 3. Performance, Parallelism, and Clean‑up
+
+These tasks are not strictly required for correctness but are important for
+making the implementation practical and robust in production.
+
+- [x] **[B] Reduce host↔device copies in EAGLE paths**
+  - Identify and remove avoidable host/device memcpy in:
+    - Draft sampling (`draft_logits` / `eagle_sampling_logits`),
+    - Tree construction and acceptance,
+    - Target‑tree decode (logits and `target_tokens`).
+  - Move as much sampling / argmax / acceptance work as possible to device
+    kernels, keeping host involvement minimal.
+
+- [x] **[C] Make multi‑token EAGLE behaviour explicit under TP/DP/PP**
+  - Decide how multi‑token EAGLE should behave when:
+    - `tp_size_ > 1`,
+    - Data or pipeline parallelism is enabled.
+  - Implement one of:
+    - A fully correct multi‑token path under these topologies (mirroring
+      the single‑GPU behaviour), or
+    - A clear, early runtime gate that disables multi‑token EAGLE and
+      logs a reason when TP/DP/PP are active.
+
+---
+
+## 4. DynamicDecode Multi‑Position Parity (Advanced TRT‑LLM Alignment)
+
+These items push TurboMind toward **full DynamicDecode‑level parity** with
+TensorRT‑LLM’s EAGLE‑3 implementation. They assume sections 1–3 are already
+functionally complete.
+
+### 4.1 Tail semantics inside `DynamicDecodeLayer::ForwardMultiStep`
+
+- [ ] **[B] Apply full stop criteria to tail tokens**
+  - Extend `ForwardMultiStep` so that each committed tail token is checked
+    with the same logic as the base token:
+    - EOS / multiple `eos_ids`,
+    - stop‑words / bad‑words,
+    - `max_new_tokens` / per‑slot length limits,
+    - guidance / repetition‑penalty related state if present.
+  - When a tail token triggers EOS/stop for a slot:
+    - Mark that slot as finished,
+    - Stop committing further tail tokens for that slot.
+
+- [ ] **[B] Drive KV/metrics strictly from committed tail lengths**
+  - Use `ForcedTailContext::committed_lengths[i]` as the *only* source of
+    truth for how many extras were actually written for slot `i`.
+  - Ensure `updateEagleMetricsAndKVLengths` and `runEagleKVRewind` derive
+    `kv_draft_lengths` / `kv_accepted_lengths` and all EAGLE metrics from:
+    - `1 + committed_lengths[i]` (base + committed extras),
+    - not from planned lengths or raw accepted lens before tail clamping.
+
+### 4.2 EAGLE3 draft head & numerics (EagleModule parity)
+
+- [ ] **[B] Remove remaining approximations in Eagle3 draft head**
+  - Align `EagleModule`’s Eagle3 path with TensorRT‑LLM / HF Eagle3:
+    - Q/K/V projection splits and shapes (e.g. `[4096,5760]`, `[512,5760]`),
+    - `fc.weight` usage and hidden‑dim factors,
+    - RMSNorm / activation order and any scaling factors.
+  - Eliminate fallback behaviours (identity attention, zero value/WO) for
+    the GPT‑OSS‑120B‑Eagle3 config so that its logits match the reference
+    implementation up to numerical tolerance.
+
+- [ ] **[B] Wire strict Eagle3 geometry from converter into EagleModule**
+  - Ensure `eagle_draft_converter.py` emits all geometry/config entries
+    required by the tightened Eagle3 path (Q/K/V sizes, FC factors, layer
+    counts), and `EagleModule` consumes them without defaulting to legacy
+    EagleNet assumptions.
+
+### 4.3 Final clean‑up for B (no scaffolding)
+
+- [ ] **[B] Remove dead EAGLE glue and duplication**
+  - Delete any unused EAGLE helper paths that were superseded by the fused
+    `dynamicDecodeWithSpecMulti` + `ForwardMultiStep` implementation, so
+    there is a single source of truth for:
+    - draft sampling,
+    - tree decode and acceptance,
+    - multi‑token commit.
+
+- [ ] **[B] Keep `update_plan` in sync with this file**
+  - For each iteration, keep `update_plan` tasks aligned with the `[ ]`
+    items in section 4 and close them here (`[x]`) only when the code
+    paths are fully implemented and compiled, not when they are sketched.

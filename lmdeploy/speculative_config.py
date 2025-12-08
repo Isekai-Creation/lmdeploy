@@ -82,6 +82,12 @@ class SpeculativeConfig:
     eagle_debug: bool = False
     eagle_metrics_debug: bool = False
 
+    # Target-tree decode (TurboMind only). When True, allow the TurboMind
+    # backend to run a dedicated target decode over the EAGLE speculation
+    # tree and produce per-node target token ids, instead of relying solely
+    # on single-step target logits to fabricate target_tokens.
+    enable_target_tree: bool = False
+
     # NGram options (TurboMind only)
     max_matching_ngram_size: int = 4
     is_public_pool: bool = True
@@ -211,6 +217,9 @@ class SpeculativeConfig:
         # that TurboMind can distinguish between "unset" and "false".
         d["eagle_debug"] = bool(self.eagle_debug)
         d["eagle_metrics_debug"] = bool(self.eagle_metrics_debug)
+        # Target-tree decode flag is always explicit as well so that
+        # the Triton backend can gate the advanced EAGLE3 path.
+        d["enable_target_tree"] = bool(self.enable_target_tree)
         return d
 
 

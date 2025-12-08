@@ -627,6 +627,21 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
                 "num_accepted_tokens": int(num_accept),
                 "avg_accepted_per_step": avg_accepted_per_step,
             }
+
+            # Optional target-tree decode metrics. These are only
+            # populated by the TurboMind backend when the engine
+            # enables the EAGLE3 target-tree path; otherwise they
+            # remain zero and we omit the nested block.
+            tree_draft = _field("eagle_tree_draft_tokens", 0)
+            tree_target = _field("eagle_tree_target_tokens", 0)
+            tree_accepted = _field("eagle_tree_accepted_tokens", 0)
+            if tree_draft or tree_target or tree_accepted:
+                spec_info["tree_decode"] = {
+                    "num_tree_draft_tokens": int(tree_draft),
+                    "num_tree_target_tokens": int(tree_target),
+                    "num_tree_accepted_tokens": int(tree_accepted),
+                }
+
             # KV rewind metrics (optional; default to zero until wired in C++).
             total_rewound = _field("eagle_total_rewound_tokens", 0)
             rewind_steps = _field("eagle_rewind_steps", 0)

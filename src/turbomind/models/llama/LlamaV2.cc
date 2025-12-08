@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <sstream>
 
 #include "src/turbomind/comm/device_comm.h"
 #include "src/turbomind/core/core.h"
@@ -36,12 +37,22 @@
 #include "src/turbomind/models/llama/unified_decoder.h"
 
 #include "src/turbomind/kernels/gpt_kernels.h"
+#include "src/turbomind/kernels/attention/kv_cache_utils_v2.h"
+#include "src/turbomind/kernels/sampling_topk_kernels.h"
+
+#include "src/turbomind/models/llama/llama_kernels.h"
 
 #include "src/turbomind/utils/anomaly_handler.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/memory_utils.h"
 #include "src/turbomind/utils/eagle_debug.h"
+
+#include "lmdeploy/turbomind/eagle_tree.h"
+#include "lmdeploy/turbomind/kernels/speculative_decoding/common.h"
+#include "lmdeploy/turbomind/kernels/speculative_decoding/eagle_kernels.h"
+#include "lmdeploy/turbomind/kernels/speculative_decoding/target_tree_decode.h"
+#include "lmdeploy/turbomind/kernels/speculative_decoding/tree_accept_kernels.h"
 
 namespace turbomind {
 
@@ -171,6 +182,57 @@ LlamaV2::LlamaV2(DataType                     dtype,
             eagle_buffers_ = std::make_unique<EagleBuffers>();
             eagle_buffers_->allocate(max_batch_size, eagle_module_.get(), stream_);
             TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE module initialized successfully");
+
+            // Enable target-tree decode only when requested and when we
+            // can provision dedicated hidden-state and FP32 logits
+            // buffers for tree tokens. This keeps tree argmax numerics
+            // stable while reusing the same BF16/MXFP4 compute path as
+            // baseline decode for hidden states and weights.
+            target_tree_supported_ = engine.enable_eagle_target_tree;
+            if (target_tree_supported_) {
+                const int64_t max_tree_tokens =
+                    static_cast<int64_t>(max_batch_size)
+                    * static_cast<int64_t>(engine.spec_max_decoding_tokens > 0
+                                                ? engine.spec_max_decoding_tokens
+                                                : 1);
+                if (max_tree_tokens <= 0 || vocab_size_padded_ == 0) {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][EAGLE][fallback] target-tree decode unavailable; "
+                        "invalid max_tree_tokens=%ld or vocab_size_padded=%zu; "
+                        "reverting to single-step target logits.",
+                        static_cast<long>(max_tree_tokens),
+                        vocab_size_padded_);
+                    target_tree_supported_ = false;
+                }
+                else {
+                    max_tree_tokens_     = static_cast<int>(max_tree_tokens);
+                    const int64_t logits_size =
+                        max_tree_tokens * static_cast<int64_t>(vocab_size_padded_);
+                    tree_hidden_states_ = Tensor{{max_tree_tokens_, static_cast<int>(hidden_units_)}, dtype_, kDEVICE};
+                    tree_logits_buffer_ = Buffer(logits_size, kFloat32, kDEVICE);
+
+                    // Lightweight runtime dtype checks for tree decode. The
+                    // hidden-state buffer must use the same dtype as the base
+                    // model, and the logits buffer must be FP32 so that
+                    // invokeTreeLogitsToTargetIds always sees FP32 logits and
+                    // writes int32 IDs. On any mismatch we disable
+                    // target-tree decode and fall back to baseline EAGLE.
+                    if (!tree_hidden_states_
+                        || tree_hidden_states_.dtype() != dtype_
+                        || !tree_logits_buffer_
+                        || tree_logits_buffer_.dtype() != kFloat32) {
+                        TM_LOG_WARNING(
+                            "[LlamaV2][EAGLE][fallback] target-tree decode disabled due to dtype/layout mismatch "
+                            "(model=%s, tree_hidden=%s, tree_logits=%s)",
+                            to_string(dtype_),
+                            tree_hidden_states_ ? to_string(tree_hidden_states_.dtype()) : "nil",
+                            tree_logits_buffer_ ? to_string(tree_logits_buffer_.dtype()) : "nil");
+                        target_tree_supported_ = false;
+                        tree_hidden_states_    = Tensor{};
+                        tree_logits_buffer_    = Buffer{};
+                    }
+                }
+            }
         }
         else {
             spec_mode_ = SpeculativeDecodingMode::None();
@@ -179,6 +241,645 @@ LlamaV2::LlamaV2(DataType                     dtype,
             TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE disabled; falling back to baseline decoding for this engine");
         }
     }
+}
+
+void LlamaV2::runEagleTargetTreeDecode(int batch_size,
+                                       const int*       d_sequence_lengths,
+                                       const Sequence** sequences)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    if (!isTargetTreeDecodeEnabled()) {
+        eagle_tree_target_tokens_valid_ = false;
+        return;
+    }
+
+    // Guard against any late-breaking incompatibility in model dtype or
+    // vocab / geometry configuration. Tree decode requires:
+    //   - a valid hidden-state buffer with the base model dtype,
+    //   - a positive max_tree_tokens_ budget,
+    //   - an FP32 logits buffer sized for
+    //       [max_tree_tokens_, vocab_size_padded_].
+    // On failure we disable target-tree decode for this engine and fall
+    // back to baseline EAGLE.
+    const bool hidden_ok = tree_hidden_states_
+                           && tree_hidden_states_.dtype() == dtype_
+                           && tree_hidden_states_.ndim() == 2
+                           && tree_hidden_states_.shape(0) >= max_tree_tokens_
+                           && static_cast<size_t>(tree_hidden_states_.shape(1)) == hidden_units_;
+
+    const bool logits_ok = tree_logits_buffer_
+                           && tree_logits_buffer_.dtype() == kFloat32
+                           && tree_logits_buffer_.size()
+                                  >= static_cast<ssize_t>(max_tree_tokens_)
+                                         * static_cast<ssize_t>(vocab_size_padded_);
+
+    if (!hidden_ok || !logits_ok || max_tree_tokens_ <= 0 || vocab_size_padded_ == 0) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] target-tree decode entry mismatch "
+            "(model=%s, tree_hidden=%s, tree_logits=%s, max_tree_tokens=%d, vocab_size_padded=%zu); "
+            "disabling target-tree for this engine.",
+            to_string(dtype_),
+            tree_hidden_states_ ? to_string(tree_hidden_states_.dtype()) : "nil",
+            tree_logits_buffer_ ? to_string(tree_logits_buffer_.dtype()) : "nil",
+            max_tree_tokens_,
+            vocab_size_padded_);
+        target_tree_supported_          = false;
+        eagle_tree_target_tokens_valid_ = false;
+        tree_hidden_states_             = Tensor{};
+        tree_logits_buffer_             = Buffer{};
+        max_tree_tokens_                = 0;
+        return;
+    }
+
+    eagle_tree_target_tokens_valid_ = false;
+
+    // Stage 1: run the staging kernel to populate per-slot tree metadata
+    // (gen_lens / seq_lens / ctx_lens) and the initial per-slot flattened
+    // tree token layout in eagle_net_input_ids / eagle_net_hidden_indices.
+    targetTreeDecode(batch_size, d_sequence_lengths);
+
+    if (!eagle_buffers_ || !eagle_buffers_->isAllocated() || !tree_hidden_states_ || !tree_logits_buffer_) {
+        return;
+    }
+
+    using SizeType    = EagleBuffers::SizeType;
+    using TokenIdType = EagleBuffers::TokenIdType;
+    using namespace kernels::speculative_decoding;
+
+    const SizeType* d_gen_lens = reinterpret_cast<SizeType const*>(eagle_buffers_->inputs.eagle_net_gen_lens);
+    if (!d_gen_lens) {
+        return;
+    }
+
+    // Copy per-slot speculative generation lengths to host and sum them
+    // to obtain the flat tree token count for this engine step.
+    std::vector<SizeType> h_gen_lens(batch_size, 0);
+    check_cuda_error(cudaMemcpyAsync(
+        h_gen_lens.data(), d_gen_lens, batch_size * sizeof(SizeType), cudaMemcpyDeviceToHost, stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    SizeType num_tree_tokens = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        const SizeType len = h_gen_lens[i];
+        if (len > 0) {
+            num_tree_tokens += len;
+        }
+    }
+
+    if (num_tree_tokens <= 0) {
+        return;
+    }
+
+    if (num_tree_tokens > static_cast<SizeType>(max_tree_tokens_)) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] num_tree_tokens=%d exceeds max_tree_tokens_=%d; "
+            "clamping to buffer limit",
+            static_cast<int>(num_tree_tokens),
+            max_tree_tokens_);
+        num_tree_tokens = static_cast<SizeType>(max_tree_tokens_);
+    }
+
+    const SizeType max_decoding_tokens =
+        static_cast<SizeType>(eagle_module_->getMaxDecodingTokens());
+
+    const TokenIdType* d_eagle_ids =
+        reinterpret_cast<TokenIdType const*>(eagle_buffers_->inputs.eagle_net_input_ids);
+    const SizeType* d_hidden_indices_flat =
+        reinterpret_cast<SizeType const*>(eagle_buffers_->inputs.eagle_net_hidden_indices);
+
+    if (!d_eagle_ids || !d_hidden_indices_flat) {
+        return;
+    }
+
+    const SizeType flat_capacity = static_cast<SizeType>(batch_size) * max_decoding_tokens;
+
+    std::vector<TokenIdType> h_eagle_ids(flat_capacity);
+    std::vector<SizeType>    h_hidden_indices_flat(static_cast<size_t>(flat_capacity) * 2);
+
+    check_cuda_error(cudaMemcpyAsync(h_eagle_ids.data(),
+                                     d_eagle_ids,
+                                     static_cast<size_t>(flat_capacity) * sizeof(TokenIdType),
+                                     cudaMemcpyDeviceToHost,
+                                     stream_));
+    check_cuda_error(cudaMemcpyAsync(h_hidden_indices_flat.data(),
+                                     d_hidden_indices_flat,
+                                     static_cast<size_t>(flat_capacity) * 2 * sizeof(SizeType),
+                                     cudaMemcpyDeviceToHost,
+                                     stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    // Compact per-slot layout [batch, max_decoding_tokens] into a contiguous
+    // [num_tree_tokens] view for this step, tracking the effective per-slot
+    // tree lengths after any clamping.
+    std::vector<TokenIdType> h_tree_ids(static_cast<size_t>(num_tree_tokens));
+    std::vector<SizeType>    h_tree_hidden_indices(static_cast<size_t>(num_tree_tokens) * 2);
+    std::vector<int>         h_tree_lens(batch_size, 0);
+
+    SizeType prefix = 0;
+    for (int local_idx = 0; local_idx < batch_size && prefix < num_tree_tokens; ++local_idx) {
+        SizeType len = h_gen_lens[local_idx];
+        if (len <= 0) {
+            continue;
+        }
+        if (prefix + len > num_tree_tokens) {
+            len = num_tree_tokens - prefix;
+        }
+
+        const SizeType slot_offset = static_cast<SizeType>(local_idx) * max_decoding_tokens;
+        for (SizeType t = 0; t < len; ++t) {
+            const SizeType flat_orig = slot_offset + t;
+            if (flat_orig >= flat_capacity) {
+                break;
+            }
+
+            const SizeType dst = prefix + t;
+
+            h_tree_ids[static_cast<size_t>(dst)] = h_eagle_ids[static_cast<size_t>(flat_orig)];
+
+            const SizeType src_hidden = flat_orig * 2;
+            const SizeType dst_hidden = dst * 2;
+            h_tree_hidden_indices[static_cast<size_t>(dst_hidden) + 0] =
+                h_hidden_indices_flat[static_cast<size_t>(src_hidden) + 0];
+            h_tree_hidden_indices[static_cast<size_t>(dst_hidden) + 1] =
+                h_hidden_indices_flat[static_cast<size_t>(src_hidden) + 1];
+        }
+
+        h_tree_lens[local_idx] = static_cast<int>(len);
+        prefix += len;
+    }
+
+    if (prefix <= 0) {
+        return;
+    }
+
+    num_tree_tokens = prefix;
+
+    Buffer_<int> d_tree_ids(num_tree_tokens, kDEVICE);
+    check_cuda_error(cudaMemcpyAsync(d_tree_ids.data(),
+                                     h_tree_ids.data(),
+                                     static_cast<size_t>(num_tree_tokens) * sizeof(TokenIdType),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+
+    Buffer_<SizeType> d_tree_hidden_indices(static_cast<ssize_t>(num_tree_tokens) * 2, kDEVICE);
+    check_cuda_error(cudaMemcpyAsync(d_tree_hidden_indices.data(),
+                                     h_tree_hidden_indices.data(),
+                                     static_cast<size_t>(num_tree_tokens) * 2 * sizeof(SizeType),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    const int token_num = static_cast<int>(num_tree_tokens);
+
+    // Stage 2: embed compact tree token ids into a [num_tree_tokens,
+    // hidden_units_] buffer which will be used as decoder_input for the
+    // scratch-KV tree decode pass.
+    Tensor tree_input_embeds;
+    if (token_num) {
+        const auto& embedding_table = weights_->pre_decoder_embedding.weight;
+        TM_CHECK_EQ(embedding_table.shape(1) * tp_size_, hidden_units_);
+
+        tree_input_embeds = Tensor{{token_num, static_cast<int>(hidden_units_)}, dtype_, kDEVICE};
+
+        if (tp_size_ == 1) {
+            invokeEmbeddingLookup(tree_input_embeds, d_tree_ids, embedding_table, stream_);
+            sync_check_cuda_error();
+        }
+        else if (use_allgather_2d_) {
+            const auto local_hidden_units = embedding_table.shape(1);
+            Tensor     temp{tree_hidden_states_.buffer(),
+                            {token_num, tp_size_, static_cast<int>(local_hidden_units)}};
+
+            auto local = temp.slice({0, tp_rank_, 0}, {-1, 1, -1}).squeeze(1);
+
+            invokeEmbeddingLookup(local, d_tree_ids, embedding_table, stream_);
+            sync_check_cuda_error();
+
+            comm_->d_comm->AllGather2D(local.raw_data(),
+                                       temp.raw_data(),
+                                       hidden_units_,
+                                       local_hidden_units,
+                                       local_hidden_units,
+                                       token_num,
+                                       local.dtype(),
+                                       {true, true},
+                                       comm_->d_tp_group,
+                                       stream_);
+            sync_check_cuda_error();
+
+            Copy(temp.buffer(), tree_input_embeds.buffer());
+        }
+        else {
+            const auto local_hidden_units = embedding_table.shape(1);
+            Tensor     temp{tree_hidden_states_.buffer(),
+                            {tp_size_, token_num, static_cast<int>(local_hidden_units)}};
+
+            auto local = temp.slice(tp_rank_).squeeze(0);
+
+            invokeEmbeddingLookup(local, d_tree_ids, embedding_table, stream_);
+            sync_check_cuda_error();
+
+            comm_->d_comm->AllGather(
+                local.raw_data(), temp.raw_data(), local.size(), dtype_, comm_->d_tp_group, stream_);
+            sync_check_cuda_error();
+
+            invokeInPlaceTranspose102((uint16_t*)tree_input_embeds.raw_data(),
+                                      (uint16_t*)temp.raw_data(),
+                                      tp_size_,
+                                      token_num,
+                                      local_hidden_units,
+                                      false,
+                                      stream_);
+            sync_check_cuda_error();
+        }
+    }
+
+    // Stage 3: build per-slot tree decode lengths and a scratch KV block
+    // table, then run UnifiedDecoder over the compacted tree tokens with a
+    // pure prefill-style pass (no mutation of SequenceManager or live KV).
+    std::vector<int> h_q_len(batch_size, 0);
+    std::vector<int> h_k_len(batch_size, 0);
+
+    // Derive per-slot prefix (history) lengths from the live sequences when
+    // available so that tree decode can reuse prefix KV as read-only. When
+    // sequences are not provided or SequenceManager is unavailable we fall
+    // back to a history_len=0 interpretation for this step.
+    const int block_seq_len = attn_param_.cache_block_seq_len;
+
+    std::vector<int> h_prefix_len(batch_size, 0);
+    if (sequences && sequence_manager_) {
+        for (int i = 0; i < batch_size; ++i) {
+            const Sequence* seq = sequences[i];
+            if (!seq) {
+                continue;
+            }
+            h_prefix_len[i] = std::max(0, seq->cache_len);
+        }
+    }
+
+    for (int i = 0; i < batch_size; ++i) {
+        const int tree_len   = h_tree_lens[i];
+        const int prefix_len = h_prefix_len[i];
+
+        if (tree_len < 0 || prefix_len < 0) {
+            TM_LOG_WARNING(
+                "[LlamaV2][EAGLE][fallback] target-tree decode sees negative lengths for slot=%d "
+                "(prefix_len=%d, tree_len=%d); disabling target-tree for this engine.",
+                i,
+                prefix_len,
+                tree_len);
+            target_tree_supported_          = false;
+            eagle_tree_target_tokens_valid_ = false;
+            return;
+        }
+
+        // Sanity check: when a live sequence is present, prefix_len must
+        // not exceed the KV coverage implied by its blocks.
+        if (sequences && sequence_manager_ && sequences[i]) {
+            const Sequence* seq          = sequences[i];
+            const int       block_tokens = static_cast<int>(seq->blocks.size()) * block_seq_len;
+            if (prefix_len > block_tokens) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][fallback] target-tree KV invariant violated for slot=%d "
+                    "(prefix_len=%d, blocks=%zu, block_seq_len=%d); disabling target-tree.",
+                    i,
+                    prefix_len,
+                    seq->blocks.size(),
+                    block_seq_len);
+                target_tree_supported_          = false;
+                eagle_tree_target_tokens_valid_ = false;
+                return;
+            }
+        }
+
+        h_q_len[i] = tree_len;
+        h_k_len[i] = prefix_len + tree_len;
+    }
+
+    // Build a per-slot block table that reuses existing prefix KV blocks as
+    // read-only (via SequenceManager) and allocates a scratch region for
+    // any additional blocks needed to store tree tokens. The logical block
+    // layout for slot `i` is:
+    //   [prefix_blocks..., scratch_tree_blocks...]
+    // where prefix_blocks come from Sequence::blocks and scratch blocks are
+    // carved out of a dedicated pool for this call only.
+    std::vector<int> h_cu_block_nums(batch_size + 1, 0);
+    std::vector<int> h_prefix_blocks(batch_size, 0);
+    std::vector<int> h_extra_blocks(batch_size, 0);
+
+    for (int i = 0; i < batch_size; ++i) {
+        const int tree_len   = h_tree_lens[i];
+        const int prefix_len = h_prefix_len[i];
+
+        int prefix_blocks = 0;
+        if (sequences && sequence_manager_) {
+            const Sequence* seq = sequences[i];
+            if (seq) {
+                prefix_blocks = static_cast<int>(seq->blocks.size());
+            }
+        }
+
+        const int total_len     = prefix_len + tree_len;
+        const int required_blk  = total_len > 0 ? (total_len + block_seq_len - 1) / block_seq_len : 0;
+        const int extra_blocks  = std::max(0, required_blk - prefix_blocks);
+
+        h_prefix_blocks[i] = std::max(prefix_blocks, 0);
+        h_extra_blocks[i]  = std::max(extra_blocks, 0);
+
+        const int blocks_i = h_prefix_blocks[i] + h_extra_blocks[i];
+        h_cu_block_nums[i + 1] = h_cu_block_nums[i] + blocks_i;
+    }
+
+    const int total_blocks = h_cu_block_nums[batch_size];
+    if (total_blocks <= 0) {
+        return;
+    }
+
+    Buffer_<int> d_cu_block_nums(batch_size + 1, kDEVICE);
+    check_cuda_error(cudaMemcpyAsync(d_cu_block_nums.data(),
+                                     h_cu_block_nums.data(),
+                                     static_cast<size_t>(batch_size + 1) * sizeof(int),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+
+    DataType kv_dtype = dtype_;
+    if (param_.quant_policy & QuantPolicy::kCacheKVInt8) {
+        kv_dtype = kUint8;
+    }
+    else if (param_.quant_policy & QuantPolicy::kCacheKVInt4) {
+        kv_dtype = kUint4;
+    }
+
+    const size_t kv_block_bytes = get_cache_block_size(
+        dtype_, kv_dtype, static_cast<int>(layer_num_), static_cast<int>(local_kv_head_num_), static_cast<int>(size_per_head_), block_seq_len);
+
+    // Scratch blocks are used only for the tree portion of each sequence.
+    int total_extra_blocks = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        total_extra_blocks += h_extra_blocks[i];
+    }
+
+    Buffer scratch_kv_blocks(static_cast<ssize_t>(std::max(1, total_extra_blocks))
+                                 * static_cast<ssize_t>(kv_block_bytes),
+                             kUint8,
+                             kDEVICE);
+
+    std::vector<uintptr_t> h_block_ptrs(static_cast<size_t>(total_blocks));
+    auto*                  kv_base = static_cast<char*>(scratch_kv_blocks.raw_data());
+
+    int scratch_block_cursor = 0;
+    for (int slot = 0; slot < batch_size; ++slot) {
+        const int prefix_blocks = h_prefix_blocks[slot];
+        const int extra_blocks  = h_extra_blocks[slot];
+        const int base_index    = h_cu_block_nums[slot];
+
+        // Prefix KV: reuse existing block pointers from SequenceManager as
+        // read-only so tree tokens can attend to committed history without
+        // mutating live KV state.
+        if (sequence_manager_ && sequences && sequences[slot]) {
+            const Sequence* seq        = sequences[slot];
+            const int       seq_blocks = static_cast<int>(seq->blocks.size());
+
+            // Invariant: prefix_blocks must match the live sequence's block
+            // count when we are reusing prefix KV; otherwise the KV layout is
+            // inconsistent and we must fall back to single-step targets.
+            if (prefix_blocks != seq_blocks) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][fallback] target-tree KV invariant violated for slot=%d "
+                    "(prefix_blocks=%d, seq.blocks.size()=%d); disabling target-tree.",
+                    slot,
+                    prefix_blocks,
+                    seq_blocks);
+                target_tree_supported_          = false;
+                eagle_tree_target_tokens_valid_ = false;
+                return;
+            }
+
+            for (int j = 0; j < seq_blocks; ++j) {
+                const int   block_id = seq->blocks[j];
+                void* const ptr      = sequence_manager_->GetBlockPtr(block_id);
+                h_block_ptrs[static_cast<size_t>(base_index + j)] =
+                    reinterpret_cast<uintptr_t>(ptr);
+            }
+        }
+
+        // Scratch KV for tree tokens beyond the existing prefix coverage.
+        for (int j = 0; j < extra_blocks; ++j) {
+            const int global_idx = base_index + prefix_blocks + j;
+            h_block_ptrs[static_cast<size_t>(global_idx)] =
+                reinterpret_cast<uintptr_t>(kv_base + static_cast<size_t>(scratch_block_cursor + j) * kv_block_bytes);
+        }
+
+        scratch_block_cursor += extra_blocks;
+    }
+
+    // Final safety check: ensure that the total KV coverage implied by the
+    // block table is sufficient for the requested prefix_len + tree_len on
+    // every active slot.
+    for (int i = 0; i < batch_size; ++i) {
+        const int prefix_len = h_prefix_len[i];
+        const int tree_len   = h_tree_lens[i];
+        const int blocks_i   = h_prefix_blocks[i] + h_extra_blocks[i];
+        const int cover      = blocks_i * block_seq_len;
+        if (prefix_len + tree_len > cover) {
+            TM_LOG_WARNING(
+                "[LlamaV2][EAGLE][fallback] target-tree KV coverage shortfall for slot=%d "
+                "(prefix_len=%d, tree_len=%d, blocks=%d, block_seq_len=%d); disabling target-tree.",
+                i,
+                prefix_len,
+                tree_len,
+                blocks_i,
+                block_seq_len);
+            target_tree_supported_          = false;
+            eagle_tree_target_tokens_valid_ = false;
+            return;
+        }
+    }
+
+    Buffer_<uintptr_t> d_block_ptrs(total_blocks, kDEVICE);
+    check_cuda_error(cudaMemcpyAsync(d_block_ptrs.data(),
+                                     h_block_ptrs.data(),
+                                     static_cast<size_t>(total_blocks) * sizeof(uintptr_t),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    Buffer_<float> rope_base_buf(batch_size, kDEVICE);
+    std::vector<float> h_rope_base(batch_size, attn_param_.rope.base);
+    check_cuda_error(cudaMemcpyAsync(rope_base_buf.data(),
+                                     h_rope_base.data(),
+                                     static_cast<size_t>(batch_size) * sizeof(float),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+
+    Buffer_<bool> finished_buf(batch_size, kDEVICE);
+    check_cuda_error(
+        cudaMemsetAsync(finished_buf.data(), 0, static_cast<size_t>(batch_size) * sizeof(bool), stream_));
+
+    const int global_token_num = token_num;
+    int       local_token_num  = global_token_num;
+
+    Buffer local_token_nums_buf{&local_token_num, 1, kCPU};
+
+    Tensor tree_hidden_view{
+        tree_hidden_states_.buffer().slice(0, static_cast<ssize_t>(num_tree_tokens) * static_cast<ssize_t>(hidden_units_)),
+        {static_cast<int>(num_tree_tokens), static_cast<int>(hidden_units_)},
+    };
+
+    Tensor tree_last_hidden{{batch_size, static_cast<int>(hidden_units_)}, dtype_, kDEVICE};
+
+    Tensor partial_ML{
+        {std::max(1, engine_param_.attn_cp_size), UnifiedAttentionLayer::kMaxWorkspaceTokens,
+         static_cast<int>(local_head_num_), 2},
+        kFloat32,
+        kDEVICE};
+
+    const int decode_num = 0;
+    const int prefil_num = batch_size;
+
+    Buffer h_q_len_buf{h_q_len.data(), batch_size, kCPU};
+    Buffer h_k_len_buf{h_k_len.data(), batch_size, kCPU};
+
+    TensorMap args{{"decoder_input", tree_input_embeds},
+                   {"decoder_output", tree_hidden_view.borrow()},
+                   {"last_token_hidden_units", tree_last_hidden},
+                   {"output_norm_weight", weights_->output_norm_weight},
+                   {"h_q_len", h_q_len_buf},
+                   {"h_k_len", h_k_len_buf},
+                   {"finished", finished_buf},
+                   {"decode_num", Buffer{const_cast<int*>(&decode_num), 1, kCPU}},
+                   {"prefil_num", Buffer{const_cast<int*>(&prefil_num), 1, kCPU}},
+                   {"rope_base", rope_base_buf},
+                   {"partial_ML", partial_ML},
+                   {"cu_block_nums", d_cu_block_nums},
+                   {"kv_block_ptrs", d_block_ptrs},
+                   {"local_token_nums", local_token_nums_buf}};
+
+    // Optional packed mask for tree decode. When target-tree is enabled we
+    // gather per-node packed masks for the compact tree token layout from
+    // the per-step packed_masks buffer and pass them into UnifiedDecoder so
+    // attention can enforce the EAGLE tree structure.
+    if (eagle_module_ && eagle_buffers_ && eagle_buffers_->inputs.packed_masks) {
+        const SizeType num_packed =
+            static_cast<SizeType>(eagle_module_->getNumPackedMasks());
+
+        Tensor tree_packed_mask{
+            {static_cast<int>(num_tree_tokens), static_cast<int>(num_packed)},
+            kInt32,
+            kDEVICE};
+
+        invokeGatherTreePackedMask(
+            reinterpret_cast<SizeType const*>(eagle_buffers_->inputs.packed_masks),
+            static_cast<SizeType>(batch_size),
+            max_decoding_tokens,
+            num_packed,
+            d_tree_hidden_indices.data(),
+            num_tree_tokens,
+            tree_packed_mask.data<SizeType>(),
+            stream_);
+        args.insert({"spec_packed_mask", tree_packed_mask});
+
+        if (isEagleDebugEnabled() && tp_rank_ == 0) {
+            const SizeType module_packed =
+                static_cast<SizeType>(eagle_module_->getNumPackedMasks());
+            if (module_packed != num_packed) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][tree-mask] num_packed mismatch: module=%d, gathered=%d",
+                    static_cast<int>(module_packed),
+                    static_cast<int>(num_packed));
+            }
+            else {
+                TM_LOG_INFO(
+                    "[LlamaV2][EAGLE][tree-mask] step tree decode: num_tree_tokens=%d, num_packed=%d",
+                    static_cast<int>(num_tree_tokens),
+                    static_cast<int>(num_packed));
+            }
+        }
+    }
+
+    unified_decoder_->Forward(args, weights_->decoder_layer_weights);
+
+    // Stage 4: project the tree hidden states through the LM head into
+    // the dedicated FP32 tree logits buffer and reduce them to per-node
+    // target_ids on device.
+    (void)postDecodeEmbedding(tree_hidden_view, tree_logits_buffer_);
+
+    const float* logits_ptr = tree_logits_buffer_.data<float>();
+
+    TokenIdType* target_tokens =
+        reinterpret_cast<TokenIdType*>(eagle_buffers_->inputs.target_tokens);
+
+    if (!target_tokens) {
+        return;
+    }
+
+    TreeLogitsToTargetsParams reduce_params{};
+    reduce_params.logits              = logits_ptr;
+    reduce_params.num_tree_tokens     = num_tree_tokens;
+    reduce_params.vocab_size          = static_cast<SizeType>(vocab_size_padded_);
+    reduce_params.hidden_indices      = d_tree_hidden_indices.data();
+    reduce_params.max_batch_size      = static_cast<SizeType>(engine_param_.max_batch_size);
+    reduce_params.max_decoding_tokens = static_cast<SizeType>(eagle_module_->getMaxDecodingTokens());
+    reduce_params.target_tokens       = target_tokens;
+    reduce_params.stream              = stream_;
+
+    invokeTreeLogitsToTargetIds(reduce_params);
+
+    sync_check_cuda_error();
+    eagle_tree_target_tokens_valid_ = true;
+}
+
+int LlamaV2::eagleMaxEngineTokensPerStep() const noexcept
+{
+    return eagle_max_engine_tokens_per_step_;
+}
+
+void LlamaV2::targetTreeDecode(int batch_size, const int* d_sequence_lengths)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    // Guard: only meaningful when EAGLE is enabled and buffers exist.
+    if (!spec_mode_.isEagle() || !eagle_module_ || !eagle_buffers_
+        || !eagle_buffers_->isAllocated()
+        || batch_size <= 0
+        || batch_size > engine_param_.max_batch_size) {
+        return;
+    }
+
+    using namespace kernels::speculative_decoding;
+
+    const SizeType max_decoding_tokens =
+        static_cast<SizeType>(engine_param_.spec_max_decoding_tokens);
+    const SizeType max_path_len =
+        static_cast<SizeType>(engine_param_.spec_max_draft_path_len);
+
+    // Use the existing EagleBuffers inputs as the target-tree decode
+    // staging area so that downstream kernels (and future decode
+    // passes) can consume a consistent layout.
+    PrepareGenTargetTreeParams params{};
+    params.draft_paths             = reinterpret_cast<SizeType const*>(eagle_buffers_->inputs.draft_paths);
+    params.batch_slots             = nullptr;  // identity mapping [0..batch_size)
+    params.draft_tokens            = reinterpret_cast<TokenIdType const*>(eagle_buffers_->inputs.draft_tokens);
+    params.base_sequence_lengths   = d_sequence_lengths
+        ? reinterpret_cast<SizeType const*>(d_sequence_lengths)
+        : nullptr;
+    params.base_context_lengths    = nullptr;
+
+    params.output_ids              = reinterpret_cast<TokenIdType*>(eagle_buffers_->inputs.eagle_net_input_ids);
+    params.position_ids            = reinterpret_cast<SizeType*>(eagle_buffers_->inputs.eagle_net_position_ids);
+    params.hidden_indices          = reinterpret_cast<SizeType*>(eagle_buffers_->inputs.eagle_net_hidden_indices);
+    params.spec_gen_lengths        = reinterpret_cast<SizeType*>(eagle_buffers_->inputs.eagle_net_gen_lens);
+    params.next_sequence_lengths   = reinterpret_cast<SizeType*>(eagle_buffers_->inputs.eagle_net_seq_lens);
+    params.next_context_lengths    = reinterpret_cast<SizeType*>(eagle_buffers_->inputs.eagle_net_ctx_lens);
+
+    params.batch_size        = static_cast<SizeType>(batch_size);
+    params.max_batch_size    = static_cast<SizeType>(engine_param_.max_batch_size);
+    params.max_decoding_tokens = max_decoding_tokens;
+    params.max_path_len      = max_path_len;
+    params.stream            = stream_;
+
+    invokePrepareGenTargetTreeInputs(params);
 }
 
 void LlamaV2::updateEmbedding(char*            decoder_input,
@@ -475,6 +1176,1269 @@ void LlamaV2::dynamicDecode(Buffer token_ids,
     }
 
     dynamic_decode_->Forward(args);
+}
+
+void LlamaV2::dynamicDecodeMultiStep(Buffer             token_ids,
+                                     Buffer             finished,
+                                     Buffer             sequence_length,
+                                     Tensor             curand_state,
+                                     Tensor             logits,
+                                     Buffer             seq_limit_len,
+                                     Buffer             init_context_length,
+                                     Buffer             context_length,
+                                     Buffer             prompt_length,
+                                     Buffer             sampled_logprobs,
+                                     Buffer             sampled_indexes,
+                                     Buffer             sampled_nums,
+                                     int                step,
+                                     int                max_context_len,
+                                     const ForcedTailContext* forced_ctx)
+{
+    NvtxScope scope("dynamicDecodeMultiStep");
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    TensorMap args{
+        {"logits", logits},
+        {"step", Buffer{&step, 1, kCPU}},
+        {"max_input_length", Buffer{&max_context_len, 1, kCPU}},
+        {"sequence_limit_length", seq_limit_len},
+        {"init_context_length", init_context_length},
+        {"context_length", context_length},
+        {"prompt_length", prompt_length},
+        {"output_ids", token_ids},             // inout
+        {"finished", finished},                // inout
+        {"sequence_length", sequence_length},  // inout
+        {"curand_state", curand_state},        // inout
+    };
+
+    if (sampled_logprobs) {
+        args.emplace("sampled_logprobs", sampled_logprobs);
+        args.emplace("sampled_indexes", sampled_indexes);
+        args.emplace("sampled_nums", sampled_nums);
+    }
+
+    dynamic_decode_->ForwardMultiStep(args, forced_ctx);
+}
+
+void LlamaV2::dynamicDecodeWithSpec(GenerationState& g,
+                                    Buffer           token_ids,
+                                    Buffer           finished,
+                                    Buffer           sequence_length,
+                                    Tensor           curand_state,
+                                    const Tensor&    decoder_features,
+                                    Tensor           logits,
+                                    Buffer           seq_limit_len,
+                                    Buffer           init_context_length,
+                                    Buffer           context_length,
+                                    Buffer           prompt_length,
+                                    Buffer           sampled_logprobs,
+                                    Buffer           sampled_indexes,
+                                    Buffer           sampled_nums,
+                                    int              max_context_len,
+                                    const SpecContext& spec_ctx)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    // Reset per-step EAGLE acceptance summary.
+    eagle_step_tokens_per_seq_ = 0;
+    eagle_step_accepted_lens_.clear();
+    eagle_step_accepted_tokens_.clear();
+    eagle_step_max_extra_ = 0;
+
+    // Route EAGLE-enabled engines through the fused multi-step path so that
+    // base decode, tree decode, acceptance, and tail commit are centralized
+    // in dynamicDecodeWithSpecMulti.
+    if (spec_ctx.enable_eagle && isEagleEnabled() && eagle_module_ && eagle_buffers_) {
+        dynamicDecodeWithSpecMulti(g,
+                                   token_ids,
+                                   finished,
+                                   sequence_length,
+                                   curand_state,
+                                   decoder_features,
+                                   logits,
+                                   seq_limit_len,
+                                   init_context_length,
+                                   context_length,
+                                   prompt_length,
+                                   sampled_logprobs,
+                                   sampled_indexes,
+                                   sampled_nums,
+                                   max_context_len,
+                                   spec_ctx);
+        return;
+    }
+
+    // Baseline path when EAGLE is disabled or not fully initialized: keep
+    // the original single-step DynamicDecode semantics.
+    dynamicDecode(token_ids,
+                  finished,
+                  sequence_length,
+                  curand_state,
+                  logits,
+                  seq_limit_len,
+                  init_context_length,
+                  context_length,
+                  prompt_length,
+                  sampled_logprobs,
+                  sampled_indexes,
+                  sampled_nums,
+                  g.step,
+                  max_context_len);
+    return;
+
+    // Compute how many draft tokens per sequence we plan to generate in
+    // this step, mirroring LlamaBatch::compute_eagle_draft_tokens_per_seq.
+    auto compute_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
+        if (decode_batch_size <= 0) {
+            return 0;
+        }
+
+        const int max_engine_tokens = eagleMaxEngineTokensPerStep();
+        if (max_engine_tokens <= 0) {
+            return 0;
+        }
+
+        // When the engine-side budget resolves to 1, treat this as
+        // single-token EAGLE regardless of batch size.
+        if (max_engine_tokens <= 1) {
+            return 1;
+        }
+
+        const int per_seq_cap = engine_param_.spec_max_decoding_draft_tokens;
+        if (per_seq_cap <= 0) {
+            return 1;
+        }
+
+        // Hard upper bound from engine budget: do not exceed the per-step
+        // engine token allowance when spreading draft tokens across the
+        // active decode batch.
+        const int max_by_engine = max_engine_tokens / decode_batch_size;
+        if (max_by_engine <= 0) {
+            return 1;
+        }
+
+        const int tokens_per_seq = std::max(1, std::min(per_seq_cap, max_by_engine));
+        return tokens_per_seq;
+    };
+
+    const int tokens_per_seq = compute_draft_tokens_per_seq(batch_size);
+    if (tokens_per_seq <= 0) {
+        TM_LOG_DEBUG("[LlamaV2][EAGLE] tokens_per_seq=0; skipping EAGLE step");
+        return;
+    }
+
+    // Run EagleNet draft model over last-token hidden states to obtain
+    // per-sequence draft logits for speculative sampling.
+    Tensor draft_logits;
+    Tensor draft_hidden;
+    eagleDraftForward(decoder_features, draft_logits, draft_hidden);
+
+    if (!draft_logits) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE] Draft forward produced empty logits; skipping EAGLE step");
+        return;
+    }
+
+    const int vocab_size      = static_cast<int>(vocab_size_);
+    const int vocab_size_pad  = logits.shape(1);
+    const int logit_elems     = batch_size * vocab_size_pad;
+    const int total_draft     = batch_size * tokens_per_seq;
+
+    // Prepare FP32 draft logits for GPU top-k.
+    Tensor eagle_sampling_logits{{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
+    if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32; "
+            "skipping EAGLE tree decode for this step.",
+            to_string(draft_logits.dtype()));
+        return;
+    }
+    invokeCastFloat2D(draft_logits, eagle_sampling_logits, stream_);
+    sync_check_cuda_error();
+
+    Buffer_<int> draft_tokens(total_draft, kCPU);
+    Buffer_<int> target_tokens(total_draft, kCPU);
+
+    if (tokens_per_seq > 0 && tokens_per_seq <= vocab_size_pad && tokens_per_seq <= 1024) {
+        Buffer_<int> topk_buf(batch_size, kDEVICE);
+        Buffer_<int> kept_buf(batch_size, kDEVICE);
+
+        std::vector<int> h_topk(batch_size, tokens_per_seq);
+        std::vector<int> h_kept(batch_size, tokens_per_seq);
+
+        core::Copy(h_topk.data(), batch_size, topk_buf.data());
+        core::Copy(h_kept.data(), batch_size, kept_buf.data());
+
+        Buffer_<int> draft_sorted_indices(logit_elems, kDEVICE);
+        Buffer_<int> target_sorted_indices(logit_elems, kDEVICE);
+
+        TopKSortFilterParams draft_params{};
+        draft_params.logits            = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_logits     = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_indices    = draft_sorted_indices.data();
+        draft_params.kept              = kept_buf.data();
+        draft_params.top_ks            = topk_buf.data();
+        draft_params.max_top_k         = tokens_per_seq;
+        draft_params.batch_size        = batch_size;
+        draft_params.vocab_size        = vocab_size;
+        draft_params.vocab_size_padded = vocab_size_pad;
+
+        invokeTopKSortFilter<float>(draft_params, stream_);
+
+        TopKSortFilterParams target_params{};
+        target_params.logits            = logits.buffer().raw_data();
+        target_params.sorted_logits     = logits.buffer().raw_data();
+        target_params.sorted_indices    = target_sorted_indices.data();
+        target_params.kept              = kept_buf.data();
+        target_params.top_ks            = topk_buf.data();
+        target_params.max_top_k         = tokens_per_seq;
+        target_params.batch_size        = batch_size;
+        target_params.vocab_size        = vocab_size;
+        target_params.vocab_size_padded = vocab_size_pad;
+
+        invokeTopKSortFilter<float>(target_params, stream_);
+
+        const size_t idx_width_bytes = sizeof(int) * tokens_per_seq;
+        const size_t idx_src_pitch   = sizeof(int) * vocab_size_pad;
+        const size_t idx_dst_pitch   = sizeof(int) * tokens_per_seq;
+
+        check_cuda_error(cudaMemcpy2DAsync(draft_tokens.data(),
+                                           idx_dst_pitch,
+                                           draft_sorted_indices.data(),
+                                           idx_src_pitch,
+                                           idx_width_bytes,
+                                           batch_size,
+                                           cudaMemcpyDeviceToHost,
+                                           stream_));
+
+        check_cuda_error(cudaMemcpy2DAsync(target_tokens.data(),
+                                           idx_dst_pitch,
+                                           target_sorted_indices.data(),
+                                           idx_src_pitch,
+                                           idx_width_bytes,
+                                           batch_size,
+                                           cudaMemcpyDeviceToHost,
+                                           stream_));
+
+        check_cuda_error(cudaStreamSynchronize(stream_));
+    }
+    else {
+        std::fill_n(draft_tokens.data(), total_draft, 0);
+        std::fill_n(target_tokens.data(), total_draft, 0);
+    }
+
+    TM_LOG_DEBUG("[LlamaV2][EAGLE] step=%d, batch=%d, tokens_per_seq=%d, num_draft_tokens=%d",
+                 g.step,
+                 batch_size,
+                 tokens_per_seq,
+                 total_draft);
+
+    // ========= Step 1: Build EAGLE tree from draft tokens =========
+    const int num_draft_tokens = total_draft;
+    const int inferred_tokens_per_seq =
+        batch_size > 0 ? std::max(1, num_draft_tokens / batch_size) : 1;
+    const int expected_total = batch_size * inferred_tokens_per_seq;
+    if (expected_total != num_draft_tokens) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE] draft_tokens size (%d) is not a multiple of batch_size (%d); "
+                       "interpreting as tokens_per_seq=%d and ignoring any trailing entries",
+                       num_draft_tokens,
+                       batch_size,
+                       inferred_tokens_per_seq);
+    }
+
+    eagle::SpeculationTree tree(
+        engine_param_.spec_max_draft_path_len,
+        engine_param_.spec_max_decoding_tokens);
+
+    const auto& choices = eagle_module_->getDefaultChoices();
+    if (!choices.empty()) {
+        tree.buildTreeWithChoices(draft_tokens.data(), inferred_tokens_per_seq, choices);
+    }
+    else {
+        tree.buildTree(draft_tokens.data(), inferred_tokens_per_seq);
+    }
+    tree.extractPaths();
+
+    const int* paths_flat = tree.getPathsFlat();
+    const int  num_paths  = tree.getNumPaths();
+    const int  max_path_len = engine_param_.spec_max_draft_path_len;
+    const int  max_decoding_tokens = engine_param_.spec_max_decoding_tokens;
+
+    if (num_paths == 0) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE] No valid paths in tree");
+        return;
+    }
+
+    TM_LOG_DEBUG("[LlamaV2][EAGLE] Built tree with %d paths, max_depth=%d",
+                 num_paths,
+                 max_path_len);
+
+    // ========= Step 2: Mirror tokens and paths into EagleBuffers =========
+    cudaMemcpyAsync(eagle_buffers_->inputs.draft_tokens,
+                    draft_tokens.data(),
+                    num_draft_tokens * sizeof(int),
+                    cudaMemcpyHostToDevice,
+                    stream_);
+    if (!isTargetTreeDecodeActiveStep()) {
+        cudaMemcpyAsync(eagle_buffers_->inputs.target_tokens,
+                        target_tokens.data(),
+                        num_draft_tokens * sizeof(int),
+                        cudaMemcpyHostToDevice,
+                        stream_);
+    }
+
+    // Prepare per-sequence path buffers. The current tree is single-sequence,
+    // so we replicate its paths across all batch slots.
+    std::vector<int> host_paths(batch_size * max_decoding_tokens * max_path_len, -1);
+    const int paths_per_seq = std::min(num_paths, max_decoding_tokens);
+
+    for (int b = 0; b < batch_size; ++b) {
+        for (int p = 0; p < paths_per_seq; ++p) {
+            const int* src = paths_flat + p * max_path_len;
+            int*       dst = host_paths.data() + (b * max_decoding_tokens + p) * max_path_len;
+            std::copy(src, src + max_path_len, dst);
+        }
+    }
+
+    cudaMemcpyAsync(eagle_buffers_->inputs.draft_paths,
+                    host_paths.data(),
+                    host_paths.size() * sizeof(int),
+                    cudaMemcpyHostToDevice,
+                    stream_);
+
+    sync_check_cuda_error();
+
+    // ========= Step 3: Generate leaf mask and packed masks =========
+    kernels::eagle::invokeBuildLeafMask(
+        eagle_buffers_->inputs.leaf_mask,
+        eagle_buffers_->inputs.draft_paths,
+        batch_size,
+        engine_param_.spec_max_decoding_tokens,
+        engine_param_.spec_max_draft_path_len,
+        stream_);
+
+    std::vector<int> batch_slots(batch_size);
+    for (int i = 0; i < batch_size; ++i) {
+        batch_slots[i] = i;
+    }
+
+    int* d_batch_slots = nullptr;
+    check_cuda_error(cudaMalloc(&d_batch_slots, batch_size * sizeof(int)));
+    check_cuda_error(cudaMemcpyAsync(
+        d_batch_slots,
+        batch_slots.data(),
+        batch_size * sizeof(int),
+        cudaMemcpyHostToDevice,
+        stream_));
+
+    kernels::eagle::invokeGetPackedMaskFromPath(
+        eagle_buffers_->inputs.packed_masks,
+        reinterpret_cast<kernels::eagle::SizeType*>(d_batch_slots),
+        reinterpret_cast<kernels::eagle::SizeType const*>(eagle_buffers_->inputs.draft_paths),
+        engine_param_.spec_max_decoding_tokens,
+        engine_param_.spec_max_draft_path_len,
+        stream_);
+
+    sync_check_cuda_error();
+
+    TM_LOG_DEBUG("[LlamaV2][EAGLE] Generated masks for %d paths", num_paths);
+
+    // Optional target-tree decode over the speculative tree.
+    if (spec_ctx.enable_eagle_target_tree && isTargetTreeDecodeEnabled()) {
+        runEagleTargetTreeDecode(batch_size, spec_ctx.d_sequence_lengths, spec_ctx.sequences);
+    }
+
+    // ========= Step 4: Device-side acceptance over tree paths =========
+    std::vector<int> h_draft(num_draft_tokens);
+    std::vector<int> h_target(num_draft_tokens);
+    std::copy_n(draft_tokens.data(), num_draft_tokens, h_draft.data());
+
+    std::vector<int> h_accepted_lens(batch_size, 0);
+    std::vector<int> h_accepted_tokens(batch_size * max_path_len, -1);
+    std::vector<int> host_best_path_ids(batch_size, 0);
+
+    using SpecSizeType    = kernels::speculative_decoding::SizeType;
+    using SpecTokenIdType = kernels::speculative_decoding::TokenIdType;
+
+    const SpecSizeType max_batch_size   = static_cast<SpecSizeType>(batch_size);
+    const SpecSizeType max_draft_tokens = static_cast<SpecSizeType>(inferred_tokens_per_seq);
+    const SpecSizeType num_paths_device = static_cast<SpecSizeType>(paths_per_seq);
+    const SpecSizeType max_path_len_dev = static_cast<SpecSizeType>(max_path_len);
+
+    kernels::speculative_decoding::invokeTreeAcceptByIdsWithPaths(
+        reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.draft_tokens),
+        reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.target_tokens),
+        reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
+        reinterpret_cast<SpecSizeType const*>(d_batch_slots),
+        static_cast<SpecSizeType>(batch_size),
+        max_batch_size,
+        num_paths_device,
+        max_path_len_dev,
+        max_draft_tokens,
+        reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.best_path_ids),
+        reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_lens),
+        reinterpret_cast<SpecTokenIdType*>(eagle_buffers_->outputs.accepted_tokens),
+        stream_);
+
+    sync_check_cuda_error();
+
+    check_cuda_error(cudaMemcpyAsync(
+        host_best_path_ids.data(),
+        eagle_buffers_->outputs.best_path_ids,
+        batch_size * sizeof(SpecSizeType),
+        cudaMemcpyDeviceToHost,
+        stream_));
+
+    check_cuda_error(cudaMemcpyAsync(
+        h_accepted_lens.data(),
+        eagle_buffers_->outputs.accepted_lens,
+        batch_size * sizeof(SpecSizeType),
+        cudaMemcpyDeviceToHost,
+        stream_));
+
+    check_cuda_error(cudaMemcpyAsync(
+        h_accepted_tokens.data(),
+        eagle_buffers_->outputs.accepted_tokens,
+        batch_size * max_path_len * sizeof(TokenIdType),
+        cudaMemcpyDeviceToHost,
+        stream_));
+
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    int total_accepted = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        if (h_accepted_lens[b] < 0) {
+            h_accepted_lens[b] = 0;
+        }
+        total_accepted += h_accepted_lens[b];
+    }
+
+    // Optional debug logging of accepted paths/tokens.
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        if (isTargetTreeDecodeActiveStep()) {
+            check_cuda_error(cudaMemcpyAsync(
+                h_target.data(),
+                eagle_buffers_->inputs.target_tokens,
+                num_draft_tokens * sizeof(int),
+                cudaMemcpyDeviceToHost,
+                stream_));
+            check_cuda_error(cudaStreamSynchronize(stream_));
+        }
+        else {
+            std::copy_n(target_tokens.data(), num_draft_tokens, h_target.data());
+        }
+
+        for (int b = 0; b < batch_size; ++b) {
+            const int len     = h_accepted_lens[b];
+            const int path_id = host_best_path_ids[b];
+            if (len <= 0) {
+                TM_LOG_WARNING("[LlamaV2][EAGLE] step_spec seq=%d no accepted tokens (best_path=%d)", b, path_id);
+                continue;
+            }
+
+            std::ostringstream draft_ss;
+            std::ostringstream target_ss;
+            std::ostringstream accepted_ss;
+
+            for (int d = 0; d < max_path_len; ++d) {
+                const int node_idx = paths_flat[path_id * max_path_len + d];
+                if (node_idx <= 0) {
+                    if (node_idx < 0) {
+                        break;
+                    }
+                    continue;
+                }
+                const int token_idx = node_idx - 1;
+                if (token_idx < 0 || token_idx >= inferred_tokens_per_seq) {
+                    break;
+                }
+                const int global_idx = b * inferred_tokens_per_seq + token_idx;
+                if (global_idx < 0 || global_idx >= num_draft_tokens) {
+                    break;
+                }
+
+                const int draft_id  = h_draft[global_idx];
+                const int target_id = h_target[global_idx];
+
+                if (draft_ss.tellp() > 0) {
+                    draft_ss << ',';
+                    target_ss << ',';
+                }
+                draft_ss << draft_id;
+                target_ss << target_id;
+            }
+
+            for (int t = 0; t < len; ++t) {
+                if (t) {
+                    accepted_ss << ',';
+                }
+                accepted_ss << h_accepted_tokens[b * max_path_len + t];
+            }
+
+            TM_LOG_WARNING("[LlamaV2][EAGLE] step_spec seq=%d best_path=%d accepted_len=%d "
+                           "path_draft_tokens=[%s] path_target_tokens=[%s] "
+                           "accepted_tokens=[%s]",
+                           b,
+                           path_id,
+                           len,
+                           draft_ss.str().c_str(),
+                           target_ss.str().c_str(),
+                           accepted_ss.str().c_str());
+        }
+    }
+
+    if (eagle_buffers_ && eagle_buffers_->isAllocated()) {
+        // Pack accepted paths on device for downstream KV / context helpers.
+        kernels::speculative_decoding::invokePackAcceptedPaths(
+            reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_lengths_cumsum),
+            reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_path_offsets),
+            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.accepted_lens),
+            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.best_path_ids),
+            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
+            reinterpret_cast<SpecSizeType const*>(d_batch_slots),
+            static_cast<SpecSizeType>(batch_size),
+            static_cast<SpecSizeType>(batch_size),
+            static_cast<SpecSizeType>(paths_per_seq),
+            static_cast<SpecSizeType>(max_path_len),
+            stream_);
+
+        check_cuda_error(cudaFree(d_batch_slots));
+    }
+
+    const int effective_draft_tokens = batch_size;  // one token considered per seq
+    float      acceptance_rate       = (effective_draft_tokens > 0)
+                                           ? static_cast<float>(total_accepted)
+                                                 / static_cast<float>(effective_draft_tokens)
+                                           : 0.0f;
+
+    TM_LOG_WARNING("[LlamaV2][EAGLE] Accepted %d/%d draft tokens (%.1f%% acceptance rate)",
+                   total_accepted,
+                   effective_draft_tokens,
+                   acceptance_rate * 100.0f);
+
+    float h_acceptance_rate = acceptance_rate;
+    cudaMemcpyAsync(
+        eagle_buffers_->outputs.acceptance_rate,
+        &h_acceptance_rate,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream_);
+
+    sync_check_cuda_error();
+
+    // Cache per-step acceptance summary for LlamaBatch metrics and
+    // multi-token advancement.
+    eagle_step_tokens_per_seq_  = inferred_tokens_per_seq;
+        eagle_step_accepted_lens_   = std::move(h_accepted_lens);
+        eagle_step_accepted_tokens_ = std::move(h_accepted_tokens);
+}
+
+void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
+                                         Buffer           token_ids,
+                                         Buffer           finished,
+                                         Buffer           sequence_length,
+                                         Tensor           curand_state,
+                                         const Tensor&    decoder_features,
+                                         Tensor           logits,
+                                         Buffer           seq_limit_len,
+                                         Buffer           init_context_length,
+                                         Buffer           context_length,
+                                         Buffer           prompt_length,
+                                         Buffer           sampled_logprobs,
+                                         Buffer           sampled_indexes,
+                                         Buffer           sampled_nums,
+                                         int              max_context_len,
+                                         const SpecContext& spec_ctx)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    // Reset per-step EAGLE acceptance summary and extra count.
+    eagle_step_tokens_per_seq_  = 0;
+    eagle_step_accepted_lens_.clear();
+    eagle_step_accepted_tokens_.clear();
+    eagle_step_max_extra_ = 0;
+
+    const int batch_size = logits.shape(0);
+    if (batch_size <= 0) {
+        // Nothing to decode; keep baseline behaviour.
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    // Baseline path when EAGLE is disabled or not fully initialized.
+    if (!spec_ctx.enable_eagle || !isEagleEnabled() || !eagle_module_ || !eagle_buffers_) {
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    // ========= EAGLE draft + tree decode + acceptance (copied from dynamicDecodeWithSpec) =========
+
+    auto compute_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
+        if (decode_batch_size <= 0) {
+            return 0;
+        }
+
+        const int max_engine_tokens = eagleMaxEngineTokensPerStep();
+        if (max_engine_tokens <= 0) {
+            return 0;
+        }
+
+        // When the engine-side budget resolves to 1, treat this as
+        // single-token EAGLE regardless of batch size.
+        if (max_engine_tokens <= 1) {
+            return 1;
+        }
+
+        const int per_seq_cap = engine_param_.spec_max_decoding_draft_tokens;
+        if (per_seq_cap <= 0) {
+            return 1;
+        }
+
+        // Hard upper bound from engine budget: do not exceed the per-step
+        // engine token allowance when spreading draft tokens across the
+        // active decode batch.
+        const int max_by_engine = max_engine_tokens / decode_batch_size;
+        if (max_by_engine <= 0) {
+            return 1;
+        }
+
+        const int tokens_per_seq = std::max(1, std::min(per_seq_cap, max_by_engine));
+        return tokens_per_seq;
+    };
+
+    const int tokens_per_seq = compute_draft_tokens_per_seq(batch_size);
+    if (tokens_per_seq <= 0) {
+        TM_LOG_DEBUG("[LlamaV2][EAGLE] tokens_per_seq=0; skipping EAGLE step");
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    // Run EagleNet draft model over last-token hidden states to obtain
+    // per-sequence draft logits for speculative sampling.
+    Tensor draft_logits;
+    Tensor draft_hidden;
+    eagleDraftForward(decoder_features, draft_logits, draft_hidden);
+
+    if (!draft_logits) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE] Draft forward produced empty logits; skipping EAGLE step");
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    const int vocab_size     = static_cast<int>(vocab_size_);
+    const int vocab_size_pad = logits.shape(1);
+    const int logit_elems    = batch_size * vocab_size_pad;
+    const int total_draft    = batch_size * tokens_per_seq;
+
+    // Prepare FP32 draft logits for GPU top-k.
+    Tensor eagle_sampling_logits{{batch_size, vocab_size_pad}, kFloat32, kDEVICE};
+    if (draft_logits.dtype() != kFloat32 && draft_logits.dtype() != kBfloat16 && draft_logits.dtype() != kFloat16) {
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][fallback] draft_logits dtype=%s is not f16/bf16/f32; "
+            "skipping EAGLE tree decode for this step.",
+            to_string(draft_logits.dtype()));
+
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+    invokeCastFloat2D(draft_logits, eagle_sampling_logits, stream_);
+    sync_check_cuda_error();
+
+    Buffer_<int> draft_tokens(total_draft, kCPU);
+    Buffer_<int> target_tokens(total_draft, kCPU);
+
+    if (tokens_per_seq > 0 && tokens_per_seq <= vocab_size_pad && tokens_per_seq <= 1024) {
+        Buffer_<int> topk_buf(batch_size, kDEVICE);
+        Buffer_<int> kept_buf(batch_size, kDEVICE);
+
+        std::vector<int> h_topk(batch_size, tokens_per_seq);
+        std::vector<int> h_kept(batch_size, tokens_per_seq);
+
+        core::Copy(h_topk.data(), batch_size, topk_buf.data());
+        core::Copy(h_kept.data(), batch_size, kept_buf.data());
+
+        Buffer_<int> draft_sorted_indices(logit_elems, kDEVICE);
+        Buffer_<int> target_sorted_indices(logit_elems, kDEVICE);
+
+        TopKSortFilterParams draft_params{};
+        draft_params.logits            = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_logits     = eagle_sampling_logits.buffer().raw_data();
+        draft_params.sorted_indices    = draft_sorted_indices.data();
+        draft_params.kept              = kept_buf.data();
+        draft_params.top_ks            = topk_buf.data();
+        draft_params.max_top_k         = tokens_per_seq;
+        draft_params.batch_size        = batch_size;
+        draft_params.vocab_size        = vocab_size;
+        draft_params.vocab_size_padded = vocab_size_pad;
+
+        invokeTopKSortFilter<float>(draft_params, stream_);
+
+        TopKSortFilterParams target_params{};
+        target_params.logits            = logits.buffer().raw_data();
+        target_params.sorted_logits     = logits.buffer().raw_data();
+        target_params.sorted_indices    = target_sorted_indices.data();
+        target_params.kept              = kept_buf.data();
+        target_params.top_ks            = topk_buf.data();
+        target_params.max_top_k         = tokens_per_seq;
+        target_params.batch_size        = batch_size;
+        target_params.vocab_size        = vocab_size;
+        target_params.vocab_size_padded = vocab_size_pad;
+
+        invokeTopKSortFilter<float>(target_params, stream_);
+
+        const size_t idx_width_bytes = sizeof(int) * tokens_per_seq;
+        const size_t idx_src_pitch   = sizeof(int) * vocab_size_pad;
+        const size_t idx_dst_pitch   = sizeof(int) * tokens_per_seq;
+
+        // Copy draft IDs and target IDs for the top tokens_per_seq indices per row from device to host.
+        //
+        // We treat the sorted indices as a [batch_size, vocab_size_padded] 2D matrix and copy the
+        // leading [batch_size, tokens_per_seq] rectangle to host with custom pitch.
+        check_cuda_error(cudaMemcpy2DAsync(draft_tokens.data(),
+                                           idx_dst_pitch,
+                                           draft_sorted_indices.data(),
+                                           idx_src_pitch,
+                                           idx_width_bytes,
+                                           batch_size,
+                                           cudaMemcpyDeviceToHost,
+                                           stream_));
+
+        check_cuda_error(cudaMemcpy2DAsync(target_tokens.data(),
+                                           idx_dst_pitch,
+                                           target_sorted_indices.data(),
+                                           idx_src_pitch,
+                                           idx_width_bytes,
+                                           batch_size,
+                                           cudaMemcpyDeviceToHost,
+                                           stream_));
+
+        check_cuda_error(cudaStreamSynchronize(stream_));
+    }
+    else {
+        std::fill_n(draft_tokens.data(), total_draft, 0);
+        std::fill_n(target_tokens.data(), total_draft, 0);
+    }
+
+    TM_LOG_DEBUG("[LlamaV2][EAGLE] step=%d, batch=%d, tokens_per_seq=%d, num_draft_tokens=%d",
+                 g.step,
+                 batch_size,
+                 tokens_per_seq,
+                 total_draft);
+
+    // ========= Step 1: Build EAGLE tree from draft tokens =========
+    const int num_draft_tokens = total_draft;
+    const int inferred_tokens_per_seq =
+        batch_size > 0 ? std::max(1, num_draft_tokens / batch_size) : 1;
+    const int expected_total = batch_size * inferred_tokens_per_seq;
+    if (expected_total != num_draft_tokens) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE] draft_tokens size (%d) is not a multiple of batch_size (%d); "
+                       "interpreting as tokens_per_seq=%d and ignoring any trailing entries",
+                       num_draft_tokens,
+                       batch_size,
+                       inferred_tokens_per_seq);
+    }
+
+    eagle::SpeculationTree tree(
+        engine_param_.spec_max_draft_path_len,
+        engine_param_.spec_max_decoding_tokens);
+
+    const auto& choices = eagle_module_->getDefaultChoices();
+    if (!choices.empty()) {
+        tree.buildTreeWithChoices(draft_tokens.data(), inferred_tokens_per_seq, choices);
+    }
+    else {
+        tree.buildTree(draft_tokens.data(), inferred_tokens_per_seq);
+    }
+    tree.extractPaths();
+
+    const int* paths_flat         = tree.getPathsFlat();
+    const int  num_paths          = tree.getNumPaths();
+    const int  max_path_len       = engine_param_.spec_max_draft_path_len;
+    const int  max_decoding_tokens = engine_param_.spec_max_decoding_tokens;
+
+    if (num_paths == 0) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE] No valid paths in tree");
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    TM_LOG_DEBUG("[LlamaV2][EAGLE] Built tree with %d paths, max_depth=%d",
+                 num_paths,
+                 max_path_len);
+
+    // ========= Step 2: Mirror tokens and paths into EagleBuffers =========
+    cudaMemcpyAsync(eagle_buffers_->inputs.draft_tokens,
+                    draft_tokens.data(),
+                    num_draft_tokens * sizeof(int),
+                    cudaMemcpyHostToDevice,
+                    stream_);
+    if (!isTargetTreeDecodeActiveStep()) {
+        cudaMemcpyAsync(eagle_buffers_->inputs.target_tokens,
+                        target_tokens.data(),
+                        num_draft_tokens * sizeof(int),
+                        cudaMemcpyHostToDevice,
+                        stream_);
+    }
+
+    // Prepare per-sequence path buffers. The current tree is single-sequence,
+    // so we replicate its paths across all batch slots.
+    std::vector<int> host_paths(batch_size * max_decoding_tokens * max_path_len, -1);
+    const int        paths_per_seq = std::min(num_paths, max_decoding_tokens);
+
+    for (int b = 0; b < batch_size; ++b) {
+        for (int p = 0; p < paths_per_seq; ++p) {
+            const int* src = paths_flat + p * max_path_len;
+            int*       dst = host_paths.data() + (b * max_decoding_tokens + p) * max_path_len;
+            std::copy(src, src + max_path_len, dst);
+        }
+    }
+
+    cudaMemcpyAsync(eagle_buffers_->inputs.draft_paths,
+                    host_paths.data(),
+                    host_paths.size() * sizeof(int),
+                    cudaMemcpyHostToDevice,
+                    stream_);
+
+    sync_check_cuda_error();
+
+    // ========= Step 3: Generate leaf mask and packed masks =========
+    kernels::eagle::invokeBuildLeafMask(
+        eagle_buffers_->inputs.leaf_mask,
+        eagle_buffers_->inputs.draft_paths,
+        batch_size,
+        engine_param_.spec_max_decoding_tokens,
+        engine_param_.spec_max_draft_path_len,
+        stream_);
+
+    std::vector<int> batch_slots(batch_size);
+    for (int i = 0; i < batch_size; ++i) {
+        batch_slots[i] = i;
+    }
+
+    int* d_batch_slots = nullptr;
+    check_cuda_error(cudaMalloc(&d_batch_slots, batch_size * sizeof(int)));
+    check_cuda_error(cudaMemcpyAsync(
+        d_batch_slots,
+        batch_slots.data(),
+        batch_size * sizeof(int),
+        cudaMemcpyHostToDevice,
+        stream_));
+
+    kernels::eagle::invokeGetPackedMaskFromPath(
+        eagle_buffers_->inputs.packed_masks,
+        reinterpret_cast<kernels::eagle::SizeType*>(d_batch_slots),
+        reinterpret_cast<kernels::eagle::SizeType const*>(eagle_buffers_->inputs.draft_paths),
+        engine_param_.spec_max_decoding_tokens,
+        engine_param_.spec_max_draft_path_len,
+        stream_);
+
+    sync_check_cuda_error();
+
+    TM_LOG_DEBUG("[LlamaV2][EAGLE] Generated masks for %d paths", num_paths);
+
+    // Optional target-tree decode over the speculative tree.
+    if (spec_ctx.enable_eagle_target_tree && isTargetTreeDecodeEnabled()) {
+        runEagleTargetTreeDecode(batch_size, spec_ctx.d_sequence_lengths, spec_ctx.sequences);
+    }
+
+    // ========= Step 4: Device-side acceptance over tree paths =========
+    std::vector<int> h_draft(num_draft_tokens);
+    std::vector<int> h_target(num_draft_tokens);
+    std::copy_n(draft_tokens.data(), num_draft_tokens, h_draft.data());
+
+    std::vector<int> h_accepted_lens(batch_size, 0);
+    std::vector<int> h_accepted_tokens(batch_size * max_path_len, -1);
+    std::vector<int> host_best_path_ids(batch_size, 0);
+
+    using SpecSizeType    = kernels::speculative_decoding::SizeType;
+    using SpecTokenIdType = kernels::speculative_decoding::TokenIdType;
+
+    const SpecSizeType max_batch_size   = static_cast<SpecSizeType>(batch_size);
+    const SpecSizeType max_draft_tokens = static_cast<SpecSizeType>(inferred_tokens_per_seq);
+    const SpecSizeType num_paths_device = static_cast<SpecSizeType>(paths_per_seq);
+    const SpecSizeType max_path_len_dev = static_cast<SpecSizeType>(max_path_len);
+
+    kernels::speculative_decoding::invokeTreeAcceptByIdsWithPaths(
+        reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.draft_tokens),
+        reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.target_tokens),
+        reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
+        reinterpret_cast<SpecSizeType const*>(d_batch_slots),
+        static_cast<SpecSizeType>(batch_size),
+        max_batch_size,
+        num_paths_device,
+        max_path_len_dev,
+        max_draft_tokens,
+        reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.best_path_ids),
+        reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_lens),
+        reinterpret_cast<SpecTokenIdType*>(eagle_buffers_->outputs.accepted_tokens),
+        stream_);
+
+    sync_check_cuda_error();
+
+    check_cuda_error(cudaMemcpyAsync(
+        host_best_path_ids.data(),
+        eagle_buffers_->outputs.best_path_ids,
+        batch_size * sizeof(SpecSizeType),
+        cudaMemcpyDeviceToHost,
+        stream_));
+
+    check_cuda_error(cudaMemcpyAsync(
+        h_accepted_lens.data(),
+        eagle_buffers_->outputs.accepted_lens,
+        batch_size * sizeof(SpecSizeType),
+        cudaMemcpyDeviceToHost,
+        stream_));
+
+    check_cuda_error(cudaMemcpyAsync(
+        h_accepted_tokens.data(),
+        eagle_buffers_->outputs.accepted_tokens,
+        batch_size * max_path_len * sizeof(TokenIdType),
+        cudaMemcpyDeviceToHost,
+        stream_));
+
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    int total_accepted = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        if (h_accepted_lens[b] < 0) {
+            h_accepted_lens[b] = 0;
+        }
+        total_accepted += h_accepted_lens[b];
+    }
+
+    // Optional debug logging of accepted paths/tokens.
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        if (isTargetTreeDecodeActiveStep()) {
+            check_cuda_error(cudaMemcpyAsync(
+                h_target.data(),
+                eagle_buffers_->inputs.target_tokens,
+                num_draft_tokens * sizeof(int),
+                cudaMemcpyDeviceToHost,
+                stream_));
+            check_cuda_error(cudaStreamSynchronize(stream_));
+        }
+        else {
+            std::copy_n(target_tokens.data(), num_draft_tokens, h_target.data());
+        }
+
+        for (int b = 0; b < batch_size; ++b) {
+            const int len     = h_accepted_lens[b];
+            const int path_id = host_best_path_ids[b];
+            if (len <= 0) {
+                TM_LOG_WARNING("[LlamaV2][EAGLE] step_spec seq=%d no accepted tokens (best_path=%d)", b, path_id);
+                continue;
+            }
+
+            std::ostringstream draft_ss;
+            std::ostringstream target_ss;
+            std::ostringstream accepted_ss;
+
+            for (int d = 0; d < max_path_len; ++d) {
+                const int node_idx = paths_flat[path_id * max_path_len + d];
+                if (node_idx <= 0) {
+                    if (node_idx < 0) {
+                        break;
+                    }
+                    continue;
+                }
+                const int token_idx = node_idx - 1;
+                if (token_idx < 0 || token_idx >= inferred_tokens_per_seq) {
+                    break;
+                }
+                const int global_idx = b * inferred_tokens_per_seq + token_idx;
+                if (global_idx < 0 || global_idx >= num_draft_tokens) {
+                    break;
+                }
+
+                const int draft_id  = h_draft[global_idx];
+                const int target_id = h_target[global_idx];
+
+                if (draft_ss.tellp() > 0) {
+                    draft_ss << ',';
+                    target_ss << ',';
+                }
+                draft_ss << draft_id;
+                target_ss << target_id;
+            }
+
+            for (int t = 0; t < len; ++t) {
+                if (t) {
+                    accepted_ss << ',';
+                }
+                accepted_ss << h_accepted_tokens[b * max_path_len + t];
+            }
+
+            TM_LOG_WARNING("[LlamaV2][EAGLE] step_spec seq=%d best_path=%d accepted_len=%d "
+                           "path_draft_tokens=[%s] path_target_tokens=[%s] "
+                           "accepted_tokens=[%s]",
+                           b,
+                           path_id,
+                           len,
+                           draft_ss.str().c_str(),
+                           target_ss.str().c_str(),
+                           accepted_ss.str().c_str());
+        }
+    }
+
+    if (eagle_buffers_ && eagle_buffers_->isAllocated()) {
+        // Pack accepted paths on device for downstream KV / context helpers.
+        kernels::speculative_decoding::invokePackAcceptedPaths(
+            reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_lengths_cumsum),
+            reinterpret_cast<SpecSizeType*>(eagle_buffers_->outputs.accepted_path_offsets),
+            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.accepted_lens),
+            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.best_path_ids),
+            reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
+            reinterpret_cast<SpecSizeType const*>(d_batch_slots),
+            static_cast<SpecSizeType>(batch_size),
+            static_cast<SpecSizeType>(batch_size),
+            static_cast<SpecSizeType>(paths_per_seq),
+            static_cast<SpecSizeType>(max_path_len),
+            stream_);
+
+        check_cuda_error(cudaFree(d_batch_slots));
+    }
+
+    const int effective_draft_tokens = batch_size;  // one token considered per seq
+    float      acceptance_rate       = (effective_draft_tokens > 0)
+                                           ? static_cast<float>(total_accepted)
+                                                 / static_cast<float>(effective_draft_tokens)
+                                           : 0.0f;
+
+    TM_LOG_WARNING("[LlamaV2][EAGLE] Accepted %d/%d draft tokens (%.1f%% acceptance rate)",
+                   total_accepted,
+                   effective_draft_tokens,
+                   acceptance_rate * 100.0f);
+
+    float h_acceptance_rate = acceptance_rate;
+    cudaMemcpyAsync(
+        eagle_buffers_->outputs.acceptance_rate,
+        &h_acceptance_rate,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream_);
+
+    sync_check_cuda_error();
+
+    // Cache per-step acceptance summary for downstream metrics and
+    // multi-token advancement.
+    eagle_step_tokens_per_seq_  = inferred_tokens_per_seq;
+    eagle_step_accepted_lens_   = std::move(h_accepted_lens);
+    eagle_step_accepted_tokens_ = std::move(h_accepted_tokens);
+
+    // ========= Build ForcedTailContext from accepted tokens (extras only) =========
+    const int max_tail_len = engine_param_.spec_max_draft_path_len;
+    if (max_tail_len <= 0 || eagle_step_accepted_lens_.empty()) {
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    std::vector<int> forced_lengths(batch_size, 0);
+    std::vector<int> forced_tokens(static_cast<size_t>(batch_size) * max_tail_len, -1);
+    std::vector<int> committed_lengths(batch_size, 0);
+
+    int any_forced = 0;
+
+    for (int i = 0; i < batch_size; ++i) {
+        int len = (i < static_cast<int>(eagle_step_accepted_lens_.size()))
+                      ? eagle_step_accepted_lens_[i]
+                      : 0;
+        if (len <= 1) {
+            continue;
+        }
+        if (len > max_tail_len) {
+            len = max_tail_len;
+        }
+
+        const int extra = len - 1;  // extras only; base token is committed by DynamicDecodeLayer
+        if (extra <= 0) {
+            continue;
+        }
+
+        const int token_offset = i * max_tail_len;
+        if (token_offset + len > static_cast<int>(eagle_step_accepted_tokens_.size())) {
+            continue;
+        }
+
+        forced_lengths[i] = extra;
+        for (int t = 0; t < extra; ++t) {
+            forced_tokens[static_cast<size_t>(i) * max_tail_len + t] =
+                eagle_step_accepted_tokens_[token_offset + 1 + t];
+        }
+
+        any_forced = std::max(any_forced, extra);
+    }
+
+    if (any_forced <= 0) {
+        // No usable tails; fall back to single-token decode.
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               nullptr);
+        return;
+    }
+
+    ForcedTailContext forced{};
+    forced.max_tail_len   = max_tail_len;
+    forced.forced_tokens  = forced_tokens.data();
+    forced.forced_lengths = forced_lengths.data();
+    forced.committed_lengths = committed_lengths.data();
+
+    dynamicDecodeMultiStep(token_ids,
+                           finished,
+                           sequence_length,
+                           curand_state,
+                           logits,
+                           seq_limit_len,
+                           init_context_length,
+                           context_length,
+                           prompt_length,
+                           sampled_logprobs,
+                           sampled_indexes,
+                           sampled_nums,
+                           g.step,
+                           max_context_len,
+                           &forced);
+
+    // Reconcile acceptance with what was actually committed by the decode
+    // layer. This ensures metrics, KV rewind, and g.step all see the same
+    // effective extra lengths.
+    int max_extra_committed = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        const int committed_extra = (i < static_cast<int>(committed_lengths.size())) ? committed_lengths[i] : 0;
+        if (committed_extra <= 0) {
+            // If nothing was committed, treat this slot as single-token.
+            if (i < static_cast<int>(eagle_step_accepted_lens_.size())) {
+                eagle_step_accepted_lens_[i] = std::min(eagle_step_accepted_lens_[i], 1);
+            }
+            continue;
+        }
+
+        max_extra_committed = std::max(max_extra_committed, committed_extra);
+
+        if (i < static_cast<int>(eagle_step_accepted_lens_.size())) {
+            const int effective_len = 1 + committed_extra;  // base + extras
+            eagle_step_accepted_lens_[i] = std::min(eagle_step_accepted_lens_[i], effective_len);
+        }
+    }
+
+    eagle_step_max_extra_ = max_extra_committed;
+}
+
+void LlamaV2::getEagleAcceptanceForStep(std::vector<int>& accepted_lens,
+                                        std::vector<int>& accepted_tokens,
+                                        int&              tokens_per_seq) const
+{
+    accepted_lens   = eagle_step_accepted_lens_;
+    accepted_tokens = eagle_step_accepted_tokens_;
+    tokens_per_seq  = eagle_step_tokens_per_seq_;
 }
 
 void LlamaV2::eagleDraftForward(const Tensor& hidden_states,

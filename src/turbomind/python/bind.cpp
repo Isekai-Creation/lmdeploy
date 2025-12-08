@@ -321,7 +321,13 @@ PYBIND11_MODULE(_turbomind, m)
         .def_readonly("eagle_total_rewound_tokens",
                       &ft::RequestMetrics::eagle_total_rewound_tokens)
         .def_readonly("eagle_rewind_steps",
-                      &ft::RequestMetrics::eagle_rewind_steps);
+                      &ft::RequestMetrics::eagle_rewind_steps)
+        .def_readonly("eagle_tree_draft_tokens",
+                      &ft::RequestMetrics::eagle_tree_draft_tokens)
+        .def_readonly("eagle_tree_target_tokens",
+                      &ft::RequestMetrics::eagle_tree_target_tokens)
+        .def_readonly("eagle_tree_accepted_tokens",
+                      &ft::RequestMetrics::eagle_tree_accepted_tokens);
 
     py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m, "ScheduleMetrics")
         .def(py::init())

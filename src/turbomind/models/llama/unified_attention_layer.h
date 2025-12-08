@@ -46,6 +46,9 @@ public:
     struct ForwardParam {
         Tensor            input;
         Tensor            output;
+        // Optional packed attention mask for speculative / tree decode
+        // flows. When empty, baseline autoregressive masking is used.
+        Tensor            packed_mask;
         const WeightType* weights;
         int               layer_id;
     };

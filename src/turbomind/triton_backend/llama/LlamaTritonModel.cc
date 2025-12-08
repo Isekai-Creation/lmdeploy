@@ -391,6 +391,10 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
         engine_param_.spec_draft_model_path               = spec_reader["model"].as<std::string>("");
         engine_param_.eagle_debug                         = spec_reader["eagle_debug"].as<bool>(false);
         engine_param_.eagle_metrics_debug                 = spec_reader["eagle_metrics_debug"].as<bool>(false);
+        // Target-tree decode is an optional, more advanced EAGLE3 path.
+        // When not specified, default to false so the engine continues
+        // to rely on the current single-step target logits path.
+        engine_param_.enable_eagle_target_tree            = spec_reader["enable_target_tree"].as<bool>(false);
 
         TM_LOG_INFO("[LlamaTritonModel] Speculative decoding enabled: method=%s, "
                     "max_path_len=%d, num_speculative_tokens=%d, max_decoding_tokens=%d",
@@ -408,6 +412,7 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
         engine_param_.spec_draft_model_path          = "";
         engine_param_.eagle_debug                    = false;
         engine_param_.eagle_metrics_debug            = false;
+        engine_param_.enable_eagle_target_tree       = false;
     }
 
     {

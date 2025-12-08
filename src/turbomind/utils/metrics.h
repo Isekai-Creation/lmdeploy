@@ -23,13 +23,21 @@ struct RequestMetrics {
     int64_t enque_time{};      // when a request is enqued
     int64_t scheduled_time{};  // when a request is scheduled for inference
 
-    // EAGLE speculative decoding metrics (TurboMind backend)
-    // Aggregated over the lifetime of a request.
+    // EAGLE speculative decoding metrics (TurboMind backend), aggregated
+    // over the lifetime of a request.
     int64_t eagle_total_draft_tokens{};      // total number of draft tokens proposed
     int64_t eagle_total_accepted_tokens{};   // total number of draft tokens accepted
     int64_t eagle_steps{};                   // number of speculative steps taken
     int64_t eagle_total_rewound_tokens{};    // total number of tokens rewound from KV cache
     int64_t eagle_rewind_steps{};            // number of steps where KV rewind was applied
+
+    // Target-tree decode specific metrics (EAGLE3). These counters are
+    // only populated when the TurboMind engine enables the target-tree
+    // path; when disabled they remain zero so downstream tooling can
+    // distinguish baseline speculative runs from tree-aware ones.
+    int64_t eagle_tree_draft_tokens{};       // total number of tree draft tokens proposed
+    int64_t eagle_tree_target_tokens{};      // total number of tree target tokens evaluated
+    int64_t eagle_tree_accepted_tokens{};    // total number of accepted tokens along tree paths
 
     static int64_t timestamp()
     {
@@ -62,8 +70,11 @@ inline std::ostream& operator<<(std::ostream& os, const RequestMetrics& m)
     os << ", eagle_total_draft_tokens=" << m.eagle_total_draft_tokens;
     os << ", eagle_total_accepted_tokens=" << m.eagle_total_accepted_tokens;
     os << ", eagle_steps=" << m.eagle_steps;
-     os << ", eagle_total_rewound_tokens=" << m.eagle_total_rewound_tokens;
-     os << ", eagle_rewind_steps=" << m.eagle_rewind_steps;
+    os << ", eagle_total_rewound_tokens=" << m.eagle_total_rewound_tokens;
+    os << ", eagle_rewind_steps=" << m.eagle_rewind_steps;
+    os << ", eagle_tree_draft_tokens=" << m.eagle_tree_draft_tokens;
+    os << ", eagle_tree_target_tokens=" << m.eagle_tree_target_tokens;
+    os << ", eagle_tree_accepted_tokens=" << m.eagle_tree_accepted_tokens;
     os << " }";
     return os;
 }

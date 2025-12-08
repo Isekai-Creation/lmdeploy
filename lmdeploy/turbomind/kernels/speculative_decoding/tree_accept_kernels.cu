@@ -43,9 +43,10 @@ __global__ void treeAcceptByIdsWithPathsKernel(
     int best_accepts = 0;
 
     // For each path, walk its nodes and count how many tokens would be
-    // accepted under the same rule as the host-side implementation in
-    // LlamaV2_eagle: accept while draft==target, but include the first
-    // mismatching target token in the count.
+    // accepted under a strict ID-equality rule (accept while draft_id ==
+    // target_id; stop on the first mismatch without including the
+    // mismatching token). This mirrors the host-side implementation in
+    // LlamaV2_eagle when tree-accept is enabled.
     for (SizeType path_idx = 0; path_idx < num_paths; ++path_idx) {
         int accepted = 0;
 
@@ -67,16 +68,16 @@ __global__ void treeAcceptByIdsWithPathsKernel(
                 break;
             }
 
-            const TokenIdType draft_id
-                = draft_ids[static_cast<size_t>(slot) * max_draft_tokens + token_idx];
-            const TokenIdType target_id
-                = target_ids[static_cast<size_t>(slot) * max_draft_tokens + token_idx];
-
-            accepted += 1;
+            const TokenIdType draft_id =
+                draft_ids[static_cast<size_t>(slot) * max_draft_tokens + token_idx];
+            const TokenIdType target_id =
+                target_ids[static_cast<size_t>(slot) * max_draft_tokens + token_idx];
 
             if (draft_id != target_id) {
                 break;
             }
+
+            accepted += 1;
         }
 
         if (accepted > best_accepts) {

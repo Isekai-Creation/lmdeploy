@@ -174,6 +174,16 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
         local_hidden_states = global_hidden_states.slice({offset, 0}, {local_token_num, -1});
     }
 
+    // Optional packed mask for speculative/tree decode. Baseline decode
+    // never sets this key in `args`, so attention runs with standard
+    // autoregressive masking only. A separate tree-decode path can
+    // provide a flattened [token_num, packed_dim] tensor via this key.
+    Tensor spec_packed_mask;
+    auto   it_mask = args.find("spec_packed_mask");
+    if (it_mask != args.end()) {
+        spec_packed_mask = it_mask->second;
+    }
+
     attn_layer_->Initialize(args);
 
     TM_DEBUG_TENSOR(local_residual, "res", 1);
@@ -193,10 +203,13 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
 
         /////////////////////////////////////////////
         /// self-attention
-        attn_layer_->Forward({local_hidden_states,  //
-                              local_hidden_states,
-                              weights.at(layer)->self_attn_weights.get(),
-                              layer});
+        UnifiedAttentionLayer::ForwardParam attn_param{};
+        attn_param.input       = local_hidden_states;
+        attn_param.output      = local_hidden_states;
+        attn_param.packed_mask = spec_packed_mask;
+        attn_param.weights     = weights.at(layer)->self_attn_weights.get();
+        attn_param.layer_id    = layer;
+        attn_layer_->Forward(attn_param);
 
         TM_DEBUG_TENSOR(local_hidden_states, Concat("attn_block", layer), 2);
 

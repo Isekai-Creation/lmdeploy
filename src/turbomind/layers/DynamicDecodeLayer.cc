@@ -23,6 +23,7 @@
 #include "src/turbomind/layers/sampling_layers/SamplingLayer.h"
 #include "src/turbomind/layers/sampling_layers/StopCriteriaLayer.h"
 #include "src/turbomind/macro.h"
+#include "src/turbomind/utils/cuda_utils.h"
 
 namespace turbomind {
 
@@ -35,6 +36,7 @@ DynamicDecodeLayer::DynamicDecodeLayer(DataType              dtype,
 {
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
     TM_CHECK(dtype == kFloat32);
+    stream_ = stream;
     BaseDynamicDecodeLayer::BaseParam param{max_batch_size, vocab_size, vocab_size_padded, stream, device_prop};
     layers_.emplace_back(new LogitsProcessorLayer<float>{param});
     layers_.emplace_back(new GuidedDecodeMaskLayer<float>{param});
@@ -85,6 +87,116 @@ void DynamicDecodeLayer::Forward(TensorMap& args)
     for (const auto& layer : layers_) {
         layer->Forward(args);
     }
+}
+
+void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailContext* forced_ctx)
+{
+    TM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    // Always run the existing single-step decode once for the base token.
+    Forward(args);
+
+    // If no forced tail is provided, we are done.
+    if (!forced_ctx || !forced_ctx->forced_tokens || !forced_ctx->forced_lengths || forced_ctx->max_tail_len <= 0) {
+        TM_LOG_DEBUG("%s stop (no tail)", __PRETTY_FUNCTION__);
+        return;
+    }
+
+    Tensor logits = args.at("logits");
+    const int batch_size = logits.shape(0);
+
+    Tensor output_ids      = args.at("output_ids");
+    Tensor sequence_length = args.at("sequence_length");
+    Tensor finished        = args.at("finished");
+
+    std::vector<int> h_seq_limit;
+    if (Tensor* seq_lim = args.try_("sequence_limit_length")) {
+        h_seq_limit.resize(batch_size);
+        check_cuda_error(cudaMemcpyAsync(
+            h_seq_limit.data(), seq_lim->data<int>(), batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+        check_cuda_error(cudaStreamSynchronize(stream_));
+    }
+
+    if (output_ids.ndim() < 2) {
+        TM_LOG_WARNING(
+            "%s: output_ids tensor has invalid ndim=%d; skipping tail tokens", __PRETTY_FUNCTION__, output_ids.ndim());
+        TM_LOG_DEBUG("%s stop (invalid output_ids)", __PRETTY_FUNCTION__);
+        return;
+    }
+
+    const int max_seq_len = output_ids.shape(0);
+    const int step        = *args.at("step").data<int>();
+
+    const int* forced_tokens  = forced_ctx->forced_tokens;
+    const int* forced_lengths = forced_ctx->forced_lengths;
+    const int  max_tail_len   = forced_ctx->max_tail_len;
+    int*       committed      = forced_ctx->committed_lengths;
+
+    // Host copies of sequence lengths and finished flags for per-slot updates.
+    std::vector<int>  h_seq_len(batch_size);
+    std::vector<bool> h_finished(batch_size);
+
+    check_cuda_error(cudaMemcpyAsync(
+        h_seq_len.data(), sequence_length.data<int>(), batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+    check_cuda_error(cudaMemcpyAsync(
+        h_finished.data(), finished.data<bool>(), batch_size * sizeof(bool), cudaMemcpyDeviceToHost, stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    int* d_output_ids = output_ids.data<int>();
+
+    for (int i = 0; i < batch_size; ++i) {
+        if (h_finished[i]) {
+            continue;
+        }
+
+        int committed_i = 0;
+
+        int len = forced_lengths[i];
+        if (len <= 0) {
+            continue;
+        }
+        if (len > max_tail_len) {
+            len = max_tail_len;
+        }
+
+        const int token_offset = i * max_tail_len;
+
+        for (int t = 0; t < len; ++t) {
+            const int pos = step + 1 + t;
+            if (pos < 0 || pos >= max_seq_len) {
+                break;
+            }
+
+            if (!h_seq_limit.empty()) {
+                const int limit = h_seq_limit[i];
+                if (limit > 0 && pos >= limit) {
+                    break;
+                }
+            }
+
+            const int value = forced_tokens[token_offset + t];
+            int*      dst   = d_output_ids + pos * batch_size + i;
+            check_cuda_error(cudaMemcpyAsync(dst, &value, sizeof(int), cudaMemcpyHostToDevice, stream_));
+
+            // Increment host-side sequence length view so subsequent tokens
+            // for this slot are appended after the newly committed ones.
+            ++h_seq_len[i];
+            ++committed_i;
+        }
+
+        if (committed) {
+            committed[i] = committed_i;
+        }
+    }
+
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    // Write back updated sequence lengths for all batch slots.
+    check_cuda_error(cudaMemcpyAsync(
+        sequence_length.data<int>(), h_seq_len.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice, stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    TM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 }  // namespace turbomind

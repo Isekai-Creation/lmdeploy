@@ -26,6 +26,13 @@
 
 namespace turbomind {
 
+struct ForcedTailContext {
+    const int* forced_tokens{nullptr};
+    const int* forced_lengths{nullptr};
+    int*       committed_lengths{nullptr};
+    int        max_tail_len{0};
+};
+
 class DynamicDecodeLayer {
 public:
     DynamicDecodeLayer(DataType              data_type,
@@ -41,7 +48,10 @@ public:
 
     void Forward(TensorMap& args);
 
+    void ForwardMultiStep(TensorMap& args, const ForcedTailContext* forced_ctx);
+
 private:
+    cudaStream_t                                           stream_{};
     std::vector<std::unique_ptr<BaseDynamicDecodeLayer>> layers_;
 };
 

@@ -272,6 +272,19 @@ Tensor UnifiedAttentionLayer::core_attention(Tensor& qkv, const ForwardParam& p,
         params.max_q_len = *std::max_element(h_q_len_.data() + offset, h_q_len_.data() + offset + batch_size);
         params.max_k_len = *std::max_element(h_k_len_.data() + offset, h_k_len_.data() + offset + batch_size);
 
+        // Optional packed mask for tree/speculative decode. The tree
+        // decode path can pass a flattened [token_num, packed_dim]
+        // tensor via ForwardParam::packed_mask; baseline decode leaves
+        // it empty and the kernel ignores these fields.
+        params.spec_decoding_packed_mask        = nullptr;
+        params.spec_decoding_packed_mask_stride = 0;
+        if (p.packed_mask && p.packed_mask.size() > 0) {
+            params.spec_decoding_packed_mask = p.packed_mask.data<int32_t>();
+            if (p.packed_mask.ndim() >= 2) {
+                params.spec_decoding_packed_mask_stride = static_cast<int>(p.packed_mask.shape(1));
+            }
+        }
+
         // Decoding use only
         params.block_iter_params = BlockIteratorParams{(char**)kv_block_ptrs_.data(),  //
                                                        cu_block_nums_.data() + offset,

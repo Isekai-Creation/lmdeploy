@@ -126,6 +126,12 @@ struct EngineParam {
     // metrics logging on the TurboMind backend.
     bool eagle_debug{false};
     bool eagle_metrics_debug{false};
+
+    // Optional: enable the target-tree decode path for EAGLE3. When true,
+    // TurboMind is allowed to run a dedicated target decode over the EAGLE
+    // speculation tree to produce per-node target token ids. When false,
+    // TurboMind will continue to rely on host-fabricated target_tokens.
+    bool enable_eagle_target_tree{false};
 };
 
 enum class LoraPolicy : int

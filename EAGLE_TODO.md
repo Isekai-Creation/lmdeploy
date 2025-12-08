@@ -154,13 +154,13 @@ validation tests are still TODO.
   - [x] For `method in {"eagle", "eagle3"}`, rely solely on native C++ EAGLE (no Python‑side draft model); keep these managers for `draft_target` / `ngram` and tests, and add tests to enforce this behaviour.
   - [x] Implement buffer reuse logic in `OptimizedBatchSpeculativeManager` (pre‑allocate `draft_buffer` / `packed_mask_buffer` and fill `draft_buffer` for the latest batch) instead of keeping it as a stub, so production batch workloads avoid per‑step allocations.
 
-## 11. Engineer‑level work split (coordination)
+## 11. Implementation work split (coordination)
 
 To avoid overlap between engineers working on TurboMind EAGLE, we track who owns which slices of the above TODOs.
 
-### Engineer A (this plan) – EagleModule / KV / metrics / Python wrappers
+### Module / KV / metrics / Python wrappers
 
-The tasks below are the 10 concrete items Engineer A is responsible for, all drawn from the TODOs above and chosen to avoid LlamaBatch / `LlamaV2_eagle` / sampling work owned by Engineer B. Items 1–10 are now implemented; the next focus areas (Phase 2) are additional optimizations, metrics, and safety hardening in EagleModule/KV/Python wrappers that other engineers can rely on.
+The tasks below are the 10 concrete items for the module/KV/metrics/Python wrapper layer, all drawn from the TODOs above and chosen to avoid LlamaBatch / `LlamaV2_eagle` / sampling work owned by other parts of the system. Items 1–10 are now implemented; the next focus areas (Phase 2) are additional optimizations, metrics, and safety hardening in EagleModule/KV/Python wrappers that other engineers can rely on.
 
 1. **Maintain config‑driven EAGLE tree choices and defaults**  
    - From section 2: keep `SpeculationTree` / `EagleModule::getDefaultChoices` wired to `eagle_tree.yaml` `choices` for offline‑tuned trees, and ensure the fallback simple chain remains a safe, well‑documented default (no demo‑only behaviour).
@@ -187,16 +187,16 @@ The tasks below are the 10 concrete items Engineer A is responsible for, all dra
    - From section 8: with a tiny synthetic config/weights, validate shapes and basic numerical sanity of the shallow attention+FC+LM head pipeline, and ensure that forwarding twice with the same batch size reuses scratch buffers instead of reallocating (implemented via `_turbomind.eagle_forward_smoke` and `test_eagle_module.py`).
 
 9. **Design host‑side EAGLE KV rewind helper callable from LlamaBatch**  
-   - From section 6: provide a helper (outside `LlamaBatch` / `LlamaV2_eagle`) that turns per‑sequence draft / accepted token lengths into `KVCacheRewindParams` and calls `invokeKVCacheRewind` (implemented as `computeAndInvokeKVCacheRewind` in `kv_rewind_helper.{h,cu}`), so Engineer B can invoke it without re‑implementing KV logic. Wiring this helper into `LlamaBatch` / `SequenceManager` remains a follow‑up step.
+   - From section 6: provide a helper (outside `LlamaBatch` / `LlamaV2_eagle`) that turns per‑sequence draft / accepted token lengths into `KVCacheRewindParams` and calls `invokeKVCacheRewind` (implemented as `computeAndInvokeKVCacheRewind` in `kv_rewind_helper.{h,cu}`), so decode logic can invoke it without re‑implementing KV logic. Wiring this helper into `LlamaBatch` / `SequenceManager` remains a follow‑up step.
 
 10. **A10: Tighten Python‑side EAGLE config/metrics and add tests**  
     - From sections 8 and 10: ensure `SpeculativeDecodingManager` / batch wrappers never run a Python draft for EAGLE, that `RequestMetrics.spec_info` is populated only from real TurboMind outputs (no fake `EngineOutput`), and add tests that exercise `SpeculativeDecodingManager` and `SpeculativeDecodingStats` for EAGLE3.
 
-#### Engineer A – Phase 2 (next 10 tasks, A‑scope only)
+#### Phase 2 (next 10 tasks, module/KV/metrics)
 
 Status: **[x] A10–A20 completed**
 
-Engineer A plan code mapping (A10–A20):
+Module/KV/metrics plan code mapping (A10–A20):
 
 - [x] **A10** – item 10 above (“Tighten Python‑side EAGLE config/metrics and add tests”).  
 - [x] **A11** – item 11 below (“Harden EagleModule::load error handling and model validation”).  
@@ -241,9 +241,9 @@ Engineer A plan code mapping (A10–A20):
     - Added `lmdeploy/tests/turbomind/test_eagle_multi_token_future.py` as the home for A‑scope multi‑token tests. It contains skipped test skeletons that describe the planned checks:
       - KV rewind correctness for multi‑token steps using `EagleKVRewindConfig` / `computeAndInvokeKVCacheRewind` and synthetic block tables.
       - Aggregation of multi‑token EAGLE metrics through `_get_metrics` and `SpeculativeDecodingStats`, ensuring invariants like `num_accepted_tokens <= num_draft_tokens` and consistent KV rewind counters.
-      These tests intentionally avoid touching `LlamaBatch` / `LlamaV2_eagle` and will be filled in once Engineer B’s multi‑token loop is integrated.
+      These tests intentionally avoid touching `LlamaBatch` / `LlamaV2_eagle` and will be filled in once the multi‑token loop is integrated.
 
-#### Engineer A – Phase 3 (next 10 tasks, A‑scope only)
+#### Phase 3 (next 10 tasks, module/KV/metrics)
 
 21. **A21: Bind EAGLE device kernels for acceptance/mask tests** – **🧪 prototype (GPU/CI validation pending)**  
     - Added lightweight C++/pybind11 bindings around the EAGLE CUDA kernels in `lmdeploy/lmdeploy/turbomind/kernels/speculative_decoding/common.{h,cu}` (at least `acceptDraftTokens` and `invokePackAcceptedPaths`) and introduced GPU-backed tests under `lmdeploy/tests/turbomind/test_speculative_kernels.py` that compare device results against the existing Python reference implementations for acceptance and path packing.  
@@ -290,7 +290,7 @@ Engineer A plan code mapping (A10–A20):
       - Core semantics (`method`, `num_speculative_tokens`) are identical across backends.
       - `SpeculativeConfig.to_turbomind_spec_dict()` produces a `speculative_config` mapping whose keys/values match what TurboMind’s `EngineParam` expects for EAGLE/EAGLE3.
 
-#### Engineer A – Future Phase (A31+ prototypes – GPU validation pending)
+#### Future Phase (A31+ prototypes – GPU validation pending)
 
 31. **A31: Tree-based device acceptance kernel (paths-level)** – **🧪 prototype (GPU/CI validation pending)**  
     - Added `invokeTreeAcceptByIdsWithPaths` in `lmdeploy/turbomind/kernels/speculative_decoding/tree_accept_kernels.{h,cu}` to evaluate SpeculationTree paths entirely on device:
@@ -317,7 +317,7 @@ Engineer A plan code mapping (A10–A20):
     - For now, these kernels should be considered **prototype-ready but not fully validated for variable per-sequence layouts**; downstream engineers should treat them as experimental until dedicated GPU tests (including multi-token end-to-end scenarios, TP/PP/DP configurations, and KV rewind integration) are added and passing in CI.  
     - **Scope:** No production call sites currently drive truly per-sequence `tokens_per_seq` variation; the design is in place, but wiring + tests are still TODO.  
     - **CI (future):**  
-      - Add multi-token E2E tests in `lmdeploy/tests/turbomind/test_eagle_multi_token_future.py` once Engineer B’s multi-token loop is ready.  
+      - Add multi-token E2E tests in `lmdeploy/tests/turbomind/test_eagle_multi_token_future.py` once the multi-token loop is ready.  
       - Extend `test_benchmark_speculative_integration.py` to cover multi-token EAGLE runs and validate metrics/KV rewind invariants under variable `tokens_per_seq`.
 
 34. **A34: Offline TurboMind pipeline examples for EAGLE** – **🧪 implemented (examples; manual GPU run required)**  
@@ -348,7 +348,7 @@ Engineer A plan code mapping (A10–A20):
     - **Scope:** Kernel behaviour remains backward compatible for valid inputs; changes only add guards for malformed or partially-initialized buffers commonly hit during experimentation.  
     - **CI / testing:**  
       - Run `pytest lmdeploy/tests/turbomind/test_speculative_kernels.py::TestAcceptDraftTokensDevice` and `::TestPackAcceptedPathsDevice` on CUDA with a built `_turbomind` extension to exercise the hardened kernels on device.  
-      - Add future GPU tests for KV rewind edge cases once Engineer B wires `computeAndInvokeKVCacheRewind` into decode loops.
+      - Add future GPU tests for KV rewind edge cases once `computeAndInvokeKVCacheRewind` is fully wired into decode loops.
 
 37. **A37: Expose EagleModule buffer / tree introspection helpers** – **✅ implemented (internal utility)**  
     - Extended `EagleModule` with additional read-only accessors used by A-scope tooling and potential future buffer sizing helpers:
@@ -394,7 +394,7 @@ Engineer A plan code mapping (A10–A20):
       - Syntax sanity via `python -m compileall scripts/eagle_inspect_tree.py`.  
       - Behaviour is validated manually by engineers using sample `eagle_tree.yaml` files and SpeculativeConfig-like parameters.
 
-### Engineer B (this plan) – LlamaBatch / LlamaV2_eagle / sampling / integration tests
+### LlamaBatch / LlamaV2_eagle / sampling / integration tests
 
 Phase 1 (completed) – initial wiring and one-step acceptance:
 
@@ -452,31 +452,31 @@ Phase 2 – multi-token EAGLE integration (single-GPU offline path implemented, 
     - and run `inference/benchmark_speculative.py` for baseline vs EAGLE comparisons.
   - Implemented as `docs/turbomind_eagle_usage.md`, which covers configuration, tests, and benchmark usage, including how to interpret the `eagle_speculation` metrics block in benchmark outputs.
 
-Engineer B plan code mapping (EngineerB‑01…EngineerB‑20):
+Plan code mapping (EngineerB‑01…EngineerB‑20):
 
-- [x] **EngineerB‑01: use eagle engine tokens**  
+- [x] **B‑01: use eagle engine tokens**  
   - Mapped to Section 4’s EAGLE‑aware engine token budget and the Phase‑1 bullet “Use EAGLE engine budget in `LlamaBatch` logs.”  
-- [x] **EngineerB‑02: multi‑token draft layout invariants**  
+- [x] **B‑02: multi‑token draft layout invariants**  
   - Mapped to Phase‑2 task “Implement multi‑token `draft_tokens` layout in `LlamaBatch`.”  
 - [x] **EngineerB‑03: map multi‑token drafts to trees**  
   - Mapped to Phase‑2 task “Extend `LlamaV2_eagle` for multi‑token tree mapping (layout‑ready).”  
 - [x] **EngineerB‑04: wire `acceptDraftTokens` device acceptance**  
   - Mapped to Phase‑2 task “Wire `acceptDraftTokens` / `invokePackAcceptedPaths` for multi‑token acceptance (logic‑only, pack side).”  
-- [x] **EngineerB‑05: advance sequences by accepted tokens**  
+- [x] **B‑05: advance sequences by accepted tokens**  
   - Implemented by wiring EAGLE acceptance into `LlamaBatch::Forward` after `dynamicDecode`: per‑sequence `accepted_lens` / `accepted_tokens` from `LlamaV2::eagleSpeculativeStep` are compared against the actual token committed by `DynamicDecode`, and `RequestMetrics.eagle_total_accepted_tokens` is advanced only when the accepted token matches the committed decode token. This keeps speculative metrics aligned with the real decode state in the current single‑token regime, and lays the groundwork for true multi‑token sequence advancement once the inner EAGLE loop is extended beyond `tokens_per_seq == 1`.  
-- [ ] **EngineerB‑06: adapt `DynamicDecodeLayer` for EAGLE (in progress)**  
+- [ ] **B‑06: adapt `DynamicDecodeLayer` for EAGLE (in progress)**  
   - Mapped to Phase‑2 task “Adapt or bypass `DynamicDecodeLayer` for EAGLE multi‑token mode.” Current work focuses on threading EAGLE acceptance through the decode step so that only tokens consistent with `dynamicDecode` are ever treated as accepted; full multi‑token integration with `DynamicDecodeLayer` remains to be completed.
-- [x] **EngineerB‑07: keep single‑token EAGLE semantics**  
+- [x] **B‑07: keep single‑token EAGLE semantics**  
   - Backed by the deterministic equality test and one‑token semantics in `lmdeploy/tests/test_eagle_e2e.py::test_eagle_equals_baseline_single_token`.  
-- [ ] **EngineerB‑08: add multi‑token tests (Engineer C infra)**  
-  - Planned in Section 12 (Engineer C) as “Extend tests for multi‑token EAGLE decoding once implemented.”  
-- [ ] **EngineerB‑09: validate benchmarks with multi‑token EAGLE**  
+- [ ] **B‑08: add multi‑token tests (test infra)**  
+  - Planned in Section 12 as “Extend tests for multi‑token EAGLE decoding once implemented.”  
+- [ ] **B‑09: validate benchmarks with multi‑token EAGLE**  
   - To be built on top of `lmdeploy/tests/test_benchmark_speculative_integration.py` once multi‑token EAGLE decode is wired.  
-- [x] **EngineerB‑10: document remaining gaps/limits**  
+- [x] **B‑10: document remaining gaps/limits**  
   - Covered by `docs/turbomind_eagle_usage.md`, including notes on current single‑token and multi‑token limitations.  
-- [x] **EngineerB‑11: honor `eagleMaxEngineTokensPerStep`**  
+- [x] **B‑11: honor `eagleMaxEngineTokensPerStep`**  
   - Implemented by using `eagle_max_engine_tokens_per_step_` in `LlamaBatch::Forward` to bound the planned `tokens_per_seq` per decode mini-batch, and reflecting this budget in the EAGLE logging so that future multi-token inner loops can respect a static engine-token budget per step.
-- [x] **EngineerB‑12: support variable `tokens_per_seq` shapes (tp=1 offline)**  
+- [x] **B‑12: support variable `tokens_per_seq` shapes (tp=1 offline)**  
   - The flattened `[batch_size, tokens_per_seq]` layout is now driven by a per-sequence plan in `eagle_planned_tokens_per_seq_`, which is clamped per-slot by `max_new_tokens` and per-slot gating. All per-slot bounds (acceptance lengths, KV draft lengths, rewinds) are computed using this per-sequence view rather than a single global scalar, while the engine-facing shapes remain static for CUDA efficiency.
 - [x] **EngineerB‑13: add detailed EAGLE acceptance logs (single-GPU)**  
   - Per-sequence `[LlamaBatch][EAGLE]` debug logs cover draft/target tokens, accepted lengths, planned tokens per seq, rewind lengths, and step-level totals. Additional end-of-run summaries will be added as part of future production hardening, but current logs are sufficient to debug single-GPU multi-token behaviour.
@@ -492,10 +492,10 @@ Engineer B plan code mapping (EngineerB‑01…EngineerB‑20):
   - Engineer‑A’s `computeAndInvokeKVCacheRewind` helper is fully integrated into `LlamaBatch::runEagleKVRewind`, using `SequenceManager`'s block tables and block pointers as described above.
 - [ ] **EngineerB‑19: align `DynamicDecodeLayer` stop criteria (future)**  
   - Remaining future work is to formally validate EOS/stop/max_new_tokens equivalence between baseline and multi-token EAGLE3 using dedicated E2E tests and CI runs. Current code enforces first-token equality, prohibits EOS in extra accepted tokens, and caps extra tokens by `max_new_tokens`, but a full DynamicDecode-aware equivalence suite remains to be added.
--- [x] **EngineerB‑20: summarize Engineer‑B work in TODO (Phase 1)**  
-  - This Engineer‑B section of `EAGLE_TODO.md` reflects the current status: single-GPU offline multi-token EAGLE3 is implemented and usable; future phases will focus on multi-GPU enablement, CI-backed E2E equivalence tests, and long-tail robustness improvements.
+-- [x] **Summary of Phase‑1 work (single‑GPU EAGLE3)**  
+  - This section of `EAGLE_TODO.md` reflects the current status: single-GPU offline multi-token EAGLE3 is implemented and usable; future phases will focus on multi-GPU enablement, CI-backed E2E equivalence tests, and long-tail robustness improvements.
 
-#### Engineer B – Phase 1 summary (single-GPU offline EAGLE3)
+#### Phase 1 summary (single-GPU offline EAGLE3)
 
 For `tp=1` TurboMind engines configured with `SpeculativeConfig(method="eagle3", num_speculative_tokens>1)`:
 
@@ -513,19 +513,19 @@ Future B-scope work (Phase 2+) will focus on:
 - Adding CI-backed multi-token E2E tests (including `test_eagle_multi_token_future.py`) that exercise EOS/stop/max_new_tokens equivalence.
 - Further performance tuning (host–device copies, layout optimizations) once correctness is fully validated.
 
-## 12. Agent test coverage and follow‑up plan (Codex CLI) - ENGINEER C
+## 12. Agent test coverage and follow‑up plan (Codex CLI)
 
 This section tracks tests and harness work added by the Codex CLI agent to
 validate the Python‑side EAGLE integration and to map TODO items to concrete
 test modules.
 
 - [x] Map existing EAGLE TODO items to tests  
-  - Section 2 / Engineer A item 7 (“Add focused unit tests for `eagle_tree`”) is covered by `lmdeploy/tests/turbomind/test_eagle_tree.py`.  
-  - Section 8 / Engineer A item 6 (“Export and plumb TurboMind EAGLE acceptance metrics end‑to‑end”) is covered on the Python side by `lmdeploy/tests/turbomind/test_eagle_metrics.py`.  
-  - Section 10 / Engineer A item 10 (“Tighten Python‑side EAGLE config/metrics and add tests”) is covered by `lmdeploy/tests/turbomind/test_speculative_manager_eagle.py` and `lmdeploy/tests/turbomind/test_speculative_manager_eagle_batch.py`.  
-  - Engineer B Phase‑1 integration tests (“baseline vs EAGLE equality” and “acceptance‑rate sanity”) are covered by `lmdeploy/tests/test_eagle_e2e.py`.
+  - Section 2 item 7 (“Add focused unit tests for `eagle_tree`”) is covered by `lmdeploy/tests/turbomind/test_eagle_tree.py`.  
+  - Section 8 item 6 (“Export and plumb TurboMind EAGLE acceptance metrics end‑to‑end”) is covered on the Python side by `lmdeploy/tests/turbomind/test_eagle_metrics.py`.  
+  - Section 10 item 10 (“Tighten Python‑side EAGLE config/metrics and add tests”) is covered by `lmdeploy/tests/turbomind/test_speculative_manager_eagle.py` and `lmdeploy/tests/turbomind/test_speculative_manager_eagle_batch.py`.  
+  - Phase‑1 integration tests (“baseline vs EAGLE equality” and “acceptance‑rate sanity”) are covered by `lmdeploy/tests/test_eagle_e2e.py`.
 
-- [x] Add benchmark integration test for EAGLE metrics (Engineer B task)  
+- [x] Add benchmark integration test for EAGLE metrics  
   - Added `lmdeploy/tests/test_benchmark_speculative_integration.py::test_benchmark_runner_reports_eagle_metrics_when_available` to exercise `inference/benchmark_speculative.py` together with a real TurboMind pipeline.  
   - This test asserts that when TurboMind populates `RequestMetrics.spec_info`, the benchmark results JSON includes an `eagle_speculation` block with sane invariants (`enabled == True`, `total_accepted_tokens <= total_draft_tokens`, acceptance rate within `[0, 1]`).
 
@@ -533,10 +533,212 @@ test modules.
   - Added `lmdeploy/tests/test_speculative_stats.py` to validate that `SpeculativeDecodingStats.update_from_output` correctly consumes TurboMind EAGLE metrics from `EngineOutput.req_metrics.spec_info`, updates draft/accepted token counters, and leaves stats unchanged when `spec_info` is absent.
 
 - [ ] Extend tests for multi‑token EAGLE decoding once implemented  
-  - When Section 4 multi‑token tasks and Engineer B Phase‑2 items are implemented, add tests that:  
-    - drive multi‑token speculative steps end‑to‑end via `LlamaBatch::Forward`,  
+  - When Section 4 multi-token tasks and later multi-token integration work are implemented, add tests that:  
+    - drive multi-token speculative steps end‑to‑end via `LlamaBatch::Forward`,  
     - verify that `accepted_tokens` / `accepted_lens` advance sequences correctly without KV rewind,  
-    - and ensure `RequestMetrics.spec_info` reflects multi‑token acceptance statistics.
+    - and ensure `RequestMetrics.spec_info` reflects multi-token acceptance statistics.
 
 - [ ] Harden CI configuration for EAGLE‑specific tests  
   - Provide small TurboMind models and CI env configuration (`MODEL_PATH` / `SPEC_MODEL_PATH`) so that all Python‑side EAGLE tests (metrics, managers, benchmark integration, e2e) run without manual setup and without relying on large production models.
+
+## 13. TurboMind target‑tree decode for EAGLE3 – production plan
+
+This section is the source of truth for the remaining *unimplemented* work needed to make TurboMind’s EAGLE3 behave like TensorRT‑LLM’s
+`eagleDecodeDraftTokens + eagleDecodingLayer` on GPT‑OSS‑120B. No scaffolding or demo stubs are allowed here: each item must be implemented
+with production correctness, shape/dtype safety, and CI coverage.
+
+### 13.1 Base TurboMind decode & KV integration
+
+- [ ] **A‑T1: Define target‑tree decode boundary in TurboMind**
+  - Decide the public C++ entry point that will perform target‑tree decode for a single generation step, e.g.:
+    - Current prototype: `void LlamaV2::targetTreeDecode(int batch_size, const int* d_sequence_lengths);`
+  - Constraints:
+    - Must **not** change existing baseline decode semantics when EAGLE is disabled.
+    - Must run after draft tree build / mask generation and before `eagleSpeculativeStep`.
+  - Current wiring:
+    - `LlamaV2_eagle::eagleSpeculativeStep` calls `targetTreeDecode(batch_size, /*d_sequence_lengths=*/nullptr)` after tree build and mask
+      generation when `EngineParam.enable_eagle_target_tree == true`.
+    - `LlamaBatch::Forward` no longer calls `targetTreeDecode` directly; it still fabricates `target_tokens` on host and passes them into
+      `eagleSpeculativeStep`.
+
+- [ ] **A‑T2: Clarify KV/cache invariants for tree decode**
+  - Document the expected behaviour of the KV cache during target‑tree decode:
+    - Prefix KV must be reused from the main decode path.
+    - Tree decode must not corrupt or leak KV blocks for sequences that continue after this step.
+  - In `LlamaBatch::runEagleKVRewind` and `SequenceManager`, define a clear contract:
+    - What KV state is valid **before** calling target‑tree decode.
+    - What KV state is allowed to change **after** acceptance and KV rewind.
+
+- [ ] **A‑T3: Choose execution granularity for tree decode**
+  - Decide between:
+    - Per‑tree‑depth decode (decode all nodes at a given depth together).
+    - Flattened “all nodes at once” decode with a packed attention mask.
+  - This choice drives:
+    - How many tokens (`num_tree_tokens`) are passed into the base model per step.
+    - How attention masks / position ids are constructed.
+  - Document the chosen strategy in this file and in a short in‑repo design note (e.g. `docs/turbomind_eagle_target_tree.md`).
+
+- [ ] **A‑T4: Define input/output tensor layouts for tree decode**
+  - For the chosen execution strategy, fix and document:
+    - Layout of `target_tree_input_ids` (SB vs BS).
+    - Layout of `target_tree_position_ids`.
+    - Layout of any tree‑specific attention masks (packed vs boolean).
+    - Mapping from a flat “tree token index” to `(slot, token_idx)` in EAGLE’s node space.
+  - These layouts must be stable and shared across kernel and test implementations.
+
+- [x] **A‑T5: Gate target‑tree decode with runtime guards**
+  - `EngineParam.enable_eagle_target_tree` is plumbed from the Triton YAML `speculative_config.enable_target_tree` flag in `LlamaTritonModel.cc`. `LlamaV2::isTargetTreeDecodeEnabled()` exposes this to `LlamaBatch`, and `targetTreeDecode` is only invoked when EAGLE is enabled, buffers are allocated, and `enable_eagle_target_tree == true`. When the flag is false, TurboMind continues to rely on the existing single‑step target logits path and host‑fabricated `target_tokens`.
+
+### 13.2 EAGLE3 target‑tree CUDA path & integration
+
+- [x] **B‑T1: Implement `PrepareGenTargetTreeInputs` kernel and API**
+  - New files: `lmdeploy/lmdeploy/turbomind/kernels/speculative_decoding/target_tree_decode.{h,cu}`.
+  - Public API (host‑callable):
+    - `void invokePrepareGenTargetTreeInputs(const PrepareGenTargetTreeParams& params);`
+  - Responsibilities:
+    - Take `EagleBuffers::inputs.draft_paths` `[max_batch_size, max_decoding_tokens, max_path_len]` and `batch_slots` `[batch_size]`.
+    - For each active slot:
+      - Identify the tree nodes to decode this step (v1 can use all non‑root nodes or all leaf nodes).
+      - Build a flattened `output_ids` buffer `[num_tree_tokens]` containing the **draft** token IDs in decode order.
+      - Build `position_ids` `[num_tree_tokens]` consistent with TurboMind’s rope strategy (base sequence length + depth).
+      - Build `hidden_indices` `[num_tree_tokens]` mapping each flat index → `(slot, token_idx)` in EAGLE node space.
+    - Fill `spec_gen_lengths`, `next_sequence_lengths`, `next_context_lengths` `[batch_size]` to describe the speculative pass size.
+
+  **Status (Engineer B – implemented / staging only):**
+
+  - `PrepareGenTargetTreeParams` is implemented in `target_tree_decode.h` with:
+    - `draft_paths`, `batch_slots`, `draft_tokens`,
+    - `base_sequence_lengths`, `base_context_lengths`,
+    - `output_ids`, `position_ids`, `hidden_indices`,
+    - `spec_gen_lengths`, `next_sequence_lengths`, `next_context_lengths`,
+    - `batch_size`, `max_batch_size`, `max_decoding_tokens`, `max_path_len`, `stream`.
+  - `invokePrepareGenTargetTreeInputs` and `prepareGenTargetTreeInputsKernel` in `target_tree_decode.cu`:
+    - For each active slot, walk `draft_paths` and emit up to `max_decoding_tokens` non‑root nodes into `output_ids` / `position_ids` / `hidden_indices`.
+    - When the optional metadata buffers are non‑null:
+      - `spec_gen_lengths[local_idx]` is set to the number of emitted tree tokens.
+      - `next_sequence_lengths[local_idx]` is set to `base_seq_len + emitted`.
+      - `next_context_lengths[local_idx]` is set to `base_ctx_len` (tree decode does not extend the context window).
+  - `LlamaV2::targetTreeDecode` wires this kernel to `EagleBuffers`:
+    - Inputs: `inputs.draft_paths`, `inputs.draft_tokens`, and optional `d_sequence_lengths`.
+    - Outputs: `inputs.eagle_net_input_ids`, `inputs.eagle_net_position_ids`, `inputs.eagle_net_hidden_indices`,
+      plus per‑slot lengths `inputs.eagle_net_gen_lens`, `inputs.eagle_net_seq_lens`, `inputs.eagle_net_ctx_lens`.
+  - These staged buffers are used only as inputs for a future base‑model target‑tree decode pass; acceptance still consumes
+    host‑fabricated `target_tokens`.
+
+- [ ] **B‑T2: Add target‑tree decode wrapper in `LlamaV2`**
+  - Implement `LlamaV2::targetTreeDecode` to:
+    - Call `invokePrepareGenTargetTreeInputs` with:
+      - `base_input_ids = token_ids_buf_`,
+      - `base_seq_lengths = sequence_lengths_`,
+      - `base_context_lengths = context_length_buf_` (or equivalent),
+      - `draft_paths = eagle_buffers.inputs.draft_paths`,
+      - `batch_slots = [0..batch_size-1]`.
+    - Run the base model (same kernels as regular decode) on `output_ids` / `position_ids` to produce logits for each tree token.
+    - Reduce logits to top‑1 target IDs per node and write them into:
+      - `EagleBuffers::inputs.target_tokens[slot * max_decoding_tokens + token_idx]`.
+  - **Current status (Engineer B – ⏳ pending decode):**
+    - `LlamaV2::targetTreeDecode(int batch_size, const int* d_sequence_lengths)` exists and is called from
+      `LlamaV2_eagle::eagleSpeculativeStep` after tree build + mask generation when `enable_eagle_target_tree == true`.
+    - Today it only launches `invokePrepareGenTargetTreeInputs` to fill the `eagle_net_*` staging buffers listed in B‑T1.
+    - No base‑model decode is yet run over these tree tokens, and `EagleBuffers::inputs.target_tokens` is **not** written on device.
+    - `eagleSpeculativeStep` still relies on host‑fabricated `target_tokens` from `LlamaBatch::Forward`, mirrored into
+      `EagleBuffers::inputs.target_tokens` before calling `invokeTreeAcceptByIdsWithPaths`.
+  - Constraints:
+    - No new `cudaMalloc/cudaFree` in the decode hot path; use pre‑allocated buffers in `EagleBuffers` or model scratch.
+    - No changes to baseline decode outputs when EAGLE is disabled.
+
+- [ ] **B‑T3: Integrate target‑tree masks with TurboMind attention**
+  - Use existing `EagleBuffers::inputs.packed_masks` (from `invokeGetPackedMaskFromPath`) to enforce tree‑structured attention:
+    - Tree nodes must attend only to allowed ancestors and siblings as in TRT‑LLM’s EAGLE.
+  - Decide whether to:
+    - Extend existing attention kernels to accept an optional packed tree mask, or
+    - Introduce a small wrapper that applies the mask at the logits or context level.
+  - Update `LlamaV2` / `unified_attention_layer` to consume these masks only in the target‑tree decode path.
+
+- [ ] **B‑T4: Wire `invokeTreeAcceptByIdsWithPaths` to new `target_tokens`**
+  - Ensure that `LlamaV2::eagleSpeculativeStep` is called **after** `targetTreeDecode` and that:
+    - `EagleBuffers::inputs.target_tokens` hold the per‑node target IDs computed by the base model.
+    - `invokeTreeAcceptByIdsWithPaths` sees:
+      - `draft_ids = inputs.draft_tokens`,
+      - `target_ids = inputs.target_tokens`,
+      - `paths = inputs.draft_paths` (with correct node indices),
+      - `batch_slots` mapping local batch → slot.
+  - Remove any remaining dependencies on host‑fabricated `target_tokens` from `LlamaBatch::Forward`.
+
+- [ ] **B‑T5: Ensure BF16/MXFP4 correctness for target‑tree logits**
+  - Verify (by inspection and unit tests) that:
+    - All target‑tree decode activations are computed in BF16 (matching GPT‑OSS compute).
+    - Logit reductions (argmax) use FP32 accumulation or equivalent for numerical stability.
+  - Guard against shape/dtype mismatches:
+    - Add checks around `EagleBuffers::inputs.target_tokens` and the logits buffer to ensure `dtype == int32` for IDs and consistent float dtype for logits.
+    - On any mismatch, log a clear `[LlamaV2][EAGLE][fallback]` message and disable target‑tree decode for that engine.
+
+### 13.3 Validation, metrics, and benchmarks
+
+- Status: core tree‑aware EAGLE3 metrics and benchmark plumbing are implemented; C‑T1/C‑T2/C‑T3/C‑T4/C‑T5 below remain focused on **tests**, **end‑to‑end validation**, and **docs**.
+
+- [x] **C‑3: Implement EAGLE3 acceptance metrics over tree nodes**
+  - Extended `RequestMetrics` (`src/turbomind/utils/metrics.h`) with tree‑specific counters:
+    - `eagle_tree_draft_tokens`, `eagle_tree_target_tokens`, `eagle_tree_accepted_tokens`, and exposed them to Python via `_turbomind.RequestMetrics` (`src/turbomind/python/bind.cpp`).
+  - In `LlamaBatch::updateEagleMetricsAndKVLengths` (`src/turbomind/models/llama/LlamaBatch.cc`), when `enable_eagle_target_tree` is set for the engine, these counters are updated per step alongside the existing EAGLE totals, so we can distinguish tree‑decode behaviour from baseline speculative decode.
+  - `lmdeploy/turbomind/turbomind.py::_get_metrics` now forwards these fields into a nested `spec_info["tree_decode"]` block (`num_tree_draft_tokens`, `num_tree_target_tokens`, `num_tree_accepted_tokens`) when non‑zero, keeping the top‑level schema stable for existing consumers.
+
+- [x] **C‑4: Hook target‑tree decode into benchmark tooling**
+  - `inference/benchmark_speculative.py::BenchmarkRunner` accepts an `enable_target_tree` flag and passes it through to `SpeculativeConfig(enable_target_tree=...)` when constructing TurboMind pipelines, so scenarios can explicitly exercise the target‑tree path.
+  - `BenchmarkRunner.run_benchmark` still aggregates core EAGLE stats via `SpeculativeDecodingStats` / `EagleMetricsSummary`, but the resulting `eagle_speculation` JSON block now includes:
+    - `target_tree_enabled: bool` mirroring the runner configuration, and
+    - an optional nested `tree_decode` summary when tree metrics are present (contributed by `EagleMetricsSummary.to_dict()`).
+  - `BenchmarkRunner.run_test_scenario` prints a short “EAGLE target‑tree” line (tree acceptance rate + total accepted tree tokens) when such metrics are available, so offline runs surface tree effectiveness directly in stdout without breaking existing JSON consumers.
+
+- [x] **C‑5: Add string‑level alignment debugging in Python**
+  - Introduced `lmdeploy/turbomind/debug_eagle.py` with:
+    - `format_eagle_alignment(...)` – given `(draft_ids_path, target_ids_path, accepted_tokens, tokenizer, baseline_text)`, returns a human‑readable multi‑line string showing ids and decoded text for each sequence, plus an optional baseline `DynamicDecode` text.
+    - `print_eagle_alignment(...)` – convenience wrapper that prints the formatted alignment for quick inspection in notebooks or loggers.
+  - These helpers are engine‑agnostic and operate purely on recorded token ids and a tokenizer, making them suitable for offline analysis of recorded EAGLE tree runs without requiring additional C++ hooks.
+
+- [ ] **C‑T1: Unit tests for `invokePrepareGenTargetTreeInputs`**
+  - Add tests in `lmdeploy/tests/turbomind/test_target_tree_decode.py` to validate that:
+    - For simple synthetic trees and fixed `draft_paths`, the kernel produces:
+      - The expected `output_ids` sequence.
+      - Correct `hidden_indices` mapping back to `(slot, token_idx)`.
+    - `spec_gen_lengths` and `next_sequence_lengths` are consistent with the number of nodes selected per batch.
+  - Cover corner cases:
+    - Single‑path trees, bushy trees, empty/non‑leaf‑only levels.
+
+- [ ] **C‑T2: Device‑level tests for target‑tree decode logits → target_ids**
+  - Add tests in `lmdeploy/tests/turbomind/test_target_tree_logits.py` that:
+    - Use a tiny TurboMind model (or a synthetic “identity logits” head) to:
+      - Run `LlamaV2::targetTreeDecode` on a known tree.
+      - Check that `EagleBuffers::inputs.target_tokens` match expected IDs for each node.
+  - These tests must run on CUDA in CI (with a small model to keep runtime reasonable).
+
+- [ ] **C‑T3: End‑to‑end acceptance behaviour tests**
+  - Extend `lmdeploy/tests/test_eagle_e2e.py` (or a new file) with:
+    - A scenario where:
+      - Draft model proposals are partially correct along a tree.
+      - Target model logits are forced (via a test model) to agree or disagree at specific nodes.
+    - Assertions that:
+      - `accepted_tokens` / `accepted_lens` from TurboMind match the expected longest prefix rule.
+      - `updateEagleMetricsAndKVLengths` reports correct acceptance lengths and KV rewind lengths.
+
+- [ ] **C‑T4: Benchmark and metrics validation for GPT‑OSS‑120B + EAGLE3**
+  - Add a dedicated benchmark script (or extend `benchmark_speculative.py`) to:
+    - Run GPT‑OSS‑120B + `gpt‑oss‑120b‑Eagle3` with target‑tree decode enabled.
+    - Log:
+      - Mean accepted tokens per step,
+      - Draft/accepted/rewound token totals,
+      - Latency per token and throughput vs baseline.
+  - Define a minimal acceptance threshold (e.g. `mean_accepted_tokens > 1.1` on standard prompts) for considering target‑tree decode “effective.”
+  - Wire this into CI as an optional “smoke benchmark” job that runs on a smaller model but verifies end‑to‑end wiring.
+
+- [ ] **C‑T5: Documentation and runbook updates**
+  - Update `docs/turbomind_eagle_usage.md` and/or a new `docs/turbomind_eagle_target_tree.md` section with:
+    - A description of the target‑tree decode path, including diagrams of:
+      - Base model forward,
+      - Tree masks,
+      - Target IDs per node,
+      - Acceptance and KV rewind.
+    - A troubleshooting guide for:
+      - Low acceptance rates under target‑tree decode,
+      - Shape/dtype assertion failures,
+      - Regressions in baseline decode when EAGLE is enabled.
