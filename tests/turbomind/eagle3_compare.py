@@ -34,15 +34,15 @@ except Exception:  # pragma: no cover - LMDeploy may not be importable in some e
     _HAVE_LMDEPLOY = False
 
 
-def _stage_stats(name: str, tm: torch.Tensor, hf: torch.Tensor | None) -> None:
-    """Print simple per-stage alignment metrics between TM and HF tensors."""
+def _stage_stats(name: str, tm: torch.Tensor, hf: torch.Tensor | None) -> Tuple[float, float, float] | None:
+    """Print simple per-stage alignment metrics between TM and HF tensors. Returns (mean_abs, max_abs, cosine) or None."""
     tm = tm.to(torch.float32)
     if hf is None:
         print(
             f"{name}: only TM tensor available; "
             f"shape={tuple(tm.shape)}, mean={tm.mean().item():.4f}, std={tm.std().item():.4f}"
         )
-        return
+        return None
 
     hf = hf.to(torch.float32)
     if tm.shape != hf.shape:
@@ -50,7 +50,7 @@ def _stage_stats(name: str, tm: torch.Tensor, hf: torch.Tensor | None) -> None:
             f"{name}: shape mismatch TM {tuple(tm.shape)} vs HF {tuple(hf.shape)}; "
             "skipping direct diff/cosine."
         )
-        return
+        return None
 
     diff = (tm - hf).abs()
     mean_abs = diff.mean().item()
@@ -66,19 +66,20 @@ def _stage_stats(name: str, tm: torch.Tensor, hf: torch.Tensor | None) -> None:
         f"{name}: mean_abs_diff={mean_abs:.4e}, "
         f"max_abs_diff={max_abs:.4e}, cosine={cos:.4f}"
     )
+    return mean_abs, max_abs, cos
 
 
 def _build_hidden_and_capture_from_ids(
     model: AutoModelForCausalLM,
     input_ids: torch.Tensor,
     device: torch.device,
-    num_capture_layers: int,
+    capture_layers: Tuple[int, ...],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the HF target model on given ids and extract hidden/capture.
 
     Returns:
         last_hidden: [B, H]
-        capture:     [B, H * num_capture_layers]
+        capture:     [B, H * len(capture_layers)]
     """
     model.eval()
     input_ids = input_ids.to(device)
@@ -88,13 +89,16 @@ def _build_hidden_and_capture_from_ids(
     hidden_states = out.hidden_states
     last_hidden = hidden_states[-1][:, -1, :]  # [B, H]
 
-    if num_capture_layers <= 0:
+    if not capture_layers:
         return last_hidden, last_hidden.new_zeros((last_hidden.shape[0], 0))
 
     layers = []
     L = len(hidden_states)
-    start = max(0, L - num_capture_layers)
-    for idx in range(start, L):
+    for idx in capture_layers:
+        if idx < 0:
+            idx = L + idx
+        if idx < 0 or idx >= L:
+            raise ValueError(f"capture layer idx {idx} out of range for L={L}")
         layers.append(hidden_states[idx][:, -1, :])
     capture = torch.cat(layers, dim=-1)
     return last_hidden, capture
@@ -105,36 +109,42 @@ def run_compare(
     target_model_name: str,
     prompt: str,
     device: str = "cuda",
-    num_capture_layers: int = 3,
+    capture_layers: Tuple[int, ...] = (1, 17, 32),
+    cosine_tol: float = 0.0,
+    max_abs_tol: float = 0.0,
+    topk_overlap_tol: float = 0.0,
 ) -> None:
     """Load HF Eagle3 + TurboMind draft and print basic alignment stats."""
     dev = torch.device(device)
 
-    # We only need hidden states / logits; using synthetic ids keeps this helper
-    # usable even if tokenizer files are missing or non-standard. If you want
-    # exact prompt-based comparison, you can replace this with real tokenization.
     cfg = AutoConfig.from_pretrained(target_model_name)
-    vocab_size = int(getattr(cfg, "vocab_size", 0) or 0)
-    if vocab_size <= 0:
-        raise RuntimeError(
-            f"Could not resolve vocab_size from config for {target_model_name!r}"
-        )
-
     target = AutoModelForCausalLM.from_pretrained(
         target_model_name,
         torch_dtype=torch.bfloat16,
         device_map={"": dev},
     )
 
-    # Simple synthetic batch: one sequence of modest length.
-    seq_len = 16
-    batch_size = 1
-    torch.manual_seed(0)
-    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=dev)
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(target_model_name)
+        enc = tokenizer(prompt, return_tensors="pt")
+        input_ids = enc.input_ids.to(dev)
+    except Exception:
+        # Fallback: synthetic ids if tokenizer not available.
+        vocab_size = int(getattr(cfg, "vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            raise RuntimeError(
+                f"Could not resolve vocab_size from config for {target_model_name!r}"
+            )
+        seq_len = 16
+        batch_size = 1
+        torch.manual_seed(0)
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=dev)
 
     # HF target hidden + capture for the last position.
     last_hidden, capture = _build_hidden_and_capture_from_ids(
-        target, input_ids, dev, num_capture_layers=num_capture_layers
+        target, input_ids, dev, capture_layers=capture_layers
     )
     last_hidden_hf = last_hidden.to(torch.float32)
 
@@ -151,9 +161,11 @@ def run_compare(
     tm_debug = _turbomind.eagle3_forward_debug(draft_dir, last_hidden_tm, capture_tm)
 
     logits_tm = torch.from_dlpack(tm_debug["logits"].__dlpack__()).to(torch.float32)
+    logits_hf = logits_hf.to(torch.float32)
 
     fc_tm = tm_debug.get("fc_out")
     attn_out_tm = tm_debug.get("attn_out")
+    qkv_tm = tm_debug.get("qkv")
     ffn_out_tm = tm_debug.get("ffn_out")
     pre_tm = tm_debug.get("pre_head_hidden")
 
@@ -161,32 +173,42 @@ def run_compare(
     # become available, wire them here for true stagewise comparisons.
     hf_stage_ref = last_hidden_hf
 
+    fc_stats = None
     if fc_tm is not None:
         fc_tm_t = torch.from_dlpack(fc_tm.__dlpack__())
-        _stage_stats("FC_OUT", fc_tm_t, hf_stage_ref)
+        fc_stats = _stage_stats("FC_OUT", fc_tm_t, hf_stage_ref)
     else:
         print("FC_OUT: not available from TurboMind debug binding.")
 
+    attn_stats = None
     if attn_out_tm is not None:
         attn_out_tm_t = torch.from_dlpack(attn_out_tm.__dlpack__())
-        _stage_stats("ATTN_OUT", attn_out_tm_t, hf_stage_ref)
+        attn_stats = _stage_stats("ATTN_OUT", attn_out_tm_t, hf_stage_ref)
     else:
         print("ATTN_OUT: not available from TurboMind debug binding.")
 
+    if qkv_tm is not None:
+        qkv_tm_t = torch.from_dlpack(qkv_tm.__dlpack__()).to(torch.float32)
+        print(f"QKV: shape={tuple(qkv_tm_t.shape)}, mean={qkv_tm_t.mean().item():.4f}, std={qkv_tm_t.std().item():.4f}")
+    else:
+        print("QKV: not available from TurboMind debug binding.")
+
+    ffn_stats = None
     if ffn_out_tm is not None:
         ffn_out_tm_t = torch.from_dlpack(ffn_out_tm.__dlpack__())
-        _stage_stats("FFN_OUT", ffn_out_tm_t, hf_stage_ref)
+        ffn_stats = _stage_stats("FFN_OUT", ffn_out_tm_t, hf_stage_ref)
     else:
         print("FFN_OUT: not available from TurboMind debug binding.")
 
+    pre_stats = None
     if pre_tm is not None:
         pre_tm_t = torch.from_dlpack(pre_tm.__dlpack__())
-        _stage_stats("PRE_HEAD_HIDDEN", pre_tm_t, hf_stage_ref)
+        pre_stats = _stage_stats("PRE_HEAD_HIDDEN", pre_tm_t, hf_stage_ref)
     else:
         print("PRE_HEAD_HIDDEN: not available from TurboMind debug binding.")
 
     # Logits: compare directly vs HF.
-    _stage_stats("LOGITS", logits_tm, logits_hf)
+    logits_stats = _stage_stats("LOGITS", logits_tm, logits_hf)
 
     # Argmax and top-k overlap.
     top1_hf = logits_hf.argmax(dim=-1)
@@ -196,9 +218,21 @@ def run_compare(
     k = 5
     topk_hf = logits_hf.topk(k, dim=-1).indices
     topk_tm = logits_tm.topk(k, dim=-1).indices
-    # Any overlap in top-k per position.
     overlap = (topk_hf[..., None] == topk_tm[..., None, :]).any(dim=-1)
     topk_overlap = overlap.float().mean().item()
+
+    if cosine_tol or max_abs_tol or topk_overlap_tol:
+        if logits_stats is None:
+            raise AssertionError("No logits stats available to apply tolerances.")
+        _, max_abs_diff, cos_val = logits_stats
+        if cosine_tol and cos_val < cosine_tol:
+            raise AssertionError(f"cosine {cos_val:.4f} below tol {cosine_tol}")
+        if max_abs_tol and max_abs_diff > max_abs_tol:
+            raise AssertionError(f"max_abs_diff {max_abs_diff:.4e} above tol {max_abs_tol}")
+        if topk_overlap_tol and topk_overlap < topk_overlap_tol:
+            raise AssertionError(
+                f"top{k} overlap {topk_overlap:.3f} below tol {topk_overlap_tol}"
+            )
 
     print(f"\nPrompt (unused for synthetic ids): {prompt!r}")
     print(f"argmax_match_rate={match_rate:.3f}")
@@ -310,19 +344,42 @@ def main() -> None:
         help="Torch device to run on (default: cuda).",
     )
     parser.add_argument(
-        "--num-capture-layers",
-        type=int,
-        default=3,
-        help="Number of last layers to concatenate into capture (default: 3).",
+        "--capture-layer-ids",
+        type=str,
+        default="1,17,32",
+        help="Comma-separated HF hidden-state indices to capture (default matches TRT Eagle3: 1,17,32).",
+    )
+    parser.add_argument(
+        "--cosine-tol",
+        type=float,
+        default=0.0,
+        help="Optional cosine tolerance on logits; raise if below.",
+    )
+    parser.add_argument(
+        "--max-abs-tol",
+        type=float,
+        default=0.0,
+        help="Optional max-abs-diff tolerance on logits; raise if above.",
+    )
+    parser.add_argument(
+        "--topk-overlap-tol",
+        type=float,
+        default=0.0,
+        help="Optional top-k overlap tolerance on logits; raise if below.",
     )
     args = parser.parse_args()
+
+    capture_layers = tuple(int(x) for x in args.capture_layer_ids.split(",") if x != "")
 
     run_compare(
         draft_dir=args.draft_dir,
         target_model_name=args.target_model,
         prompt=args.prompt,
         device=args.device,
-        num_capture_layers=args.num_capture_layers,
+        capture_layers=capture_layers,
+        cosine_tol=args.cosine_tol,
+        max_abs_tol=args.max_abs_tol,
+        topk_overlap_tol=args.topk_overlap_tol,
     )
 
     # Optional LMDeploy PyTorchEngine comparison: compares the first new token

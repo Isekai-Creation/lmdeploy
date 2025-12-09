@@ -318,6 +318,155 @@ void launchPackAcceptedPathsKernel(
 
 namespace {
 
+__global__ void maskLogitsBasedOnEntropyKernel(
+    float**       logits_ptrs,
+    TokenIdType** output_id_ptrs,
+    bool*         skip_decode,
+    TokenIdType*  output_ids,
+    float*        runtime_top_p,
+    float const*  probs,
+    float const*  entropies,
+    int const*    generation_lengths,
+    float const*  posterior_thresholds,
+    float const*  posterior_alphas,
+    float const*  temperatures,
+    int const*    batch_slots,
+    int           batch_size,
+    int           max_tokens,
+    int           vocab_size)
+{
+    const int vocab_idx = static_cast<int>(blockIdx.z * blockDim.x + threadIdx.x);
+    const int batch_idx = static_cast<int>(blockIdx.x);
+    const int token_idx = static_cast<int>(blockIdx.y);
+
+    if (batch_idx >= batch_size || token_idx >= max_tokens) {
+        return;
+    }
+
+    const int batch_slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
+    if (batch_slot < 0 || batch_slot >= batch_size) {
+        return;
+    }
+
+    const bool valid = token_idx < generation_lengths[batch_slot] && vocab_idx < vocab_size;
+
+    if (vocab_idx == 0) {
+        const float temp = temperatures ? temperatures[batch_slot] : 1.0f;
+        runtime_top_p[batch_slot * max_tokens + token_idx] = (temp < 1e-6f) ? 0.0f : 1.0f;
+        output_id_ptrs[batch_slot * max_tokens + token_idx]
+            = output_ids + static_cast<size_t>(batch_slot) * max_tokens + token_idx;
+        skip_decode[batch_slot * max_tokens + token_idx] = !valid;
+    }
+
+    if (!valid) {
+        return;
+    }
+
+    const float posterior_threshold = posterior_thresholds ? posterior_thresholds[batch_slot] : 1.0f;
+    const float posterior_alpha     = posterior_alphas ? posterior_alphas[batch_slot] : 1.0f;
+    const float entropy             = entropies ? entropies[batch_slot * max_tokens + token_idx] : 0.0f;
+
+    const float prob   = probs[(batch_slot * max_tokens + token_idx) * vocab_size + vocab_idx];
+    const float thresh = fminf(posterior_threshold, posterior_alpha * expf(-entropy));
+    if (prob < thresh && logits_ptrs) {
+        logits_ptrs[batch_idx * max_tokens + token_idx][vocab_idx] = -CUDART_INF_F;
+    }
+}
+
+}  // namespace
+
+void maskLogitsBasedOnEntropy(const EntropyMaskParams& params)
+{
+    if (!params.logits_ptrs || !params.probs || params.batch_size <= 0 || params.max_tokens <= 0
+        || params.vocab_size <= 0) {
+        return;
+    }
+
+    constexpr int BLOCK = 256;
+    const int     grid_z = (params.vocab_size + BLOCK - 1) / BLOCK;
+    dim3          grid(params.batch_size, params.max_tokens, grid_z);
+
+    maskLogitsBasedOnEntropyKernel<<<grid, BLOCK, 0, params.stream>>>(
+        params.logits_ptrs,
+        params.output_id_ptrs,
+        params.skip_decode,
+        params.output_ids,
+        params.runtime_top_p,
+        params.probs,
+        params.entropies,
+        params.generation_lengths,
+        params.posterior_thresholds,
+        params.posterior_alphas,
+        params.temperatures,
+        params.batch_slots,
+        params.batch_size,
+        params.max_tokens,
+        params.vocab_size);
+}
+
+// Simple row-wise softmax + entropy for float logits.
+namespace {
+__global__ void softmaxEntropyKernel(const float* logits,
+                                     float*       probs,
+                                     float*       entropy,
+                                     int          cols)
+{
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+
+    // Max
+    float local_max = -CUDART_INF_F;
+    for (int i = lane; i < cols; i += blockDim.x) {
+        local_max = fmaxf(local_max, logits[row * cols + i]);
+    }
+    using BlockReduce = cub::BlockReduce<float, 256>;
+    __shared__ typename BlockReduce::TempStorage max_storage;
+    float max_val = BlockReduce(max_storage).Reduce(local_max, cub::Max());
+    __syncthreads();
+
+    // Sum exp
+    float local_sum = 0.f;
+    for (int i = lane; i < cols; i += blockDim.x) {
+        local_sum += expf(logits[row * cols + i] - max_val);
+    }
+    __shared__ typename BlockReduce::TempStorage sum_storage;
+    float sum_val = BlockReduce(sum_storage).Reduce(local_sum, cub::Sum());
+    __syncthreads();
+
+    // Probs and partial entropy
+    float local_entropy = 0.f;
+    for (int i = lane; i < cols; i += blockDim.x) {
+        const float p = expf(logits[row * cols + i] - max_val) / sum_val;
+        probs[row * cols + i] = p;
+        if (p > 0.f) {
+            local_entropy -= p * logf(p + 1e-9f);
+        }
+    }
+    __shared__ typename BlockReduce::TempStorage ent_storage;
+    float ent_val = BlockReduce(ent_storage).Reduce(local_entropy, cub::Sum());
+    if (lane == 0) {
+        entropy[row] = ent_val;
+    }
+}
+}  // namespace
+
+void invokeSoftmaxWithEntropy(const float* logits,
+                              float*       probs,
+                              float*       entropy,
+                              int          rows,
+                              int          cols,
+                              cudaStream_t stream)
+{
+    if (!logits || !probs || !entropy || rows <= 0 || cols <= 0) {
+        return;
+    }
+    dim3 grid(rows);
+    dim3 block(256);
+    softmaxEntropyKernel<<<grid, block, 0, stream>>>(logits, probs, entropy, cols);
+}
+
+namespace {
+
 __global__ void computeSuccessorMetaKernel(SizeType const* runtime_offsets,
                                            SizeType        batch_size,
                                            SizeType*       successor_offsets,

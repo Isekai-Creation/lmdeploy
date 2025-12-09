@@ -827,9 +827,19 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
         eagle_kv_block_tables_ = {ssize_t(max_batch_size_ * kv_max_blocks_per_seq_), kDEVICE};
     }
 
+    // Per-request EOS id for EAGLE acceptance (first eos id or -1).
+    eagle_end_ids_ = {max_batch_size_, kDEVICE};
+    eagle_posterior_thresholds_ = {max_batch_size_, kDEVICE};
+    eagle_posterior_alphas_     = {max_batch_size_, kDEVICE};
+    eagle_temperatures_         = {max_batch_size_, kDEVICE};
+
     // Multi-token per-slot kill switch, initially all zero (multi-token
     // enabled). Length is fixed to `max_batch_size_`.
     eagle_disable_multitoken_slot_.assign(max_batch_size_, 0);
+    std::fill_n(eagle_end_ids_.data(), max_batch_size_, -1);
+    std::fill_n(eagle_posterior_thresholds_.data(), max_batch_size_, 1.0f);
+    std::fill_n(eagle_posterior_alphas_.data(), max_batch_size_, 1.0f);
+    std::fill_n(eagle_temperatures_.data(), max_batch_size_, 1.0f);
 }
 
 void LlamaBatch::AllocSymmBuffers()
@@ -2285,6 +2295,44 @@ bool LlamaBatch::Forward(GenerationState& g)
                 eagle_planned_tokens_per_seq_.empty() ? nullptr : eagle_planned_tokens_per_seq_.data();
             spec_ctx.enable_eagle             = true;
             spec_ctx.enable_eagle_target_tree = param_.enable_eagle_target_tree && model_->isTargetTreeDecodeEnabled();
+            // Populate per-slot end_ids (first EOS id per request or -1).
+            {
+                std::vector<int> host_end_ids(batch_size, -1);
+                for (int i = 0; i < batch_size; ++i) {
+                    const auto* req = state_->requests[i].get();
+                    if (req && !req->gen_cfg.eos_ids.empty()) {
+                        host_end_ids[i] = req->gen_cfg.eos_ids.front();
+                    }
+                }
+                core::Copy(host_end_ids.data(), batch_size, eagle_end_ids_.data());
+                spec_ctx.d_end_ids = eagle_end_ids_.data();
+            }
+            // Posterior/typical gating knobs (per TRT).
+            {
+                std::vector<float> host_thr(batch_size, 1.0f);
+                std::vector<float> host_alpha(batch_size, 1.0f);
+                std::vector<float> host_temp(batch_size, 1.0f);
+                for (int i = 0; i < batch_size; ++i) {
+                    const auto* req = state_->requests[i].get();
+                    if (!req) {
+                        continue;
+                    }
+                    host_temp[i] = req->gen_cfg.temperature;
+                    // If posterior params are absent, default to 1.0 (no masking).
+                    if (!req->gen_cfg.posterior_thresholds.empty()) {
+                        host_thr[i] = req->gen_cfg.posterior_thresholds.front();
+                    }
+                    if (!req->gen_cfg.posterior_alphas.empty()) {
+                        host_alpha[i] = req->gen_cfg.posterior_alphas.front();
+                    }
+                }
+                core::Copy(host_thr.data(), batch_size, eagle_posterior_thresholds_.data());
+                core::Copy(host_alpha.data(), batch_size, eagle_posterior_alphas_.data());
+                core::Copy(host_temp.data(), batch_size, eagle_temperatures_.data());
+                spec_ctx.d_posterior_thresholds = eagle_posterior_thresholds_.data();
+                spec_ctx.d_posterior_alphas     = eagle_posterior_alphas_.data();
+                spec_ctx.d_temperatures         = eagle_temperatures_.data();
+            }
 
             model_->dynamicDecodeWithSpecMulti(g,
                                                token_ids_buf_,

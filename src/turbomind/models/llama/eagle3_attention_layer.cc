@@ -57,7 +57,8 @@ __device__ inline float from_float<float>(float x)
 }
 
 // Apply standard RoPE to Q/K in-place. Position ids are optional; when
-// absent we fall back to (past_kv_len + token_idx % q_len).
+// absent we fall back to (past_kv_len + token_idx % q_len). When provided,
+// position_ids are treated as absolute and past_kv_len is not added again.
 template<typename T>
 __global__ void apply_rope_kernel(T*       q_ptr,
                                   T*       k_ptr,
@@ -68,7 +69,8 @@ __global__ void apply_rope_kernel(T*       q_ptr,
                                   int      q_len,
                                   int      past_kv_len,
                                   const int* position_ids,
-                                  float    rope_base)
+                                  float    rope_base,
+                                  float    rope_scale)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_q = token_num * num_q_heads * head_dim;
@@ -80,14 +82,20 @@ __global__ void apply_rope_kernel(T*       q_ptr,
     const int head     = (idx / head_dim) % num_q_heads;
     const int token_id = idx / (head_dim * num_q_heads);
 
-    // Apply past_kv_len offset so RoPE aligns with absolute positions.
-    const int base_pos = position_ids ? position_ids[token_id] : (q_len > 0 ? token_id % q_len : token_id);
-    const int pos      = base_pos + past_kv_len;
+    // Apply past_kv_len offset so RoPE aligns with absolute positions only
+    // when position ids are not explicitly provided.
+    const int base_pos =
+        position_ids ? position_ids[token_id] : (past_kv_len + (q_len > 0 ? token_id % q_len : token_id));
+    const int pos = base_pos;
 
-    const float inv_freq = powf(rope_base, -2.f * (d / 2) / static_cast<float>(head_dim));
-    const float angle    = static_cast<float>(pos) * inv_freq;
-    const float cosv     = cosf(angle);
-    const float sinv     = sinf(angle);
+    // TRT computes inv_freq = scale / (theta^(i / (dim/2))) and multiplies by
+    // the absolute position once. Mirror that here with rope_base/rope_scale.
+    const int   pair_idx = d >> 1;  // even/odd pair index
+    const float inv_freq =
+        rope_scale * powf(rope_base, -2.f * static_cast<float>(pair_idx) / static_cast<float>(head_dim));
+    const float angle = static_cast<float>(pos) * inv_freq;
+    const float cosv  = cosf(angle);
+    const float sinv  = sinf(angle);
 
     auto rotate = [&](T* base, int h, int head_count) {
         T* vec = base + (token_id * head_count + h) * head_dim;
@@ -125,8 +133,14 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
                             int                   num_kv_heads,
                             int                   head_dim,
                             int                   past_kv_len,
+                            const int*            position_ids,
                             const int32_t*        packed_mask,
-                            int                   packed_stride)
+                            int                   packed_stride,
+                            const int32_t*        runtime_offsets,
+                            const int32_t*        tree_offsets,
+                            const int32_t*        kv_lens_runtime,
+                            const int32_t*        successor_offsets,
+                            const int32_t*        successor_counts)
 {
     const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = token_num * num_q_heads;
@@ -147,50 +161,91 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
 
     const T* q = q_ptr + (token_idx * num_q_heads + head) * head_dim;
 
+    // Resolve slot-specific kv span using runtime or tree offsets.
+    int kv_start    = 0;
+    int kv_len_slot = kv_len;
+    if (runtime_offsets) {
+        const int start = runtime_offsets[batch];
+        const int end   = runtime_offsets[batch + 1];
+        kv_start        = start;
+        kv_len_slot     = max(0, min(kv_len, end - start));
+    }
+    else if (tree_offsets) {
+        const int start = tree_offsets[batch];
+        const int end   = tree_offsets[batch + 1];
+        kv_start        = start;
+        kv_len_slot     = max(0, min(kv_len, end - start));
+    }
+    // Bound kv span by packed-mask coverage when provided.
+    if (packed_mask && packed_stride > 0) {
+        const int packed_cap = packed_stride * 32;
+        kv_len_slot          = max(0, min(kv_len_slot, packed_cap - kv_start));
+    }
+    // Optional clamp by kv_lens_runtime semantics (exclude extra draft tokens).
+    if (kv_lens_runtime) {
+        const int runtime_len = kv_lens_runtime[batch];
+        kv_len_slot           = max(0, min(kv_len_slot, runtime_len - kv_start));
+    }
+
+    if (kv_len_slot <= 0) {
+        return;
+    }
+
+    // Resolve absolute positions for causal masking.
+    const int pos_idx_q  = position_ids ? min(token_idx, token_num - 1) : token_idx;
+    const int q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start + q_pos);
+    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
+
     // Pass 1: find max logit for numerical stability.
     float max_score = -1e20f;
-    for (int j = 0; j < kv_len; ++j) {
-        const int kv_token = batch * kv_len + j;
+    for (int j = 0; j < kv_len_slot; ++j) {
+        const int kv_token = batch * kv_len + (kv_start + j);
         const T*  k        = k_ptr + (kv_token * num_kv_heads + kv_head) * head_dim;
         float     dot      = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             dot += to_float(q[d]) * to_float(k[d]);
         }
         // Causal guard: forbid attending beyond current q position.
-        if (j + past_kv_len > q_pos + past_kv_len) {
+        const int pos_idx_k   = position_ids ? min(kv_token, token_num - 1) : kv_token;
+        const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
+        if (kv_position > q_position) {
             dot = -1e20f;
         }
         // Optional packed mask per token.
         if (packed_mask && packed_stride > 0) {
-            const int32_t mask_val = packed_mask[token_idx * packed_stride + j / 32];
-            const bool    allowed  = (mask_val >> (j & 31)) & 1;
+            const int j_off_mask   = kv_start + j;
+            const int32_t mask_val = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+            const bool    allowed  = (mask_val >> (j_off_mask & 31)) & 1;
             if (!allowed) {
                 dot = -1e20f;
             }
         }
-        max_score = fmaxf(max_score, dot / sqrtf(static_cast<float>(head_dim)));
+        max_score = fmaxf(max_score, dot * inv_sqrt);
     }
 
     // Pass 2: compute softmax denominator.
     float sum_exp = 0.f;
-    for (int j = 0; j < kv_len; ++j) {
-        const int kv_token = batch * kv_len + j;
+    for (int j = 0; j < kv_len_slot; ++j) {
+        const int kv_token = batch * kv_len + (kv_start + j);
         const T*  k        = k_ptr + (kv_token * num_kv_heads + kv_head) * head_dim;
         float     dot      = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             dot += to_float(q[d]) * to_float(k[d]);
         }
-        if (j + past_kv_len > q_pos + past_kv_len) {
+        const int pos_idx_k   = position_ids ? min(kv_token, token_num - 1) : kv_token;
+        const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
+        if (kv_position > q_position) {
             dot = -1e20f;
         }
         if (packed_mask && packed_stride > 0) {
-            const int32_t mask_val = packed_mask[token_idx * packed_stride + j / 32];
-            const bool    allowed  = (mask_val >> (j & 31)) & 1;
+            const int j_off_mask   = kv_start + j;
+            const int32_t mask_val = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+            const bool    allowed  = (mask_val >> (j_off_mask & 31)) & 1;
             if (!allowed) {
                 dot = -1e20f;
             }
         }
-        const float score = dot / sqrtf(static_cast<float>(head_dim)) - max_score;
+        const float score = dot * inv_sqrt - max_score;
         sum_exp += __expf(score);
     }
     const float inv_denom = sum_exp > 0.f ? (1.f / sum_exp) : 0.f;
@@ -201,25 +256,28 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
         ctx[d] = from_float<T>(0.f);
     }
 
-    for (int j = 0; j < kv_len; ++j) {
-        const int kv_token = batch * kv_len + j;
+    for (int j = 0; j < kv_len_slot; ++j) {
+        const int kv_token = batch * kv_len + (kv_start + j);
         const T*  k        = k_ptr + (kv_token * num_kv_heads + kv_head) * head_dim;
         const T*  v        = v_ptr + (kv_token * num_kv_heads + kv_head) * head_dim;
         float     dot      = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             dot += to_float(q[d]) * to_float(k[d]);
         }
-        if (j + past_kv_len > q_pos + past_kv_len) {
+        const int pos_idx_k   = position_ids ? min(kv_token, token_num - 1) : kv_token;
+        const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
+        if (kv_position > q_position) {
             dot = -1e20f;
         }
         if (packed_mask && packed_stride > 0) {
-            const int32_t mask_val = packed_mask[token_idx * packed_stride + j / 32];
-            const bool    allowed  = (mask_val >> (j & 31)) & 1;
+            const int j_off_mask   = kv_start + j;
+            const int32_t mask_val = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+            const bool    allowed  = (mask_val >> (j_off_mask & 31)) & 1;
             if (!allowed) {
                 dot = -1e20f;
             }
         }
-        const float score = dot / sqrtf(static_cast<float>(head_dim)) - max_score;
+        const float score = dot * inv_sqrt - max_score;
         const float w     = __expf(score) * inv_denom;
         for (int d = 0; d < head_dim; ++d) {
             const float acc = to_float(ctx[d]) + w * to_float(v[d]);
@@ -238,6 +296,8 @@ void launch_apply_rope(T* q_ptr,
                        int q_len,
                        int past_kv_len,
                        const Tensor* position_ids,
+                       float rope_base,
+                       float rope_scale,
                        cudaStream_t stream)
 {
     if (!q_ptr || !k_ptr || token_num <= 0 || head_dim <= 0) {
@@ -247,10 +307,8 @@ void launch_apply_rope(T* q_ptr,
     constexpr int kBlock = 256;
     const int grid       = (total + kBlock - 1) / kBlock;
     const int* pos_ptr   = position_ids ? position_ids->data<int>() : nullptr;
-    // LLaMA-style base; TRT uses the same default for Eagle-3.
-    constexpr float rope_base = 10000.f;
     apply_rope_kernel<T><<<grid, kBlock, 0, stream>>>(
-        q_ptr, k_ptr, token_num, num_q_heads, num_kv_heads, head_dim, q_len, past_kv_len, pos_ptr, rope_base);
+        q_ptr, k_ptr, token_num, num_q_heads, num_kv_heads, head_dim, q_len, past_kv_len, pos_ptr, rope_base, rope_scale);
 }
 
 template<typename T>
@@ -266,8 +324,14 @@ void launch_sdpa(const T* q_ptr,
                  int      num_kv_heads,
                  int      head_dim,
                  int      past_kv_len,
+                 const Tensor* position_ids,
                  const Tensor* packed_mask,
                  int      packed_mask_stride,
+                 const Tensor* runtime_offsets,
+                 const Tensor* tree_offsets,
+                 const Tensor* kv_lens_runtime,
+                 const Tensor* successor_offsets,
+                 const Tensor* successor_counts,
                  cudaStream_t stream)
 {
     if (!q_ptr || !k_ptr || !v_ptr || !ctx_ptr || token_num <= 0 || q_len <= 0 || kv_len <= 0) {
@@ -279,6 +343,17 @@ void launch_sdpa(const T* q_ptr,
     constexpr int kBlock    = 256;
     const int grid          = (total + kBlock - 1) / kBlock;
     const int32_t* packed   = packed_mask ? packed_mask->data<int32_t>() : nullptr;
+    const int* pos_ptr      = position_ids ? position_ids->data<int>() : nullptr;
+    const int32_t* runtime  = (runtime_offsets && runtime_offsets->dtype() == kInt32)
+                                 ? runtime_offsets->data<int32_t>()
+                                 : nullptr;
+    const int32_t* tree = (tree_offsets && tree_offsets->dtype() == kInt32) ? tree_offsets->data<int32_t>() : nullptr;
+    const int32_t* kv_runtime =
+        (kv_lens_runtime && kv_lens_runtime->dtype() == kInt32) ? kv_lens_runtime->data<int32_t>() : nullptr;
+    const int32_t* succ_off =
+        (successor_offsets && successor_offsets->dtype() == kInt32) ? successor_offsets->data<int32_t>() : nullptr;
+    const int32_t* succ_cnt =
+        (successor_counts && successor_counts->dtype() == kInt32) ? successor_counts->data<int32_t>() : nullptr;
     sdpa_kernel<T><<<grid, kBlock, 0, stream>>>(q_ptr,
                                                 k_ptr,
                                                 v_ptr,
@@ -291,8 +366,14 @@ void launch_sdpa(const T* q_ptr,
                                                 num_kv_heads,
                                                 head_dim,
                                                 past_kv_len,
+                                                pos_ptr,
                                                 packed,
-                                                packed_stride);
+                                                packed_stride,
+                                                runtime,
+                                                tree,
+                                                kv_runtime,
+                                                succ_off,
+                                                succ_cnt);
 }
 
 }  // namespace
@@ -367,10 +448,31 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         return;
     }
 
-    const int batch_size = param.batch_size > 0 ? param.batch_size : token_num;
-    const int q_len      = param.q_len > 0 ? param.q_len : (batch_size > 0 ? token_num / batch_size : 1);
+    const int q_len = param.q_len > 0 ? param.q_len : 1;
+    const int slot_count =
+        (q_len > 0 && token_num % q_len == 0) ? (token_num / q_len) : (param.batch_size > 0 ? param.batch_size : 1);
+    const int batch_size = slot_count;
     const int kv_len     = param.kv_len > 0 ? param.kv_len : q_len;
     const int group_size = std::max(1, num_q_heads / num_kv_heads);
+    const auto* runtime_offsets = param.runtime_offsets;
+    const auto* tree_offsets    = param.tree_offsets;
+    auto offsets_invalid = [&](const Tensor* t) -> bool {
+        return t && (!(*t) || t->dtype() != kInt32 || t->ndim() != 1 || t->shape(0) < slot_count + 1);
+    };
+    if (offsets_invalid(runtime_offsets)) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Attention][fallback] runtime_offsets invalid (len=%d, expect=%d); ignoring offsets.",
+            runtime_offsets ? runtime_offsets->shape(0) : -1,
+            slot_count + 1);
+        runtime_offsets = nullptr;
+    }
+    if (offsets_invalid(tree_offsets)) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Attention][fallback] tree_offsets invalid (len=%d, expect=%d); ignoring offsets.",
+            tree_offsets ? tree_offsets->shape(0) : -1,
+            slot_count + 1);
+        tree_offsets = nullptr;
+    }
 
     // Temporary buffers for Q/K/V and context.
     Tensor q{{token_num, q_out_dim}, dtype, param.input.device()};
@@ -441,6 +543,8 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                              q_len,
                              param.past_kv_len,
                              param.position_ids,
+                             param.rope_base,
+                             param.rope_scale,
                              stream_);
         sync_check_cuda_error();
 
@@ -457,8 +561,12 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                        num_kv_heads,
                        head_dim,
                        param.past_kv_len,
+                       param.position_ids,
                        param.packed_mask,
                        param.packed_mask_stride,
+                       runtime_offsets,
+                       tree_offsets,
+                       param.kv_lens_runtime,
                        stream_);
         sync_check_cuda_error();
 
@@ -575,3 +683,10 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 }
 
 }  // namespace turbomind
+    // Optional successor metadata (tree) to clamp kv span per slot.
+    if (successor_offsets && successor_counts) {
+        const int start = successor_offsets[batch];
+        const int end   = successor_offsets[batch + 1];
+        kv_start        = start;
+        kv_len_slot     = max(0, min(kv_len_slot, end - start));
+    }

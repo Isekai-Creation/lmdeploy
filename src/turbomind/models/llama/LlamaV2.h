@@ -47,6 +47,11 @@ public:
         const Sequence**    sequences{nullptr};
         const int*          d_sequence_lengths{nullptr};
         const int*          planned_tokens_per_seq{nullptr};
+        const int*          d_end_ids{nullptr};
+        // Typical/posterior gating (optional). Null to skip.
+        const float*        d_posterior_thresholds{nullptr};
+        const float*        d_posterior_alphas{nullptr};
+        const float*        d_temperatures{nullptr};
         EagleBuffers*       eagle_buffers{nullptr};
         bool                enable_eagle{false};
         bool                enable_eagle_target_tree{false};

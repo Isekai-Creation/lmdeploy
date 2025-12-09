@@ -31,6 +31,8 @@ struct Eagle3AttentionWeight {
     int num_q_heads{0};
     int num_kv_heads{0};
     int head_dim{0};
+    float rope_base{10000.f};
+    float rope_scale{1.f};
 
     bool is_initialized{false};
 
@@ -59,4 +61,3 @@ struct Eagle3AttentionWeight {
 };
 
 }  // namespace turbomind
-

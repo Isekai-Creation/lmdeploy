@@ -189,6 +189,27 @@ struct KVCacheRewindParams {
     cudaStream_t stream;
 };
 
+struct EntropyMaskParams {
+    float**      logits_ptrs{nullptr};         // [batch, max_tokens]
+    TokenIdType** output_id_ptrs{nullptr};     // [batch, max_tokens]
+    bool*        skip_decode{nullptr};         // [batch, max_tokens]
+    TokenIdType* output_ids{nullptr};          // [batch, max_tokens]
+    float*       runtime_top_p{nullptr};       // [batch, max_tokens]
+    float const* probs{nullptr};               // [batch * max_tokens * vocab]
+    float const* entropies{nullptr};           // [batch, max_tokens]
+    int const*   generation_lengths{nullptr};  // [batch]
+    float const* posterior_thresholds{nullptr};  // [batch]
+    float const* posterior_alphas{nullptr};      // [batch]
+    float const* temperatures{nullptr};          // [batch]
+    int const*   batch_slots{nullptr};           // [batch]
+    int          batch_size{0};
+    int          max_tokens{0};
+    int          vocab_size{0};
+    cudaStream_t stream{};
+};
+
+void maskLogitsBasedOnEntropy(const EntropyMaskParams& params);
+
 /**
  * @brief Rewind KV cache by marking blocks as free
  * 
@@ -196,6 +217,14 @@ struct KVCacheRewindParams {
  * Blocks are marked as available without actual memory operations.
  */
 void invokeKVCacheRewind(KVCacheRewindParams const& params);
+
+// Compute softmax + entropy per row. logits/probs layout: [rows, cols].
+void invokeSoftmaxWithEntropy(const float* logits,
+                              float*       probs,
+                              float*       entropy,
+                              int          rows,
+                              int          cols,
+                              cudaStream_t stream);
 
 } // namespace speculative_decoding
 } // namespace kernels

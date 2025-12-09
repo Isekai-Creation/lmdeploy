@@ -596,6 +596,7 @@ void LlamaV2::runEagle3DraftTreeDecode(const Tensor& decoder_features,
                                    draft_packed_mask,
                                    draft_tree_offsets,
                                    draft_runtime_offsets,
+                                   draft_kv_lens_runtime,
                                    draft_successor_offsets,
                                    draft_successor_counts,
                                    q_len,
@@ -3371,6 +3372,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     //  - successor_offsets: [batch+1], successor_counts: [total_topk]
     Tensor draft_tree_offsets{{batch_size + 1}, kInt32, kDEVICE};
     Tensor draft_runtime_offsets{{batch_size + 1}, kInt32, kDEVICE};
+    Tensor draft_kv_lens_runtime{{batch_size}, kInt32, kDEVICE};
     check_cuda_error(cudaMemcpyAsync(draft_tree_offsets.raw_data(),
                                      h_tree_offsets.data(),
                                      h_tree_offsets.size() * sizeof(SizeType),
@@ -3381,6 +3383,18 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                                      h_runtime_offsets.size() * sizeof(SizeType),
                                      cudaMemcpyHostToDevice,
                                      stream_));
+    // kv_lens_runtime matches TRT semantics: per-slot runtime lengths excluding extra draft tokens.
+    {
+        std::vector<SizeType> h_runtime_lens(static_cast<size_t>(batch_size), 0);
+        for (int b = 0; b < batch_size; ++b) {
+            h_runtime_lens[b] = std::max<SizeType>(0, h_runtime_offsets[b + 1] - h_runtime_offsets[b]);
+        }
+        check_cuda_error(cudaMemcpyAsync(draft_kv_lens_runtime.raw_data(),
+                                         h_runtime_lens.data(),
+                                         h_runtime_lens.size() * sizeof(SizeType),
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+    }
 
     Tensor draft_successor_offsets;
     Tensor draft_successor_counts;
@@ -3454,6 +3468,77 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         runEagleTargetTreeDecode(batch_size, spec_ctx.d_sequence_lengths, spec_ctx.sequences);
     }
 
+    // Posterior/typical gating (entropy-based) on draft logits if provided.
+    if (draft_logits && draft_logits.dtype() == kFloat32 && spec_ctx.d_posterior_thresholds
+        && spec_ctx.d_posterior_alphas && spec_ctx.d_temperatures) {
+        // For now assume flat layout [batch, vocab] per slot; reuse tokens_per_seq as max_tokens.
+        const int max_tokens      = tokens_per_seq;
+        const int vocab_size_pad  = draft_logits.shape(1);
+        float**   logits_ptrs_dev = nullptr;
+        float**   out_ids_ptrs    = nullptr;
+        bool*     skip_decode     = nullptr;
+        float*    runtime_top_p   = nullptr;
+
+        // Allocate small helper buffers on device.
+        check_cuda_error(cudaMalloc(&logits_ptrs_dev, sizeof(float*) * batch_size * max_tokens));
+        check_cuda_error(cudaMalloc(&out_ids_ptrs, sizeof(float*) * batch_size * max_tokens));
+        check_cuda_error(cudaMalloc(&skip_decode, sizeof(bool) * batch_size * max_tokens));
+        check_cuda_error(cudaMalloc(&runtime_top_p, sizeof(float) * batch_size * max_tokens));
+
+        // Build logits_ptrs as contiguous rows in draft_logits.
+        std::vector<float*> h_logits_ptrs(static_cast<size_t>(batch_size * max_tokens), nullptr);
+        for (int b = 0; b < batch_size; ++b) {
+            for (int t = 0; t < max_tokens; ++t) {
+                h_logits_ptrs[b * max_tokens + t] =
+                    static_cast<float*>(draft_logits.raw_data()) + static_cast<size_t>(b) * vocab_size_pad;
+            }
+        }
+        check_cuda_error(cudaMemcpyAsync(
+            logits_ptrs_dev, h_logits_ptrs.data(), h_logits_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice, stream_));
+
+        // Entropy buffer: allocate and compute softmax+entropy for each row.
+        const size_t probs_elems = static_cast<size_t>(batch_size * max_tokens * vocab_size_pad);
+        float*       probs_dev   = nullptr;
+        float*       entropy_dev = nullptr;
+        check_cuda_error(cudaMalloc(&probs_dev, probs_elems * sizeof(float)));
+        check_cuda_error(cudaMalloc(&entropy_dev, static_cast<size_t>(batch_size * max_tokens) * sizeof(float)));
+
+        // Simple softmax + entropy per row.
+        invokeSoftmaxWithEntropy(static_cast<const float*>(draft_logits.raw_data()),
+                                 probs_dev,
+                                 entropy_dev,
+                                 batch_size * max_tokens,
+                                 vocab_size_pad,
+                                 stream_);
+
+        kernels::speculative_decoding::EntropyMaskParams mask_params{};
+        mask_params.logits_ptrs         = logits_ptrs_dev;
+        mask_params.output_id_ptrs      = out_ids_ptrs;
+        mask_params.skip_decode         = skip_decode;
+        mask_params.output_ids          = nullptr;
+        mask_params.runtime_top_p       = runtime_top_p;
+        mask_params.probs               = probs_dev;
+        mask_params.entropies           = entropy_dev;
+        mask_params.generation_lengths  = spec_ctx.d_sequence_lengths;
+        mask_params.posterior_thresholds = spec_ctx.d_posterior_thresholds;
+        mask_params.posterior_alphas    = spec_ctx.d_posterior_alphas;
+        mask_params.temperatures        = spec_ctx.d_temperatures;
+        mask_params.batch_slots         = nullptr;
+        mask_params.batch_size          = batch_size;
+        mask_params.max_tokens          = max_tokens;
+        mask_params.vocab_size          = vocab_size_pad;
+        mask_params.stream              = stream_;
+
+        kernels::speculative_decoding::maskLogitsBasedOnEntropy(mask_params);
+
+        cudaFree(logits_ptrs_dev);
+        cudaFree(out_ids_ptrs);
+        cudaFree(skip_decode);
+        cudaFree(runtime_top_p);
+        cudaFree(probs_dev);
+        cudaFree(entropy_dev);
+    }
+
     // ========= Step 4: Device-side acceptance over tree paths =========
     std::vector<int> h_draft(num_draft_tokens);
     std::vector<int> h_target(num_draft_tokens);
@@ -3475,6 +3560,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.draft_tokens),
         reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.target_tokens),
         reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
+        reinterpret_cast<SpecTokenIdType const*>(spec_ctx.d_end_ids),
         reinterpret_cast<SpecSizeType const*>(d_batch_slots),
         static_cast<SpecSizeType>(batch_size),
         max_batch_size,

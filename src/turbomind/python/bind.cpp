@@ -419,6 +419,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
 
         fc_out_dbg   = draft_layer.debug_fc_out();
         attn_out_dbg = draft_layer.debug_attn_out();
+        Tensor qkv_dbg = draft_layer.debug_qkv();
         ffn_out_dbg  = draft_layer.debug_ffn_out();
         pre_head_dbg = draft_layer.debug_pre_head_hidden();
 
@@ -480,6 +481,9 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         }
         if (attn_out_dbg) {
             out["attn_out"] = attn_out_dbg;
+        }
+        if (qkv_dbg) {
+            out["qkv"] = qkv_dbg;
         }
         if (ffn_out_dbg) {
             out["ffn_out"] = ffn_out_dbg;
@@ -947,6 +951,7 @@ PYBIND11_MODULE(_turbomind, m)
                 draft_ids_ptr,
                 target_ids_ptr,
                 paths_ptr,
+                nullptr,  // end_ids placeholder for parity
                 batch_slots_ptr,
                 static_cast<eagle_kernels::SizeType>(batch_size),
                 static_cast<eagle_kernels::SizeType>(max_batch_size),
@@ -1374,6 +1379,10 @@ PYBIND11_MODULE(_turbomind, m)
                 }
                 if (pre_head_dbg) {
                     out["pre_head_hidden"] = pre_head_dbg;
+                }
+                // Optional QKV capture from Eagle3 attention.
+                if (Tensor qkv = draft_layer.debug_qkv()) {
+                    out["qkv"] = qkv;
                 }
             }
             else {

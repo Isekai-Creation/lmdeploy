@@ -37,14 +37,15 @@ public:
     void Forward(const Tensor& input_hidden,
                  const Tensor& captured_hidden,
                  const Tensor& position_ids,
-                 const Tensor& packed_mask,
-                 const Tensor& tree_offsets,
-                 const Tensor& runtime_offsets,
-                 const Tensor& successor_offsets,
-                 const Tensor& successor_counts,
-                 int           q_len,
-                 int           kv_len,
-                 int           past_kv_len,
+                     const Tensor& packed_mask,
+                     const Tensor& tree_offsets,
+                     const Tensor& runtime_offsets,
+                     const Tensor& kv_lens_runtime,
+                     const Tensor& successor_offsets,
+                     const Tensor& successor_counts,
+                     int           q_len,
+                     int           kv_len,
+                     int           past_kv_len,
                  Tensor&       output_hidden,
                  cudaStream_t  stream);
 
@@ -70,7 +71,7 @@ private:
     int                    head_num_{0};
     int                    kv_head_num_{0};
     int                    size_per_head_{0};
-    bool attn_geom_ok(int hidden_dim) const;
+    bool attn_geom_ok_(int hidden_dim) const;
     bool is_qkv_compatible_() const;
     int draft_hidden_dim_{0};
     int base_hidden_dim_{0};

@@ -860,6 +860,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                         ew.head_dim     = head_dim;
                         ew.num_q_heads  = head_num;
                         ew.num_kv_heads = ew.kv_out / head_dim;
+                        ew.rope_base    = static_cast<float>(rope_base_);
+                        ew.rope_scale   = static_cast<float>(rope_scale_);
                     }
                     else {
                         TM_LOG_WARNING(

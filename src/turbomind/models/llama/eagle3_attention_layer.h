@@ -62,11 +62,24 @@ struct Eagle3AttentionParam {
     const Tensor* packed_mask{nullptr};
     int           packed_mask_stride{0};
 
+    // Optional tree/runtime offsets and successor metadata for multi-token
+    // draft attention. Runtime offsets mirror kv_lens_runtime semantics in
+    // TRT (excluding extra KV tokens), while tree offsets describe the full
+    // flattened tree layout. These are currently used to clamp kv_len per
+    // request in the naive SDPA path.
+    const Tensor* tree_offsets{nullptr};     // [batch+1]
+    const Tensor* runtime_offsets{nullptr};  // [batch+1]
+    const Tensor* kv_lens_runtime{nullptr};  // [batch] optional clamp excluding extra draft tokens
+    const Tensor* successor_offsets{nullptr};  // [batch+1]
+    const Tensor* successor_counts{nullptr};   // [total successors]
+
     // Token geometry for multi-position draft attention.
     int batch_size{0};
     int q_len{1};
     int kv_len{1};
     int past_kv_len{0};
+    float rope_base{10000.f};
+    float rope_scale{1.f};
 
     int layer_id{0};
 

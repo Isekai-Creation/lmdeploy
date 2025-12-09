@@ -45,6 +45,7 @@ void invokeTreeAcceptByIdsWithPaths(
     TokenIdType const* draft_ids,
     TokenIdType const* target_ids,
     SizeType const*    paths,
+    TokenIdType const* end_ids,
     SizeType const*    batch_slots,
     SizeType           batch_size,
     SizeType           max_batch_size,

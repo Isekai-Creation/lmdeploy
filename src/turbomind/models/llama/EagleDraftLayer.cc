@@ -138,7 +138,17 @@ bool Eagle3DraftLayer::attn_geom_ok_(int hidden_dim) const
 void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden, cudaStream_t stream)
 {
     Tensor empty;
-    Forward(input_hidden, empty, Tensor{}, Tensor{}, /*q_len=*/1, /*kv_len=*/1, /*past_kv_len=*/0, output_hidden, stream);
+    Forward(input_hidden,
+            empty,
+            Tensor{},
+            Tensor{},
+            Tensor{},
+            Tensor{},
+            /*q_len=*/1,
+            /*kv_len=*/1,
+            /*past_kv_len=*/0,
+            output_hidden,
+            stream);
 }
 
 void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
@@ -147,6 +157,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
                                const Tensor& packed_mask,
                                const Tensor& tree_offsets,
                                const Tensor& runtime_offsets,
+                               const Tensor& kv_lens_runtime,
                                const Tensor& successor_offsets,
                                const Tensor& successor_counts,
                                int           q_len,
@@ -158,10 +169,6 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     // Tree/run-time metadata is threaded through to enable full TRT-style
     // masking/branching once the real attention backend is wired. For now
     // they are unused in the shallow path.
-    (void)tree_offsets;
-    (void)runtime_offsets;
-    (void)successor_offsets;
-    (void)successor_counts;
     if (!input_hidden) {
         return;
     }
@@ -252,37 +259,69 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         have_fc = true;
     }
 
-    // Build 2H QKV input for Eagle-3 attention. Use the fused QKV input width
-    // when available; otherwise fall back to 2 * draft_dim.
-    const int qkv_in_dim = weight_->attn.qkv.weight ? weight_->attn.qkv.weight.shape(0) : 2 * draft_dim;
+    // Build 2H QKV input for Eagle-3 attention. TRT packs
+    // [embedding_norm, fc_norm] so default to that layout when shapes match.
+    int qkv_in_dim = weight_->attn.qkv.weight ? weight_->attn.qkv.weight.shape(0) : 2 * draft_dim;
+    if (weight_->eagle3_attn.is_initialized && weight_->eagle3_attn.q_in > 0) {
+        qkv_in_dim = weight_->eagle3_attn.q_in;
+    }
+    const bool expect_two_h  = (qkv_in_dim == 2 * draft_dim);
     Tensor     qkv_input{{batch_size, qkv_in_dim}, dtype, input_hidden.device()};
     check_cuda_error(cudaMemsetAsync(qkv_input.raw_data(), 0, qkv_input.byte_size(), stream));
 
     const size_t elem_bytes    = byte_size(dtype, 1);
     const size_t src_row_bytes = static_cast<size_t>(hidden_norm.stride(0)) * elem_bytes;
     const size_t dst_row_bytes = static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
-    const size_t copy_bytes    = static_cast<size_t>(std::min(draft_dim, qkv_in_dim)) * elem_bytes;
 
     char*       dst_base = static_cast<char*>(qkv_input.raw_data());
     const char* src_base = static_cast<const char*>(hidden_norm.raw_data());
     const size_t fc_row_bytes = have_fc ? static_cast<size_t>(fc_norm.stride(0)) * elem_bytes : src_row_bytes;
     const char* fc_base       = have_fc ? static_cast<const char*>(fc_norm.raw_data()) : src_base;
 
-    for (int b = 0; b < batch_size; ++b) {
-        char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-        const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-        // First slice from normalized last hidden.
-        check_cuda_error(cudaMemcpyAsync(dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+    if (expect_two_h) {
+        // Strict TRT packing: first half embedding_norm, second half FC_norm.
+        const size_t slice_bytes = static_cast<size_t>(draft_dim) * elem_bytes;
+        for (int b = 0; b < batch_size; ++b) {
+            char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+            const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
+            check_cuda_error(
+                cudaMemcpyAsync(dst_row, src_row, slice_bytes, cudaMemcpyDeviceToDevice, stream));
 
-        if (qkv_in_dim > draft_dim) {
-            const size_t second_bytes = static_cast<size_t>(std::min(draft_dim, qkv_in_dim - draft_dim)) * elem_bytes;
-            const char*  second_src   = fc_base + static_cast<size_t>(b) * fc_row_bytes;
-            check_cuda_error(cudaMemcpyAsync(
-                dst_row + static_cast<size_t>(draft_dim) * elem_bytes,
-                second_src,
-                second_bytes,
-                cudaMemcpyDeviceToDevice,
-                stream));
+            char* second_dst = dst_row + slice_bytes;
+            if (have_fc) {
+                const char* second_src = fc_base + static_cast<size_t>(b) * fc_row_bytes;
+                check_cuda_error(cudaMemcpyAsync(
+                    second_dst, second_src, slice_bytes, cudaMemcpyDeviceToDevice, stream));
+            }
+            else {
+                // No FC capture available; leave the second half zero but log once.
+                static bool logged_missing_fc = false;
+                if (!logged_missing_fc) {
+                    TM_LOG_WARNING(
+                        "[EAGLE3][Draft] FC capture missing; filling 2H QKV input second half with zeros.");
+                    logged_missing_fc = true;
+                }
+            }
+        }
+    }
+    else {
+        // Fallback packing: copy as much as fits from hidden_norm then FC/hidden_norm.
+        const size_t copy_bytes = static_cast<size_t>(std::min(draft_dim, qkv_in_dim)) * elem_bytes;
+        for (int b = 0; b < batch_size; ++b) {
+            char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+            const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
+            check_cuda_error(cudaMemcpyAsync(dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+
+            if (qkv_in_dim > draft_dim) {
+                const size_t second_bytes = static_cast<size_t>(std::min(draft_dim, qkv_in_dim - draft_dim)) * elem_bytes;
+                const char*  second_src   = fc_base + static_cast<size_t>(b) * fc_row_bytes;
+                check_cuda_error(cudaMemcpyAsync(
+                    dst_row + static_cast<size_t>(draft_dim) * elem_bytes,
+                    second_src,
+                    second_bytes,
+                    cudaMemcpyDeviceToDevice,
+                    stream));
+            }
         }
     }
 
@@ -302,101 +341,34 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
                                   && weight_->attn.qkv.weight.shape(1) == 3 * draft_dim
                                   && weight_->attn.output.weight.shape(0) == draft_dim
                                   && weight_->attn.output.weight.shape(1) == draft_dim;
-
-    // Native Eagle3 fused QKV path: [2 * draft_hidden, q + 2 * kv] with Wo [q, base_hidden].
-    const Tensor& qkv_w = weight_->attn.qkv.weight;
-    const Tensor& wo_w  = weight_->attn.output.weight;
-    const int     qkv_out_dim =
-        (qkv_w && qkv_w.ndim() == 2) ? static_cast<int>(qkv_w.shape(1)) : 0;
-    const int q_size  = (wo_w && wo_w.ndim() == 2) ? static_cast<int>(wo_w.shape(0)) : 0;
-    const int kv_size = qkv_out_dim > q_size ? (qkv_out_dim - q_size) / 2 : 0;
-    const int head_dim = size_per_head_ > 0 ? size_per_head_ : (head_num_ > 0 ? q_size / head_num_ : 0);
-    int       kv_head_num = kv_head_num_ > 0 ? kv_head_num_ : (head_dim > 0 ? kv_size / head_dim : 0);
-    const int group_size  = (kv_head_num > 0) ? (head_num_ / kv_head_num) : 0;
-
-    const bool native_eagle3_ok = qkv_w && wo_w && q_size > 0 && kv_size > 0 && head_num_ > 0 && head_dim > 0
-        && kv_head_num > 0 && group_size > 0 && (qkv_w.shape(0) == qkv_in_dim || qkv_w.shape(0) == draft_dim)
-        && wo_w.shape(1) == wo_out_dim && qkv_out_dim == q_size + 2 * kv_size;
+    const bool native_eagle3_ok = has_eagle3_layer && weight_->eagle3_attn.is_initialized
+        && qkv_input.shape(1) == weight_->eagle3_attn.q_in && weight_->eagle3_attn.q_out > 0
+        && weight_->eagle3_attn.kv_out > 0;
 
     if (native_eagle3_ok) {
-        if (!ffn_layer_) {
-            TM_LOG_WARNING(
-                "[EAGLE3][Draft] ffn_layer_ missing; cannot run fused QKV projection, falling back.");
-        }
-    }
-
-    if (native_eagle3_ok && ffn_layer_) {
-        // QKV projection: [B, qkv_out_dim]
-        Tensor qkv{{batch_size, qkv_out_dim}, dtype, input_hidden.device()};
-        LlamaLinear& linear_qkv = ffn_layer_->linear();
-        linear_qkv.Forward(qkv_input, qkv_w, qkv);
-        if (debug_enabled) {
-            debug_qkv_ = qkv;
-        }
-
-        // Slice Q/K/V and reshape to heads.
-        Tensor q_tensor = qkv.slice({0, 0}, {batch_size, q_size});
-        Tensor k_tensor = qkv.slice({0, q_size}, {batch_size, kv_size});
-        Tensor v_tensor = qkv.slice({0, q_size + kv_size}, {batch_size, kv_size});
-
-        Tensor q_heads = q_tensor.view({batch_size, head_num_, head_dim});
-        if (kv_head_num == 0 && head_dim > 0) {
-            kv_head_num = kv_size / head_dim;
-        }
-        if (kv_head_num <= 0 || head_num_ % kv_head_num != 0) {
-            TM_LOG_WARNING(
-                "[EAGLE3][Draft] kv_head_num mismatch (kv_head_num=%d, head_num=%d); "
-                "falling back to Unified/Shallow attention.",
-                kv_head_num,
-                head_num_);
-        }
-        Tensor k_heads = k_tensor.view({batch_size, kv_head_num, head_dim});
-        Tensor v_heads = v_tensor.view({batch_size, kv_head_num, head_dim});
-
-        // Expand K/V to Q-head count for GQA.
-        Tensor k_expanded{{batch_size, head_num_, head_dim}, dtype, input_hidden.device()};
-        Tensor v_expanded{{batch_size, head_num_, head_dim}, dtype, input_hidden.device()};
-
-        if (dtype == kBfloat16) {
-#if ENABLE_BF16
-            expand_kv_to_q<bfloat16_t>(k_heads, k_expanded, kv_head_num, head_dim, group_size, stream);
-            expand_kv_to_q<bfloat16_t>(v_heads, v_expanded, kv_head_num, head_dim, group_size, stream);
-#else
-            TM_LOG_WARNING("[EAGLE3][Draft] BF16 expand_kv_to_q requested but BF16 disabled; falling back to half.");
-            expand_kv_to_q<half>(k_heads, k_expanded, kv_head_num, head_dim, group_size, stream);
-            expand_kv_to_q<half>(v_heads, v_expanded, kv_head_num, head_dim, group_size, stream);
-#endif
-        }
-        else if (dtype == kFloat) {
-            expand_kv_to_q<float>(k_heads, k_expanded, kv_head_num, head_dim, group_size, stream);
-            expand_kv_to_q<float>(v_heads, v_expanded, kv_head_num, head_dim, group_size, stream);
-        }
-        else {
-            expand_kv_to_q<half>(k_heads, k_expanded, kv_head_num, head_dim, group_size, stream);
-            expand_kv_to_q<half>(v_heads, v_expanded, kv_head_num, head_dim, group_size, stream);
-        }
-
-        // Pack attention params (q_len/kv_len/past_kv_len/masks/positions) and
-        // let the dedicated Eagle3 backend handle RoPE + SDPA.
         Eagle3AttentionParam ep{};
-        ep.input        = qkv_input;
-        ep.output       = attn_out;
-        ep.attn_weights = &weight_->attn;
-        ep.weights      = &weight_->eagle3_attn;
-        ep.layer_id     = 0;
-        ep.past_kv_len  = past_kv_len;
-        ep.packed_mask  = packed_mask ? &packed_mask : nullptr;
+        ep.input              = qkv_input;
+        ep.output             = attn_out;
+        ep.attn_weights       = &weight_->attn;
+        ep.weights            = &weight_->eagle3_attn;
+        ep.layer_id           = 0;
+        ep.past_kv_len        = past_kv_len;
+        ep.packed_mask        = packed_mask ? &packed_mask : nullptr;
         ep.packed_mask_stride = (packed_mask && packed_mask.ndim() >= 2) ? packed_mask.shape(1) : 0;
-        ep.position_ids = position_ids ? &position_ids : nullptr;
-        ep.batch_size   = batch_size;
-        ep.q_len        = q_len > 0 ? q_len : 1;
-        ep.kv_len       = kv_len > 0 ? kv_len : ep.q_len;
-        ep.debug_qkv      = debug_enabled ? &debug_qkv_ : nullptr;
-        ep.debug_attn_out = debug_enabled ? &debug_attn_out_ : nullptr;
+        ep.position_ids       = position_ids ? &position_ids : nullptr;
+        ep.tree_offsets       = tree_offsets ? &tree_offsets : nullptr;
+        ep.runtime_offsets    = runtime_offsets ? &runtime_offsets : nullptr;
+        ep.kv_lens_runtime    = kv_lens_runtime ? &kv_lens_runtime : nullptr;
+        ep.successor_offsets  = successor_offsets ? &successor_offsets : nullptr;
+        ep.successor_counts   = successor_counts ? &successor_counts : nullptr;
+        ep.batch_size         = batch_size;
+        ep.q_len              = q_len > 0 ? q_len : 1;
+        ep.kv_len             = kv_len > 0 ? kv_len : ep.q_len;
+        ep.debug_qkv          = debug_enabled ? &debug_qkv_ : nullptr;
+        ep.debug_attn_out     = debug_enabled ? &debug_attn_out_ : nullptr;
         eagle3_attn_layer_->Forward(ep);
         attn_out = ep.output;
         sync_check_cuda_error();
-
     }
     else if (can_use_unified) {
         UnifiedAttentionLayer::ForwardParam param{};
@@ -408,8 +380,8 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         param.output   = attn_out;
         param.weights  = &weight_->attn;
         param.layer_id = 0;
-        param.q_len    = 1;
-        param.kv_len   = 1;
+        param.q_len    = q_len > 0 ? q_len : 1;
+        param.kv_len   = kv_len > 0 ? kv_len : param.q_len;
 
         attn_layer_->Forward(param);
         sync_check_cuda_error();
@@ -425,6 +397,13 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         ep.q_len        = q_len > 0 ? q_len : 1;
         ep.kv_len       = kv_len > 0 ? kv_len : ep.q_len;
         ep.past_kv_len  = past_kv_len;
+        ep.rope_base    = weight_->eagle3_attn.rope_base > 0.f ? weight_->eagle3_attn.rope_base : 10000.f;
+        ep.rope_scale   = weight_->eagle3_attn.rope_scale > 0.f ? weight_->eagle3_attn.rope_scale : 1.f;
+        ep.tree_offsets       = tree_offsets ? &tree_offsets : nullptr;
+        ep.runtime_offsets    = runtime_offsets ? &runtime_offsets : nullptr;
+        ep.kv_lens_runtime    = kv_lens_runtime ? &kv_lens_runtime : nullptr;
+        ep.successor_offsets = successor_offsets ? &successor_offsets : nullptr;
+        ep.successor_counts  = successor_counts ? &successor_counts : nullptr;
         if (position_ids) {
             ep.position_ids = &position_ids;
         }
