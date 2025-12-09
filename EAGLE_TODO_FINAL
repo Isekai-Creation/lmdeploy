@@ -8,11 +8,118 @@ Status markers:
 - `[x]` implemented in this tree (may still need tuning)
 - `[ ]` not implemented / still to do
 
+Current progress (no stubs): **~76/100** toward full TRT‑LLM parity.
+- Geometry/export/shape guards are locked (B done).
+- Draft attention now runs real Q/K/V GEMMs + RoPE + naive SDPA + Wo, with q_len/kv_len/past_kv_len/packed_mask_stride/positions plumbed; masking/RoPE offsets/KV reuse still need TRT parity (A in progress).
+- Tree decode has per-node logits scaffold, packed-mask fallback, successor offsets/counts on device with host/device validation; successor/topK semantics and kv_lens parity still missing (C in progress).
+
 Roles (for reference):
 - **A – Kernels & math** (attention, RoPE, KV layout, CUDA)
 - **B – Model & converter** (HF → draft dir, geometry, config)
 - **C – TurboMind integration** (LlamaV2, UnifiedDecoder, KV, LMDeploy)
 - **D – Validation & infra** (tests, debug harnesses, benchmarks)
+
+## Engineer Task Matrix (blocking items to completion)
+
+- **Engineer A – Kernels & math (CUDA/attention)**
+  - **State:** Q/K/V GEMMs + RoPE + naive SDPA + Wo with q_len/kv_len/past_kv_len/packed_mask_stride/positions plumbed; UnifiedAttention gated off for non-Llama geometries.
+  - **Next:** Implement full SDPA parity (q_len/kv_len>1) with causal + tree masks and TRT RoPE positions; enforce true 2H packed input (embedding_norm + FC_norm); mirror scaling/clamping/KV reuse; expose debug tensors/CPU ref and remove shallow fallback on valid geometry. Primary refs: `cpp/tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.cu`, `draftTokenTreeKernels.cu`, `tensorrt_llm/_torch/speculative/eagle3.py`, `modeling_speculative.py`.
+
+- **Engineer B – Converter & model geometry**
+  - Lock GPT‑OSS‑120B Eagle‑3 geometry: base_hidden vs draft_hidden, q/k/v/o shapes, head counts/dims, eagle_fc_in_factor; document in design doc and enforce in converter.
+  - Strengthen `eagle_draft_converter.py` checks: fail fast on HF layout drift; ensure Wo is padded to base_hidden, QKV in uses 2*draft_hidden, norms/FFN use draft_hidden. Add unit tests under `tests/turbomind` to read back `config.yaml` and weights and assert shapes/dtypes.
+  - Confirm capture ordering (`layers_to_capture`) matches EAGLE/TRT; align `eagle_capture_hidden_` and `eagle_fc_in_dim_` with converter outputs. Update docs accordingly.
+  - Keep LMDeploy config parity with TRT‑LLM (eagle_q_size, eagle_kv_size, eagle_qkv_in_dim, eagle_fc_in_dim, eagle_choices, max_total_draft_tokens).
+  - [x] Converter exports geometry/capture layers (1,17,32), enforces qkv_in=2*draft_hidden; shape unit added (`tests/turbomind/test_eagle_converter_shapes.py`).
+  - **State:** Geometry/config scope complete; keep CI guard running. Await A/C to land real attention/tree decode to delete shallow path.
+
+- **Engineer C – Integration, tree decode, validation**
+  - **State:** Per-node draft logits scaffolded; packed masks upgraded with fallback; successor offsets/counts on device; lengths clamped and synced. Successor/topK semantics, kv_lens parity, and attention hookup still pending.
+  - **Next:** Finish F2 by porting successor/topK/offset prep and kv_lens runtime parity from TRT (`eagleDecodingKernels.cu`, `draftTokenTreeKernels.cu`, `eagleDecodingLayer.cpp`); wire offsets/masks into attention; align acceptance semantics; coordinate with A to pass per-node positions/masks. Add stagewise compare/benchmarks once kernels land.
+
+Handoff (A/C) after geometry:
+- Converter/config now export base_hidden vs draft_hidden, qkv_in=2*draft_hidden, capture layers [1,17,32]; shape guard `tests/turbomind/test_eagle_converter_shapes.py` (CPU).
+- EagleModule enforces Eagle3 shapes; draft layer norms/FFN run in draft space and warn when shallow pass-through is active. Remove shallow path once real Eagle3 attention lands.
+- Remaining gaps: real Eagle3 attention kernels (Q/K/V+RoPE+SDPA), 2H input packing parity (emb_norm+fc_norm), per-node draft tree decode/acceptance, stagewise compare + spec benchmarks.
+
+## Engineer Detailed Task Checklist (to 100% completion)
+
+### Engineer A – Kernels & math
+- [ ] Implement `Eagle3AttentionWeight` construction and metadata (q heads, kv heads, head dims, scaling).
+- [ ] Replace TODO in `Eagle3AttentionLayer::Forward` with full CUDA path: Q/K/V GEMMs, reshape, RoPE, SDPA (masking), V aggregation, O GEMM, output assign; no stubs. **Current:** Q/K/V GEMM + RoPE + naive SDPA + Wo with q_len/kv_len/past_kv_len/packed_mask_stride/positions plumbed; **missing:** tree/causal mask parity, KV reuse, true 2H packing enforcement, multi-token.
+- [ ] Mirror TRT‑LLM scaling/clamping exactly: 1/sqrt(d_k), max-subtraction, dtype handling (BF16/FP16), apply attention mask semantics identical to TRT tree masks.
+- [ ] Compose true 2H QKV input (embedding_norm + fc_out mapped/padded to base_hidden) in draft forward; remove placeholder composition and head_num*size_per_head gating; match TRT packing order.
+- [ ] Ensure draft attention uses real backend when geometry matches; log explicit fallback otherwise. Remove shallow path for valid Eagle‑3 configs (no demo shortcuts).
+- [ ] Add per-node draft attention support if TRT uses q_len>1; otherwise document single-position semantics and guard. Include KV reuse across tree tokens as TRT does.
+- [ ] Implement mask-aware kernels for tree attention (packed masks from `draft_paths`) matching TRT behaviour for multi-token speculative decoding.
+- [ ] Expose debug tensors (fc_out, attn_out, ffn_out, pre_head_hidden, logits) and a small-batch CPU reference for cross-checks; keep fidelity to TRT values.
+- [ ] Validate KV reuse semantics in tree decode (scratch KV, prefix read-only) vs TRT; fix any layout mismatch so acceptance outcomes align.
+- [ ] Optimize kernels after correctness: benchmark vs TRT Eagle‑3, ensure equal or better throughput without regressing numerics.
+- [ ] Production-ready hardening: add error checks on stream/cublas status, guard against shape/dtype mismatches at runtime, and ensure kernels handle dynamic batch/tree sizes without silent failure.
+- [ ] Cross-verify against current TRT‑LLM code/tests: head geometry, RoPE axes/scale, tree mask semantics, q_len handling; update kernels/doc immediately on drift.
+- [ ] Read and mirror TensorRT‑LLM sources: `tensorrt_llm/_torch/speculative/eagle3.py`, `tensorrt_llm/_torch/models/modeling_speculative.py` (Eagle3Attention), attention backend in `tensorrt_llm/_torch/attention_backend/trtllm.py`, and unit tests `tests/unittest/_torch/speculative/test_eagle3.py` to capture exact math, masking, and indexing. Document any discovered quirks (KV padding, scaling tweaks) and reflect them in kernels.
+- [ ] GPT‑OSS‑120B‑Eagle3 specifics (from HF ckpt + TRT): draft hidden 2880, target hidden 2880, Q_proj [4096, 5760], K/V_proj [512, 5760], O_proj [2880, 4096]; num_heads=64, num_kv_heads=8, head_dim=64 for Q, kv_head_dim=64. Ensure kernels use these exact shapes and stride assumptions.
+
+### Engineer B – Converter & geometry
+- [ ] Lock Eagle‑3 geometry for GPT‑OSS‑120B: base_hidden, draft_hidden, q/k/v/o shapes, head counts/dims, eagle_fc_in_factor; document in design doc.
+- [ ] Enforce geometry in `eagle_draft_converter.py`: Wo padded to base_hidden, QKV input uses 2*draft_hidden, norms/FFN on draft_hidden, head metadata exported.
+- [ ] Add fail-fast checks for HF layout drift (q/k/v/o, fc shapes, capture layers) with clear errors.
+- [ ] Add unit tests (`tests/turbomind`) to run converter on sample checkpoint/subset, read `config.yaml` and weights, assert shapes/dtypes for all exported tensors.
+- [ ] Confirm capture ordering (`layers_to_capture`) matches EAGLE/TRT; align `eagle_capture_hidden_`, `eagle_fc_in_dim_`, and design doc.
+- [ ] Keep LMDeploy config parity: expose eagle_q_size, eagle_kv_size, eagle_qkv_in_dim, eagle_fc_in_dim, eagle_choices, max_total_draft_tokens; validate parsing.
+- [ ] Update docs with final geometry, converter behaviour, and failure modes.
+- [ ] Production-ready hardening: deterministic converter outputs, checksum/logging of exported weights, and CI guard to fail on shape drift across checkpoints.
+- [ ] Cross-check geometry and capture ordering directly against TRT‑LLM checkpoints/configs and unit tests; if mismatch, fix converter and docs before release.
+- [ ] Read TRT‑LLM configs/checkpoints for GPT‑OSS‑120B‑Eagle3 to confirm `head_num`, `kv_head_num`, `head_dim`, FC fan-in/out, and capture layers; sync converter and `config.yaml` fields to those exact values.
+- [ ] Encode GPT‑OSS‑120B‑Eagle3 geometry: q_proj [4096, 5760], k_proj/v_proj [512, 5760], o_proj [2880, 4096], fc.weight [2880, 8640]; head_num=64, kv_head_num=8, head_dim=64; draft_hidden=2880, qkv_in=5760 (2*draft_hidden), fc_in=8640 (3*draft_hidden). Enforce these in converter and config.
+- [ ] Capture layers per TRT defaults: for target 36 layers, Eagle3 capture indices (1, 17, 32) as in config `eagle_aux_hidden_state_layer_ids`; ensure converter writes `num_capture_layers=3` and matches ordering used in TRT.
+
+### Engineer C – Integration, tree decode, validation
+- [ ] Thread base_hidden/draft_hidden through `EagleModule`, `Eagle3DraftLayer`, `UnifiedDecoder`, `LlamaV2`; ensure allocations/norms/FFN use draft_hidden, attention/O use base_hidden.
+- [ ] Route draft attention to new Eagle3 backend when geometry matches; keep strict `[EAGLE3][Attention][fallback]` logging for invalid cases only.
+- [ ] Extend draft tree decode to per-node logits for acceptance; update `runEagle3DraftTreeDecode` / acceptance kernels to consume per-node outputs. If deferring, add warning/log and plan.
+- [ ] Align tree masks/acceptance with TRT semantics (static tree, branching, root token handling, per-node KV slots); document any intentional differences. Match TRT multi-token speculative behaviour end-to-end.
+- [ ] Add stagewise compare harness (`tests/turbomind/eagle3_compare.py`) pulling HF/TRT refs; compute cosine/max diff/top‑k overlap for fc_out, attn_out, ffn_out, pre_head_hidden, logits; set tolerances.
+- [ ] Add Eagle‑3 profile to `run_spec_suite.sh` / `benchmark_speculative.py`; record acceptance metrics (mean length, frac>=2) and throughput vs TRT; fail if below TRT parity targets.
+- [ ] Validate dynamic batching/block reuse/KV invariants under spec: cache_len, block manager consistency, KV rewind correctness.
+- [ ] Clean up legacy shallow paths once parity proven; centralize `spec_method="eagle3"` handling; ensure LMDeploy surfaces TRT-like options (choices, max_total_draft_tokens, SpecPV toggle).
+- [ ] Validate SpecPV long-context behaviour vs full KV with Eagle‑3; log/disable on invariant failure.
+- [ ] Update `EAGLE_TODO_FINAL` and design doc once milestones are green; maintain progress markers.
+- [ ] Production-ready hardening: add regression tests for acceptance/KV invariants, enable debug counters for attention fallback frequency, and document operational runbooks for Eagle‑3 in LMDeploy (config knobs, known limits).
+- [ ] Define explicit tolerances/benchmarks (cosine/logit overlap, acceptance lengths, throughput) pre-run; enforce CI failures on violations. Keep doc synchronized with any newly observed TRT behaviours (KV padding, scaling quirks, tree masks).
+- [ ] Read TRT‑LLM speculative path: `tensorrt_llm/_torch/speculative/drafting_loops.py`, `tensorrt_llm/models/eagle/model.py`, `tests/unittest/_torch/speculative/test_kv_cache_reuse.py` to replicate tree construction, masks, acceptance, KV slotting, and q_len semantics exactly; update TurboMind tree decode/acceptance to match.
+- [ ] For GPT‑OSS‑120B‑Eagle3: apply static tree masks as TRT (packed mask via powers-of-two, position offsets contiguous), generation_length=max_total_draft_tokens+1 for target; first draft layer uses padded max_draft_len+1 tokens when static tree; linear tree requires max_draft_len==max_total_draft_tokens. Match kv_lens rewinding and position_id updates per TRT drafting loop (q_len=1 per step).
+- [ ] KV semantics: ensure `kv_lens_runtime` excludes `num_extra_kv_tokens` (max_draft_len-1) while internal `kv_lens` includes them, mirroring TRT test `test_kv_lens_runtime_with_eagle3_one_model`; add regression.
+- [ ] Mirror TRT plugins/acceptance: replicate behaviour of `eagle_sample_and_accept_draft_plugin` and `eagle_draft_decoder_plugin` (tree paths, posterior thresholds, greedy vs multinomial) or document deviations; ensure acceptance outputs (accepted_tokens/paths/lens) match TRT for GPT‑OSS‑120B static tree.
+- [ ] Mirror TRT C++ tree prep kernels: implement equivalents of `prepareCtxEagleNetInputs`, `buildLeafMask`, `getNonLeafEndingSubtree`, `prepareGenEagleNetInputs`, `getPackedMask`, `getPackedMaskFromPath`, `assembleTarget/DraftLogitsOffsets`, successor counting/topK from `eagleDecodingKernels.cu`; ensure hidden-state indices, lastTokenIndices, packed masks, position offsets match TRT layouts and padding (batch<=512 constraint noted).
+- [ ] Align orchestration with `eagleDecodingLayer.cpp`: call order and buffer layouts for static/dynamic tree, mask/position prep, acceptance integration; ensure TurboMind module/buffers match `runtime/eagleModule.h` expectations.
+- [ ] Audit TurboMind vs TRT pipeline end-to-end: capture→FC→Eagle3 attn→FFN→LM head→tree build→draft logits→acceptance→target tree decode→KV rewind. For each stage, mark implemented vs missing vs stub; ensure no shallow fallback remains in normal Eagle‑3 configs. Document any intentional deviations.
+- [ ] Align with TRT stack map (porting targets):
+  - Runtime API/headers: `cpp/include/tensorrt_llm/runtime/eagleModule.h`, `eagleBuffers.h`, `explicitDraftTokensBuffers.h`, `lookaheadBuffers.h`, `lookaheadModule.h`, `speculativeDecodingModule.h`, `speculativeDecodingMode.h`, `decodingInput.h`, `decodingOutput.h`, `utils/speculativeChoicesUtils.h`; executor configs `executor/speculativeDecodingConfig.cpp`, `executor/decodingConfig.cpp`, `executor/guidedDecodingConfig.cpp`.
+  - Kernels: `kernels/speculativeDecoding/common.{h,cu}`, `draftTokenTreeKernels.{h,cu}`, `mtpKernels.{h,cu}`, `eagleDecodingKernels.{h,cu}`, `kvCacheUpdateKernels.{h,cu}`, plus medusa/explicit/external draft kernels for patterns.
+  - Layers (host orchestration): `layers/eagleDecodingLayer.{h,cpp}`, `explicitDraftTokensLayer.{h,cpp}`, `externalDraftTokensLayer.{h,cpp}`, `medusaDecodingLayer.{h,cpp}`, `lookaheadDecodingLayer/Algorithm/PoolManager`, `dynamicDecodeLayer.{h,cpp}`, `decodingLayer.{h,cpp}`.
+  - Plugins: `plugins/eaglePlugin/eaglePrepareDrafterInputsPlugin.{h,cpp}`, `eagleDecodeDraftTokensPlugin.{h,cpp}`, `eagleSampleAndAcceptDraftTokensPlugin.{h,cpp}` (bridge to kernels); study plugin wiring/inputs/outputs.
+  - Runtime impl: `runtime/eagleBuffers.cpp`, `explicitDraftTokensBuffers.cpp`, `decodingLayerWorkspace.{h,cpp}`, `utils/speculativeChoicesUtils.cpp`, `runtime/gptDecoder.{h,cpp}`, `runtime/gptDecoderBatched.{h,cpp}`, batch manager KV (`batch_manager/kvCacheManager.cpp`, `kvCacheUtils.h`, `guidedDecoder.{h,cpp}`).
+  - Torch ops: `thop/specDecOp.cpp`, `thop/dynamicDecodeOp.{h,cpp}`, `thop/attentionOp.*` for exposure/testing.
+  - Tests/resources: `tests/unit_tests/layers/eagleLayerTest.{cpp,h}`, `explicitDraftTokensLayerTest.{cpp,h}`, `externalDraftTokensLayerTest.{cpp,h}`, `medusaDecodeLayerTest.{cpp,h}`, `tests/unit_tests/kernels/eaglePackDataTest.cpp`; scripts `tests/resources/scripts/build_eagle_engines.py`, `generate_expected_eagle_output.py`, `build_gpt_engines.py`.
+  - Docs: `docs/source/blogs/tech_blog/blog11_GPT_OSS_Eagle3.md`, blog9, blog6, blog12, deployment guide for GPT-OSS on TRT-LLM, `docs/source/commands/trtllm-build.rst`. Mirror config knobs/runtime behaviour accordingly.
+  - Assignments: Engineer A owns kernels/math parity; Engineer B owns converter/config/geometry; Engineer C owns layers/plugins/runtime integration, tree logic, KV/cache, and validation.
+- [ ] Pipeline parity checklist (fill with IMPLEMENTED/MISSING): capture layers order/concatenation; FC geometry (3H→H); 2H QKV compose; Eagle3 attention (QKV/O shapes, RoPE, scaling, masking); FFN/norms on draft_hidden; LM head routing; tree construction (paths/masks/offsets/padding); draft logits assembly; acceptance plugin semantics; target tree decode scratch KV + masks; KV rewind/num_extra_kv_tokens handling; dynamic batching/block reuse invariants; SpecPV optional path. Update this checklist as work lands; no stubs.
+
+**Pipeline parity status (current, do not fake; update as you implement)**
+- capture layers order/concatenation: PARTIAL (capture plumbing present; enforce TRT ordering 1/17/32 + doc).
+- FC geometry (3H→H): IMPLEMENTED in converter; runtime uses draft_hidden allocations.
+- 2H QKV compose: MISSING (still placeholder/tiled; must pack embedding_norm + fc_out into 2*draft_hidden exactly like TRT).
+- Eagle3 attention (QKV/O shapes, RoPE, scaling, masking): PARTIAL (Q/K/V GEMM + RoPE + naive SDPA + Wo with q_len/kv_len/past_kv_len/positions; missing tree/causal mask parity, KV reuse, multi-token RoPE).
+- FFN/norms on draft_hidden: IMPLEMENTED allocations; verify residual/norm paths stay draft_hidden.
+- LM head routing: IMPLEMENTED (base_hidden×vocab); stagewise compare pending.
+- tree construction (paths/masks/offsets/padding): PARTIAL (tree + packed-mask fallback; successor/topK offsets and kv_lens parity pending).
+- draft logits assembly (per-node, offsets): PARTIAL (per-node logits scaffolded; acceptance wiring pending).
+- acceptance plugin semantics: MISSING (need behaviour match to `eagle_sample_and_accept_draft_plugin`/decoder plugin).
+- target tree decode scratch KV + masks: IMPLEMENTED in TurboMind, not validated against TRT masks/offsets.
+- KV rewind/num_extra_kv_tokens handling: PARTIAL (kv_lens_runtime vs internal extra tokens parity not enforced).
+- dynamic batching/block reuse invariants: MISSING validation under Eagle-3.
+- SpecPV optional path: IMPLEMENTED plumbing, UNVALIDATED with Eagle-3.
 
 ---
 
@@ -45,9 +152,24 @@ Roles (for reference):
 **Integration**
 - [x] Works in **offline pipeline** (TurboMind engine via LMDeploy).
 - [ ] Coexists cleanly with:
-      - non‑speculative decode,
-      - other speculative methods (vanilla, lookahead, Medusa‑style),
-      - **SpecPV** (partial KV) as an optional long‑context optimisation.
+      - non-speculative decode,
+      - other speculative methods (vanilla, lookahead, Medusa-style),
+      - **SpecPV** (partial KV) as an optional long-context optimisation.
+
+---
+
+## Engineer C – Next 10 Implementation Tasks (each ~10–15% of remaining work)
+
+1. **Geometry split in C++**: propagate base_hidden (attention/output) vs draft_hidden (FC/MLP) through EagleModule/Eagle3DraftLayer; allocate norms/FFN/LM head on draft_hidden, attn Wo on base_hidden, QKV input on 2*draft_hidden; soft-disable draft layer on geometry mismatch.
+2. **Converter/config alignment**: ensure `config.yaml` carries base/draft hidden, qkv/fc factors (`eagle_qkv_in_dim=2*draft_hidden`, `eagle_fc_in_dim=3*draft_hidden`), and dtype; enforce shapes when exporting fused QKV/Wo.
+3. **Eagle3DraftLayer Forward 2H input**: build true 2×draft_hidden QKV input from embedding_norm + Eagle-3 FC capture (TRT-LLM composition); fallback to tiled last_hidden only if capture/embeddings absent.
+4. **Real attention path**: wire UnifiedAttentionLayer/Eagle3AttentionLayer for q_len=kv_len=1, no KV cache; shallow linear fallback only when QKV/Wo invalid; remove head_num*size_per_head gating.
+5. **Stagewise compare harness**: extend `tests/turbomind/eagle3_compare.py` to pull HF draft FC/attn/FFN/pre/logits and compare to turbomind debug tensors via dlpack; print cosines/argmax/top5.
+6. **Tree draft per-node**: add per-node draft logits in UnifiedDecoder/LlamaV2 using existing tree flattening; fill draft_tokens from per-node device logits; if deferred, log the current per-slot limitation explicitly.
+7. **Gating/cleanup**: remove legacy shallow Eagle-3 paths; centralize `spec_method == "eagle3"` in LlamaV2 with per-step soft fallback only; keep SpecPV/EAGLE metrics consistent.
+8. **SpecPV validation**: rerun long-context (16k/32k) baseline/Eagle3/Eagle3+SpecPV; add targeted logging in PartialKVCache::update_after_acceptance and LlamaV2::updateSpecPVAfterAcceptance for inconsistencies.
+9. **Benchmarks**: run `run_spec_suite.sh` post-geometry fixes; track mean/max acceptance, fraction_accept_ge2, mean_committed_extras, throughput vs baseline.
+10. **Docs/cleanup**: update design doc and this TODO after validation; ensure legacy shallow Eagle3 is removed and final gating is single-source.
 
 ---
 

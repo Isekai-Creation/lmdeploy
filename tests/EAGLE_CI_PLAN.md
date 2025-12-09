@@ -43,8 +43,21 @@ pytest lmdeploy/tests/test_benchmark_speculative_integration.py \
        lmdeploy/tests/turbomind/test_eagle_metrics.py \
        lmdeploy/tests/turbomind/test_speculative_manager_eagle.py \
        lmdeploy/tests/turbomind/test_speculative_manager_eagle_batch.py
+
+# Converter / geometry guardrail (CPU-only)
+
+To catch drift in exported Eagle3 geometry early, always run the
+lightweight converter shape test as part of your CPU CI stage:
+
+```bash
+pytest lmdeploy/tests/turbomind/test_eagle_converter_shapes.py
+```
+
+It fabricates a tiny Eagle3 stub checkpoint and asserts `config.yaml`
+keys (base/draft hidden, qkv/fc factors, capture layers) plus fused
+QKV/Wo/native projection sizes via deterministic checksums. No GPU is
+required.
 ```
 
 Additional multi-token EAGLE tests should be added to this list once the
 multi-token decode loop is implemented in `LlamaBatch` / `LlamaV2_eagle`.
-

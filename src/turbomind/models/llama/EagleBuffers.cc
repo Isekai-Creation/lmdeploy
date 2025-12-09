@@ -34,6 +34,15 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMalloc(&inputs.eagle_net_ctx_lens, batch_size_ * sizeof(SizeType));
     cudaMalloc(&inputs.eagle_net_gen_lens, batch_size_ * sizeof(SizeType));
     cudaMalloc(&inputs.eagle_net_seq_lens, batch_size_ * sizeof(SizeType));
+    cudaMalloc(&inputs.draft_offsets, (static_cast<size_t>(batch_size_) + 1) * sizeof(SizeType));
+    cudaMalloc(&inputs.target_offsets, (static_cast<size_t>(batch_size_) + 1) * sizeof(SizeType));
+    // Successor metadata is tracked per tree node. Allocate counts at
+    // [batch_size, max_decoding_tokens] to mirror TRT's per-node
+    // successor histograms, even if downstream consumers only need a
+    // flattened view.
+    cudaMalloc(&inputs.successor_offsets, (static_cast<size_t>(batch_size_) + 1) * sizeof(SizeType));
+    cudaMalloc(&inputs.successor_counts,
+               static_cast<size_t>(batch_size_) * static_cast<size_t>(max_decoding_tokens_) * sizeof(SizeType));
     
     // Allocate larger buffers for EagleNet inputs (conservative estimate)
     SizeType max_eagle_tokens = batch_size_ * max_decoding_tokens_ * 2;
@@ -55,7 +64,7 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMalloc(&outputs.accepted_tokens, batch_size_ * max_path_len_ * sizeof(TokenIdType));
     cudaMalloc(&outputs.accepted_lens, batch_size_ * sizeof(SizeType));
     cudaMalloc(&outputs.best_path_ids, batch_size_ * sizeof(SizeType));
-    cudaMalloc(&outputs.accepted_lengths_cumsum, batch_size_ * sizeof(SizeType));
+    cudaMalloc(&outputs.accepted_lengths_cumsum, (static_cast<size_t>(batch_size_) + 1) * sizeof(SizeType));
     cudaMalloc(&outputs.accepted_path_offsets, batch_size_ * max_decoding_tokens_ * sizeof(SizeType));
     cudaMalloc(&outputs.acceptance_rate, batch_size_ * sizeof(float));
     
@@ -89,6 +98,10 @@ void EagleBuffers::free() {
     cudaFree(inputs.eagle_net_ctx_lens);
     cudaFree(inputs.eagle_net_gen_lens);
     cudaFree(inputs.eagle_net_seq_lens);
+    cudaFree(inputs.draft_offsets);
+    cudaFree(inputs.target_offsets);
+    cudaFree(inputs.successor_offsets);
+    cudaFree(inputs.successor_counts);
     cudaFree(inputs.eagle_net_input_ids);
     cudaFree(inputs.eagle_net_position_ids);
     cudaFree(inputs.eagle_net_hidden_indices);

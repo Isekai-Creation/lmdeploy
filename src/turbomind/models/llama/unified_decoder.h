@@ -30,9 +30,28 @@ public:
     void setEagle3DraftLayer(const Eagle3DraftLayerWeight* w);
 
     void ForwardDraft(const Tensor& input_hidden,
+                      const Tensor& captured_hidden,
+                      const Tensor& position_ids,
+                      const Tensor& packed_mask,
+                      const Tensor& tree_offsets,
+                      const Tensor& runtime_offsets,
+                      const Tensor& successor_offsets,
+                      const Tensor& successor_counts,
+                      int           q_len,
+                      int           kv_len,
+                      int           past_kv_len,
                       Tensor&       output_hidden,
                       int           batch_size,
                       cudaStream_t  stream);
+
+    // Debug tensor accessors for eagle3 draft layer (populated when
+    // eagle_debug is enabled). These return empty tensors when the
+    // draft layer is unavailable or debug is off.
+    const Tensor& debug_fc_out() const;
+    const Tensor& debug_qkv() const;
+    const Tensor& debug_attn_out() const;
+    const Tensor& debug_ffn_out() const;
+    const Tensor& debug_pre_head_hidden() const;
 
 private:
     const size_t layer_num_;

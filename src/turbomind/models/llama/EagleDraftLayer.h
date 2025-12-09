@@ -18,6 +18,7 @@ struct Eagle3DraftLayerWeight {
     // the shallow QKV path.
     Eagle3AttentionWeight eagle3_attn;
     Tensor               fc_weight;      // keep if your converter fills it
+    Tensor               hidden_norm;
     Tensor               input_norm;
     Tensor               post_attn_norm;
     Tensor               output_norm;
@@ -34,6 +35,16 @@ public:
                      float                         rmsnorm_eps);
 
     void Forward(const Tensor& input_hidden,
+                 const Tensor& captured_hidden,
+                 const Tensor& position_ids,
+                 const Tensor& packed_mask,
+                 const Tensor& tree_offsets,
+                 const Tensor& runtime_offsets,
+                 const Tensor& successor_offsets,
+                 const Tensor& successor_counts,
+                 int           q_len,
+                 int           kv_len,
+                 int           past_kv_len,
                  Tensor&       output_hidden,
                  cudaStream_t  stream);
 
@@ -41,6 +52,7 @@ public:
     const Tensor& debug_attn_out() const       { return debug_attn_out_; }
     const Tensor& debug_ffn_out() const        { return debug_ffn_out_; }
     const Tensor& debug_pre_head_hidden() const{ return debug_pre_head_hidden_; }
+    const Tensor& debug_qkv() const            { return debug_qkv_; }
 
 private:
     const Eagle3DraftLayerWeight* weight_{nullptr};
@@ -51,13 +63,17 @@ private:
     Tensor debug_attn_out_;
     Tensor debug_ffn_out_;
     Tensor debug_pre_head_hidden_;
+    Tensor debug_qkv_;
 
     UnifiedAttentionLayer* attn_layer_{nullptr};
     class Eagle3AttentionLayer* eagle3_attn_layer_{nullptr};
     int                    head_num_{0};
     int                    kv_head_num_{0};
     int                    size_per_head_{0};
-    bool is_qkv_compatible_() const;   // <--- add this
+    bool attn_geom_ok(int hidden_dim) const;
+    bool is_qkv_compatible_() const;
+    int draft_hidden_dim_{0};
+    int base_hidden_dim_{0};
 };
 
 }  // namespace turbomind

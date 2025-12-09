@@ -1290,7 +1290,19 @@ PYBIND11_MODULE(_turbomind, m)
                     hidden_tm->dtype(),
                     ft::kDEVICE);
 
-                draft_layer.Forward(*hidden_tm, hidden_out, stream);
+                draft_layer.Forward(*hidden_tm,
+                                    /*captured_hidden=*/Tensor{},
+                                    /*position_ids=*/Tensor{},
+                                    /*packed_mask=*/Tensor{},
+                                    /*tree_offsets=*/Tensor{},
+                                    /*runtime_offsets=*/Tensor{},
+                                    /*successor_offsets=*/Tensor{},
+                                    /*successor_counts=*/Tensor{},
+                                    /*q_len=*/1,
+                                    /*kv_len=*/1,
+                                    /*past_kv_len=*/0,
+                                    hidden_out,
+                                    stream);
                 ft::check_cuda_error(cudaStreamSynchronize(stream));
 
                 fc_out_dbg   = draft_layer.debug_fc_out();

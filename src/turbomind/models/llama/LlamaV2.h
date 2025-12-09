@@ -261,6 +261,11 @@ private:
                                      const Sequence**     sequences,
                                      const std::vector<int>* committed_lengths = nullptr);
 
+    // Prepare per-slot EagleNet context inputs using previous acceptance
+    // results (EagleNet0). Mirrors TRT's prepareCtxEagleNetInputs to seed
+    // eagle_net_* lengths and positions for the next step.
+    void prepareEagleContextInputs(int batch_size);
+
     // Max engine tokens TurboMind should handle per decode step
     // when running in EAGLE speculative mode.
     int eagleMaxEngineTokensPerStep() const noexcept

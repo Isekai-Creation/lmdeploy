@@ -137,23 +137,6 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         return;
     }
 
-    // Some EAGLE draft checkpoints (e.g. NVIDIA's GPT-OSS EAGLE3 models)
-    // intentionally use hidden_size that does NOT equal
-    // num_attention_heads * head_dim. The rest of EagleModule only relies
-    // on `hidden_units` and `intermediate_size` for buffer and weight
-    // shapes, so we treat this mismatch as a warning instead of a hard
-    // error. As long as the exported weights match `hidden_units` and
-    // `intermediate_size`, the draft network can run correctly.
-    if (hidden_units != head_num * head_dim) {
-        TM_LOG_WARNING(
-            "[EAGLE][EagleModule::load] hidden_units (%d) != head_num (%d) * size_per_head (%d); "
-            "continuing with hidden_units=%d based on config.yaml",
-            hidden_units,
-            head_num,
-            head_dim,
-            hidden_units);
-    }
-
     // Parse optional Eagle3 geometry hints. When absent, we fall back to
     // the legacy EagleNet layout (single-hidden QKV / FC). For backward
     // compatibility with older config.yaml files that only contain the
@@ -176,6 +159,21 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     eagle_qkv_in_factor_ = model_config["eagle_qkv_in_factor"] ? model_config["eagle_qkv_in_factor"].as<int>() : 0;
     eagle_fc_in_dim_     = model_config["eagle_fc_in_dim"] ? model_config["eagle_fc_in_dim"].as<int>() : 0;
     eagle_fc_in_factor_  = model_config["eagle_fc_in_factor"] ? model_config["eagle_fc_in_factor"].as<int>() : 0;
+    if (model_config["eagle_capture_layers"] && model_config["eagle_capture_layers"].IsSequence()) {
+        try {
+            for (auto const& v : model_config["eagle_capture_layers"]) {
+                eagle_capture_layers_cfg_.push_back(v.as<int>());
+            }
+        }
+        catch (const std::exception&) {
+            eagle_capture_layers_cfg_.clear();
+        }
+    }
+
+    base_hidden_units_  = model_config["eagle_base_hidden"] ? model_config["eagle_base_hidden"].as<int>() : hidden_units;
+    draft_hidden_units_ = model_config["eagle_draft_hidden"]
+        ? model_config["eagle_draft_hidden"].as<int>()
+        : (eagle_qkv_in_dim_ > 0 ? eagle_qkv_in_dim_ / 2 : hidden_units);
 
     const bool has_eagle_geometry =
         eagle_qkv_in_dim_ > 0 || eagle_q_size_ > 0 || eagle_kv_size_ > 0 || eagle_fc_in_dim_ > 0;
@@ -187,8 +185,22 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         eagle_mode_ = EagleMode::kEagleNet;
     }
 
+    // Keep the base hidden width for the target model; draft-specific tensors
+    // explicitly use draft_hidden_units_ below.
     hidden_units_ = hidden_units;
+    hidden_units  = hidden_units_;
     vocab_size_   = vocab_size;
+
+    // Warn when base hidden does not match head geometry.
+    if (base_hidden_units_ != head_num * head_dim) {
+        TM_LOG_WARNING(
+            "[EAGLE][EagleModule::load] base_hidden (%d) != head_num (%d) * size_per_head (%d); "
+            "continuing with base_hidden=%d based on config.yaml",
+            base_hidden_units_,
+            head_num,
+            head_dim,
+            base_hidden_units_);
+    }
 
     // Decide draft weight dtype from config.yaml. The converter records
     // the on-disk precision in `eagle_weight_dtype`:
@@ -224,65 +236,87 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 "(eagle_q_size/eagle_kv_size/eagle_qkv_in_dim/eagle_fc_in_dim)");
             return;
         }
-        if (eagle_qkv_in_factor_ > 0 && eagle_qkv_in_dim_ != eagle_qkv_in_factor_ * hidden_units_) {
+        if (eagle_qkv_in_factor_ > 0 && eagle_qkv_in_dim_ != eagle_qkv_in_factor_ * draft_hidden_units_) {
             TM_LOG_WARNING(
-                "[EAGLE][EagleModule::load] Eagle3 qkv_in_dim (%d) != factor (%d) * hidden_units (%d); "
+                "[EAGLE][EagleModule::load] Eagle3 qkv_in_dim (%d) != factor (%d) * draft_hidden (%d); "
                 "continuing but behaviour may not match the source draft.",
                 eagle_qkv_in_dim_,
                 eagle_qkv_in_factor_,
-                hidden_units_);
+                draft_hidden_units_);
         }
-        if (eagle_fc_in_factor_ > 0 && eagle_fc_in_dim_ != eagle_fc_in_factor_ * hidden_units_) {
+        if (eagle_fc_in_factor_ > 0 && eagle_fc_in_dim_ != eagle_fc_in_factor_ * draft_hidden_units_) {
             TM_LOG_WARNING(
-                "[EAGLE][EAGLE3][EagleModule::load] fc_in_dim (%d) != factor (%d) * hidden_units (%d);",
+                "[EAGLE][EAGLE3][EagleModule::load] fc_in_dim (%d) != factor (%d) * draft_hidden (%d);",
                 eagle_fc_in_dim_,
                 eagle_fc_in_factor_,
-                hidden_units_);
+                draft_hidden_units_);
+        }
+        if (!eagle_capture_layers_cfg_.empty()) {
+            const int expected_fc_in = static_cast<int>(eagle_capture_layers_cfg_.size()) * base_hidden_units_;
+            if (eagle_fc_in_dim_ > 0 && eagle_fc_in_dim_ != expected_fc_in) {
+                TM_LOG_ERROR(
+                    "[EAGLE][EAGLE3][EagleModule::load] fc_in_dim (%d) != capture_layers (%zu) * base_hidden (%d); "
+                    "refusing to enable Eagle3 draft because capture ordering/width drifted from config.",
+                    eagle_fc_in_dim_,
+                    eagle_capture_layers_cfg_.size(),
+                    base_hidden_units_);
+                success = false;
+            }
+        }
+        else {
+            // Capture layers must be present for Eagle3 to be meaningful; treat absence as fatal to avoid
+            // running with an undefined FC input width.
+            logEagleError(
+                "[EAGLE][EAGLE3][EagleModule::load] eagle_capture_layers missing in config.yaml; "
+                "disabling Eagle3 draft to avoid geometry drift.");
+            success = false;
         }
     }
 
-    weights_.embed_tokens = Tensor{{vocab_size, hidden_units}, dtype, kDEVICE};
+    weights_.embed_tokens = Tensor{{vocab_size, base_hidden_units_}, dtype, kDEVICE};
 
-    weights_.fc = Tensor{{hidden_units * 2, hidden_units}, dtype, kDEVICE};
+    // Legacy shallow FC reduces captured features to the draft hidden width.
+    // Legacy FC path stays in draft-hidden space.
+    weights_.fc = Tensor{{draft_hidden_units_ * 2, draft_hidden_units_}, dtype, kDEVICE};
 
     // Eagle3-specific FC weight that consumes the full concatenated
     // multi-layer hidden (e.g. 3 * hidden) before attention.
     if (eagle3 && eagle_fc_in_dim_ > 0) {
-        weights_.eagle_fc = Tensor{{eagle_fc_in_dim_, hidden_units}, dtype, kDEVICE};
+        weights_.eagle_fc = Tensor{{eagle_fc_in_dim_, draft_hidden_units_}, dtype, kDEVICE};
     }
 
     // Layer weights (single EagleNet / Eagle3 shallow layer)
-    weights_.input_norm  = Tensor{{hidden_units}, dtype, kDEVICE};
-    weights_.hidden_norm = Tensor{{hidden_units}, dtype, kDEVICE};
+    weights_.input_norm  = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
+    weights_.hidden_norm = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
 
     // Attention weight shapes differ slightly between EagleNet and Eagle3:
     //  - EagleNet: [hidden, 3 * hidden] and Wo [hidden, hidden]
-    //  - Eagle3:   [qkv_in_dim, q_size + 2 * kv_size] and Wo [q_size, hidden]
-    int qkv_in_dim = hidden_units;
-    int q_size     = hidden_units;
-    int kv_size    = hidden_units;
+    //  - Eagle3:   [2 * draft_hidden, q_size + 2 * kv_size] and Wo [q_size, base_hidden]
+    int qkv_in_dim = hidden_units_;
+    int q_size     = hidden_units_;
+    int kv_size    = hidden_units_;
     if (eagle3) {
-        // For Eagle3 we want attention in full model space:
-        // QKV: [attn_hidden_units, 3 * attn_hidden_units]
-        // Wo:  [attn_hidden_units, draft_hidden] (hidden_units)
-        qkv_in_dim = attn_hidden_units;
-        q_size     = attn_hidden_units;
-        kv_size    = attn_hidden_units;
+        // For Eagle3 we want attention over draft-hidden inputs:
+        // QKV: [2 * draft_hidden_units_, eagle_q_size_ + 2 * eagle_kv_size_]
+        // Wo:  [eagle_q_size_, base_hidden_units_]
+        qkv_in_dim = eagle_qkv_in_dim_ > 0 ? eagle_qkv_in_dim_ : 2 * draft_hidden_units_;
+        q_size     = eagle_q_size_ > 0 ? eagle_q_size_ : attn_hidden_units;
+        kv_size    = eagle_kv_size_ > 0 ? eagle_kv_size_ : attn_hidden_units;
     }
 
-    const int qkv_out_dim = eagle3
-        ? 3 * attn_hidden_units
-        : q_size + 2 * kv_size;
+    const int qkv_out_dim = q_size + 2 * kv_size;
 
     weights_.attn_qkv = Tensor{{qkv_in_dim, qkv_out_dim}, dtype, kDEVICE};
-    weights_.attn_o   = Tensor{{q_size, hidden_units}, dtype, kDEVICE};
-    weights_.attn_norm = Tensor{{hidden_units}, dtype, kDEVICE};
+    // Wo projects back to base_hidden to align with target model width.
+    weights_.attn_o   = Tensor{{q_size, base_hidden_units_}, dtype, kDEVICE};
+    weights_.attn_norm = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
 
-    weights_.mlp_gate_up = Tensor{{intermediate_size * 2, hidden_units}, dtype, kDEVICE};
-    weights_.mlp_down    = Tensor{{intermediate_size, hidden_units}, dtype, kDEVICE};
+    // Draft FFN stays in draft_hidden space.
+    weights_.mlp_gate_up = Tensor{{intermediate_size * 2, draft_hidden_units_}, dtype, kDEVICE};
+    weights_.mlp_down    = Tensor{{intermediate_size, draft_hidden_units_}, dtype, kDEVICE};
 
-    weights_.output_norm = Tensor{{hidden_units}, dtype, kDEVICE};
-    weights_.lm_head     = Tensor{{hidden_units, vocab_size}, dtype, kDEVICE};
+    weights_.output_norm = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
+    weights_.lm_head     = Tensor{{base_hidden_units_, vocab_size}, dtype, kDEVICE};
 
     // Optional native Eagle3 attention projections (non‑LLaMA geometry).
     // Only allocate these when we have full Eagle3 geometry; otherwise
@@ -477,6 +511,38 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         const bool have_eagle_fc  = weights_.eagle_fc && eagle_fc_ok;
 
         if (have_attn && (have_legacy_fc || have_eagle_fc)) {
+            if (eagle_mode_ == EagleMode::kEagle3) {
+                const int expected_qkv_in  = eagle_qkv_in_dim_;
+                const int expected_qkv_out = eagle_q_size_ + 2 * eagle_kv_size_;
+                const int expected_attn_o0 = eagle_q_size_;
+                const int expected_attn_o1 = base_hidden_units_;
+                if (weights_.attn_qkv.shape(0) != expected_qkv_in || weights_.attn_qkv.shape(1) != expected_qkv_out
+                    || weights_.attn_o.shape(0) != expected_attn_o0 || weights_.attn_o.shape(1) != expected_attn_o1) {
+                    logEagleError(
+                        "[EAGLE][EagleModule::load] Eagle3 attention weights have unexpected shapes; disabling EAGLE for this engine");
+                    success = false;
+                }
+                const int expected_fc_in  = draft_hidden_units_ * 2;
+                const int expected_fc_out = draft_hidden_units_;
+                if (have_legacy_fc
+                    && (weights_.fc.shape(0) != expected_fc_in || weights_.fc.shape(1) != expected_fc_out)) {
+                    logEagleError(
+                        "[EAGLE][EagleModule::load] Eagle3 legacy fc.weight shape mismatch; disabling EAGLE for this engine");
+                    success = false;
+                }
+                if (have_eagle_fc
+                    && (weights_.eagle_fc.shape(0) != eagle_fc_in_dim_
+                        || weights_.eagle_fc.shape(1) != draft_hidden_units_)) {
+                    logEagleError(
+                        "[EAGLE][EagleModule::load] Eagle3 eagle_fc.weight shape mismatch; disabling EAGLE for this engine");
+                    success = false;
+                }
+                if (!success) {
+                    enabled_ = false;
+                    return;
+                }
+            }
+
             const int qkv_in  = weights_.attn_qkv.shape(0);
             const int qkv_out = weights_.attn_qkv.shape(1);
             attn_qkv_weight_.emplace(
@@ -544,6 +610,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayerWeight>();
 
         // Attach norms.
+        eagle3_draft_layer_->hidden_norm    = weights_.hidden_norm.borrow();
         eagle3_draft_layer_->input_norm     = weights_.input_norm.borrow();
         eagle3_draft_layer_->post_attn_norm = weights_.attn_norm.borrow();
         eagle3_draft_layer_->output_norm    = weights_.output_norm.borrow();
@@ -570,6 +637,12 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         eagle3_draft_layer_->ffn.fused_gating_intermediate.weight = weights_.mlp_gate_up.borrow();
         eagle3_draft_layer_->ffn.output.weight                    = weights_.mlp_down.borrow();
         eagle3_draft_layer_->ffn.prepare(/*fused_moe=*/false);
+
+        // Optional FC capture projection for building the 2H QKV input
+        // from concatenated captured hidden states. When present, the
+        // draft layer can compute fc_out directly from the captured
+        // hidden tensor instead of relying on caller-provided tiling.
+        eagle3_draft_layer_->fc_weight = weights_.eagle_fc.borrow();
 
         // Hard geometry checks for Eagle3 draft layer. When any of these
         // invariants fail we disable the Eagle3 draft layer only and fall
@@ -612,34 +685,35 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         };
 
         auto check_norm = [&](const Tensor& t, const char* name) {
-            if (!t || t.ndim() != 1 || t.shape(0) != hidden_units) {
+            const int expected = draft_hidden_units_;
+            if (!t || t.ndim() != 1 || t.shape(0) != expected) {
                 TM_LOG_WARNING(
                     "[EAGLE][Eagle3DraftLayer][fallback] %s norm has shape [%d], expected [%d]; "
                     "disabling Eagle3 draft layer.",
                     name,
                     t ? t.shape(0) : -1,
-                    hidden_units);
+                    expected);
                 draft_ok = false;
             }
         };
 
         // FFN geometry:
-        //   mlp_gate_up: [2 * inter_size, hidden_units]
-        //   mlp_down:    [inter_size, hidden_units]
-        check_shape_2d(weights_.mlp_gate_up, inter_size * 2, hidden_units, "mlp_gate_up");
-        check_shape_2d(weights_.mlp_down, inter_size, hidden_units, "mlp_down");
+        //   mlp_gate_up: [2 * inter_size, draft_hidden_units_]
+        //   mlp_down:    [inter_size, draft_hidden_units_]
+        check_shape_2d(weights_.mlp_gate_up, inter_size * 2, draft_hidden_units_, "mlp_gate_up");
+        check_shape_2d(weights_.mlp_down, inter_size, draft_hidden_units_, "mlp_down");
 
         // Attention geometry for Eagle3 shallow block (LLaMA-style path):
-        //   attn_qkv: [2 * hidden_units, eagle_q_size_ + 2 * eagle_kv_size_]
-        //   attn_o:   [eagle_q_size_, hidden_units]
+        //   attn_qkv: [2 * draft_hidden_units_, eagle_q_size_ + 2 * eagle_kv_size_]
+        //   attn_o:   [eagle_q_size_, base_hidden_units_]
         bool attn_ok = true;
         if (eagle_q_size_ > 0 && eagle_kv_size_ > 0) {
-            const int qkv_expected_in  = hidden_units * 2;
+            const int qkv_expected_in  = eagle_qkv_in_dim_;
             const int qkv_expected_out = eagle_q_size_ + 2 * eagle_kv_size_;
             check_shape_2d_attn(weights_.attn_qkv, qkv_expected_in, qkv_expected_out, "attn_qkv", attn_ok);
 
             const int attn_o_expected_in  = eagle_q_size_;
-            const int attn_o_expected_out = hidden_units;
+            const int attn_o_expected_out = base_hidden_units_;
             check_shape_2d_attn(weights_.attn_o, attn_o_expected_in, attn_o_expected_out, "attn_o", attn_ok);
 
             // Prepare a draft-layer LlamaAttentionWeight only when the
@@ -1200,20 +1274,34 @@ void EagleModule::forward(const Tensor& input_ids,
             && captured_hidden_states && captured_hidden_states.shape(0) == batch_size
             && captured_hidden_states.shape(1) == eagle_fc_in_dim_
             && captured_hidden_states.dtype() == hidden_dtype) {
+            const int draft_dim = draft_hidden_units_ > 0 ? draft_hidden_units_ : hidden_dim;
             bool need_fc_out =
                 !eagle_fc_out_scratch_ || eagle_fc_out_scratch_.dtype() != hidden_dtype
                 || eagle_fc_out_scratch_.device().type != kDEVICE
                 || eagle_fc_out_scratch_.shape(0) < batch_size
-                || eagle_fc_out_scratch_.shape(1) != hidden_dim;
+                || eagle_fc_out_scratch_.shape(1) != draft_dim;
             if (need_fc_out) {
-                eagle_fc_out_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+                eagle_fc_out_scratch_ = Tensor{{batch_size, draft_dim}, hidden_dtype, kDEVICE};
             }
             fc_out = eagle_fc_out_scratch_;
             linear.Forward(captured_hidden_states, eagle_fc_weight_, /*output=*/fc_out);
 
-            // Eagle3: normalize the FC output with the hidden_norm
-            // weight, mirroring the midlayer.hidden_norm behaviour.
-            invokeRMSNorm(attn_input, fc_out, weights_.hidden_norm, kEps, stream);
+            // Map FC output (draft_dim) to base_hidden width with zero pad / truncate.
+            check_cuda_error(cudaMemsetAsync(attn_input.raw_data(), 0, attn_input.byte_size(), stream));
+            const size_t elem_bytes = byte_size(hidden_dtype, 8) / 8;
+            const size_t src_stride = static_cast<size_t>(fc_out.stride(0)) * elem_bytes;
+            const size_t dst_stride = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
+            const int    copy_cols  = std::min(draft_dim, hidden_dim);
+
+            for (int b = 0; b < batch_size; ++b) {
+                const char* src_row = static_cast<const char*>(fc_out.raw_data()) + static_cast<size_t>(b) * src_stride;
+                char*       dst_row = static_cast<char*>(attn_input.raw_data()) + static_cast<size_t>(b) * dst_stride;
+                check_cuda_error(cudaMemcpyAsync(
+                    dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+            }
+
+            // Normalize the base-hidden view with hidden_norm.
+            invokeRMSNorm(attn_input, attn_input, weights_.hidden_norm, kEps, stream);
 
             if (isEagleDebugEnabled()) {
                 debug_fc_out_     = fc_out;
@@ -1247,9 +1335,9 @@ void EagleModule::forward(const Tensor& input_ids,
         }
 
         // 2) Single-token self-attention (degenerates to a learned projection
-        // for one token). For Eagle3 we build a 2×hidden (or more general)
-        // input to match the fused QKV geometry; for legacy EagleNet we keep
-        // the original [hidden, 3 * hidden] layout.
+        // for one token). For Eagle3 we build a 2×draft_hidden input composed
+        // of embedding_norm (first half) + FC-normalised capture (second half),
+        // mirroring TRT-LLM Eagle-3. Legacy EagleNet keeps the [hidden, 3*hidden].
         const int qkv_out_dim = weights_.attn_qkv.shape(1);
         bool      need_qkv =
             !qkv_scratch_ || qkv_scratch_.dtype() != weight_dtype_ || qkv_scratch_.device().type != kDEVICE
@@ -1261,7 +1349,9 @@ void EagleModule::forward(const Tensor& input_ids,
 
         if (eagle3) {
             const int qkv_in_dim = weights_.attn_qkv.shape(0);
-            const int factor     = eagle_qkv_in_factor_ > 0 ? eagle_qkv_in_factor_ : 2;
+            const int inferred_factor =
+                hidden_dim > 0 && qkv_in_dim % hidden_dim == 0 ? qkv_in_dim / hidden_dim : 0;
+            const int factor = eagle_qkv_in_factor_ > 0 ? eagle_qkv_in_factor_ : (inferred_factor > 0 ? inferred_factor : 2);
 
             bool need_qkv_in =
                 !attn_qkv_input_scratch_ || attn_qkv_input_scratch_.dtype() != hidden_dtype
@@ -1278,13 +1368,8 @@ void EagleModule::forward(const Tensor& input_ids,
             const size_t dst_row_bytes = static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
             char*        dst_base      = static_cast<char*>(qkv_input.raw_data());
 
-            // Optional embedding path: if we have valid input_ids and an
-            // embedding table, build the first half of the QKV input from
-            // normalized embeddings and the second half from the normalized
-            // FC-reduced hidden. This mirrors the Eagle3 2×hidden input
-            // layout more closely.
+            // Build normalized embeddings.
             if (eagle3 && input_ids && weights_.embed_tokens && qkv_in_dim >= 2 * hidden_dim) {
-                // Build normalized embeddings.
                 bool need_embed_in =
                     !embed_input_scratch_ || embed_input_scratch_.dtype() != hidden_dtype
                     || embed_input_scratch_.device().type != kDEVICE || embed_input_scratch_.shape(0) < batch_size
@@ -1292,10 +1377,7 @@ void EagleModule::forward(const Tensor& input_ids,
                 if (need_embed_in) {
                     embed_input_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
                 }
-                core::Buffer raw_ids(const_cast<void*>(input_ids.raw_data()),
-                                     batch_size,
-                                     kInt32,
-                                     kDEVICE);
+                core::Buffer raw_ids(const_cast<void*>(input_ids.raw_data()), batch_size, kInt32, kDEVICE);
                 core::Buffer_<int> token_ids(raw_ids);
                 core::Ref<Tensor>  embed_out(embed_input_scratch_);
                 invokeEmbeddingLookup(embed_out, token_ids, weights_.embed_tokens, stream);
@@ -1312,70 +1394,41 @@ void EagleModule::forward(const Tensor& input_ids,
                 have_embed = true;
             }
 
-            if (qkv_in_dim >= 2 * hidden_dim && (can_use_eagle_fc || have_embed)) {
-                const size_t src_row_bytes_attn = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
-                const size_t copy_bytes         = static_cast<size_t>(hidden_dim) * elem_bytes;
-                char*        attn_base          = static_cast<char*>(attn_input.raw_data());
+            const int    draft_dim  = draft_hidden_units_ > 0 ? draft_hidden_units_ : hidden_dim;
+            const size_t copy_bytes = static_cast<size_t>(std::min(hidden_dim, draft_dim)) * elem_bytes;
+            const size_t src_row_bytes_attn = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
+            const size_t src_row_bytes_emb  = have_embed
+                                                  ? static_cast<size_t>(embed_norm.stride(0)) * elem_bytes
+                                                  : src_row_bytes_attn;
+            char* emb_base  = have_embed ? static_cast<char*>(embed_norm.raw_data())
+                                         : static_cast<char*>(attn_input.raw_data());
+            char* attn_base = static_cast<char*>(attn_input.raw_data());
 
-                const size_t src_row_bytes_emb = have_embed
-                                                     ? static_cast<size_t>(embed_norm.stride(0)) * elem_bytes
-                                                     : src_row_bytes_attn;
-                char*        emb_base          = have_embed
-                                                     ? static_cast<char*>(embed_norm.raw_data())
-                                                     : attn_base;
+            for (int b = 0; b < batch_size; ++b) {
+                char* dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+                char* emb_row = emb_base + static_cast<size_t>(b) * src_row_bytes_emb;
+                char* attn_row = attn_base + static_cast<size_t>(b) * src_row_bytes_attn;
 
-                for (int b = 0; b < batch_size; ++b) {
-                    char* dst_row   = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-                    char* emb_row   = emb_base + static_cast<size_t>(b) * src_row_bytes_emb;
-                    char* attn_row  = attn_base + static_cast<size_t>(b) * src_row_bytes_attn;
-
-                    // First hidden_dim features from normalized embeddings
-                    // when available; otherwise fall back to normalized FC.
+                // First half: embedding norm (or attn_input as fallback)
+                check_cuda_error(cudaMemcpyAsync(dst_row, emb_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+                // Second half: FC-normalised capture / last hidden
+                if (qkv_in_dim >= 2 * draft_dim) {
                     check_cuda_error(cudaMemcpyAsync(
-                        dst_row, emb_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
-                    // Second hidden_dim features from normalized FC / hidden.
-                    check_cuda_error(cudaMemcpyAsync(
-                        dst_row + static_cast<size_t>(hidden_dim) * elem_bytes,
+                        dst_row + static_cast<size_t>(draft_dim) * elem_bytes,
                         attn_row,
                         copy_bytes,
                         cudaMemcpyDeviceToDevice,
                         stream));
                 }
-            }
-            else {
-                // Fallback: either consume the concatenated multi-layer
-                // hidden directly (when available) or repeat the normalized
-                // last-layer hidden state `factor` times.
-                const size_t copy_hidden = static_cast<size_t>(hidden_dim) * elem_bytes;
-                bool         use_captured =
-                    captured_hidden_states && captured_hidden_states.shape(0) == batch_size
-                    && captured_hidden_states.shape(1) >= qkv_in_dim && captured_hidden_states.dtype() == hidden_dtype;
-
-                if (use_captured) {
-                    const size_t   src_row_bytes = static_cast<size_t>(captured_hidden_states.stride(0)) * elem_bytes;
-                    const size_t   copy_bytes    = static_cast<size_t>(qkv_in_dim) * elem_bytes;
-                    const char*    src_base      = static_cast<const char*>(captured_hidden_states.raw_data());
-                    for (int b = 0; b < batch_size; ++b) {
-                        const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-                        char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-                        check_cuda_error(cudaMemcpyAsync(
-                            dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
-                    }
-                }
                 else {
-                    const size_t src_row_bytes = static_cast<size_t>(attn_input.stride(0)) * elem_bytes;
-                    char*        src_base      = static_cast<char*>(attn_input.raw_data());
-                    for (int b = 0; b < batch_size; ++b) {
-                        char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-                        char* dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-                        for (int r = 0; r < factor && (r * hidden_dim) < qkv_in_dim; ++r) {
-                            check_cuda_error(cudaMemcpyAsync(
-                                dst_row + static_cast<size_t>(r * hidden_dim) * elem_bytes,
-                                src_row,
-                                copy_hidden,
-                                cudaMemcpyDeviceToDevice,
-                                stream));
-                        }
+                    // Repeat as many factors as fit.
+                    for (int r = 1; r < factor && (r * draft_dim) < qkv_in_dim; ++r) {
+                        check_cuda_error(cudaMemcpyAsync(
+                            dst_row + static_cast<size_t>(r * draft_dim) * elem_bytes,
+                            attn_row,
+                            copy_bytes,
+                            cudaMemcpyDeviceToDevice,
+                            stream));
                     }
                 }
             }

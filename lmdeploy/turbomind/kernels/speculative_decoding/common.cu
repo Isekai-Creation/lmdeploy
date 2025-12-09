@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
+#include <cub/cub.cuh>
 
 #include "src/turbomind/utils/eagle_debug.h"
 
@@ -313,6 +314,186 @@ void launchPackAcceptedPathsKernel(
         num_paths,
         max_path_len,
         stream);
+}
+
+namespace {
+
+__global__ void computeSuccessorMetaKernel(SizeType const* runtime_offsets,
+                                           SizeType        batch_size,
+                                           SizeType*       successor_offsets,
+                                           SizeType*       successor_counts)
+{
+    const SizeType idx = static_cast<SizeType>(blockIdx.x);
+    if (idx >= batch_size) {
+        return;
+    }
+    if (successor_offsets) {
+        successor_offsets[idx] = runtime_offsets ? runtime_offsets[idx] : 0;
+    }
+    if (successor_counts && runtime_offsets) {
+        successor_counts[idx] = runtime_offsets[idx + 1] - runtime_offsets[idx];
+    }
+    if (idx == batch_size - 1 && successor_offsets && runtime_offsets) {
+        successor_offsets[idx + 1] = runtime_offsets[idx + 1];
+    }
+}
+
+}  // namespace
+
+void invokeComputeSuccessorMeta(SizeType const* runtime_offsets,
+                                SizeType        batch_size,
+                                SizeType*       successor_offsets,
+                                SizeType*       successor_counts,
+                                cudaStream_t    stream)
+{
+    if (!runtime_offsets || batch_size <= 0) {
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(batch_size));
+    const dim3 block(1);
+    computeSuccessorMetaKernel<<<grid, block, 0, stream>>>(
+        runtime_offsets, batch_size, successor_offsets, successor_counts);
+}
+
+namespace {
+
+__global__ void computeSuccessorCountsKernel(SizeType const* paths,
+                                             SizeType        batch_size,
+                                             SizeType        max_decoding_tokens,
+                                             SizeType        max_path_len,
+                                             SizeType*       num_successors)
+{
+    const SizeType batch_idx = static_cast<SizeType>(blockIdx.x);
+    if (batch_idx >= batch_size) {
+        return;
+    }
+
+    extern __shared__ uint8_t adj[];
+    const SizeType adj_size = max_decoding_tokens * max_decoding_tokens;
+
+    // Zero adjacency matrix
+    for (SizeType idx = static_cast<SizeType>(threadIdx.x); idx < adj_size; idx += blockDim.x) {
+        adj[idx] = 0;
+    }
+    __syncthreads();
+
+    // Populate adjacency from paths: for each edge (level -> level+1) set adj[from,to]=1
+    const SizeType path_base = batch_idx * max_decoding_tokens * max_path_len;
+    for (SizeType path_idx = static_cast<SizeType>(threadIdx.x); path_idx < max_decoding_tokens;
+         path_idx += blockDim.x) {
+        const SizeType* path = paths + path_base + path_idx * max_path_len;
+        for (SizeType level = 0; level + 1 < max_path_len; ++level) {
+            const SizeType from = path[level];
+            const SizeType to   = path[level + 1];
+            if (from >= 0 && to >= 0 && from < max_decoding_tokens && to < max_decoding_tokens) {
+                adj[from * max_decoding_tokens + to] = 1;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Count successors per node
+    for (SizeType node = static_cast<SizeType>(threadIdx.x); node < max_decoding_tokens; node += blockDim.x) {
+        SizeType count      = 0;
+        const SizeType base = node * max_decoding_tokens;
+        for (SizeType j = 0; j < max_decoding_tokens; ++j) {
+            count += static_cast<SizeType>(adj[base + j]);
+        }
+        num_successors[batch_idx * max_decoding_tokens + node] = count;
+    }
+}
+
+template<int BLOCK_SIZE>
+__global__ void compactSuccessorsKernel(SizeType const* num_successors,
+                                        SizeType        batch_size,
+                                        SizeType        max_decoding_tokens,
+                                        SizeType*       successor_offsets,
+                                        SizeType*       successor_counts)
+{
+    using BlockScan   = cub::BlockScan<SizeType, BLOCK_SIZE>;
+    using BlockReduce = cub::BlockReduce<SizeType, BLOCK_SIZE>;
+
+    __shared__ typename BlockScan::TempStorage   scan_storage;
+    __shared__ typename BlockReduce::TempStorage reduce_storage;
+    __shared__ SizeType                          total_nodes_with_successors;
+
+    const SizeType tid = static_cast<SizeType>(threadIdx.x);
+
+    // Count how many nodes in this request have successors.
+    SizeType nodes_with_successors = 0;
+    if (tid < batch_size) {
+        const SizeType* row = num_successors + tid * max_decoding_tokens;
+        for (SizeType i = 0; i < max_decoding_tokens; ++i) {
+            nodes_with_successors += (row[i] > 0 ? 1 : 0);
+        }
+    }
+
+    SizeType offset = 0;
+    BlockScan(scan_storage).ExclusiveSum(nodes_with_successors, offset);
+
+    const SizeType total = BlockReduce(reduce_storage).Sum(nodes_with_successors);
+    if (tid == 0) {
+        total_nodes_with_successors = total;
+    }
+    __syncthreads();
+
+    if (tid < batch_size) {
+        successor_offsets[tid] = offset;
+
+        const SizeType* row = num_successors + tid * max_decoding_tokens;
+        SizeType        cursor = offset;
+        for (SizeType i = 0; i < max_decoding_tokens; ++i) {
+            const SizeType count = row[i];
+            if (count > 0) {
+                successor_counts[cursor++] = count;
+            }
+        }
+    }
+
+    if (tid == 0) {
+        successor_offsets[batch_size] = total_nodes_with_successors;
+    }
+}
+
+}  // namespace
+
+void invokeExtractSuccessorsFromPaths(SizeType const* paths,
+                                      SizeType        batch_size,
+                                      SizeType        max_decoding_tokens,
+                                      SizeType        max_path_len,
+                                      SizeType*       successor_offsets,
+                                      SizeType*       successor_counts,
+                                      SizeType*       num_successors,
+                                      cudaStream_t    stream)
+{
+    if (!paths || batch_size <= 0 || max_decoding_tokens <= 0 || max_path_len <= 0
+        || !successor_offsets || !successor_counts) {
+        return;
+    }
+
+    // First pass: build per-node successor histogram from paths.
+    const SizeType adj_bytes = max_decoding_tokens * max_decoding_tokens * sizeof(uint8_t);
+    constexpr int  BLOCK_HIST = 256;
+    computeSuccessorCountsKernel<<<batch_size, BLOCK_HIST, adj_bytes, stream>>>(
+        paths, batch_size, max_decoding_tokens, max_path_len, num_successors);
+
+    // Second pass: compact histograms into flat successor_counts with offsets.
+    constexpr int BLOCK_COMPACT = 512;
+    if (batch_size > BLOCK_COMPACT) {
+        // Constraint inherited from TRT: batch size for EAGLE tree decode
+        // must be <= 512. Exceeding this would require a multi-block scan.
+        if (::turbomind::isEagleDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[EAGLE][successor][fallback] batch_size=%d exceeds BLOCK_COMPACT=%d; "
+                         "successor metadata not updated.\n",
+                         static_cast<int>(batch_size),
+                         BLOCK_COMPACT);
+        }
+        return;
+    }
+
+    compactSuccessorsKernel<BLOCK_COMPACT><<<1, BLOCK_COMPACT, 0, stream>>>(
+        num_successors, batch_size, max_decoding_tokens, successor_offsets, successor_counts);
 }
 
 /**

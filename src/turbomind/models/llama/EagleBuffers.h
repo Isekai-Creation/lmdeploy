@@ -38,6 +38,14 @@ struct EagleBuffers {
         SizeType* eagle_net_ctx_lens;        // [batch_size]
         SizeType* eagle_net_gen_lens;        // [batch_size]
         SizeType* eagle_net_seq_lens;        // [batch_size]
+        SizeType* draft_offsets;             // [batch_size + 1]
+        SizeType* target_offsets;            // [batch_size + 1]
+        SizeType* successor_offsets;         // [batch_size + 1]
+        // Flattened successor TopK counts per request. Entries are dense but
+        // only the nodes with successors are populated; offsets points into
+        // this flattened array. Sized to an upper bound of
+        // [batch_size * max_decoding_tokens].
+        SizeType* successor_counts;
         TokenIdType* eagle_net_input_ids;    // [total_eagle_tokens]
         SizeType* eagle_net_position_ids;    // [total_eagle_tokens]
         SizeType* eagle_net_hidden_indices;  // [total_eagle_tokens]
@@ -61,6 +69,10 @@ struct EagleBuffers {
             eagle_net_ctx_lens = nullptr;
             eagle_net_gen_lens = nullptr;
             eagle_net_seq_lens = nullptr;
+            draft_offsets = nullptr;
+            target_offsets = nullptr;
+            successor_offsets = nullptr;
+            successor_counts = nullptr;
             eagle_net_input_ids = nullptr;
             eagle_net_position_ids = nullptr;
             eagle_net_hidden_indices = nullptr;

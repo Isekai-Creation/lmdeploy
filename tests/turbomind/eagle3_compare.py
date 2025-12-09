@@ -157,9 +157,8 @@ def run_compare(
     ffn_out_tm = tm_debug.get("ffn_out")
     pre_tm = tm_debug.get("pre_head_hidden")
 
-    # For now we use HF last_hidden as a crude reference for FC/ATTN/FFN/PRE.
-    # Once a proper HF Eagle3 draft head is available, replace these with
-    # real stage tensors (hf_fc, hf_attn, hf_ffn, hf_pre).
+    # These reference tensors are placeholders; when HF Eagle3 draft exports
+    # become available, wire them here for true stagewise comparisons.
     hf_stage_ref = last_hidden_hf
 
     if fc_tm is not None:

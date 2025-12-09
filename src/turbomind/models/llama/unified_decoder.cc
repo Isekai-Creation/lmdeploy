@@ -109,6 +109,16 @@ void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
 }
 
 void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
+                                  const Tensor& captured_hidden,
+                                  const Tensor& position_ids,
+                                  const Tensor& packed_mask,
+                                  const Tensor& tree_offsets,
+                                  const Tensor& runtime_offsets,
+                                  const Tensor& successor_offsets,
+                                  const Tensor& successor_counts,
+                                  int           q_len,
+                                  int           kv_len,
+                                  int           past_kv_len,
                                   Tensor&       output_hidden,
                                   int           batch_size,
                                   cudaStream_t  stream)
@@ -142,7 +152,51 @@ void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
         output_hidden = Tensor{{batch_size, static_cast<int>(hidden_units_)}, input_hidden.dtype(), kDEVICE};
     }
 
-    eagle3_draft_layer_->Forward(input_hidden, output_hidden, stream);
+    Tensor mask_tensor = packed_mask;
+    // Attach position ids / masks to Eagle3 attention via optional params.
+    eagle3_draft_layer_->Forward(input_hidden,
+                                 captured_hidden,
+                                 position_ids,
+                                 mask_tensor,
+                                 tree_offsets,
+                                 runtime_offsets,
+                                 successor_offsets,
+                                 successor_counts,
+                                 q_len,
+                                 kv_len,
+                                 past_kv_len,
+                                 output_hidden,
+                                 stream);
+}
+
+const Tensor& UnifiedDecoder::debug_fc_out() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_fc_out() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_qkv() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_qkv() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_attn_out() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_attn_out() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_ffn_out() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_ffn_out() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_pre_head_hidden() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_pre_head_hidden() : empty;
 }
 
 void UnifiedDecoder::AllreduceResidualRMSnorm(Tensor&       hidden_states,
@@ -266,6 +320,13 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
     auto   it_mask = args.find("spec_packed_mask");
     if (it_mask != args.end()) {
         spec_packed_mask = it_mask->second;
+    }
+
+    // Optional runtime kv lengths for speculative/tree decode: when present,
+    // prefer these over the default h_k_len to match TRT kv_lens_runtime.
+    auto it_k_rt = args.find("spec_runtime_k_len");
+    if (it_k_rt != args.end()) {
+        args["h_k_len"] = it_k_rt->second;
     }
 
     attn_layer_->Initialize(args);

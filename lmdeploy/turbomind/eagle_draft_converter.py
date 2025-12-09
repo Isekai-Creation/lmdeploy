@@ -143,29 +143,76 @@ def _infer_eagle3_geometry(
     k_w = _load_tensor_from_shards(
         shards, "midlayer.self_attn.k_proj.weight", optional=True
     )
+    v_w = _load_tensor_from_shards(
+        shards, "midlayer.self_attn.v_proj.weight", optional=True
+    )
     fc_w = _load_tensor_from_shards(shards, "fc.weight", optional=True)
+
+    if hidden_size > 0:
+        meta["eagle_base_hidden"] = int(hidden_size)
+
+    draft_hidden: Optional[int] = None
+    if fc_w is not None:
+        draft_hidden = int(fc_w.shape[0])
+        meta["eagle_draft_hidden"] = draft_hidden
 
     if q_w is not None:
         q_size, q_in_dim = q_w.shape
         meta["eagle_q_size"] = int(q_size)
         meta["eagle_qkv_in_dim"] = int(q_in_dim)
-        if hidden_size > 0 and q_in_dim % hidden_size == 0:
+        # Treat q_size as the attention/output hidden width.
+        meta["eagle_base_hidden"] = int(q_size)
+        if draft_hidden is None and q_in_dim % 2 == 0:
+            draft_hidden = int(q_in_dim // 2)
+            meta["eagle_draft_hidden"] = draft_hidden
+        if draft_hidden:
+            meta["eagle_qkv_in_factor"] = int(q_in_dim // draft_hidden)
+        elif hidden_size > 0 and q_in_dim % hidden_size == 0:
             meta["eagle_qkv_in_factor"] = int(q_in_dim // hidden_size)
 
     if k_w is not None:
-        kv_size, _ = k_w.shape
+        kv_size, kv_in = k_w.shape
+        meta["eagle_kv_size"] = int(kv_size)
+        # Keep symmetry with q-proj inferences for downstream consumers.
+        # This is purely advisory metadata used to sanity check fused
+        # QKV construction in the converter / EagleModule.
+        if draft_hidden:
+            meta["eagle_kv_factor"] = int(kv_size // draft_hidden)
+        elif hidden_size > 0 and kv_size % hidden_size == 0:
+            meta["eagle_kv_factor"] = int(kv_size // hidden_size)
+        if "eagle_qkv_in_dim" not in meta:
+            meta["eagle_qkv_in_dim"] = int(kv_in)
+
+    if v_w is not None and "eagle_kv_size" not in meta:
+        kv_size, _ = v_w.shape
         meta["eagle_kv_size"] = int(kv_size)
 
     if fc_w is not None:
         fc_out, fc_in = fc_w.shape
-        if fc_out == hidden_size and fc_in % hidden_size == 0:
-            meta["eagle_fc_in_factor"] = int(fc_in // hidden_size)
-            meta["eagle_fc_in_dim"] = int(fc_in)
+        if fc_out > 0:
+            meta.setdefault("eagle_hidden_units", int(fc_out))
+            meta.setdefault("eagle_draft_hidden", int(fc_out))
+            draft_hidden = draft_hidden or int(fc_out)
+            if fc_in % fc_out == 0:
+                meta["eagle_fc_in_factor"] = int(fc_in // fc_out)
+                meta["eagle_fc_in_dim"] = int(fc_in)
         elif log:
             log.warning(
                 "EAGLE3 fc.weight shape %s does not look like "
                 "[hidden, N * hidden]; skipping fc geometry metadata.",
                 tuple(fc_w.shape),
+            )
+
+    if draft_hidden:
+        meta.setdefault("eagle_hidden_units", int(draft_hidden))
+        meta.setdefault("eagle_draft_hidden", int(draft_hidden))
+        if "eagle_qkv_in_dim" in meta and meta["eagle_qkv_in_dim"] % draft_hidden == 0:
+            meta.setdefault(
+                "eagle_qkv_in_factor", int(meta["eagle_qkv_in_dim"] // draft_hidden)
+            )
+        if "eagle_fc_in_dim" in meta and meta["eagle_fc_in_dim"] % draft_hidden == 0:
+            meta.setdefault(
+                "eagle_fc_in_factor", int(meta["eagle_fc_in_dim"] // draft_hidden)
             )
 
     return meta
@@ -578,23 +625,24 @@ def _convert_eagle3_midlayer(
         )
 
     # ------------------------------------------------------------------
-    # Real attention weights in LlamaAttention layout (Option 1).
+    # Fused QKV / WO in 2×hidden geometry (Eagle-3 draft attention).
     #
-    # Instead of using the midlayer.self_attn.* geometry (which is based
-    # on 2x/3x hidden concatenations), we reuse the *base model's*
-    # first-layer Q/K/V/O as the Eagle3 draft attention backbone.
-    #
-    # This gives:
-    #   - QKV: [attn_hidden, 3 * attn_hidden]
-    #   - Wo:  [attn_hidden, hidden_size] (draft hidden)
-    #
-    # These shapes match the new C++ EagleModule/Eagle3DraftLayer real
-    # attention path.
+    # We build a fused QKV weight that consumes a 2 * draft_hidden input
+    # vector and produces [q_size, kv_size, kv_size] outputs matching the
+    # native Eagle-3 midlayer projections (e.g. q_size=4096, kv_size=512).
+    # The first eagle_qkv_in_dim rows are populated from the HF Eagle-3
+    # q/k/v projections; remaining rows are zero-initialised so the C++
+    # runtime can extend the 2H input without shape mismatches.
     # ------------------------------------------------------------------
+    if q_mid is None or k_mid is None or v_mid is None:
+        raise RuntimeError(
+            "Eagle3 midlayer attention weights incomplete; cannot build fused QKV/WO tensors."
+        )
+
     if base_model_dir is None:
         raise RuntimeError(
-            "Eagle3 real-attention conversion (Option 1) requires "
-            "base_model_dir to provide model.layers.0.self_attn.{q,k,v,o}_proj.weight"
+            "Eagle3 fused QKV construction requires base_model_dir "
+            "to provide model.layers.0.self_attn.o_proj.weight"
         )
 
     base_shards = _find_safetensor_shards(base_model_dir)
@@ -603,56 +651,67 @@ def _convert_eagle3_midlayer(
             f"No *.safetensors files found under base_model_dir={base_model_dir!r}"
         )
 
-    base_q = _load_tensor_from_shards(
-        base_shards, "model.layers.0.self_attn.q_proj.weight", optional=False
-    )
-    base_k = _load_tensor_from_shards(
-        base_shards, "model.layers.0.self_attn.k_proj.weight", optional=False
-    )
-    base_v = _load_tensor_from_shards(
-        base_shards, "model.layers.0.self_attn.v_proj.weight", optional=False
-    )
     base_o = _load_tensor_from_shards(
         base_shards, "model.layers.0.self_attn.o_proj.weight", optional=False
     )
 
-    # HF Q/K/V/O are [out, in] with out = attn_hidden, in = attn_hidden
-    attn_hidden = base_q.shape[0]
-    if (
-        base_q.shape != (attn_hidden, attn_hidden)
-        or base_k.shape != (attn_hidden, attn_hidden)
-        or base_v.shape != (attn_hidden, attn_hidden)
-        or base_o.shape != (attn_hidden, attn_hidden)
-    ):
+    eagle_q_size = int(geo.get("eagle_q_size", 0))
+    eagle_kv_size = int(geo.get("eagle_kv_size", 0))
+    eagle_qkv_in_dim = int(geo.get("eagle_qkv_in_dim", 0))
+    base_hidden = int(geo.get("eagle_base_hidden", q_mid.shape[0]))
+
+    if eagle_q_size <= 0 or eagle_kv_size <= 0 or eagle_qkv_in_dim <= 0:
         raise RuntimeError(
-            "Base model Q/K/V/O shapes do not match expected "
-            f"[attn_hidden, attn_hidden]; got "
-            f"q={tuple(base_q.shape)}, k={tuple(base_k.shape)}, "
-            f"v={tuple(base_v.shape)}, o={tuple(base_o.shape)}"
+            "Eagle-3 fused QKV construction missing geometry "
+            f"(q={eagle_q_size}, kv={eagle_kv_size}, in_dim={eagle_qkv_in_dim})"
         )
 
-    # QKV in [attn_hidden, 3 * attn_hidden] layout:
-    #   cat([Q, K, V], dim=0) → [3*attn_hidden, attn_hidden], then transpose.
-    qkv_cat = torch.cat([base_q, base_k, base_v], dim=0)  # [3*hidden, hidden]
-    qkv_tm = qkv_cat.to(w_dtype).transpose(0, 1).contiguous()  # [hidden, 3*hidden]
+    # qkv_in_dim already reflects the 2 * draft_hidden Eagle3 layout
+    # (e.g. 5760 for GPT-OSS-120B). Keep it verbatim to mirror TRT-LLM.
+    draft_hidden = int(geo.get("eagle_draft_hidden", 0)) or eagle_qkv_in_dim // 2
+    fused_qkv_in = eagle_qkv_in_dim
+    fused_qkv_out = eagle_q_size + 2 * eagle_kv_size
+
+    if draft_hidden <= 0 or fused_qkv_in != draft_hidden * 2:
+        raise RuntimeError(
+            f"Eagle-3 fused QKV expects qkv_in_dim == 2 * draft_hidden; "
+            f"got draft_hidden={draft_hidden}, qkv_in_dim={fused_qkv_in}"
+        )
+
+    # Start with zeros then populate the leading rows from Eagle-3 q/k/v.
+    attn_qkv_tm = torch.zeros((fused_qkv_in, fused_qkv_out), dtype=w_dtype)
+
+    q_block = q_mid.to(w_dtype).transpose(0, 1)  # [qkv_in_dim, q_size]
+    k_block = k_mid.to(w_dtype).transpose(0, 1)  # [qkv_in_dim, kv_size]
+    v_block = v_mid.to(w_dtype).transpose(0, 1)  # [qkv_in_dim, kv_size]
+
+    attn_qkv_tm[:eagle_qkv_in_dim, :eagle_q_size] = q_block
+    attn_qkv_tm[:eagle_qkv_in_dim, eagle_q_size : eagle_q_size + eagle_kv_size] = k_block
+    attn_qkv_tm[:eagle_qkv_in_dim, eagle_q_size + eagle_kv_size :] = v_block
+
     _write_tensor(
-        qkv_tm,
+        attn_qkv_tm,
         os.path.join(out_dir, "layers.0.attention.w_qkv.weight"),
         w_dtype,
     )
 
-    # Wo: [attn_hidden, hidden_size] (draft hidden). Base o_proj is
-    # [attn_hidden, attn_hidden]; take the first hidden_size columns
-    # and pad if needed.
-    if base_o.shape[1] >= hidden_size:
-        wo_tm = base_o[:, :hidden_size].to(w_dtype)
+    # Wo: [q_size, base_hidden]. Use the base model's o_proj as the
+    # backbone, trimming/padding to match the target hidden width.
+    attn_o_tm: torch.Tensor
+    if base_o.shape == (base_hidden, base_hidden):
+        attn_o_tm = base_o.to(w_dtype)
+    elif base_o.shape[0] >= eagle_q_size:
+        attn_o_tm = base_o[:eagle_q_size, :base_hidden].to(w_dtype)
     else:
-        extra = hidden_size - base_o.shape[1]
-        pad = torch.zeros(base_o.shape[0], extra, dtype=base_o.dtype)
-        wo_tm = torch.cat([base_o, pad], dim=1).to(w_dtype)
+        pad_cols = max(base_hidden - base_o.shape[1], 0)
+        pad_rows = max(eagle_q_size - base_o.shape[0], 0)
+        attn_o_tm = base_o.to(w_dtype)
+        if pad_rows or pad_cols:
+            attn_o_tm = torch.nn.functional.pad(attn_o_tm, (0, pad_cols, 0, pad_rows))
+        attn_o_tm = attn_o_tm[:eagle_q_size, :base_hidden]
 
     _write_tensor(
-        wo_tm,
+        attn_o_tm,
         os.path.join(out_dir, "layers.0.attention.wo.weight"),
         w_dtype,
     )
@@ -727,6 +786,12 @@ def prepare_eagle_draft_from_hf(
 
     if layout == "eagle3_midlayer":
         geo = _infer_eagle3_geometry(shards, hidden_size, logger=log)
+        base_hidden = int(geo.get("eagle_base_hidden", hidden_size))
+        draft_hidden = int(geo.get("eagle_draft_hidden", hidden_size))
+        # Fused QKV input dim is 2 * draft_hidden (e.g. 2 * 2880 = 5760).
+        geo["eagle_qkv_in_dim"] = 2 * draft_hidden
+        geo["eagle_qkv_in_factor"] = 2
+
         for k, v in geo.items():
             if k == "eagle_mode":
                 continue
@@ -742,8 +807,19 @@ def prepare_eagle_draft_from_hf(
                 f"Failed to infer full Eagle3 geometry for {hf_model_dir!r}: "
                 f"missing one of {required}"
             )
+        # Explicitly record the base (target) hidden size and the
+        # Eagle-3 midlayer / draft hidden size. The base hidden tracks
+        # the target model width (e.g. 4096 for GPT-OSS-120B) while the
+        # draft hidden corresponds to the midlayer FC / QKV input width
+        # (e.g. 2880 for Eagle-3). TurboMind uses both to configure the
+        # fused QKV geometry.
+        model_cfg["eagle_base_hidden"] = base_hidden
+        model_cfg["eagle_draft_hidden"] = draft_hidden
         # Tag as Eagle3 so EagleModule can branch.
         model_cfg["eagle_mode"] = "eagle3"
+        # Capture ordering from TRT-LLM GPT-OSS default (layers 1, 17, 32).
+        model_cfg["eagle_capture_layers"] = [1, 17, 32]
+        model_cfg["eagle_num_capture_layers"] = len(model_cfg["eagle_capture_layers"])
 
     tm_cfg = {"model_config": model_cfg}
     with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as f:

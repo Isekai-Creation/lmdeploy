@@ -129,6 +129,44 @@ void launchPackAcceptedPathsKernel(
     cudaStream_t    stream);
 
 /**
+ * @brief Compute successor offsets/counts from cumulative runtime lengths.
+ */
+void invokeComputeSuccessorMeta(SizeType const* runtime_offsets,
+                                SizeType        batch_size,
+                                SizeType*       successor_offsets,
+                                SizeType*       successor_counts,
+                                cudaStream_t    stream);
+
+/**
+ * @brief Extract per-node successor counts and flattened TopK offsets from
+ *        tree paths.
+ *
+ * This mirrors TensorRT-LLM's successor histogram logic: for each request,
+ * it builds an adjacency matrix from the draft paths, counts successors per
+ * node, and compacts the non-zero counts into a flat array. The offsets
+ * array is length batch_size+1; successor_offsets[i] marks the starting
+ * index of request i inside successor_counts, and successor_offsets[end]
+ * stores the total number of nodes with successors.
+ *
+ * @param paths                Flattened tree paths [batch, max_decoding_tokens, max_path_len]
+ * @param batch_size           Active batch size
+ * @param max_decoding_tokens  Max draft tokens per sequence (tree width)
+ * @param max_path_len         Max path length (tree depth)
+ * @param successor_offsets    Output offsets [batch_size + 1]
+ * @param successor_counts     Output flattened successor counts; sized at least batch_size*max_decoding_tokens
+ * @param num_successors       Optional per-node successor histogram [batch_size, max_decoding_tokens]
+ * @param stream               CUDA stream
+ */
+void invokeExtractSuccessorsFromPaths(SizeType const* paths,
+                                      SizeType        batch_size,
+                                      SizeType        max_decoding_tokens,
+                                      SizeType        max_path_len,
+                                      SizeType*       successor_offsets,
+                                      SizeType*       successor_counts,
+                                      SizeType*       num_successors,
+                                      cudaStream_t    stream);
+
+/**
  * @brief Parameters for KV cache rewind
  * 
  * Manages freeing KV cache blocks for rejected draft tokens.

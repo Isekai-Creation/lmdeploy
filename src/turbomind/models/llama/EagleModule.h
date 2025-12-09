@@ -127,6 +127,8 @@ public:
 
     /// Return the hidden size of the draft model loaded from config.yaml.
     int getHiddenUnits() const { return hidden_units_; }
+    int getBaseHiddenUnits() const { return base_hidden_units_; }
+    int getDraftHiddenUnits() const { return draft_hidden_units_; }
 
     /// Return the Eagle3 FC input dimension when available (0 otherwise).
     int getEagleFcInDim() const { return eagle_fc_in_dim_; }
@@ -136,6 +138,9 @@ public:
     {
         return eagle_mode_ == EagleMode::kEagle3 && static_cast<bool>(eagle3_draft_layer_);
     }
+
+    /// Optional capture layer ordering from config.yaml.
+    const std::vector<int>& getCaptureLayers() const { return eagle_capture_layers_cfg_; }
 
     /// Return the vocab size of the draft model loaded from config.yaml.
     int getVocabSize() const { return vocab_size_; }
@@ -191,12 +196,20 @@ private:
 
     EagleMode eagle_mode_{EagleMode::kEagleNet};
 
+    // Base / draft hidden sizes. base_hidden_units_ tracks the target
+    // model hidden width (e.g. 4096 for GPT-OSS-120B) while
+    // draft_hidden_units_ tracks the Eagle-3 midlayer FC output width
+    // (e.g. 2880). hidden_units_ remains aligned to base_hidden_units_
+    // for legacy callers.
+    int base_hidden_units_{0};
+    int draft_hidden_units_{0};
     int eagle_q_size_{0};
     int eagle_kv_size_{0};
     int eagle_qkv_in_dim_{0};
     int eagle_qkv_in_factor_{0};
     int eagle_fc_in_dim_{0};
     int eagle_fc_in_factor_{0};
+    std::vector<int> eagle_capture_layers_cfg_;
 
     // Shallow EagleNet block weights formatted for LlamaLinear
     // (single self‑attention + FC “MLP” style block).
@@ -254,10 +267,10 @@ public:
     const Tensor& debug_pre_head_hidden() const { return debug_pre_head_hidden_; }
     const Tensor& debug_logits() const { return debug_logits_; }
 
-    // Tree-aware draft path used from LlamaV2. This is a structural
-    // wrapper around the main Eagle draft forward that also applies
-    // Top-K over the draft / target logits to populate EagleBuffers
-    // draft/target token IDs on device.
+    // Tree-aware draft path used from LlamaV2. Current implementation
+    // runs per-sequence logits only (no per-node logits); tree nodes
+    // reuse per-slot last logits. TODO(Engineer C Task F): extend to
+    // per-node draft logits using flattened tree inputs.
     void forward_draft_tree(const Tensor& last_hidden_states,
                             const Tensor& captured_hidden_states,
                             const Tensor& base_logits,
@@ -268,7 +281,9 @@ public:
                             cudaStream_t  stream);
 
     // Cached model dims / dtype
-    int      hidden_units_{0};
+    int      hidden_units_{0};        // legacy default (draft hidden unless overridden)
+    int      base_hidden_units_{0};   // attention/output hidden width
+    int      draft_hidden_units_{0};  // Eagle-3 midlayer hidden width
     int      vocab_size_{0};
     DataType weight_dtype_{kFloat16};
     
