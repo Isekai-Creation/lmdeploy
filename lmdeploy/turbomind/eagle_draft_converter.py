@@ -209,7 +209,9 @@ def _resolve_base_lm_head(
         shards = _find_safetensor_shards(base_model_dir)
         if shards:
             try:
-                lm_head = _load_tensor_from_shards(shards, "lm_head.weight", optional=True)
+                lm_head = _load_tensor_from_shards(
+                    shards, "lm_head.weight", optional=True
+                )
             except Exception:
                 lm_head = None
             if lm_head is not None:
@@ -252,9 +254,7 @@ def _convert_llama_like(
     w_dtype = torch.float16
 
     # Token embeddings (optional).
-    emb = _load_tensor_from_shards(
-        shards, "model.embed_tokens.weight", optional=True
-    )
+    emb = _load_tensor_from_shards(shards, "model.embed_tokens.weight", optional=True)
     if emb is not None:
         _write_tensor(emb, os.path.join(out_dir, "tok_embeddings.weight"), w_dtype)
 
@@ -357,7 +357,16 @@ def _convert_eagle3_midlayer(
     base_model_dir: Optional[str],
     logger=None,
 ) -> None:
-    """Handle NVIDIA GPT‑OSS Eagle3 midlayer checkpoint (model.safetensors)."""
+    """Handle NVIDIA GPT-OSS Eagle3 midlayer checkpoint (model.safetensors).
+
+    This variant (Option 1) builds real attention weights for TurboMind's
+    LlamaAttention in *attention space* using the base model's first-layer
+    Q/K/V/O. QKV is laid out as [attn_hidden, 3 * attn_hidden] and Wo as
+    [attn_hidden, hidden_size], so Eagle3DraftLayer can run real MHA in
+    model space and project back to the draft hidden size.
+
+    MLP / FC / norms still come from the Eagle3 midlayer checkpoint.
+    """
     log = logger
     shards = _find_safetensor_shards(hf_dir)
     keys = _collect_all_keys(shards)
@@ -376,16 +385,10 @@ def _convert_eagle3_midlayer(
     _write_tensor(norm, os.path.join(out_dir, "norm.weight"), w_dtype)
 
     # LM head: ideally from base LM; otherwise synthetic.
-    lm_head = _resolve_base_lm_head(
-        base_model_dir, hidden_size, vocab_size, logger=log
-    )
+    lm_head = _resolve_base_lm_head(base_model_dir, hidden_size, vocab_size, logger=log)
     _write_tensor(lm_head, os.path.join(out_dir, "output.weight"), w_dtype)
 
-    # Token embeddings: the Eagle3 midlayer checkpoint for GPT‑OSS does
-    # not ship its own input token embedding table, but EagleModule's
-    # on‑disk layout includes a `tok_embeddings.weight` slot. Prefer to
-    # populate this from the *base* model so the draft head can consume
-    # real embeddings; if that fails, fall back to zeros as before.
+    # Token embeddings: populate from base model if available, else zeros.
     tok_emb_path = os.path.join(out_dir, "tok_embeddings.weight")
     if not os.path.exists(tok_emb_path):
         tok_emb: Optional[torch.Tensor] = None
@@ -405,7 +408,6 @@ def _convert_eagle3_midlayer(
                     if emb.shape == (vocab_size, hidden_size):
                         tok_emb = emb.to(w_dtype)
                     elif emb.shape == (hidden_size, vocab_size):
-                        # Transpose if layout is [hidden, vocab].
                         tok_emb = emb.to(w_dtype).transpose(0, 1)
                     elif log:
                         log.warning(
@@ -479,7 +481,7 @@ def _convert_eagle3_midlayer(
             if log:
                 log.warning(
                     "midlayer.mlp.down_proj.weight shape %s != (%d, %d); "
-                    "using as‑is for w2.weight.",
+                    "using as-is for w2.weight.",
                     tuple(down_w.shape),
                     hidden_size,
                     inter_size,
@@ -490,14 +492,7 @@ def _convert_eagle3_midlayer(
             w_dtype,
         )
 
-    # Pre-FC over concatenated hidden states. The Eagle3 checkpoint's
-    # `fc.weight` has shape [hidden, 3 * hidden] (out, in). For the
-    # simplified EagleNet block, we:
-    #   - export a legacy EagleNet-style FC as `fc.weight`
-    #     with shape [2 * hidden, hidden] (for existing paths), and
-    #   - export the full Eagle3 FC as `eagle_fc.weight` with shape
-    #     [3 * hidden, hidden] so EagleModule can consume the true
-    #     Eagle3 geometry when multi-layer capture is enabled.
+    # Pre-FC over concatenated hidden states (Eagle3-specific FC).
     fc_w = get("fc.weight", optional=True)
     if fc_w is None:
         raise RuntimeError("Eagle3 draft checkpoint is missing fc.weight")
@@ -524,42 +519,82 @@ def _convert_eagle3_midlayer(
         w_dtype,
     )
 
-    # Real Eagle3 attention weights (midlayer.self_attn.*). HF stores
-    # them as [out, in]; EagleModule expects a fused [in, q+2*kv] QKV
-    # matrix and a separate Wo of shape [q_size, hidden]. For GPT‑OSS
-    # Eagle3 this matches the TensorRT‑LLM geometry where Q uses a
-    # 2×hidden input.
-    q_w = get("midlayer.self_attn.q_proj.weight", optional=True)
-    k_w = get("midlayer.self_attn.k_proj.weight", optional=True)
-    v_w = get("midlayer.self_attn.v_proj.weight", optional=True)
-    o_w = get("midlayer.self_attn.o_proj.weight", optional=True)
-
-    if q_w is None or k_w is None or v_w is None or o_w is None:
+    # ------------------------------------------------------------------
+    # Real attention weights in LlamaAttention layout (Option 1).
+    #
+    # Instead of using the midlayer.self_attn.* geometry (which is based
+    # on 2x/3x hidden concatenations), we reuse the *base model's*
+    # first-layer Q/K/V/O as the Eagle3 draft attention backbone.
+    #
+    # This gives:
+    #   - QKV: [attn_hidden, 3 * attn_hidden]
+    #   - Wo:  [attn_hidden, hidden_size] (draft hidden)
+    #
+    # These shapes match the new C++ EagleModule/Eagle3DraftLayer real
+    # attention path.
+    # ------------------------------------------------------------------
+    if base_model_dir is None:
         raise RuntimeError(
-            "Eagle3 draft checkpoint is missing one of "
-            "midlayer.self_attn.{q_proj,k_proj,v_proj,o_proj}.weight"
+            "Eagle3 real-attention conversion (Option 1) requires "
+            "base_model_dir to provide model.layers.0.self_attn.{q,k,v,o}_proj.weight"
         )
 
-    q_in = q_w.shape[1]
-    if k_w.shape[1] != q_in or v_w.shape[1] != q_in:
+    base_shards = _find_safetensor_shards(base_model_dir)
+    if not base_shards:
         raise RuntimeError(
-            "Eagle3 q/k/v in_dims differ: "
-            f"q={tuple(q_w.shape)} k={tuple(k_w.shape)} v={tuple(v_w.shape)}"
+            f"No *.safetensors files found under base_model_dir={base_model_dir!r}"
         )
 
-    q_t = q_w.to(w_dtype).transpose(0, 1)  # [in, q_size]
-    k_t = k_w.to(w_dtype).transpose(0, 1)  # [in, kv_size]
-    v_t = v_w.to(w_dtype).transpose(0, 1)  # [in, kv_size]
-    qkv_fused = torch.cat([q_t, k_t, v_t], dim=1)  # [in, q+2*kv]
+    base_q = _load_tensor_from_shards(
+        base_shards, "model.layers.0.self_attn.q_proj.weight", optional=False
+    )
+    base_k = _load_tensor_from_shards(
+        base_shards, "model.layers.0.self_attn.k_proj.weight", optional=False
+    )
+    base_v = _load_tensor_from_shards(
+        base_shards, "model.layers.0.self_attn.v_proj.weight", optional=False
+    )
+    base_o = _load_tensor_from_shards(
+        base_shards, "model.layers.0.self_attn.o_proj.weight", optional=False
+    )
+
+    # HF Q/K/V/O are [out, in] with out = attn_hidden, in = attn_hidden
+    attn_hidden = base_q.shape[0]
+    if (
+        base_q.shape != (attn_hidden, attn_hidden)
+        or base_k.shape != (attn_hidden, attn_hidden)
+        or base_v.shape != (attn_hidden, attn_hidden)
+        or base_o.shape != (attn_hidden, attn_hidden)
+    ):
+        raise RuntimeError(
+            "Base model Q/K/V/O shapes do not match expected "
+            f"[attn_hidden, attn_hidden]; got "
+            f"q={tuple(base_q.shape)}, k={tuple(base_k.shape)}, "
+            f"v={tuple(base_v.shape)}, o={tuple(base_o.shape)}"
+        )
+
+    # QKV in [attn_hidden, 3 * attn_hidden] layout:
+    #   cat([Q, K, V], dim=0) → [3*attn_hidden, attn_hidden], then transpose.
+    qkv_cat = torch.cat([base_q, base_k, base_v], dim=0)  # [3*hidden, hidden]
+    qkv_tm = qkv_cat.to(w_dtype).transpose(0, 1).contiguous()  # [hidden, 3*hidden]
     _write_tensor(
-        qkv_fused,
+        qkv_tm,
         os.path.join(out_dir, "layers.0.attention.w_qkv.weight"),
         w_dtype,
     )
 
-    o_t = o_w.to(w_dtype).transpose(0, 1)  # [q_size, hidden]
+    # Wo: [attn_hidden, hidden_size] (draft hidden). Base o_proj is
+    # [attn_hidden, attn_hidden]; take the first hidden_size columns
+    # and pad if needed.
+    if base_o.shape[1] >= hidden_size:
+        wo_tm = base_o[:, :hidden_size].to(w_dtype)
+    else:
+        extra = hidden_size - base_o.shape[1]
+        pad = torch.zeros(base_o.shape[0], extra, dtype=base_o.dtype)
+        wo_tm = torch.cat([base_o, pad], dim=1).to(w_dtype)
+
     _write_tensor(
-        o_t,
+        wo_tm,
         os.path.join(out_dir, "layers.0.attention.wo.weight"),
         w_dtype,
     )
@@ -638,7 +673,12 @@ def prepare_eagle_draft_from_hf(
             if k == "eagle_mode":
                 continue
             model_cfg[k] = int(v)
-        required = ("eagle_q_size", "eagle_kv_size", "eagle_qkv_in_dim", "eagle_fc_in_dim")
+        required = (
+            "eagle_q_size",
+            "eagle_kv_size",
+            "eagle_qkv_in_dim",
+            "eagle_fc_in_dim",
+        )
         if not all(k in model_cfg for k in required):
             raise RuntimeError(
                 f"Failed to infer full Eagle3 geometry for {hf_model_dir!r}: "
