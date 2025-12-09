@@ -284,6 +284,21 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     weights_.output_norm = Tensor{{hidden_units}, dtype, kDEVICE};
     weights_.lm_head     = Tensor{{hidden_units, vocab_size}, dtype, kDEVICE};
 
+    // Optional native Eagle3 attention projections (non‑LLaMA geometry).
+    // Only allocate these when we have full Eagle3 geometry; otherwise
+    // they remain empty and the dedicated Eagle3Attention backend will
+    // be considered unavailable.
+    if (eagle3 && eagle_q_size_ > 0 && eagle_kv_size_ > 0 && eagle_qkv_in_dim_ > 0) {
+        // midlayer.self_attn.q_proj.weight: [q_out, q_in]   = [eagle_q_size_, eagle_qkv_in_dim_]
+        // midlayer.self_attn.k_proj.weight: [kv_out, q_in]  = [eagle_kv_size_, eagle_qkv_in_dim_]
+        // midlayer.self_attn.v_proj.weight: [kv_out, q_in]  = [eagle_kv_size_, eagle_qkv_in_dim_]
+        // midlayer.self_attn.o_proj.weight: [q_in, q_out]   = [eagle_qkv_in_dim_, eagle_q_size_]
+        weights_.eagle_q_proj = Tensor{{eagle_q_size_, eagle_qkv_in_dim_}, dtype, kDEVICE};
+        weights_.eagle_k_proj = Tensor{{eagle_kv_size_, eagle_qkv_in_dim_}, dtype, kDEVICE};
+        weights_.eagle_v_proj = Tensor{{eagle_kv_size_, eagle_qkv_in_dim_}, dtype, kDEVICE};
+        weights_.eagle_o_proj = Tensor{{eagle_qkv_in_dim_, eagle_q_size_}, dtype, kDEVICE};
+    }
+
     weights_.is_initialized = true;
 
     const std::string base = model_dir + "/";
@@ -364,6 +379,41 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     bool attn_o_ok = load_with_variants(weights_.attn_o, "layers.0.attention.wo.weight");
     if (!attn_o_ok) {
         TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.attention.wo.weight missing");
+    }
+    // Native Eagle3 Q/K/V/O projections (optional). These are only
+    // expected for true Eagle3 midlayer checkpoints; when absent we
+    // simply keep the dedicated Eagle3 attention backend disabled.
+    bool eagle_q_ok = false;
+    bool eagle_k_ok = false;
+    bool eagle_v_ok = false;
+    bool eagle_o_ok = false;
+    if (weights_.eagle_q_proj) {
+        eagle_q_ok = load_with_variants(weights_.eagle_q_proj, "eagle3.q_proj.weight");
+        if (!eagle_q_ok) {
+            TM_LOG_WARNING(
+                "[EAGLE][EagleModule::load] eagle3.q_proj.weight missing; Eagle3 native attention disabled for this engine");
+        }
+    }
+    if (weights_.eagle_k_proj) {
+        eagle_k_ok = load_with_variants(weights_.eagle_k_proj, "eagle3.k_proj.weight");
+        if (!eagle_k_ok) {
+            TM_LOG_WARNING(
+                "[EAGLE][EagleModule::load] eagle3.k_proj.weight missing; Eagle3 native attention disabled for this engine");
+        }
+    }
+    if (weights_.eagle_v_proj) {
+        eagle_v_ok = load_with_variants(weights_.eagle_v_proj, "eagle3.v_proj.weight");
+        if (!eagle_v_ok) {
+            TM_LOG_WARNING(
+                "[EAGLE][EagleModule::load] eagle3.v_proj.weight missing; Eagle3 native attention disabled for this engine");
+        }
+    }
+    if (weights_.eagle_o_proj) {
+        eagle_o_ok = load_with_variants(weights_.eagle_o_proj, "eagle3.o_proj.weight");
+        if (!eagle_o_ok) {
+            TM_LOG_WARNING(
+                "[EAGLE][EagleModule::load] eagle3.o_proj.weight missing; Eagle3 native attention disabled for this engine");
+        }
     }
     if (!load_with_variants(weights_.attn_norm, "layers.0.ffn_norm.weight")) {
         TM_LOG_WARNING("[EAGLE][EagleModule::load] layers.0.ffn_norm.weight missing");
@@ -579,7 +629,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         check_shape_2d(weights_.mlp_gate_up, inter_size * 2, hidden_units, "mlp_gate_up");
         check_shape_2d(weights_.mlp_down, inter_size, hidden_units, "mlp_down");
 
-        // Attention geometry for Eagle3 shallow block:
+        // Attention geometry for Eagle3 shallow block (LLaMA-style path):
         //   attn_qkv: [2 * hidden_units, eagle_q_size_ + 2 * eagle_kv_size_]
         //   attn_o:   [eagle_q_size_, hidden_units]
         bool attn_ok = true;
@@ -654,6 +704,74 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 }
                 // If mapped_ok is false, runtime fallback in Eagle3DraftLayer::Forward will
                 // handle this by using shallow QKV / pass-through for the step.
+            }
+        }
+
+        // Native Eagle3 attention geometry (non‑LLaMA). When available, we
+        // initialise Eagle3DraftLayerWeight::eagle3_attn so that the
+        // dedicated Eagle3Attention backend can be used instead of trying
+        // to reshape Eagle3 Q/K/V/O into a LLaMA layout.
+        if (eagle_q_ok && eagle_k_ok && eagle_v_ok && eagle_o_ok) {
+            eagle3_draft_layer_->eagle3_attn.init_from_tensors(
+                weights_.eagle_q_proj.borrow(),
+                weights_.eagle_k_proj.borrow(),
+                weights_.eagle_v_proj.borrow(),
+                weights_.eagle_o_proj.borrow());
+
+            auto& ew = eagle3_draft_layer_->eagle3_attn;
+            // Strict shape checks against Eagle3 geometry from config.yaml.
+            if (ew.is_initialized) {
+                if (!ew.q_proj || ew.q_proj.ndim() != 2
+                    || ew.q_proj.shape(0) != eagle_q_size_
+                    || ew.q_proj.shape(1) != eagle_qkv_in_dim_) {
+                    TM_LOG_WARNING(
+                        "[EAGLE3][EagleModule::load] q_proj shape [%d,%d] "
+                        "!= [%d,%d]; disabling Eagle3 attention for this engine.",
+                        ew.q_proj ? ew.q_proj.shape(0) : -1,
+                        ew.q_proj ? ew.q_proj.shape(1) : -1,
+                        eagle_q_size_,
+                        eagle_qkv_in_dim_);
+                    ew.is_initialized = false;
+                }
+                if (ew.is_initialized
+                    && (!ew.k_proj || ew.k_proj.ndim() != 2
+                        || ew.k_proj.shape(0) != eagle_kv_size_
+                        || ew.k_proj.shape(1) != eagle_qkv_in_dim_)) {
+                    TM_LOG_WARNING(
+                        "[EAGLE3][EagleModule::load] k_proj shape [%d,%d] "
+                        "!= [%d,%d]; disabling Eagle3 attention for this engine.",
+                        ew.k_proj ? ew.k_proj.shape(0) : -1,
+                        ew.k_proj ? ew.k_proj.shape(1) : -1,
+                        eagle_kv_size_,
+                        eagle_qkv_in_dim_);
+                    ew.is_initialized = false;
+                }
+                if (ew.is_initialized
+                    && (!ew.v_proj || ew.v_proj.ndim() != 2
+                        || ew.v_proj.shape(0) != eagle_kv_size_
+                        || ew.v_proj.shape(1) != eagle_qkv_in_dim_)) {
+                    TM_LOG_WARNING(
+                        "[EAGLE3][EagleModule::load] v_proj shape [%d,%d] "
+                        "!= [%d,%d]; disabling Eagle3 attention for this engine.",
+                        ew.v_proj ? ew.v_proj.shape(0) : -1,
+                        ew.v_proj ? ew.v_proj.shape(1) : -1,
+                        eagle_kv_size_,
+                        eagle_qkv_in_dim_);
+                    ew.is_initialized = false;
+                }
+                if (ew.is_initialized
+                    && (!ew.o_proj || ew.o_proj.ndim() != 2
+                        || ew.o_proj.shape(0) != eagle_qkv_in_dim_
+                        || ew.o_proj.shape(1) != eagle_q_size_)) {
+                    TM_LOG_WARNING(
+                        "[EAGLE3][EagleModule::load] o_proj shape [%d,%d] "
+                        "!= [%d,%d]; disabling Eagle3 attention for this engine.",
+                        ew.o_proj ? ew.o_proj.shape(0) : -1,
+                        ew.o_proj ? ew.o_proj.shape(1) : -1,
+                        eagle_qkv_in_dim_,
+                        eagle_q_size_);
+                    ew.is_initialized = false;
+                }
             }
         }
 

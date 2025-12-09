@@ -25,7 +25,7 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         if (param.input && param.output) {
             // Best-effort pass-through: copy input into output when the
             // caller has already allocated output.
-            Copy(param.input, param.output);
+            core::Copy(param.input, param.output);
         }
         return;
     }
@@ -40,7 +40,7 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             batch_size,
             q_in_dim);
         if (param.input && param.output) {
-            Copy(param.input, param.output);
+            core::Copy(param.input, param.output);
         }
         return;
     }
@@ -52,7 +52,7 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             q_in_dim,
             param.weights->q_in);
         if (param.input && param.output) {
-            Copy(param.input, param.output);
+            core::Copy(param.input, param.output);
         }
         return;
     }
@@ -70,9 +70,8 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
     //
     // For now, we keep behaviour safe by copying input into output.
     if (param.input && param.output) {
-        Copy(param.input, param.output);
+        core::Copy(param.input, param.output);
     }
 }
 
 }  // namespace turbomind
-

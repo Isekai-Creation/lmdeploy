@@ -115,21 +115,6 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         debug_fc_out_ = hidden_norm;
     }
 
-    // If QKV is totally incompatible, treat this step as pass-through instead
-    // of disabling the whole layer.
-    if (!is_qkv_compatible_()) {
-        TM_LOG_WARNING(
-            "[EAGLE3][Draft][fallback] LlamaAttentionWeight.qkv shape incompatible with Eagle3 "
-            "attn_qkv; treating Eagle3 draft as pass-through for this step.");
-        output_hidden = input_hidden;
-        if (debug_enabled) {
-            debug_attn_out_        = Tensor{};
-            debug_ffn_out_         = Tensor{};
-            debug_pre_head_hidden_ = input_hidden;
-        }
-        return;
-    }
-
     // 2) Attention: prefer real UnifiedAttentionLayer if available and geometry is sane;
     //    otherwise fall back to the shallow QKV+V→Wo path.
     Tensor attn_out{{batch_size, hidden_dim}, dtype, input_hidden.device()};

@@ -520,6 +520,64 @@ def _convert_eagle3_midlayer(
     )
 
     # ------------------------------------------------------------------
+    # Native Eagle3 midlayer attention projections.
+    #
+    # For GPT-OSS-style Eagle3 drafts, midlayer.self_attn.{q,k,v,o}_proj
+    # have non‑LLaMA geometry, e.g.:
+    #   q_proj: [q_out, q_in]   = [4096, 2880]
+    #   k_proj: [kv_out, q_in]  = [ 512, 2880]
+    #   v_proj: [kv_out, q_in]  = [ 512, 2880]
+    #   o_proj: [q_in, q_out]   = [2880, 4096]
+    #
+    # These are exported as‑is so that TurboMind can consume them via
+    # Eagle3AttentionWeight / Eagle3AttentionLayer without trying to
+    # squeeze them into a standard LLaMA attention layout.
+    # ------------------------------------------------------------------
+    q_mid = get("midlayer.self_attn.q_proj.weight", optional=True)
+    k_mid = get("midlayer.self_attn.k_proj.weight", optional=True)
+    v_mid = get("midlayer.self_attn.v_proj.weight", optional=True)
+    o_mid = get("midlayer.self_attn.o_proj.weight", optional=True)
+
+    if q_mid is not None and k_mid is not None and v_mid is not None and o_mid is not None:
+        # Derive expected Eagle-3 geometry and enforce it strictly so we
+        # never silently export malformed Q/K/V/O tensors.
+        geo = _infer_eagle3_geometry(shards, hidden_size, logger=log)
+        eagle_q_size = int(geo.get("eagle_q_size", 0))
+        eagle_qkv_in_dim = int(geo.get("eagle_qkv_in_dim", 0))
+
+        if eagle_q_size <= 0 or eagle_qkv_in_dim <= 0:
+            raise RuntimeError(
+                f"Eagle-3 draft geometry could not be inferred for {hf_dir!r}; "
+                f"missing eagle_q_size/eagle_qkv_in_dim metadata."
+            )
+
+        if q_mid.shape != (eagle_q_size, eagle_qkv_in_dim) \
+           or k_mid.shape[1] != eagle_qkv_in_dim \
+           or v_mid.shape[1] != eagle_qkv_in_dim \
+           or o_mid.shape != (eagle_qkv_in_dim, eagle_q_size):
+            raise RuntimeError(
+                "Eagle-3 draft Q/K/V/O shapes do not match expected geometry; refusing to export. "
+                f"Expected q=({eagle_q_size}, {eagle_qkv_in_dim}), "
+                f"k/v second dim={eagle_qkv_in_dim}, o=({eagle_qkv_in_dim}, {eagle_q_size}); "
+                f"got q={tuple(q_mid.shape)}, k={tuple(k_mid.shape)}, "
+                f"v={tuple(v_mid.shape)}, o={tuple(o_mid.shape)}"
+            )
+
+        _write_tensor(q_mid, os.path.join(out_dir, "eagle3.q_proj.weight"), w_dtype)
+        _write_tensor(k_mid, os.path.join(out_dir, "eagle3.k_proj.weight"), w_dtype)
+        _write_tensor(v_mid, os.path.join(out_dir, "eagle3.v_proj.weight"), w_dtype)
+        _write_tensor(o_mid, os.path.join(out_dir, "eagle3.o_proj.weight"), w_dtype)
+    elif log:
+        log.warning(
+            "Eagle3 midlayer attention weights incomplete "
+            "(found q=%s, k=%s, v=%s, o=%s); native Eagle3 attention will be disabled.",
+            tuple(q_mid.shape) if q_mid is not None else None,
+            tuple(k_mid.shape) if k_mid is not None else None,
+            tuple(v_mid.shape) if v_mid is not None else None,
+            tuple(o_mid.shape) if o_mid is not None else None,
+        )
+
+    # ------------------------------------------------------------------
     # Real attention weights in LlamaAttention layout (Option 1).
     #
     # Instead of using the midlayer.self_attn.* geometry (which is based

@@ -27,7 +27,7 @@ struct EagleWeight {
     Tensor embed_tokens;
     Tensor fc;
     Tensor eagle_fc;
-    
+
     // Layer level (single layer for Eagle3)
     Tensor input_norm;
     Tensor hidden_norm;
@@ -36,6 +36,15 @@ struct EagleWeight {
     Tensor attn_norm; // post_attention_layernorm
     Tensor mlp_gate_up;
     Tensor mlp_down;
+
+    // Optional native Eagle3 midlayer projections (non‑LLaMA geometry).
+    // When present, these hold midlayer.self_attn.{q,k,v,o}_proj weights
+    // exactly as exported from the HF Eagle3 checkpoint and are consumed
+    // by Eagle3AttentionLayer via Eagle3AttentionWeight.
+    Tensor eagle_q_proj;
+    Tensor eagle_k_proj;
+    Tensor eagle_v_proj;
+    Tensor eagle_o_proj;
     
     // Output level
     Tensor output_norm;
