@@ -97,40 +97,142 @@ Remaining / refinement tasks:
 
 Goal:
 
-- Retrofit MLA-style **latent KV** into GPT‑OSS / TurboMind **without changing the pretrained GPT‑OSS weights**:
-  - Store a compact latent representation per token (`c_i`).
-  - Reconstruct K/V from `c_i` at attention time.
-  - Compress long-range KV (especially SpecPV sink/retrieval), while keeping local window/buffer high‑fidelity.
+- Add MLA-lite **latent KV** to GPT‑OSS / TurboMind so that:
+  - The KV cache stores a smaller latent vector `c_t` per token (`d_c << 2 * d_k_total`).
+  - K/V are reconstructed from `c_t` on demand for attention.
+  - The path works in **prefill** and **decode**, with or without EAGLE/speculative decoding, and can be toggled by config.
 
-Conceptual design (per layer):
+#### 1.3.1 Config & weights
 
-- Add new projection matrices (trainable, but separate from GPT‑OSS weights):
-  - `W_c`: hidden_dim → d_c (e.g. d_c ≈ 512 or similar).
-  - `W_k_latent`: d_c → (num_kv_heads * head_dim).
-  - `W_v_latent`: d_c → (num_kv_heads * head_dim).
-- At runtime:
-  - Compute `c_i = h_i W_c` for each token and store `c_i` in the KV cache.
-  - When attention needs K/V:
-    - `K_i = c_i W_k_latent`
-    - `V_i = c_i W_v_latent`
-  - Apply RoPE / masking as in the existing attention backend.
+- Config:
+  - Extend model config (YAML / JSON) with:
+    - `attention.use_mla_kv: bool`
+    - `attention.mla_latent_dim: int` (d_c, e.g. 256/512).
+  - In C++ (TurboMind):
+    - Add fields to `AttentionParam` / equivalent:
+      - `bool use_mla_kv{false};`
+      - `int  mla_latent_dim{0};`
+- Weights (`LlamaAttentionWeight`):
+  - Existing:
+    - `qkv` / `q_proj`, `kv_a_proj` / `kv_b_proj` etc. (GPT‑OSS attention).
+  - MLA-lite additions per layer:
+    - `bool   use_mla_kv{false};`
+    - `int    mla_latent_dim{0};`
+    - `Tensor mla_W_c;      // [d_model, d_c]`
+    - `Tensor mla_W_k_lat;  // [d_c, n_kv_heads * d_head]`
+    - `Tensor mla_W_v_lat;  // [d_c, n_kv_heads * d_head]`
+  - Loader:
+    - If MLA tensors (e.g. `model.layers.{L}.self_attn.mla_W_*`) are present, load them and set `use_mla_kv=true`, `mla_latent_dim=mla_W_c.shape(1)`.
+    - Keep original K/V projections around for fallback and A/B.
+- Checkpoint surgery (Phase‑1 script):
+  - `scripts/gptoss_mla_kv_factor.py`:
+    - Reads GPT‑OSS HF shards and `model.safetensors.index.json`.
+    - For each layer, loads `self_attn.k_proj.weight` / `v_proj.weight` (W_k, W_v) and performs low-rank SVD on `[W_k | W_v]`:
+      - Produces `W_c`, `W_k_lat`, `W_v_lat` with rank `d_c`.
+    - Saves MLA-lite tensors into a standalone safetensors file:
+      - `model.layers.{L}.self_attn.mla_W_c`
+      - `model.layers.{L}.self_attn.mla_W_k_lat`
+      - `model.layers.{L}.self_attn.mla_W_v_lat`.
 
-Near-term implementation tasks:
+#### 1.3.2 KV-cache layout (with latent C)
 
-- TurboMind / UnifiedDecoder:
-  - Extend the KV cache layout / context to support storing `c_i` instead of (or in addition to) raw K/V for selected segments.
-  - Add a flag in engine config / `EngineParam` to enable MLA-lite KV compression.
-- Attention backend:
-  - Add a path where the attention kernel:
-    - Consumes latent KV (`c_i`) for sink/retrieval, reconstructs K/V on the fly via `W_k_latent` / `W_v_latent`.
-    - Keeps window/buffer in full KV representation.
-  - Start with a two-call implementation:
-    - One call over `[sink+retrieval]` using reconstructed K/V.
-    - One call over `[window+buffer]` using full K/V.
-  - Later fuse into a single kernel once numerics / layouts are validated.
-- Initialization:
-  - Implement SVD/PCA-based initialization for `W_c`, `W_k_latent`, `W_v_latent` from the frozen GPT‑OSS `W_k` / `W_v` to approximate them in a low-rank fashion.
-  - Provide a no-training “pure inference” mode for rapid experimentation.
+- Extend KV cache to store latent C per layer:
+  - Existing:
+    - `K_cache[layer, batch, n_kv_heads, max_seq, d_head]`
+    - `V_cache[layer, batch, n_kv_heads, max_seq, d_head]`
+  - New latent cache:
+    - `C_cache[layer, batch, max_seq, d_c]`
+- KV view helpers:
+  - `LayerKvView` / equivalent should expose:
+    - Pointers/slices for `k`, `v`, and `c`.
+    - Logical sequence length per layer (`current_len`).
+  - KV management (rewind/copy/gather) must treat `c` exactly like K/V:
+    - `rewind(new_len)` updates logical length for K, V, and C.
+    - `copy_prefix(src, dst, len)` copies C segments along with K/V.
+
+#### 1.3.3 LlamaAttention forward paths
+
+Assume a `UnifiedAttentionLayer`/`LlamaAttention` style interface with separate **prefill** and **decode** flows.
+
+- Prefill (B×T segment):
+  - Projection:
+    - Always compute Q from hidden states:
+      - `Q = H @ W_q`.
+    - If `use_mla_kv == false`:
+      - Compute `K = H @ W_k`, `V = H @ W_v` as today.
+    - If `use_mla_kv == true`:
+      - Compute latent:
+        - `C = H @ W_c` → `[B, T, d_c]`.
+      - Reconstruct K/V for this segment:
+        - `K = C @ W_k_lat`, `V = C @ W_v_lat`.
+  - RoPE:
+    - Apply existing RoPE kernels to Q and K as usual (per-head reshape).
+  - KV caching:
+    - Baseline path:
+      - Store K/V into KV cache for positions `[0..T-1]`.
+    - MLA-lite path:
+      - Store C into `C_cache` for positions `[0..T-1]`.
+      - Optionally store K/V too for debugging during rollout.
+  - Attention:
+    - For prefill, use the dense K/V computed from this H (no change to attention kernels).
+
+- Decode (single step t):
+  - Hidden input for step t: `h_t` (`[B, d_model]`).
+  - If `use_mla_kv == false`:
+    - Same as today: compute `q_t`, `k_t`, `v_t`, store `k_t/v_t` in caches, attend over full K/V history.
+  - If `use_mla_kv == true`:
+    - Projections:
+      - `q_t = h_t @ W_q`, `c_t = h_t @ W_c`.
+    - Cache:
+      - Store `c_t` into `C_cache` at position `t`.
+    - Reconstruct history:
+      - Fetch `C_hist = C_cache[:, :t+1, :]`.
+      - Compute:
+        - `K_hist = C_hist @ W_k_lat`, `V_hist = C_hist @ W_v_lat`.
+      - Apply RoPE to `q_t` and `K_hist` (per-position, per-head).
+      - Reshape to `[B, n_kv_heads, t+1, d_head]`.
+    - Attention:
+      - Call existing decode attention kernel with `q_t`, `K_hist`, `V_hist`.
+    - Complexity:
+      - This keeps O(T²) attention but adds GEMMs for `C_hist @ W_k_lat` / `C_hist @ W_v_lat`. Phase‑1 focuses on correctness + memory layout, not compute wins.
+
+#### 1.3.4 GEMM / CUDA placement
+
+- Reuse existing GEMM wrappers and cuBLAS/cuBLASLt paths used for Q/K/V projections:
+  - Prefill:
+    - `H_flat = [B*T, d_model]`, `W_c: [d_model, d_c]`, `W_k_lat/W_v_lat` same pattern.
+  - Decode:
+    - `h_t: [B, d_model]` for `q_t`, `c_t`.
+    - `C_hist_flat = [B*(t+1), d_c]` for reconstructing K/V.
+- No changes to RoPE kernels or core attention CUDA templates are needed for Phase‑1; they see dense Q/K/V as before.
+
+#### 1.3.5 Speculative decoding / EAGLE interaction
+
+- KV rewinds:
+  - Wherever `SequenceManager` / KV helpers truncate or rewind KV (`current_len` changes), ensure `C_cache` uses the same logical length as K/V.
+  - No P2P copies are required beyond what already exists for KV; just include `c` in prefix copy operations.
+- Branching / tree decode:
+  - Any KV branch, duplication, or gather (e.g. for EAGLE trees or beam search) must copy `c` segments alongside K/V.
+  - Provide a `copy_prefix` helper that copies K, V, and C consistently.
+- Draft vs target:
+  - Draft (EAGLE) model may remain non‑MLA; MLA-lite applies to the **target** GPT‑OSS decoder.
+  - Easiest integration:
+    - After each accepted prefix (prompt + accepted draft tokens), rebuild target KV via a prefill pass:
+      - This fills `C_cache` and ensures subsequent decode runs on MLA-lite KV.
+  - More advanced synchronized KV (sharing KV between draft/target) is a later optimization; Phase‑1 only requires target-side MLA-lite correctness.
+
+#### 1.3.6 Validation tasks
+
+- Sanity and A/B:
+  - With `rank = d_k_total + d_v_total` (full‑rank), verify:
+    - `||W_k - W_c @ W_k_lat||` and `||W_v - W_c @ W_v_lat||` are near machine epsilon.
+    - Prefill+decode logits match baseline within numeric noise on small prompts.
+  - With reduced ranks (`d_c = 768, 512, 256`), log:
+    - Relative reconstruction error norms for K/V.
+    - Perplexity deltas on small validation sets.
+  - Measure KV memory footprint:
+    - Confirm KV cache reduces from `2 * d_k_total` floats/token/layer to `d_c` floats/token/layer in MLA mode.
+
 
 ### 1.4 DSA-lite sparse attention (DeepSeek-style indexing)
 
@@ -336,4 +438,3 @@ Suggested loss stack for Strategy B:
      - Base vs EAGLE3 vs EAGLE3+SpecPV vs EAGLE3+SpecPV+MLA/DSA.
 
 This doc should stay in sync with `EAGLE_TODO.md`, `EAGLE_TODO_COMPLETE`, and `SPECPV_TODO.md` as the implementation progresses. 
-

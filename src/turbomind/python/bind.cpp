@@ -399,11 +399,12 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         const auto* draft_w = module.eagle3_draft_layer();
 
         // In this offline helper we don't have a full UnifiedAttentionLayer
-        // instance, so we pass nullptr for attn_layer. Eagle3DraftLayer will
-        // fall back to its guarded shallow path when attn_layer_ is null.
+        // instance or Eagle3AttentionLayer, so we pass nullptr for both.
+        // Eagle3DraftLayer will fall back to its guarded shallow path.
         ft::Eagle3DraftLayer draft_layer(
             draft_w,
             /*attn_layer=*/nullptr,
+            /*eagle3_attn_layer=*/nullptr,
             &ffn_layer,
             /*rmsnorm_eps=*/1e-5f);
 
@@ -1273,11 +1274,15 @@ PYBIND11_MODULE(_turbomind, m)
 
                 const auto* draft_w = module.eagle3_draft_layer();
                 // For this standalone debug helper we do not have a
-                // UnifiedDecoder context, so we pass a null
-                // UnifiedAttentionLayer pointer and rely on the
-                // single-position draft attention path.
+                // UnifiedDecoder context or Eagle3 attention backend,
+                // so we pass null pointers and rely on the guarded
+                // single-position draft path.
                 ft::Eagle3DraftLayer draft_layer(
-                    draft_w, /*attn_layer=*/nullptr, &ffn_layer, /*rmsnorm_eps=*/1e-5f);
+                    draft_w,
+                    /*attn_layer=*/nullptr,
+                    /*eagle3_attn_layer=*/nullptr,
+                    &ffn_layer,
+                    /*rmsnorm_eps=*/1e-5f);
 
                 // Allocate output hidden buffer and run the draft layer.
                 hidden_out = Tensor(

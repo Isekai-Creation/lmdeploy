@@ -10,6 +10,7 @@ add_library(Llama STATIC
         LlamaBatch.cc
         specpv_kv_cache.cc
         LlamaLinear.cu
+        eagle3_attention_layer.cc
         EagleDraftLayer.cc
         BlockManager.cc
         BlockTrie.cc

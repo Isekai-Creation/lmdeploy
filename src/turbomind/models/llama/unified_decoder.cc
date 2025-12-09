@@ -11,6 +11,7 @@
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/models/llama/moe_ffn_layer.h"
 #include "src/turbomind/models/llama/unified_attention_layer.h"
+#include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include "src/turbomind/models/llama/unified_decoder.h"
 #include "src/turbomind/utils/anomaly_handler.h"
 #include "src/turbomind/utils/cuda_utils.h"
@@ -36,6 +37,7 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
     tune_layer_num_(model.tune_layer_num)
 {
     attn_layer_ = std::make_unique<UnifiedAttentionLayer>(model, attn, engine, lora, attn_tp_size_, ctx);
+    eagle3_attn_layer_ = std::make_unique<Eagle3AttentionLayer>(&ctx.device_prop, ctx.stream);
 
     if (std::accumulate(moe.expert_num.begin(), moe.expert_num.end(), 0LL)) {
         moe_ffn_layer_ = std::make_unique<MoeFfnLayer>(model, moe, engine, ctx);
@@ -82,6 +84,7 @@ void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
         eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayer>(
             w,
             attn_layer_.get(),
+            eagle3_attn_layer_.get(),
             ffn_layer_ ? ffn_layer_.get() : nullptr,
             rmsnorm_eps_);
 
@@ -94,9 +97,10 @@ void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
     else {
         TM_LOG_WARNING(
             "[UnifiedDecoder][EAGLE3][fallback] draft layer disabled "
-            "(weights=%p, attn_layer=%p, ffn_layer=%p)",
+            "(weights=%p, attn_layer=%p, eagle3_attn_layer=%p, ffn_layer=%p)",
             static_cast<const void*>(w),
             static_cast<void*>(attn_layer_.get()),
+            static_cast<void*>(eagle3_attn_layer_.get()),
             static_cast<void*>(ffn_layer_.get()));
         eagle3_draft_layer_.reset();
     }

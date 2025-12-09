@@ -1,261 +1,475 @@
-# TurboMind EAGLE3 – Final TODO Snapshot (Code State as of Current Branch)
+# TurboMind EAGLE‑3 – Design & TODO Checklist
 
-This file reflects the **current implementation** in this repo and the
-**remaining coding work** needed to get as close as practical to
-TensorRT‑LLM Eagle‑3 behaviour on TurboMind.
-
-It is implementation‑only: no process, no docs, no tests.
+This file is the **implementation + design TODO** for bringing TurboMind’s
+EAGLE‑3 path to **production‑grade parity** with TensorRT‑LLM on
+**GPT‑OSS‑120B‑Eagle3**.
 
 Status markers:
 - `[x]` implemented in this tree (may still need tuning)
 - `[ ]` not implemented / still to do
 
----
-
-## 0. High‑Level Progress (per area)
-
-- Target‑tree decode (TurboMind target side):
-  - **[x]** Prepared tree inputs (`targetTreeDecode` → `EagleBuffers::inputs.eagle_net_*`).
-  - **[x]** Scratch KV tree decode with prefix reuse (`runEagleTargetTreeDecode`).
-  - **[x]** Packed tree masks in attention (`spec_packed_mask` → `UnifiedAttentionLayer`).
-  - **[x]** Tree logits → per‑node `target_tokens` (device argmax + scatter).
-
-- Acceptance + multi‑token tails + KV rewind:
-  - **[x]** Device tree acceptance (`invokeTreeAcceptByIdsWithPaths`, strict ID equality).
-  - **[x]** Tail commit via `DynamicDecodeLayer::ForwardMultiStep`
-           (EOS, seq_limit_len / max_new_tokens, per‑slot finished).
-  - **[x]** Multi‑token metrics + KV rewind driven by committed tail lengths.
-
-- Eagle‑3 converter, geometry, capture + FC:
-  - **[x]** Converter exports Eagle‑3 FC/QKV/WO/MLP/norms/embeddings/LM head
-           with correct geometry into draft dir + `config.yaml`.
-  - **[x]** `EagleModule::load` enforces Eagle‑3 geometry and builds
-           `Eagle3DraftLayerWeight` with strict shape checks and local fallbacks.
-  - **[x]** UnifiedDecoder capture width matches `eagle_fc_in_dim`; FC+norm path
-           is enforced and locally disabled per engine on mismatch.
-
-- Eagle‑3 draft layer under UnifiedDecoder:
-  - **[x]** `Eagle3DraftLayerWeight` (attn + FFN + norms) built from converter exports.
-  - **[x]** `Eagle3DraftLayer::Forward` path exists:
-           RMSNorm → attention (UnifiedAttentionLayer when geometry OK,
-           otherwise shallow QKV+V→Wo) → RMSNorm → GatedMLP →
-           residual + output RMSNorm.
-  - **[x]** `UnifiedDecoder::ForwardDraft` uses `Eagle3DraftLayer` when available.
-  - **[x]** `LlamaV2::runEagle3DraftTreeDecode` drives draft logits and fills
-           `EagleBuffers::inputs.draft_tokens/target_tokens`.
-  - **[x]** For `spec_method == "eagle3"`, `dynamicDecodeWithSpecMulti` uses
-           `runEagle3DraftTreeDecode` exclusively; EagleModule draft is used only
-           for non‑Eagle‑3 modes.
-  - **[ ]** Eagle‑3 draft attention still runs at “single‑position” semantics
-           (q_len = kv_len = 1, no KV reuse) – multi‑position target‑tree parity
-           with TensorRT‑LLM is still pending.
-
-- SpecPV partial KV:
-  - **[x]** `SpecPVCacheConfig` + `PartialKVCache` implemented (`specpv_kv_cache`).
-  - **[x]** Seeding from full KV (`initSpecPVFromFullKV`) and partial/full
-           switching policy in `LlamaV2`.
-  - **[x]** Tree decode can run against partial KV in SpecPV mode.
-  - **[x]** Post‑acceptance partial KV update wired to EAGLE committed tail
-           lengths via `PartialKVCache::update_after_acceptance` and
-           `LlamaV2::updateSpecPVAfterAcceptance`, with per‑layer/slot guards.
+Roles (for reference):
+- **A – Kernels & math** (attention, RoPE, KV layout, CUDA)
+- **B – Model & converter** (HF → draft dir, geometry, config)
+- **C – TurboMind integration** (LlamaV2, UnifiedDecoder, KV, LMDeploy)
+- **D – Validation & infra** (tests, debug harnesses, benchmarks)
 
 ---
 
-## 1. Eagle‑3 Draft Layer – Remaining Work
+## 0. Scope & Success Criteria
 
-### 1.1 Tighten real multi‑head attention usage
+**Functional parity (vs TensorRT‑LLM Eagle‑3 on GPT‑OSS‑120B)**
+- [ ] Multi‑token EAGLE‑3 draft tree decode (static tree for GPT‑OSS‑120B).
+- [ ] **Real Eagle‑3 attention** in the draft head
+      (no “shallow QKV hack” in normal configs).
+- [ ] Correct acceptance, tail commit, and KV reuse under:
+      - dynamic batching,
+      - block reuse / block manager semantics,
+      - mixed prefill + decode (offline pipeline).
 
-**Where:**
-- `src/turbomind/models/llama/EagleDraftLayer.{h,cc}`
-- `src/turbomind/models/llama/unified_attention_layer.{h,cc}` / `LlamaAttentionLayer` (reference)
+**Numeric parity**
+- [ ] Stage‑wise draft numerics for GPT‑OSS‑120B‑Eagle3:
+      - ATTN_OUT / FFN_OUT / PRE_HEAD / LOGITS:
+        TM vs HF/TRT within agreed tolerances (cosine, max diff).
+- [ ] Speculative acceptance behaviour consistent with TRT‑LLM
+      for the **same model + prompts** (distribution of accepted lengths,
+      EOS/stop behaviour).
 
-**Current:**
-- `Eagle3DraftLayer::Forward` does:
-  - `input_norm` RMSNorm on `input_hidden`.
-  - If geometry is valid (hidden_dim == head_num * size_per_head) and
-    `UnifiedAttentionLayer` is available:
-    - Calls `UnifiedAttentionLayer::Forward` once with `q_len = kv_len = 1`.
-  - Otherwise falls back to a shallow fused QKV+V→Wo path using
-    `attn.qkv.weight` and `attn.output.weight`.
-  - Then FFN + residual + output RMSNorm as a mini‑decoder block.
+**Performance parity**
+- [ ] Mean acceptance length in the **4–7 tokens** range on
+      GPT‑OSS‑120B‑Eagle3 workloads comparable to TRT‑LLM.
+- [ ] Throughput improvement vs baseline TurboMind (no spec) is
+      **≥ TRT‑LLM Eagle‑3** on the same hardware class (H100/B200/GB200)
+      for representative prompts (8K/32K context).
 
-**TODO:**
-- [ ] Ensure Eagle‑3 always uses UnifiedAttentionLayer when geometry allows:
-  - Validate that `head_num`, `kv_head_num`, `size_per_head` are read from
-    Eagle‑3 geometry and match GPT‑OSS‑120B config.
-  - Confirm in logs (when `eagle_debug` is enabled) that UnifiedAttentionLayer
-    is actually used in normal Eagle‑3 runs (not just falling back).
-- [ ] For future multi‑position draft paths (if needed):
-  - Extend `Eagle3DraftLayer::Forward` and/or a new `ForwardTree` to accept
-    `q_len > 1` and `kv_len >= q_len`, using the same KV/rope path as
-    the main decoder.
-  - This is optional but required for strict TensorRT‑LLM parity.
-
-**Guards:**
-- [x] If attention cannot be set up (geometry mismatch, invalid head config):
-  - Logs `[EAGLE3][Draft] invalid attention geometry; skipping Eagle3DraftLayer::Forward`.
-  - Passes through `output_hidden = input_hidden`.
-  - Does **not** modify global EAGLE state.
-
-### 1.2 Confirm Eagle‑3 draft source is solely `UnifiedDecoder::ForwardDraft`
-
-**Where:**
-- `src/turbomind/models/llama/LlamaV2.cc`
-- `src/turbomind/models/llama/EagleModule.cc`
-
-**Status:**
-- [x] For `engine_param.spec_method == "eagle3"`:
-  - `LlamaV2::dynamicDecodeWithSpecMulti` uses only:
-    - `runEagle3DraftTreeDecode` → `UnifiedDecoder::ForwardDraft` → LM head →
-      device Top‑K → `EagleBuffers::inputs.draft_tokens/target_tokens`.
-  - `EagleModule::forward_draft_tree` is used only for legacy (non‑Eagle‑3) modes.
-
-**TODO:**
-- [ ] Keep this invariant when refactoring:
-  - Any new Eagle‑3 draft implementation (e.g. multi‑position) must live under
-    UnifiedDecoder and be invoked via `ForwardDraft` / `runEagle3DraftTreeDecode`.
-  - `EagleModule` stays responsible only for non‑Eagle‑3 draft modes.
-
-### 1.3 Eagle‑3 debug binding and HF/TRT comparison
-
-**Where:**
-- `src/turbomind/python/bind.cpp`
-- `tests/turbomind/eagle3_compare.py`
-
-**Status:**
-- [x] `_turbomind.eagle_forward_logits_debug` / `_turbomind.eagle3_forward_debug`
-  share a C++ helper that:
-  - Imports `hidden_states` (and optionally `captured_hidden`) via DLPack.
-  - If an Eagle‑3 draft layer is present:
-    - Runs `Eagle3DraftLayer::Forward` + LM head directly.
-    - Returns `logits` and, when enabled, stage‑wise intermediates
-      (e.g. `attn_out`, `ffn_out`, `pre_head_hidden`).
-  - Otherwise falls back to the legacy EagleModule shallow path.
-- [x] `tests/turbomind/eagle3_compare.py` calls this debug binding and computes
-  argmax/top‑k overlap for logits; some variants already print per‑stage stats.
-
-**TODO:**
-- [ ] Ensure `eagle3_compare.py` always uses the Eagle‑3 draft path:
-  - Prefer `_turbomind.eagle3_forward_debug` and assert that it exercises
-    `Eagle3DraftLayer` (not the legacy path).
-- [ ] In `eagle3_compare.py`:
-  - For each stage where HF and TM tensors exist:
-    - ATTN_OUT, FFN_OUT, PRE_HEAD, LOGITS:
-      - Compute `mean_abs_diff`, `max_abs_diff`, cosine similarity.
-    - For LOGITS:
-      - argmax match rate and top‑k overlap.
-  - Use this as the core numeric loop for tuning Eagle‑3 draft geometry and
-    capture ordering.
-
-### 1.4 Iterate numerically until draft logits are usable
-
-**Where:**
-- `tests/turbomind/eagle3_compare.py`
-- `TensorRT-LLM/` reference (`Eagle3DecoderLayer`, `Eagle3DraftModel`)
-
-**TODO:**
-- [ ] For GPT‑OSS‑120B‑Eagle3:
-  - Compare TM vs HF stage‑wise and adjust only when metrics show clear issues:
-    - capture layer indices/order vs HF,
-    - QKV input composition (`[embed_norm, fc_norm]`, etc.),
-    - norm placements (only if absolutely necessary).
-- [ ] Stop when:
-  - LOGITS `argmax_match_rate > 0` with non‑trivial top‑k overlap, and
-  - LOGITS cosine similarity is reasonable given MXFP4/BF16 vs HF.
-
-### 1.5 Final Eagle‑3 draft cleanup
-
-**TODO:**
-- [ ] Once the new Eagle‑3 draft layer is stable:
-  - Remove any remaining Eagle‑3‑specific shallow QKV+Wo draft paths and
-    debug‑only code in `EagleModule`.
-  - Verify:
-    - All draft tokens for `spec_method == "eagle3"` come from
-      `UnifiedDecoder::ForwardDraft` + LM head + Top‑K.
-    - `EagleModule` does not participate in Eagle‑3 drafting at all.
+**Integration**
+- [x] Works in **offline pipeline** (TurboMind engine via LMDeploy).
+- [ ] Coexists cleanly with:
+      - non‑speculative decode,
+      - other speculative methods (vanilla, lookahead, Medusa‑style),
+      - **SpecPV** (partial KV) as an optional long‑context optimisation.
 
 ---
 
-## 2. SpecPV Partial KV – Remaining Work
+## 1. Phase 0 – Spec Extraction & Design Alignment (TRT‑LLM + EAGLE)
 
-### 2.1 Explicit post‑acceptance update in `PartialKVCache`
+Goal: a short **design doc** that is the source of truth for the rest of the
+work. No further refactors until this is written and reviewed.
 
-**Where:**
-- `src/turbomind/models/llama/specpv_kv_cache.{h,cc}`
+**Where to read (TRT‑LLM side):**
+- `tensorrt_llm/models/eagle/model.py`
+- `tensorrt_llm/_torch/speculative/eagle3.py`
+- `tensorrt_llm/_torch/speculative/drafting_loops.py`
+- `tensorrt_llm/_torch/models/modeling_speculative.py`
+  (Eagle3Attention / Eagle3DecoderLayer / Eagle3DraftModel / Eagle3ForCausalLM)
+- KV + attention meta:
+  - `tensorrt_llm/_torch/attention_backend/trtllm.py`
+  - `tensorrt_llm/_torch/metadata.py` (`KVCacheParams`, `AttentionMetadata`)
+- E2E & Eagle‑3 tests:
+  - `tests/unittest/_torch/speculative/test_eagle3.py`
+  - `tests/unittest/_torch/speculative/test_kv_cache_reuse.py`
+- Docs:
+  - `docs/source/blogs/tech_blog/blog11_GPT_OSS_Eagle3.md`
+  - `docs/source/advanced/speculative/eagle3_*` (if present)
 
-**Status:**
-- [x] `SpecPVCacheConfig` and `PartialKVCache` exist, with:
-  - K/V segments (sink, retrieval, window, buffer),
-  - summary Kmax/Kmin, retrieval scoring, update/refresh/reset.
-- [x] `PartialKVCache::update_after_acceptance(layer_idx, slot, advance_tokens)`
-  is implemented and used to advance `verified_lens_[layer_idx]` and update
-  `global_verified_len_`.
-  - On invalid `layer_idx`, zero `buffer_size()`, negative current length,
-    or buffer overflow:
-    - Logs `[SpecPV][fallback] ...`.
-    - Disables SpecPV for the engine (`enabled_ = false`) and resets
-      `global_verified_len_` to 0.
+**Where to read (EAGLE repo side):**
+- `EAGLE/eagle/modeling_eagle.py`
+- EAGLE‑3 training/inference scripts:
+  - `EAGLE/eagle/traineagle3/*`
+  - `EAGLE/eagle/application/*`
 
-### 2.2 Wire `update_after_acceptance` into the EAGLE multi‑token path
+**Deliverables (doc to live under `docs/` – name TBC):**
 
-**Where:**
-- `src/turbomind/models/llama/LlamaV2.cc`
-- `src/turbomind/layers/DynamicDecodeLayer.cc` (for `committed_lengths`)
+- [ ] **1.1 Eagle‑3 inference loop (TRT‑LLM) – GPT‑OSS‑120B**
+  - Diagram the flow for *one step* of speculative decoding:
+    - Base model forward (GPT‑OSS‑120B) with KV reuse.
+    - Hidden capture for Eagle‑3 (which layers; how concatenated).
+    - Eagle‑3 FC + attention + MLP + LM head → draft logits.
+    - Tree structure construction (static tree for Eagle‑3).
+    - Acceptance and KV cache updates.
+  - Include:
+    - `Eagle3ResourceManager.hidden_states` shape:
+      `[max_tokens, hidden_size * num_capture_layers]`.
+    - How `layers_to_capture` translates into the FC input layout.
+    - How `max_draft_len` and `max_total_draft_tokens` feed into KV
+      over‑provisioning (extra KV tokens).
 
-**Status:**
-- [x] After `dynamicDecodeWithSpecMulti` commits tails, `LlamaV2`
-  calls `updateSpecPVAfterAcceptance`, which:
-  - Reads per‑slot committed tail lengths from `ForwardMultiStep`.
-  - Treats single‑token steps as `advance = 1`.
-  - For each slot and each layer, calls
-    `specpv_kv_cache_->update_after_acceptance(layer, slot, advance)`
-    when SpecPV is enabled.
-  - If the cache disables itself during these updates, logs
-    `[SpecPV][fallback] PartialKVCache update_after_acceptance failed; disabling SpecPV for this engine.`
-    and clears SpecPV state without affecting EAGLE or baseline KV.
+- [ ] **1.2 Tensor shapes at each Eagle‑3 draft stage**
+  - For GPT‑OSS‑120B‑Eagle3 specifically:
+    - Pre‑FC input: `[B, hidden * num_capture_layers]` or equivalent.
+    - `fc.weight` from Eagle‑3 draft: `[hidden, hidden * N]` (EAGLE code +
+      HF checkpoint; N≈3 for current GPT‑OSS checkpoint).
+    - q/k/v/o projections:
+      - HF/EAGLE: `midlayer.self_attn.{q,k,v,o}_proj.weight`.
+      - TRT‑LLM: shapes used in attention kernels.
+    - Attention outputs and LM head input/output:
+      - context vector dimension,
+      - LM head weight layout (row/column major).
 
-### 2.3 Keep partial/full switching disciplined
-
-**Where:**
-- `LlamaV2` SpecPV helpers (`isSpecPVEnabled`, `shouldUseSpecPV`,
-  `initSpecPVFromFullKV`, refresh logic)
-
-**Status / remaining checks:**
-- [x] `shouldUseSpecPV`, `specpv_partial_steps_`, and headroom thresholds:
-  - Gate entry into SpecPV based on sequence length.
-  - Force full‑KV tree decode when partial steps or buffer headroom are
-    exhausted.
-  - Reseed the partial KV from full KV via `initSpecPVFromFullKV`,
-    then rely on `update_after_acceptance` for buffer‑local tails.
-- [ ] When tuning SpecPV further, always verify that:
-  - EAGLE semantics (tree structure, acceptance, EOS/stop handling) are
-    unchanged.
-  - SpecPV only affects which KV entries the target attends to during
-    target‑tree decode, not the logical sequence of accepted tokens.
+- [ ] **1.3 Mapping TRT‑LLM ↔ TurboMind components**
+  - TRT‑LLM:
+    - Eagle‑3 PyTorch stack:
+      - `Eagle3SpecMetadata`, `Eagle3ResourceManager`,
+      - Eagle‑3 **one‑model** worker / sampler,
+      - drafting loops & KV reuse.
+    - Engine pieces:
+      - draft QKV + attention kernels,
+      - KV layout (paged KV, extra KV tokens per sequence).
+  - TurboMind:
+    - `EagleModule` / `Eagle3DraftLayerWeight` / `Eagle3DraftLayer`.
+    - `UnifiedDecoder::ForwardDraft`.
+    - `LlamaV2::dynamicDecodeWithSpecMulti` /
+      `runEagle3DraftTreeDecode` / `runEagleTargetTreeDecode`.
+    - `SequenceManager`, KV layout, block manager.
+  - The doc should state *explicitly* which TRT‑LLM behaviours we are
+    reproducing and which we intentionally approximate (e.g. if we keep
+    single‑position draft attention initially).
 
 ---
 
-## 3. Quick Numeric/Perf Checklist Before Calling It “Done”
+## 2. Phase 1 – Converter & Weight Layout (EAGLE‑3 Draft)  – **Owner: B**
 
-Once the TODOs above are implemented, the final validation loop should be:
+Current state:
+- **[x]** `lmdeploy/turbomind/eagle_draft_converter.py`:
+  - Detects `eagle3_midlayer` layout by inspecting HF keys.
+  - Writes `config.yaml` with:
+    - `hidden_units`, `vocab_size`, `head_num`, `size_per_head`,
+      `inter_size`,
+    - Eagle‑3 metadata: `eagle_q_size`, `eagle_kv_size`,
+      `eagle_qkv_in_dim`, `eagle_fc_in_dim`, `eagle_mode="eagle3"`.
+  - `_convert_eagle3_midlayer`:
+    - Writes norms, MLP weights from `midlayer.*`.
+    - Validates `fc.weight` shape `(hidden, 3 * hidden)`.
+    - Exports:
+      - `fc.weight` (legacy shallow path),
+      - `eagle_fc.weight` (`[3*hidden, hidden]`).
+    - Builds real attention weights **from the base model’s** layer‑0
+      Q/K/V/O into TurboMind’s LlamaAttention layout:
+      - `layers.0.attention.w_qkv.weight`: `[hidden, 3 * hidden]`.
+      - `layers.0.attention.wo.weight`:  `[attn_hidden, hidden]` (draft).
 
-- [ ] `tests/turbomind/eagle3_compare.py`:
-  - Stage stats for Eagle‑3 draft:
-    - ATTN_OUT, FFN_OUT, PRE_HEAD, LOGITS vs HF Eagle‑3.
-  - LOGITS:
-    - `argmax_match_rate` and top‑k overlap > 0.
+**TODOs:**
 
-- [ ] `inference/benchmark_speculative.py` / `run_spec_suite.sh`:
-  - For GPT‑OSS‑120B + Eagle‑3 draft:
-    - `mean_acceptance_length > 1`.
-    - `fraction_steps_accept_ge2 > 0`.
-    - Throughput ≥ baseline (non‑speculative) in key scenarios (e.g., 8K/32K).
+- [ ] **2.1 Lock in Eagle‑3 geometry for GPT‑OSS‑120B**
+  - Using HF configs:
+    - `openai/gpt-oss-120b`,
+    - `nvidia/gpt-oss-120b-Eagle3`,
+    - Eagle repo’s `EAGLEConfig` in `modeling_eagle.py`.
+  - Document in the design doc:
+    - `hidden_size`, `intermediate_size`,
+    - `num_attention_heads`, `num_key_value_heads`, head dim,
+    - Eagle‑3 FC fan‑in factor (`eagle_fc_in_factor`) and
+      Q/K/V sizes used in the draft head.
 
-- [ ] SpecPV‑enabled runs (long context only):
-  - EAGLE acceptance stats similar to full‑KV runs.
-  - Lower target‑tree decode cost at long context (fewer KV tokens per step).
+- [ ] **2.2 Reconcile converter layout with TRT‑LLM Eagle‑3**
+  - Compare:
+    - EAGLE’s `midlayer.self_attn.{q,k,v,o}_proj.weight`
+      and `fc.weight`.
+    - TRT‑LLM’s Eagle‑3 path (PyTorch):
+      - how it forms FC input from captured hidden states,
+      - how Q/K/V/O are applied.
+  - Decide, **per model family**:
+    - whether we can safely reuse base‑model layer‑0 Q/K/V/O in a
+      standard LLaMA attention layout (for “Llama‑like” Eagle‑3 drafts),
+      or
+    - for GPT‑OSS‑style Eagle‑3 midlayers (e.g. q/k/v/o shapes
+      4096×2880, 512×2880, 512×2880, 2880×4096), we must treat these
+      as **non‑LLaMA geometry** and feed them to a dedicated Eagle‑3
+      attention backend instead of trying to squeeze them into
+      `UnifiedAttentionLayer`.
+  - Update `_convert_eagle3_midlayer` accordingly:
+    - keep the existing “Llama‑like” path that exports
+      `layers.0.attention.w_qkv.weight` / `wo.weight` only when the
+      HF shapes match `[hidden, hidden]`,
+    - add a **separate Eagle‑3 path** that:
+      - writes midlayer `q_proj/k_proj/v_proj/o_proj` as‑is under
+        Eagle‑3‑specific names (e.g. `eagle3_q/k/v/o.weight`),
+      - records the Eagle‑3 attention geometry in `config.yaml`
+        (q_size, kv_size, eagle_in_dim, head counts),
+      - is consumed by the dedicated Eagle‑3 attention backend in
+        Phase 2 instead of `UnifiedAttentionLayer`.
 
-At that point, TurboMind’s Eagle‑3 speculative decoding is structurally and
-numerically aligned as far as is reasonable with TensorRT‑LLM, with SpecPV
-providing an additional, optional verification optimisation on top.
+- [ ] **2.3 Strengthen config + shape validation**
+  - Add explicit unit tests under `tests/turbomind` to:
+    - run `prepare_eagle_draft_from_hf` on a small Eagle‑3 checkpoint
+      (or a synthetic subset),
+    - read back `config.yaml` and all `.weight` files,
+    - assert shapes/dtypes:
+      - `layers.0.attention.w_qkv.weight`,
+      - `layers.0.attention.wo.weight`,
+      - `fc.weight`, `eagle_fc.weight`,
+      - MLP and norm weights.
+  - Converter should:
+    - **fail fast** with clear messages if the HF checkpoint deviates
+      from the expected Eagle‑3 layout (rather than silently producing
+      an approximate draft).
 
+---
+
+## 3. Phase 2 – Eagle‑3 Draft Attention & Capture  – **Owner: A**
+
+Current state:
+- **[x]** `Eagle3DraftLayerWeight` aggregates:
+  - `LlamaAttentionWeight` + `LlamaFfnWeight` + norm tensors.
+- **[x]** `Eagle3DraftLayer::Forward`:
+  - `input_norm` RMSNorm → attention backend → `post_attn_norm` RMSNorm →
+    FFN → residual + `output_norm` RMSNorm.
+  - Today the attention backend is:
+    - `UnifiedAttentionLayer` when geometry matches standard Llama
+      (Q/K/V/O all `hidden × hidden`, fused QKV `[hidden, 3*hidden]`),
+    - **fallback** shallow QKV+V→Wo path otherwise.
+  - This is **not compatible** with GPT‑OSS‑120B‑Eagle3 midlayer shapes:
+    - `fc.weight`         = `[hidden=2880, 3*hidden=8640]`
+    - `q_proj.weight`     = `[4096, 2880]`
+    - `k_proj/v_proj`     = `[512, 2880]`
+    - `o_proj.weight`     = `[2880, 4096]`
+    - i.e. non‑square, non‑uniform Q/K/V dims that cannot be “reshaped”
+      into a standard Llama attention layout without changing the math.
+  - Robust shape/dtype checks are already in place and correctly refuse
+    to “magically” reinterpret these weights.
+- **[x]** `UnifiedDecoder::ForwardDraft` calls `Eagle3DraftLayer` when
+          present; draft logits are produced via `LlamaLinear` LM head.
+
+Known gap:
+- **[ ]** There is **no dedicated Eagle‑3 attention backend** today:
+  - GPT‑OSS‑120B‑Eagle3 midlayer geometry cannot be expressed via
+    `UnifiedAttentionLayer` without rewriting kernels.
+  - Any attempt to reshape `[4096×2880, 512×2880, 2880×4096]` weights
+    into a `[hidden, 3*hidden]` Llama layout would produce numerically
+    wrong and unstable behaviour, and would not match TRT‑LLM.
+  - Draft attention also currently runs with **q_len = kv_len = 1**
+    (single‑position semantics) and does **not** reuse KV along the
+    tree like TRT‑LLM Eagle‑3.
+
+**TODOs:**
+
+- [ ] **3.1 Introduce a dedicated Eagle‑3 attention backend**
+  - Add an `Eagle3AttentionWeight` struct that holds:
+    - Q: `[q_dim, hidden]`   (e.g. 4096×2880),
+    - K/V: `[kv_dim, hidden]` (e.g. 512×2880),
+    - O: `[hidden, q_dim]`   (e.g. 2880×4096),
+    - any head metadata needed to map these into heads for CUDA kernels.
+  - Implement an `Eagle3AttentionLayer` with its own CUDA kernels that:
+    - consumes FC‑projected Eagle‑3 input (e.g. `[B, hidden]` or `[B, L, hidden]`),
+    - applies Q/K/V projections with the Eagle‑3 geometry,
+    - applies RoPE and softmax exactly as in EAGLE3/TRT‑LLM,
+    - produces context vectors in the expected dimension (e.g. q_dim),
+      followed by `o_proj` back into `hidden`.
+  - Plug `Eagle3AttentionLayer` into `Eagle3DraftLayer::Forward` when
+    `eagle_mode == "eagle3"` and the weight shapes match GPT‑OSS‑120B,
+    instead of going through `UnifiedAttentionLayer`.
+  - Keep strict shape checks; on mismatch:
+    - log a clear `[EAGLE3][Attention][fallback]` warning,
+    - fall back to a pass‑through draft (no speculative gains), but do
+      **not** attempt to reinterpret weights.
+
+- [ ] **3.2 Guarantee real Eagle‑3 attention in normal Eagle‑3 runs**
+  - For GPT‑OSS‑120B‑Eagle3 (and other supported Eagle‑3 drafts):
+    - ensure `EagleModule::load` builds `Eagle3AttentionWeight` from
+      `midlayer.self_attn.{q,k,v,o}_proj.weight` and exposes it to
+      `Eagle3DraftLayer`,
+    - ensure `Eagle3DraftLayer::Forward` always uses
+      `Eagle3AttentionLayer` (and never the shallow QKV path) under
+      valid configs.
+  - Add a debug counter / log (gated by `eagle_debug`) that reports,
+    per run:
+    - how often Eagle‑3 attention is used,
+    - how often we fall back to pass‑through or legacy paths.
+
+- [ ] **3.3 Align draft FC + capture layout with EAGLE/TRT‑LLM**
+  - From EAGLE + TRT‑LLM:
+    - Confirm which layers’ hidden states are concatenated into the
+      Eagle‑3 FC input (e.g. `[low, mid, high]` layer selection).
+    - Confirm the FC input ordering and any norms applied before FC.
+  - In TurboMind:
+    - Verify that `eagle_capture_hidden_` and `eagle_fc_in_dim_`
+      correspond to the same capture pattern.
+    - If necessary, adjust the capture ordering / concatenation in
+      `UnifiedDecoder` and `EagleModule::load` so FC sees the same
+      feature arrangement as the Eagle‑3 training setup.
+
+- [ ] **3.4 (Optional for strict TRT parity) multi‑position draft attention**
+  - If TRT‑LLM uses **q_len>1** in the draft tree for Eagle‑3:
+    - Add a `ForwardTree` or extended `Forward` that:
+      - accepts `[B, q_len, hidden]`,
+      - reuses KV for draft tokens exactly as the main decoder does.
+    - Wire this from `runEagle3DraftTreeDecode` so draft tokens per
+      layer are produced using the same attention geometry as TRT‑LLM.
+  - If TRT‑LLM keeps q_len=1 for Eagle‑3, document that and mark this
+    item as “not required”.
+
+- [ ] **3.5 Clean up shallow draft path once numerics are good**
+  - Once 4.x validation (below) shows Eagle‑3 numerics are solid:
+    - Restrict the shallow QKV path to:
+      - explicit debug builds, or
+      - non‑Eagle‑3 legacy modes.
+    - Ensure `EagleModule` does **not** participate in Eagle‑3 drafting
+      at all (only UnifiedDecoder + Eagle‑3 draft layer).
+
+---
+
+## 4. Phase 3 – TurboMind Integration & KV Semantics  – **Owner: C**
+
+Current state (TurboMind side):
+- **[x]** `LlamaV2::dynamicDecodeWithSpecMulti`:
+  - For `spec_method == "eagle3"`:
+    - calls `runEagle3DraftTreeDecode` to generate draft tokens +
+      initial target tokens,
+    - builds a tree via `eagle::SpeculationTree` using default choices
+      from `EagleModule::getDefaultChoices()`,
+    - mirrors paths into `EagleBuffers::inputs.draft_paths`,
+    - builds leaf + packed masks (tree attention + acceptance),
+    - uses device‑side acceptance (`invokeTreeAcceptByIdsWithPaths`,
+      `invokePackAcceptedPaths`),
+    - commits extra tokens via `DynamicDecodeLayer::ForwardMultiStep`
+      + KV rewind driven by committed tails.
+- **[x]** `targetTreeDecode` + `runEagleTargetTreeDecode`:
+  - prepare tree inputs (`eagle_net_*` tensors),
+  - compact tree tokens, embed them, and run a **scratch‑KV** target
+    decode pass that reuses prefix KV read‑only,
+  - write per‑node `target_tokens` back into `EagleBuffers`.
+- **[x]** KV invariants:
+  - Tree decode never mutates live `SequenceManager` KV:
+    - prefix blocks reused as read‑only,
+    - tree tokens live in scratch KV and are discarded,
+    - only `KVCacheRewind` mutates KV after acceptance.
+- **[x]** SpecPV path:
+  - partial KV cache (`PartialKVCache`) can be used instead of full
+    prefix KV for target‑tree decode, with clear fallbacks on mismatch.
+
+**TODOs:**
+
+- [ ] **4.1 Formalise target‑tree + acceptance contract vs TRT‑LLM**
+  - In the design doc, explicitly compare:
+    - TurboMind’s `eagle::SpeculationTree` default choices +
+      packed masks,
+    - TRT‑LLM’s Eagle‑3 tree semantics:
+      - static vs dynamic tree,
+      - branching factor and depth for GPT‑OSS‑120B,
+      - acceptance algorithm (ID equality, root token behaviour).
+  - Confirm that:
+    - TurboMind’s `invokeTreeAcceptByIdsWithPaths` and
+      `invokePackAcceptedPaths` implement the same semantics as
+      TRT‑LLM for the static tree used in GPT‑OSS‑120B‑Eagle3.
+
+- [ ] **4.2 Dynamic batching, block reuse, and KV invariants**
+  - Re‑run and extend KV‑related tests with EAGLE‑3 enabled:
+    - existing TurboMind KV tests,
+    - TRT‑LLM tests like `test_kv_lens_runtime_with_eagle3_one_model`
+      as inspiration (num_extra_kv_tokens semantics).
+  - For TurboMind:
+    - assert that `Sequence::blocks` and `cache_len` are consistent
+      after many speculative steps with variable batch sizes.
+    - ensure KV over‑provisioning for EAGLE matches what TRT‑LLM does
+      for `max_draft_len` / `max_total_draft_tokens` (conceptually).
+
+- [ ] **4.3 LMDeploy integration surface**
+  - Ensure LMDeploy users can configure Eagle‑3 in a way that mirrors
+    TRT‑LLM’s `EagleDecodingConfig`:
+    - `method="eagle3"`, `num_speculative_tokens`, `max_draft_len`,
+      `eagle_choices` (optional override), `use_dynamic_tree` (if
+      supported), `max_total_draft_tokens`.
+  - Validate that:
+    - offline `pipeline(...)` and `TurbomindEngineConfig` accept
+      Eagle‑3 config cleanly,
+    - misconfigurations fail fast with clear messages.
+
+---
+
+## 5. Phase 4 – Numeric & Behavioural Validation  – **Owner: D**
+
+Goal: prove TurboMind+EAGLE‑3 behaves like TRT‑LLM Eagle‑3 on
+GPT‑OSS‑120B, within agreed tolerances.
+
+**5.1 Stage‑wise draft compare (HF/TRT vs TurboMind)**
+- [ ] Extend `tests/turbomind/eagle3_compare.py` to:
+  - call a debug binding (`_turbomind.eagle3_forward_debug`) that:
+    - runs `Eagle3DraftLayer::Forward` + LM head,
+    - exposes intermediate tensors:
+      - `fc_out`, `attn_out`, `ffn_out`, `pre_head_hidden`, `logits`.
+  - For each stage available from HF/TRT and TurboMind:
+    - compute `mean_abs_diff`, `max_abs_diff`, cosine similarity.
+  - For `logits` specifically:
+    - compute argmax match rate and top‑k overlap (e.g. top‑5).
+- [ ] Define tolerances (documented in the design doc), e.g.:
+  - cosine(logits) > 0.98,
+  - top‑5 overlap > 0.8,
+  - max_abs_diff within expected BF16 / MXFP ranges.
+
+**5.2 Speculative acceptance metrics vs TRT‑LLM**
+- [ ] Use `SpeculativeDecodingStats` / `EagleMetricsSummary` and
+      TRT‑LLM’s test patterns to compare:
+  - `mean_acceptance_length`,
+  - `fraction_steps_accept_ge2`,
+  - `eagle_total_draft_tokens`, `eagle_total_accepted_tokens`.
+- [ ] On GPT‑OSS‑120B‑Eagle3:
+  - run the same prompt sets in:
+    - TRT‑LLM (per blog11),
+    - TurboMind + LMDeploy,
+  - compare acceptance distributions; investigate discrepancies beyond
+    an agreed threshold.
+
+**5.3 Throughput benchmarks**
+- [ ] Extend `inference/benchmark_speculative.py` / `run_spec_suite.sh`
+      with a GPT‑OSS‑120B‑Eagle3 profile:
+  - baseline (no spec),
+  - Eagle‑3 (TurboMind),
+  - optionally TRT‑LLM for reference.
+- [ ] Target:
+  - TurboMind Eagle‑3 ≥ TurboMind baseline throughput,
+  - TurboMind Eagle‑3 ≈ TRT‑LLM Eagle‑3 on the same hardware class in
+    key scenarios (8K/32K contexts, realistic prompts).
+
+**5.4 Regression & CI**
+- [ ] Add a minimal CI spec test:
+  - small Eagle‑3 draft (or synthetic),
+  - one short prompt,
+  - asserts:
+    - no EAGLE fallback warnings,
+    - acceptance is neither 0 nor “always full accept”,
+    - token stream is stable against a recorded golden log
+      (within allowed stochasticity).
+
+---
+
+## 6. Phase 5 – SpecPV (Partial KV) Follow‑Ups  – **Owner: A/C**
+
+Current state:
+- **[x]** `SpecPVCacheConfig` + `PartialKVCache`:
+  - segments (sink, retrieval, window, buffer),
+  - Kmax/Kmin summaries, retrieval scoring, update/refresh/reset.
+- **[x]** `initSpecPVFromFullKV` flattens full KV prefix and seeds partial
+          KV cache.
+- **[x]** `runEagleTargetTreeDecode` can run tree decode against partial KV:
+  - builds scratch KV blocks from `PartialKVCache::active_prefix`,
+  - uses scratch KV for prefix + tree; live KV untouched.
+- **[x]** `updateSpecPVAfterAcceptance`:
+  - reads committed tail lengths from `ForwardMultiStep`,
+  - calls `PartialKVCache::update_after_acceptance` per layer/slot,
+  - robustly disables SpecPV on any invariant failure.
+
+**TODOs (after Eagle‑3 core is solid):**
+
+- [ ] **6.1 Validate semantics with EAGLE‑3**
+  - For long‑context runs:
+    - verify token streams with SpecPV enabled vs disabled are
+      identical (within numerical noise),
+    - confirm EAGLE metrics (acceptance lengths, EOS handling) are
+      unchanged by SpecPV.
+
+- [ ] **6.2 Tune SpecPV geometry for GPT‑OSS‑120B‑Eagle3**
+  - Choose default `specpv_*` parameters (block sizes, retrieval window,
+    buffer) that:
+    - give a measurable reduction in KV tokens attended during tree
+      decode at long context,
+    - maintain acceptance metrics close to full‑KV runs.
+
+- [ ] **6.3 Perf benchmarks with SpecPV**
+  - Extend the speculative benchmark suite with SpecPV‑enabled runs:
+    - throughput vs full‑KV Eagle‑3 at 32K/64K context,
+    - memory usage and KV bandwidth comparisons.
+
+When all the above phases are checked off, TurboMind’s EAGLE‑3 path
+should be functionally, numerically, and performance‑wise aligned
+with TensorRT‑LLM Eagle‑3 on GPT‑OSS‑120B, with SpecPV as an optional
+long‑context optimisation layer on top.

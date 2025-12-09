@@ -50,9 +50,14 @@ private:
 
     const int tune_layer_num_;
 
-    std::unique_ptr<UnifiedAttentionLayer> attn_layer_;
-    std::unique_ptr<LlamaFfnLayer>         ffn_layer_;
-    std::unique_ptr<MoeFfnLayer>           moe_ffn_layer_;
+    std::unique_ptr<UnifiedAttentionLayer>    attn_layer_;
+    std::unique_ptr<LlamaFfnLayer>            ffn_layer_;
+    std::unique_ptr<MoeFfnLayer>              moe_ffn_layer_;
+    // Optional dedicated Eagle‑3 attention backend for non‑LLaMA Eagle‑3
+    // geometries (e.g. GPT‑OSS‑120B‑Eagle3 midlayer q/k/v/o). When null,
+    // Eagle‑3 draft attention falls back to UnifiedAttentionLayer or the
+    // shallow QKV path.
+    std::unique_ptr<class Eagle3AttentionLayer> eagle3_attn_layer_;
 
     // Eagle3 multi-layer hidden capture metadata. When enabled, the
     // decoder will capture last-token hidden states from a small set

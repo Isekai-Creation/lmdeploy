@@ -7,11 +7,13 @@
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/eagle_debug.h"
 #include "src/turbomind/models/llama/unified_attention_layer.h"
+#include "src/turbomind/models/llama/eagle3_attention_layer.h"
 
 namespace turbomind {
 
 Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
                                    UnifiedAttentionLayer*        attn_layer,
+                                   Eagle3AttentionLayer*         eagle3_attn_layer,
                                    LlamaFfnLayer*                ffn_layer,
                                    float                         rmsnorm_eps):
     weight_{weight},
@@ -22,6 +24,7 @@ Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
     debug_ffn_out_{},
     debug_pre_head_hidden_{},
     attn_layer_{attn_layer},
+    eagle3_attn_layer_{eagle3_attn_layer},
     head_num_{0},
     kv_head_num_{0},
     size_per_head_{0}
@@ -131,7 +134,8 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
     //    otherwise fall back to the shallow QKV+V→Wo path.
     Tensor attn_out{{batch_size, hidden_dim}, dtype, input_hidden.device()};
 
-    const bool has_attn_layer = (attn_layer_ != nullptr);
+    const bool has_attn_layer   = (attn_layer_ != nullptr);
+    const bool has_eagle3_layer = (eagle3_attn_layer_ != nullptr && weight_->eagle3_attn.is_initialized);
 
     auto attn_geom_ok = [&]() -> bool {
         if (head_num_ <= 0 || size_per_head_ <= 0) {
@@ -154,6 +158,18 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden
         sync_check_cuda_error();
 
         used_unified_attention = true;
+    }
+    else if (has_eagle3_layer) {
+        // Dedicated Eagle3 attention backend for non‑LLaMA geometry. At this
+        // stage the implementation is a pass‑through placeholder; real Eagle3
+        // kernels will be wired in later.
+        Eagle3AttentionParam ep{};
+        ep.input   = hidden_norm;
+        ep.output  = attn_out;
+        ep.weights = &weight_->eagle3_attn;
+        ep.layer_id = 0;
+        eagle3_attn_layer_->Forward(ep);
+        sync_check_cuda_error();
     }
     else {
         if (has_attn_layer && !attn_geom_ok()) {

@@ -5,12 +5,18 @@
 
 #include "src/turbomind/models/llama/LlamaFfnLayer.h"
 #include "src/turbomind/models/llama/unified_attention_layer.h"
+#include "src/turbomind/models/llama/Eagle3AttentionWeight.h"
 
 namespace turbomind {
 
 struct Eagle3DraftLayerWeight {
     LlamaAttentionWeight attn;
     LlamaFfnWeight       ffn;
+    // Optional dedicated Eagle3 attention weights with non‑LLaMA geometry
+    // (e.g. GPT‑OSS‑120B‑Eagle3 midlayer q/k/v/o projections). When not
+    // initialised, the draft layer falls back to UnifiedAttentionLayer or
+    // the shallow QKV path.
+    Eagle3AttentionWeight eagle3_attn;
     Tensor               fc_weight;      // keep if your converter fills it
     Tensor               input_norm;
     Tensor               post_attn_norm;
@@ -23,6 +29,7 @@ class Eagle3DraftLayer {
 public:
     Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
                      UnifiedAttentionLayer*        attn_layer,
+                     class Eagle3AttentionLayer*   eagle3_attn_layer,
                      LlamaFfnLayer*                ffn_layer,
                      float                         rmsnorm_eps);
 
@@ -46,6 +53,7 @@ private:
     Tensor debug_pre_head_hidden_;
 
     UnifiedAttentionLayer* attn_layer_{nullptr};
+    class Eagle3AttentionLayer* eagle3_attn_layer_{nullptr};
     int                    head_num_{0};
     int                    kv_head_num_{0};
     int                    size_per_head_{0};
