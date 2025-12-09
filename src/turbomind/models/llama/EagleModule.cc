@@ -262,17 +262,17 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     int q_size     = hidden_units;
     int kv_size    = hidden_units;
     if (eagle3) {
-        if (eagle_qkv_in_dim_ > 0) {
-            qkv_in_dim = eagle_qkv_in_dim_;
-        }
-        if (eagle_q_size_ > 0) {
-            q_size = eagle_q_size_;
-        }
-        if (eagle_kv_size_ > 0) {
-            kv_size = eagle_kv_size_;
-        }
+        // For Eagle3 we want attention in full model space:
+        // QKV: [attn_hidden_units, 3 * attn_hidden_units]
+        // Wo:  [attn_hidden_units, draft_hidden] (hidden_units)
+        qkv_in_dim = attn_hidden_units;
+        q_size     = attn_hidden_units;
+        kv_size    = attn_hidden_units;
     }
-    const int qkv_out_dim = q_size + 2 * kv_size;
+
+    const int qkv_out_dim = eagle3
+        ? 3 * attn_hidden_units
+        : q_size + 2 * kv_size;
 
     weights_.attn_qkv = Tensor{{qkv_in_dim, qkv_out_dim}, dtype, kDEVICE};
     weights_.attn_o   = Tensor{{q_size, hidden_units}, dtype, kDEVICE};
