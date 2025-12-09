@@ -72,6 +72,8 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
     }
 }
 
+UnifiedDecoder::~UnifiedDecoder() = default;
+
 void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
 {
     eagle3_draft_weight_ = w;

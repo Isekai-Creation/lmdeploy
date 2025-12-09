@@ -772,6 +772,34 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                         eagle_q_size_);
                     ew.is_initialized = false;
                 }
+
+                // When geometry checks pass, derive the head layout for the
+                // Eagle3 attention backend from the base model config. We
+                // treat q_out as head_num * head_dim and kv_out as
+                // kv_head_num * head_dim, mirroring the standard GQA
+                // convention. This metadata is required by
+                // Eagle3AttentionLayer to interpret the flattened Q/K/V
+                // projections.
+                if (ew.is_initialized) {
+                    const int attn_hidden_units = head_num * head_dim;
+                    if (ew.q_out == attn_hidden_units && head_dim > 0 && ew.kv_out % head_dim == 0) {
+                        ew.head_dim     = head_dim;
+                        ew.num_q_heads  = head_num;
+                        ew.num_kv_heads = ew.kv_out / head_dim;
+                    }
+                    else {
+                        TM_LOG_WARNING(
+                            "[EAGLE3][EagleModule::load] unable to derive Eagle3 head layout "
+                            "(q_out=%d, kv_out=%d, hidden=%d, head_num=%d, head_dim=%d); "
+                            "disabling Eagle3 attention for this engine.",
+                            ew.q_out,
+                            ew.kv_out,
+                            attn_hidden_units,
+                            head_num,
+                            head_dim);
+                        ew.is_initialized = false;
+                    }
+                }
             }
         }
 

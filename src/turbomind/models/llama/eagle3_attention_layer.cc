@@ -2,6 +2,8 @@
 
 #include "src/turbomind/models/llama/eagle3_attention_layer.h"
 
+#include <type_traits>
+
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
 
@@ -23,8 +25,6 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             "[EAGLE3][Attention][fallback] invalid Eagle3AttentionParam; "
             "treating Eagle-3 attention as pass-through for this step.");
         if (param.input && param.output) {
-            // Best-effort pass-through: copy input into output when the
-            // caller has already allocated output.
             core::Copy(param.input, param.output);
         }
         return;
@@ -32,6 +32,7 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 
     const int batch_size = param.input.shape(0);
     const int q_in_dim   = param.input.shape(1);
+    const auto dtype     = param.input.dtype();
 
     if (batch_size <= 0 || q_in_dim <= 0) {
         TM_LOG_WARNING(
@@ -39,37 +40,122 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             "(batch=%d, q_in=%d); treating as pass-through.",
             batch_size,
             q_in_dim);
-        if (param.input && param.output) {
-            core::Copy(param.input, param.output);
-        }
+        core::Copy(param.input, param.output);
         return;
     }
 
-    if (q_in_dim != param.weights->q_in) {
+    const auto& w = *param.weights;
+
+    if (q_in_dim != w.q_in) {
         TM_LOG_WARNING(
             "[EAGLE3][Attention][fallback] input dim (%d) != q_in (%d); "
             "treating Eagle-3 attention as pass-through.",
             q_in_dim,
-            param.weights->q_in);
-        if (param.input && param.output) {
-            core::Copy(param.input, param.output);
-        }
+            w.q_in);
+        core::Copy(param.input, param.output);
         return;
     }
 
-    // TODO: Implement real Eagle-3 attention here by porting the math
-    // from TensorRT-LLM:
-    //
-    // 1) Q = X @ Wq^T   : [B, q_in] @ [q_in, q_out]   -> [B, q_out]
-    // 2) K = X @ Wk^T   : [B, q_in] @ [q_in, kv_out]  -> [B, kv_out]
-    // 3) V = X @ Wv^T   : [B, q_in] @ [q_in, kv_out]  -> [B, kv_out]
-    // 4) Reshape Q/K/V into [B, num_heads, head_dim] / [B, num_kv_heads, head_dim].
-    // 5) Apply RoPE to Q/K as in GPT-OSS/Eagle-3.
-    // 6) Compute SDPA(Q, K, V) with optional packed tree mask.
-    // 7) Context @ o_proj^T -> [B, q_in] or [B, q_out] depending on design.
-    //
-    // For now, we keep behaviour safe by copying input into output.
-    if (param.input && param.output) {
+    if (!w.q_proj || !w.o_proj || w.q_proj.ndim() != 2 || w.o_proj.ndim() != 2) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Attention][fallback] missing or invalid q_proj/o_proj; "
+            "treating Eagle-3 attention as pass-through.");
+        core::Copy(param.input, param.output);
+        return;
+    }
+
+    const int q_out_dim = w.q_out;
+    if (q_out_dim <= 0 || w.o_proj.shape(0) != q_in_dim || w.o_proj.shape(1) != q_out_dim) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Attention][fallback] Eagle-3 q/o geometry mismatch "
+            "(q_out=%d, o_proj=[%d,%d], q_in=%d); treating as pass-through.",
+            q_out_dim,
+            w.o_proj.shape(0),
+            w.o_proj.shape(1),
+            q_in_dim);
+        core::Copy(param.input, param.output);
+        return;
+    }
+
+    if (w.q_proj.dtype() != dtype || w.o_proj.dtype() != dtype) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Attention][fallback] dtype mismatch between input (%s) "
+            "and Eagle3 q/o weights (q=%s, o=%s); treating as pass-through.",
+            to_string(dtype),
+            to_string(w.q_proj.dtype()),
+            to_string(w.o_proj.dtype()));
+        core::Copy(param.input, param.output);
+        return;
+    }
+
+    // Ensure output buffer has the expected [B, q_in] layout and dtype.
+    if (!param.output || param.output.ndim() != 2 || param.output.shape(0) != batch_size
+        || param.output.shape(1) != q_in_dim || param.output.dtype() != dtype
+        || param.output.device().type != param.input.device().type) {
+        param.output = Tensor{{batch_size, q_in_dim}, dtype, param.input.device()};
+    }
+
+    // Temporary buffer for Q = X @ Wq^T of shape [B, q_out_dim].
+    Tensor q{{batch_size, q_out_dim}, dtype, param.input.device()};
+
+    auto do_gemm = [&](auto tag) {
+        using T = decltype(tag);
+        const T* x_ptr  = param.input.data<T>();
+        const T* wq_ptr = w.q_proj.data<T>();
+        const T* wo_ptr = w.o_proj.data<T>();
+        T*       q_ptr  = q.data<T>();
+        T*       y_ptr  = param.output.data<T>();
+
+        if constexpr (std::is_same_v<T, half_t>) {
+            launch_eagle3_matmul_rowmajor_half(x_ptr, wq_ptr, q_ptr, batch_size, q_in_dim, q_out_dim, stream_);
+            sync_check_cuda_error();
+            launch_eagle3_matmul_rowmajor_half(q_ptr, wo_ptr, y_ptr, batch_size, q_out_dim, q_in_dim, stream_);
+            sync_check_cuda_error();
+        }
+#if ENABLE_BF16
+        else if constexpr (std::is_same_v<T, bfloat16_t>) {
+            launch_eagle3_matmul_rowmajor_bf16(x_ptr, wq_ptr, q_ptr, batch_size, q_in_dim, q_out_dim, stream_);
+            sync_check_cuda_error();
+            launch_eagle3_matmul_rowmajor_bf16(q_ptr, wo_ptr, y_ptr, batch_size, q_out_dim, q_in_dim, stream_);
+            sync_check_cuda_error();
+        }
+#endif
+#if ENABLE_FP32
+        else if constexpr (std::is_same_v<T, float>) {
+            launch_eagle3_matmul_rowmajor_float(x_ptr, wq_ptr, q_ptr, batch_size, q_in_dim, q_out_dim, stream_);
+            sync_check_cuda_error();
+            launch_eagle3_matmul_rowmajor_float(q_ptr, wo_ptr, y_ptr, batch_size, q_out_dim, q_in_dim, stream_);
+            sync_check_cuda_error();
+        }
+#endif
+        else {
+            TM_LOG_WARNING(
+                "[EAGLE3][Attention][fallback] unsupported Eagle3Attention dtype=%s; "
+                "treating as pass-through.",
+                to_string(dtype));
+            core::Copy(param.input, param.output);
+        }
+    };
+
+    if (dtype == kFloat16) {
+        do_gemm(half_t{});
+    }
+#if ENABLE_BF16
+    else if (dtype == kBfloat16) {
+        do_gemm(bfloat16_t{});
+    }
+#endif
+#if ENABLE_FP32
+    else if (dtype == kFloat32) {
+        do_gemm(float{});
+    }
+    else
+#endif
+    {
+        TM_LOG_WARNING(
+            "[EAGLE3][Attention][fallback] unsupported Eagle3Attention dtype=%s; "
+            "treating as pass-through.",
+            to_string(dtype));
         core::Copy(param.input, param.output);
     }
 }

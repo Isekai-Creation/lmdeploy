@@ -23,6 +23,8 @@ public:
                    const LoraParam&      lora,
                    const Context&        ctx);
 
+    ~UnifiedDecoder();
+
     void Forward(TensorMap& args, const std::vector<WeightType*>& weights);
 
     void setEagle3DraftLayer(const Eagle3DraftLayerWeight* w);
