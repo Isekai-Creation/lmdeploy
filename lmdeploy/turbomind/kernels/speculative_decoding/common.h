@@ -192,35 +192,20 @@ struct KVCacheRewindParams {
 void invokeKVCacheRewind(KVCacheRewindParams const& params);
 
 struct EntropyMaskParams {
-    // Flat view: rows = batch_size * max_tokens, cols = vocab_size_pad.
-    // Row index r corresponds to (batch_slot = r / max_tokens,
-    // token_idx = r % max_tokens).
-    float const* logits{nullptr};               // [rows, cols] input logits
-    float*       logits_out{nullptr};           // optional out (if null, in-place)
-
-    float const* probs{nullptr};                // [rows, cols] softmax probs
-    float const* entropies{nullptr};            // [rows] row-wise entropies
-
-    // Per-request thresholds/params (indexed by batch_slot).
-    float const* posterior_thresholds{nullptr}; // [batch_size]
-    float const* posterior_alphas{nullptr};     // [batch_size]
-    float const* temperatures{nullptr};         // [batch_size]
-
-    // Row-wise skip mask and per-request generation lengths.
-    // skip_decode[r] == true  -> row r is ignored.
-    // generation_lengths[batch_slot] gives valid token length.
+    float const* logits{nullptr};             // [rows, cols]
+    float*       logits_out{nullptr};         // optional out (if null, in-place)
+    float const* probs{nullptr};              // [rows, cols]
+    float const* entropies{nullptr};          // [rows]
+    float const* posterior_thresholds{nullptr}; // [batch]
+    float const* posterior_alphas{nullptr};     // [batch]
+    float const* temperatures{nullptr};         // [batch]
     const bool*  skip_decode{nullptr};          // [rows]
-    const int*   generation_lengths{nullptr};   // [batch_size]
-
-    // Optional per-row top-p state (mirrors TRT runtime_top_p semantics).
-    // If null, no top-p state is written.
     float*       runtime_top_p{nullptr};        // [rows] optional
-
+    const int*   generation_lengths{nullptr};   // [batch]
     int          rows{0};                       // batch_size * max_tokens
     int          cols{0};                       // vocab_size_pad
     int          max_tokens{0};                 // tokens_per_seq
     int          batch_size{0};
-
     cudaStream_t stream{};
 };
 

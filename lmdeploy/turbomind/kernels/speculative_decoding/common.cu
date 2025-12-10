@@ -348,70 +348,60 @@ __global__ void maskLogitsEntropyFlatKernel(const float* logits,
         return;
     }
 
-    const int batch_slot = (max_tokens > 0) ? (row / max_tokens) : 0;
-    const int token_idx  = (max_tokens > 0) ? (row % max_tokens) : row;
+    const int batch_slot = max_tokens > 0 ? row / max_tokens : 0;
+    const int token_idx  = max_tokens > 0 ? row % max_tokens : row;
 
-    // Skip explicit-mask rows or padded positions.
-    if ((skip_decode && skip_decode[row]) ||
-        (generation_lengths && batch_slot >= 0 && token_idx >= generation_lengths[batch_slot])) {
+    // skip masked or padded rows
+    if ((skip_decode && skip_decode[row]) || (generation_lengths && token_idx >= generation_lengths[batch_slot])) {
         return;
     }
 
-    // TRT-style posterior threshold: min(threshold, alpha * exp(-entropy)).
-    const float entropy_row = entropies ? entropies[row] : 0.0f;
-    const float posterior_threshold =
-        posterior_thresholds ? posterior_thresholds[batch_slot] : 1.0f;
-    const float posterior_alpha =
-        posterior_alphas ? posterior_alphas[batch_slot] : 1.0f;
-
-    const float thresh = fminf(posterior_threshold,
-                               posterior_alpha * expf(-entropy_row));
+    const float posterior_threshold = posterior_thresholds ? posterior_thresholds[batch_slot] : 1.0f;
+    const float posterior_alpha     = posterior_alphas ? posterior_alphas[batch_slot] : 1.0f;
+    const float H                   = entropies ? entropies[row] : 0.0f;
+    const float thresh              = fminf(posterior_threshold, posterior_alpha * expf(-H));
 
     const float prob = probs[row * cols + col];
     if (prob < thresh) {
-        // Mask out low-posterior logits.
         out_logits[row * cols + col] = -CUDART_INF_F;
     }
     else if (out_logits != logits) {
-        // Preserve original logits if writing to a separate buffer.
         out_logits[row * cols + col] = logits[row * cols + col];
     }
 
-    // Per-row runtime_top_p: TRT uses this as a per-step top-p marker.
-    // Here we mirror the 0/1 behavior: 0 when temperature ~0, 1 otherwise.
+    // optional runtime_top_p (per-row)
     if (runtime_top_p && col == 0) {
-        const float temp = temperatures ? temperatures[batch_slot] : 1.0f;
+        const float temp   = temperatures ? temperatures[batch_slot] : 1.0f;
         runtime_top_p[row] = (temp < 1e-6f) ? 0.0f : 1.0f;
     }
 }
 
 }  // namespace
 
-void maskLogitsBasedOnEntropy(const EntropyMaskParams& params)
+void maskLogitsBasedOnEntropy(const EntropyMaskParams& p)
 {
-    if (!params.logits || !params.probs || params.rows <= 0 || params.cols <= 0) {
+    if (!p.logits || !p.probs || p.rows <= 0 || p.cols <= 0 || p.max_tokens <= 0 || p.batch_size <= 0) {
         return;
     }
 
     constexpr int BLOCK = 256;
-    const int     grid_x = (params.cols + BLOCK - 1) / BLOCK;
-    dim3          grid(grid_x, params.rows, 1);
+    const int     grid_x = (p.cols + BLOCK - 1) / BLOCK;
+    dim3          grid(grid_x, p.rows, 1);
     dim3          block(BLOCK);
 
-    maskLogitsEntropyFlatKernel<<<grid, block, 0, params.stream>>>(
-        params.logits,
-        params.probs,
-        params.entropies,
-        params.posterior_thresholds,
-        params.posterior_alphas,
-        params.temperatures,
-        params.skip_decode,
-        params.generation_lengths,
-        params.max_tokens,
-        params.rows,
-        params.cols,
-        params.logits_out ? params.logits_out : const_cast<float*>(params.logits),
-        params.runtime_top_p);
+    maskLogitsEntropyFlatKernel<<<grid, block, 0, p.stream>>>(p.logits,
+                                                             p.probs,
+                                                             p.entropies,
+                                                             p.posterior_thresholds,
+                                                             p.posterior_alphas,
+                                                             p.temperatures,
+                                                             p.skip_decode,
+                                                             p.generation_lengths,
+                                                             p.max_tokens,
+                                                             p.rows,
+                                                             p.cols,
+                                                             p.logits_out ? p.logits_out : const_cast<float*>(p.logits),
+                                                             p.runtime_top_p);
 }
 
 // Simple row-wise softmax + entropy for float logits (unchanged).

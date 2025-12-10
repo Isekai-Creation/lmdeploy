@@ -34,7 +34,7 @@
 #include "src/turbomind/utils/eagle_debug.h"
 
 namespace py = pybind11;
-namespace ft = turbomind;
+
 using namespace pybind11::literals;
 
 using ft::core::Tensor;
@@ -164,7 +164,7 @@ ft::DeviceType getMemoryType(DLDevice device)
     }
 }
 
-ft::DataType getDataType(DLDataType data_type)
+turbomind::DataType getDataType(DLDataType data_type)
 {
     using ft::data_type_v;
     switch (data_type.code) {
@@ -415,7 +415,24 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
             hidden_tm->dtype(),
             ft::kDEVICE);
 
-        draft_layer.Forward(*hidden_tm, hidden_out, stream);
+        // Call Eagle3DraftLayer::Forward with all 16 arguments.
+        // Provide empty Tensors for arguments not directly available in debug binding.
+        draft_layer.Forward(*hidden_tm,      // input_hidden
+                            Tensor{},        // captured_hidden (empty)
+                            Tensor{},        // input_ids (empty)
+                            Tensor{},        // embed_tokens_weights (empty)
+                            Tensor{},        // position_ids (empty)
+                            Tensor{},        // packed_mask (empty)
+                            Tensor{},        // tree_offsets (empty)
+                            Tensor{},        // runtime_offsets (empty)
+                            Tensor{},        // kv_lens_runtime (empty)
+                            Tensor{},        // successor_offsets (empty)
+                            Tensor{},        // successor_counts (empty)
+                            1,               // q_len (default to 1)
+                            1,               // kv_len (default to 1)
+                            0,               // past_kv_len (default to 0)
+                            hidden_out,      // output_hidden
+                            stream);         // stream
         ft::check_cuda_error(cudaStreamSynchronize(stream));
 
         fc_out_dbg   = draft_layer.debug_fc_out();
@@ -483,7 +500,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         if (attn_out_dbg) {
             out["attn_out"] = attn_out_dbg;
         }
-        if (qkv_dbg) {
+        if (qkv_dbg.size() > 0) { // Check if the Tensor is valid
             out["qkv"] = qkv_dbg;
         }
         if (ffn_out_dbg) {
@@ -602,7 +619,7 @@ PYBIND11_MODULE(_turbomind, m)
     // DataType / MemoryType enums
     {
         using namespace turbomind;
-        py::enum_<ft::DataType>(m, "DataType")
+        py::enum_<turbomind::DataType>(m, "DataType")
             .value("TYPE_INVALID", kNull)
             .value("TYPE_BOOL", kBool)
             .value("TYPE_UINT8", kUint8)
@@ -618,9 +635,9 @@ PYBIND11_MODULE(_turbomind, m)
             .value("TYPE_FP64", kFloat64)
             .value("TYPE_BF16", kBfloat16);
 
-        py::enum_<ft::DeviceType>(m, "MemoryType")
-            .value("MEMORY_CPU", ft::DeviceType::kCPU)
-            .value("MEMORY_CPU_PINNED", ft::DeviceType::kCPUpinned)
+        py::enum_<turbomind::DeviceType>(m, "MemoryType")
+            .value("MEMORY_CPU", turbomind::DeviceType::kCPU)
+            .value("MEMORY_CPU_PINNED", turbomind::DeviceType::kCPUpinned)
             .value("MEMORY_GPU", ft::DeviceType::kDEVICE);
     }
 

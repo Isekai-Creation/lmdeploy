@@ -237,19 +237,22 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             return;
         }
         if (eagle_qkv_in_factor_ > 0 && eagle_qkv_in_dim_ != eagle_qkv_in_factor_ * draft_hidden_units_) {
-            TM_LOG_WARNING(
+            TM_LOG_ERROR(
                 "[EAGLE][EagleModule::load] Eagle3 qkv_in_dim (%d) != factor (%d) * draft_hidden (%d); "
-                "continuing but behaviour may not match the source draft.",
+                "disabling Eagle3 draft due to geometry inconsistency.",
                 eagle_qkv_in_dim_,
                 eagle_qkv_in_factor_,
                 draft_hidden_units_);
+            success = false;
         }
         if (eagle_fc_in_factor_ > 0 && eagle_fc_in_dim_ != eagle_fc_in_factor_ * draft_hidden_units_) {
-            TM_LOG_WARNING(
-                "[EAGLE][EAGLE3][EagleModule::load] fc_in_dim (%d) != factor (%d) * draft_hidden (%d);",
+            TM_LOG_ERROR(
+                "[EAGLE][EAGLE3][EagleModule::load] fc_in_dim (%d) != factor (%d) * draft_hidden (%d); "
+                "disabling Eagle3 draft due to geometry inconsistency.",
                 eagle_fc_in_dim_,
                 eagle_fc_in_factor_,
                 draft_hidden_units_);
+            success = false;
         }
         if (!eagle_capture_layers_cfg_.empty()) {
             const int expected_fc_in = static_cast<int>(eagle_capture_layers_cfg_.size()) * base_hidden_units_;
@@ -273,21 +276,21 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         }
     }
 
-    weights_.embed_tokens = Tensor{{vocab_size, base_hidden_units_}, dtype, kDEVICE};
+    weights_.embed_tokens = Tensor{Layout({vocab_size, base_hidden_units_}), dtype, kDEVICE};
 
     // Legacy shallow FC reduces captured features to the draft hidden width.
     // Legacy FC path stays in draft-hidden space.
-    weights_.fc = Tensor{{draft_hidden_units_ * 2, draft_hidden_units_}, dtype, kDEVICE};
+    weights_.fc = Tensor{Layout({draft_hidden_units_ * 2, draft_hidden_units_}), dtype, kDEVICE};
 
     // Eagle3-specific FC weight that consumes the full concatenated
     // multi-layer hidden (e.g. 3 * hidden) before attention.
     if (eagle3 && eagle_fc_in_dim_ > 0) {
-        weights_.eagle_fc = Tensor{{eagle_fc_in_dim_, draft_hidden_units_}, dtype, kDEVICE};
+        weights_.eagle_fc = Tensor{Layout({eagle_fc_in_dim_, draft_hidden_units_}), dtype, kDEVICE};
     }
 
     // Layer weights (single EagleNet / Eagle3 shallow layer)
-    weights_.input_norm  = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
-    weights_.hidden_norm = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
+    weights_.input_norm  = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
+    weights_.hidden_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
 
     // Attention weight shapes differ slightly between EagleNet and Eagle3:
     //  - EagleNet: [hidden, 3 * hidden] and Wo [hidden, hidden]
@@ -306,17 +309,17 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     const int qkv_out_dim = q_size + 2 * kv_size;
 
-    weights_.attn_qkv = Tensor{{qkv_in_dim, qkv_out_dim}, dtype, kDEVICE};
+    weights_.attn_qkv = Tensor{Layout({qkv_in_dim, qkv_out_dim}), dtype, kDEVICE};
     // Wo projects back to base_hidden to align with target model width.
-    weights_.attn_o   = Tensor{{q_size, base_hidden_units_}, dtype, kDEVICE};
-    weights_.attn_norm = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
+    weights_.attn_o   = Tensor{Layout({q_size, base_hidden_units_}), dtype, kDEVICE};
+    weights_.attn_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
 
     // Draft FFN stays in draft_hidden space.
-    weights_.mlp_gate_up = Tensor{{intermediate_size * 2, draft_hidden_units_}, dtype, kDEVICE};
-    weights_.mlp_down    = Tensor{{intermediate_size, draft_hidden_units_}, dtype, kDEVICE};
+    weights_.mlp_gate_up = Tensor{Layout({intermediate_size * 2, draft_hidden_units_}), dtype, kDEVICE};
+    weights_.mlp_down    = Tensor{Layout({intermediate_size, draft_hidden_units_}), dtype, kDEVICE};
 
-    weights_.output_norm = Tensor{{draft_hidden_units_}, dtype, kDEVICE};
-    weights_.lm_head     = Tensor{{base_hidden_units_, vocab_size}, dtype, kDEVICE};
+    weights_.output_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
+    weights_.lm_head     = Tensor{Layout({base_hidden_units_, vocab_size}), dtype, kDEVICE};
 
     // Optional native Eagle3 attention projections (non‑LLaMA geometry).
     // Only allocate these when we have full Eagle3 geometry; otherwise
@@ -327,10 +330,10 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         // midlayer.self_attn.k_proj.weight: [kv_out, q_in]  = [eagle_kv_size_, eagle_qkv_in_dim_]
         // midlayer.self_attn.v_proj.weight: [kv_out, q_in]  = [eagle_kv_size_, eagle_qkv_in_dim_]
         // midlayer.self_attn.o_proj.weight: [q_in, q_out]   = [eagle_qkv_in_dim_, eagle_q_size_]
-        weights_.eagle_q_proj = Tensor{{eagle_q_size_, eagle_qkv_in_dim_}, dtype, kDEVICE};
-        weights_.eagle_k_proj = Tensor{{eagle_kv_size_, eagle_qkv_in_dim_}, dtype, kDEVICE};
-        weights_.eagle_v_proj = Tensor{{eagle_kv_size_, eagle_qkv_in_dim_}, dtype, kDEVICE};
-        weights_.eagle_o_proj = Tensor{{eagle_qkv_in_dim_, eagle_q_size_}, dtype, kDEVICE};
+        weights_.eagle_q_proj = Tensor{Layout({eagle_q_size_, eagle_qkv_in_dim_}), dtype, kDEVICE};
+        weights_.eagle_k_proj = Tensor{Layout({eagle_kv_size_, eagle_qkv_in_dim_}), dtype, kDEVICE};
+        weights_.eagle_v_proj = Tensor{Layout({eagle_kv_size_, eagle_qkv_in_dim_}), dtype, kDEVICE};
+        weights_.eagle_o_proj = Tensor{Layout({eagle_qkv_in_dim_, eagle_q_size_}), dtype, kDEVICE};
     }
 
     weights_.is_initialized = true;
@@ -494,7 +497,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     // Prepare LM head wrapper for LlamaLinear.
     if (weights_.lm_head) {
         lm_head_weight_.emplace(
-            hidden_units_, vocab_size_, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+            this->hidden_units_, this->vocab_size_, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
         lm_head_weight_.weight      = weights_.lm_head.borrow();
         lm_head_weight_.bias        = {};
         lm_head_weight_.data_type   = weight_dtype_;
@@ -546,24 +549,24 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             const int qkv_in  = weights_.attn_qkv.shape(0);
             const int qkv_out = weights_.attn_qkv.shape(1);
             attn_qkv_weight_.emplace(
-                qkv_in, qkv_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                qkv_in, qkv_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
             attn_qkv_weight_.weight      = weights_.attn_qkv.borrow();
             attn_qkv_weight_.bias        = {};
-            attn_qkv_weight_.data_type   = weight_dtype_;
-            attn_qkv_weight_.weight_type = weight_dtype_;
-            attn_qkv_weight_.input_type  = weight_dtype_;
+            attn_qkv_weight_.data_type   = this->weight_dtype_;
+            attn_qkv_weight_.weight_type = this->weight_dtype_;
+            attn_qkv_weight_.input_type  = this->weight_dtype_;
             attn_qkv_weight_.prepare(/*fused_moe=*/false);
 
             // Attention output: [q_size, hidden]
             const int attn_o_in  = weights_.attn_o.shape(0);
             const int attn_o_out = weights_.attn_o.shape(1);
             attn_o_weight_.emplace(
-                attn_o_in, attn_o_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                attn_o_in, attn_o_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
             attn_o_weight_.weight      = weights_.attn_o.borrow();
             attn_o_weight_.bias        = {};
-            attn_o_weight_.data_type   = weight_dtype_;
-            attn_o_weight_.weight_type = weight_dtype_;
-            attn_o_weight_.input_type  = weight_dtype_;
+            attn_o_weight_.data_type   = this->weight_dtype_;
+            attn_o_weight_.weight_type = this->weight_dtype_;
+            attn_o_weight_.input_type  = this->weight_dtype_;
             attn_o_weight_.prepare(/*fused_moe=*/false);
 
             // Legacy EagleNet FC “MLP” projection: [2 * hidden, hidden]
@@ -571,12 +574,12 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 const int fc_in  = weights_.fc.shape(0);
                 const int fc_out = weights_.fc.shape(1);
                 fc_weight_.emplace(
-                    fc_in, fc_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                    fc_in, fc_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
                 fc_weight_.weight      = weights_.fc.borrow();
                 fc_weight_.bias        = {};
-                fc_weight_.data_type   = weight_dtype_;
-                fc_weight_.weight_type = weight_dtype_;
-                fc_weight_.input_type  = weight_dtype_;
+                fc_weight_.data_type   = this->weight_dtype_;
+                fc_weight_.weight_type = this->weight_dtype_;
+                fc_weight_.input_type  = this->weight_dtype_;
                 fc_weight_.prepare(/*fused_moe=*/false);
             }
 
@@ -586,12 +589,12 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 const int eagle_fc_in  = weights_.eagle_fc.shape(0);
                 const int eagle_fc_out = weights_.eagle_fc.shape(1);
                 eagle_fc_weight_.emplace(
-                    eagle_fc_in, eagle_fc_out, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+                    eagle_fc_in, eagle_fc_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
                 eagle_fc_weight_.weight      = weights_.eagle_fc.borrow();
                 eagle_fc_weight_.bias        = {};
-                eagle_fc_weight_.data_type   = weight_dtype_;
-                eagle_fc_weight_.weight_type = weight_dtype_;
-                eagle_fc_weight_.input_type  = weight_dtype_;
+                eagle_fc_weight_.data_type   = this->weight_dtype_;
+                eagle_fc_weight_.weight_type = this->weight_dtype_;
+                eagle_fc_weight_.input_type  = this->weight_dtype_;
                 eagle_fc_weight_.prepare(/*fused_moe=*/false);
             }
 
@@ -615,6 +618,13 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         eagle3_draft_layer_->post_attn_norm = weights_.attn_norm.borrow();
         eagle3_draft_layer_->output_norm    = weights_.output_norm.borrow();
 
+        // Populate newly added fields for geometry propagation
+        eagle3_draft_layer_->base_hidden_dim  = base_hidden_units_;
+        eagle3_draft_layer_->draft_hidden_dim = draft_hidden_units_;
+        eagle3_draft_layer_->head_num         = head_num;
+        eagle3_draft_layer_->kv_head_num      = head_num; // Assuming MHA if not specified, otherwise needs config entry
+        eagle3_draft_layer_->size_per_head    = head_dim;
+
         // Minimal FFN wrapper: treat mlp_gate_up as a fused gating
         // projection and mlp_down as the output projection. We rely on
         // the same LlamaLinear backend used elsewhere in EagleModule.
@@ -623,7 +633,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         const int tp_rank    = 0;
         const int group_size = 1;
 
-        new (&eagle3_draft_layer_->ffn) LlamaFfnWeight(hidden_units,
+        new (&eagle3_draft_layer_->ffn) LlamaFfnWeight(draft_hidden_units_,
                                                        inter_size,
                                                        /*bias=*/false,
                                                        tp_size,
@@ -1224,7 +1234,7 @@ void EagleModule::forward(const Tensor& input_ids,
     // Ensure LM head wrapper is ready (defensive in case load() was skipped)
     if (!lm_head_prepared_ && weights_.lm_head) {
         lm_head_weight_.emplace(
-            hidden_units_, vocab_size_, weight_dtype_, /*bias=*/false, weight_dtype_, /*group_size=*/1);
+            this->hidden_units_, this->vocab_size_, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
         lm_head_weight_.weight      = weights_.lm_head.borrow();
         lm_head_weight_.bias        = {};
         lm_head_weight_.data_type   = weight_dtype_;
@@ -1268,7 +1278,7 @@ void EagleModule::forward(const Tensor& input_ids,
             || attn_input_scratch_.device().type != kDEVICE || attn_input_scratch_.shape(0) < batch_size
             || attn_input_scratch_.shape(1) != hidden_dim;
         if (need_attn_in) {
-            attn_input_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+            attn_input_scratch_ = Tensor{Layout({batch_size, hidden_dim}), hidden_dtype, kDEVICE};
         }
         Tensor& attn_input = attn_input_scratch_;
 
@@ -1283,7 +1293,7 @@ void EagleModule::forward(const Tensor& input_ids,
                 || eagle_fc_out_scratch_.shape(0) < batch_size
                 || eagle_fc_out_scratch_.shape(1) != draft_dim;
             if (need_fc_out) {
-                eagle_fc_out_scratch_ = Tensor{{batch_size, draft_dim}, hidden_dtype, kDEVICE};
+                eagle_fc_out_scratch_ = Tensor{Layout({batch_size, draft_dim}), hidden_dtype, kDEVICE};
             }
             fc_out = eagle_fc_out_scratch_;
             linear.Forward(captured_hidden_states, eagle_fc_weight_, /*output=*/fc_out);
@@ -1344,9 +1354,9 @@ void EagleModule::forward(const Tensor& input_ids,
         bool      need_qkv =
             !qkv_scratch_ || qkv_scratch_.dtype() != weight_dtype_ || qkv_scratch_.device().type != kDEVICE
             || qkv_scratch_.shape(0) < batch_size || qkv_scratch_.shape(1) != qkv_out_dim;
-        if (need_qkv) {
-            qkv_scratch_ = Tensor{{batch_size, qkv_out_dim}, weight_dtype_, kDEVICE};
-        }
+            if (need_qkv) {
+                qkv_scratch_ = Tensor{Layout({batch_size, qkv_out_dim}), this->weight_dtype_, kDEVICE};
+            }
         Tensor& qkv = qkv_scratch_;
 
         if (eagle3) {
@@ -1360,7 +1370,7 @@ void EagleModule::forward(const Tensor& input_ids,
                 || attn_qkv_input_scratch_.device().type != kDEVICE || attn_qkv_input_scratch_.shape(0) < batch_size
                 || attn_qkv_input_scratch_.shape(1) != qkv_in_dim;
             if (need_qkv_in) {
-                attn_qkv_input_scratch_ = Tensor{{batch_size, qkv_in_dim}, hidden_dtype, kDEVICE};
+                attn_qkv_input_scratch_ = Tensor{Layout({batch_size, qkv_in_dim}), hidden_dtype, kDEVICE};
             }
             Tensor& qkv_input = attn_qkv_input_scratch_;
 
@@ -1377,7 +1387,7 @@ void EagleModule::forward(const Tensor& input_ids,
                     || embed_input_scratch_.device().type != kDEVICE || embed_input_scratch_.shape(0) < batch_size
                     || embed_input_scratch_.shape(1) != hidden_dim;
                 if (need_embed_in) {
-                    embed_input_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+                    embed_input_scratch_ = Tensor{Layout({batch_size, hidden_dim}), hidden_dtype, kDEVICE};
                 }
                 core::Buffer raw_ids(const_cast<void*>(input_ids.raw_data()), batch_size, kInt32, kDEVICE);
                 core::Buffer_<int> token_ids(raw_ids);
@@ -1389,7 +1399,7 @@ void EagleModule::forward(const Tensor& input_ids,
                     || embed_norm_scratch_.device().type != kDEVICE || embed_norm_scratch_.shape(0) < batch_size
                     || embed_norm_scratch_.shape(1) != hidden_dim;
                 if (need_embed_norm) {
-                    embed_norm_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+                    embed_norm_scratch_ = Tensor{Layout({batch_size, hidden_dim}), hidden_dtype, kDEVICE};
                 }
                 embed_norm = embed_norm_scratch_;
                 invokeRMSNorm(embed_norm, embed_input_scratch_, weights_.input_norm, kEps, stream);
@@ -1443,7 +1453,7 @@ void EagleModule::forward(const Tensor& input_ids,
                 !qkv_scratch_ || qkv_scratch_.dtype() != weight_dtype_ || qkv_scratch_.device().type != kDEVICE
                 || qkv_scratch_.shape(0) < batch_size || qkv_scratch_.shape(1) != qkv_dim;
             if (need_qkv_in) {
-                qkv_scratch_ = Tensor{{batch_size, qkv_dim}, weight_dtype_, kDEVICE};
+                qkv_scratch_ = Tensor{Layout({batch_size, qkv_dim}), this->weight_dtype_, kDEVICE};
             }
             Tensor& qkv_legacy = qkv_scratch_;
             linear.Forward(attn_input, attn_qkv_weight_, /*output=*/qkv_legacy);
@@ -1464,10 +1474,9 @@ void EagleModule::forward(const Tensor& input_ids,
             !attn_out_scratch_ || attn_out_scratch_.dtype() != weight_dtype_
             || attn_out_scratch_.device().type != kDEVICE || attn_out_scratch_.shape(0) < batch_size
             || attn_out_scratch_.shape(1) != hidden_dim;
-        if (need_attn_out) {
-            attn_out_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
-        }
-        Tensor& attn_out = attn_out_scratch_;
+                    if (need_attn_out) {
+                        attn_out_scratch_ = Tensor{Layout({batch_size, hidden_dim}), this->weight_dtype_, kDEVICE};
+                    }        Tensor& attn_out = attn_out_scratch_;
         linear.Forward(value, attn_o_weight_, /*output=*/attn_out);
         if (isEagleDebugEnabled()) {
             debug_attn_out_ = attn_out;
@@ -1488,12 +1497,34 @@ void EagleModule::forward(const Tensor& input_ids,
                 !mlp_input_scratch_ || mlp_input_scratch_.dtype() != weight_dtype_
                 || mlp_input_scratch_.device().type != kDEVICE
                 || mlp_input_scratch_.shape(0) < batch_size
-                || mlp_input_scratch_.shape(1) != hidden_dim;
+                || mlp_input_scratch_.shape(1) != draft_hidden_units_;
             if (need_ffn_in) {
-                mlp_input_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+                mlp_input_scratch_ = Tensor{Layout({batch_size, draft_hidden_units_}), this->weight_dtype_, kDEVICE};
             }
             Tensor& ffn_input = mlp_input_scratch_;
-            invokeRMSNorm(ffn_input, attn_out, eagle3_draft_layer_->post_attn_norm, kEps, stream);
+
+            // attn_out (base_hidden_units_) is converted to ffn_input (draft_hidden_units_)
+            const int current_attn_out_dim = eagle3_draft_layer_->base_hidden_dim;
+            const int target_ffn_in_dim = eagle3_draft_layer_->draft_hidden_dim;
+
+            if (current_attn_out_dim != target_ffn_in_dim) {
+                check_cuda_error(cudaMemsetAsync(ffn_input.raw_data(), 0, ffn_input.byte_size(), stream));
+                const size_t elem_bytes = byte_size(weight_dtype_, 1);
+                const size_t src_stride = static_cast<size_t>(attn_out.stride(0)) * elem_bytes;
+                const size_t dst_stride = static_cast<size_t>(ffn_input.stride(0)) * elem_bytes;
+                const int    copy_cols  = std::min(current_attn_out_dim, target_ffn_in_dim);
+
+                for (int b = 0; b < batch_size; ++b) {
+                    const char* src_row = static_cast<const char*>(attn_out.raw_data()) + static_cast<size_t>(b) * src_stride;
+                    char*       dst_row = static_cast<char*>(ffn_input.raw_data()) + static_cast<size_t>(b) * dst_stride;
+                    check_cuda_error(cudaMemcpyAsync(
+                        dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+                }
+            } else {
+                check_cuda_error(cudaMemcpyAsync(ffn_input.raw_data(), attn_out.raw_data(), attn_out.byte_size(), cudaMemcpyDeviceToDevice, stream));
+            }
+
+            invokeRMSNorm(ffn_input, ffn_input, eagle3_draft_layer_->post_attn_norm, kEps, stream);
 
             // Fused gating projection: [B, 2 * inter_sz]
             Tensor mix = linear.Forward(ffn_input, mlp.fused_gating_intermediate);
@@ -1507,14 +1538,14 @@ void EagleModule::forward(const Tensor& input_ids,
             // gate' = silu(gate) * up (or Eagle3-specific variant).
             Activation(gating, up, mlp.act_type, stream);
 
-            // Output projection: [B, hidden_dim]
+            // Output projection: [B, draft_hidden_units_]
             bool need_mlp_out =
                 !mlp_out_scratch_ || mlp_out_scratch_.dtype() != weight_dtype_
                 || mlp_out_scratch_.device().type != kDEVICE
                 || mlp_out_scratch_.shape(0) < batch_size
-                || mlp_out_scratch_.shape(1) != hidden_dim;
+                || mlp_out_scratch_.shape(1) != draft_hidden_units_;
             if (need_mlp_out) {
-                mlp_out_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+                mlp_out_scratch_ = Tensor{Layout({batch_size, draft_hidden_units_}), this->weight_dtype_, kDEVICE};
             }
             Tensor& ffn_out = mlp_out_scratch_;
             linear.Forward(gating, mlp.output, ffn_out);
@@ -1522,18 +1553,45 @@ void EagleModule::forward(const Tensor& input_ids,
             if (isEagleDebugEnabled()) {
                 debug_ffn_out_ = ffn_out;
             }
+
             // Apply FFN residual + RMSNorm in one step:
-            //   y = RMSNorm(attn_out + FFN(norm(attn_out)), output_norm)
-            // using the shared residual/norm helper. Here `ffn_out`
-            // holds FFN(norm(attn_out)) and `attn_out_scratch_` is the
-            // residual from attention.
+            //   y = RMSNorm(attn_out_converted + FFN(norm(attn_out_converted)), output_norm)
+            // Here ffn_out holds FFN(norm(attn_out_converted)).
+            // Convert attn_out_scratch_ (base_hidden_units_) to draft_hidden_units_ for residual.
+            bool need_residual_scratch =
+                !residual_to_ffn_dim_scratch_ || residual_to_ffn_dim_scratch_.dtype() != weight_dtype_
+                || residual_to_ffn_dim_scratch_.device().type != kDEVICE
+                || residual_to_ffn_dim_scratch_.shape(0) < batch_size
+                || residual_to_ffn_dim_scratch_.shape(1) != target_ffn_in_dim; // target_ffn_in_dim is draft_hidden_units_
+            if (need_residual_scratch) {
+                residual_to_ffn_dim_scratch_ = Tensor{Layout({batch_size, target_ffn_in_dim}), this->weight_dtype_, kDEVICE};
+            }
+            Tensor& converted_residual = residual_to_ffn_dim_scratch_;
+
+            if (current_attn_out_dim != target_ffn_in_dim) {
+                check_cuda_error(cudaMemsetAsync(converted_residual.raw_data(), 0, converted_residual.byte_size(), stream));
+                const size_t elem_bytes = byte_size(weight_dtype_, 1);
+                const size_t src_stride = static_cast<size_t>(attn_out_scratch_.stride(0)) * elem_bytes;
+                const size_t dst_stride = static_cast<size_t>(converted_residual.stride(0)) * elem_bytes;
+                const int    copy_cols  = std::min(current_attn_out_dim, target_ffn_in_dim);
+
+                for (int b = 0; b < batch_size; ++b) {
+                    const char* src_row = static_cast<const char*>(attn_out_scratch_.raw_data()) + static_cast<size_t>(b) * src_stride;
+                    char*       dst_row = static_cast<char*>(converted_residual.raw_data()) + static_cast<size_t>(b) * dst_stride;
+                    check_cuda_error(cudaMemcpyAsync(
+                        dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+                }
+            } else {
+                check_cuda_error(cudaMemcpyAsync(converted_residual.raw_data(), attn_out_scratch_.raw_data(), attn_out_scratch_.byte_size(), cudaMemcpyDeviceToDevice, stream));
+            }
+
             invokeResidualBiasRMSNorm(
                 /*hidden_states=*/ffn_out.raw_data(),
-                /*residual=*/attn_out_scratch_.raw_data(),
+                /*residual=*/converted_residual.raw_data(),
                 /*weights=*/eagle3_draft_layer_->output_norm.raw_data(),
                 /*bias=*/nullptr,
                 weight_dtype_,
-                hidden_dim,
+                eagle3_draft_layer_->draft_hidden_dim, // Corrected dimension
                 batch_size,
                 kEps,
                 stream);
@@ -1551,7 +1609,7 @@ void EagleModule::forward(const Tensor& input_ids,
                 || normed_hidden_scratch_.shape(0) < batch_size
                 || normed_hidden_scratch_.shape(1) != hidden_dim;
             if (need_norm_scratch) {
-                normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, weight_dtype_, kDEVICE};
+                normed_hidden_scratch_ = Tensor{Layout({batch_size, hidden_dim}), this->weight_dtype_, kDEVICE};
             }
             Tensor& normed_hidden = normed_hidden_scratch_;
             invokeRMSNorm(normed_hidden, attn_out_scratch_, weights_.output_norm, kEps, stream);
@@ -1570,7 +1628,7 @@ void EagleModule::forward(const Tensor& input_ids,
             || normed_hidden_scratch_.device().type != kDEVICE || normed_hidden_scratch_.shape(0) < batch_size
             || normed_hidden_scratch_.shape(1) != hidden_dim;
         if (need_norm) {
-            normed_hidden_scratch_ = Tensor{{batch_size, hidden_dim}, hidden_dtype, kDEVICE};
+            normed_hidden_scratch_ = Tensor{Layout({batch_size, hidden_dim}), hidden_dtype, kDEVICE};
         }
         Tensor& normed_hidden = normed_hidden_scratch_;
         invokeRMSNorm(normed_hidden, hidden_states, weights_.output_norm, kEps, stream);
@@ -1586,17 +1644,17 @@ void EagleModule::forward(const Tensor& input_ids,
         return;
     }
 
-    const int vocab = vocab_size_ > 0 ? vocab_size_ : weights_.lm_head.shape(1);
+    const int vocab = this->vocab_size_ > 0 ? this->vocab_size_ : weights_.lm_head.shape(1);
 
     const bool need_new_logits_scratch =
         !logits_scratch_
-        || logits_scratch_.dtype() != weight_dtype_
+        || logits_scratch_.dtype() != this->weight_dtype_
         || logits_scratch_.device().type != kDEVICE
         || logits_scratch_.shape(0) < batch_size
         || logits_scratch_.shape(1) != vocab;
 
     if (need_new_logits_scratch) {
-        logits_scratch_ = Tensor{{batch_size, vocab}, weight_dtype_, kDEVICE};
+        logits_scratch_ = Tensor{Layout({batch_size, vocab}), this->weight_dtype_, kDEVICE};
     }
 
     Tensor& logits = logits_scratch_;

@@ -212,7 +212,7 @@ private:
     // d_sequence_lengths is a device pointer to per-slot sequence lengths
     // (one entry per engine slot); it is used to derive position ids for
     // tree tokens. When nullptr, a base sequence length of 0 is assumed.
-    void targetTreeDecode(int batch_size, const int* d_sequence_lengths);
+    void targetTreeDecode(int batch_size, const int* d_sequence_lengths, const int* d_batch_slots);
 
     // Entry point for base-model target-tree decode. This runs the
     // staging kernel (`targetTreeDecode`) using the provided per-slot
@@ -222,7 +222,8 @@ private:
     // tree path.
     void runEagleTargetTreeDecode(int batch_size,
                                   const int*       d_sequence_lengths,
-                                  const Sequence** sequences);
+                                  const Sequence** sequences,
+                                  const int*       d_batch_slots);
 
     // Eagle3 draft-tree decode entry point. This runs a lightweight
     // Eagle3 draft layer under UnifiedDecoder to produce per-slot

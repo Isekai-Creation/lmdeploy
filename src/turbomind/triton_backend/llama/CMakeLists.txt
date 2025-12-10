@@ -19,6 +19,7 @@ cmake_minimum_required(VERSION 3.8)
 
 set(llama_triton_backend_files
     LlamaTritonModel.cc
+    ../../models/llama/eagle3_attention_kernels.cu
 )
 
 find_package(CUDAToolkit REQUIRED)

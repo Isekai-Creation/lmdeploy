@@ -421,6 +421,11 @@ def _convert_eagle3_midlayer(
     def get(name: str, *, optional: bool = False) -> Optional[torch.Tensor]:
         return _load_tensor_from_shards(shards, name, optional=optional)
 
+    geo = _infer_eagle3_geometry(shards, hidden_size, logger=log)
+    draft_hidden = int(geo.get("eagle_draft_hidden", 0))
+    if draft_hidden <= 0:
+        raise RuntimeError(f"Could not determine Eagle3 draft_hidden from checkpoint: {hf_dir!r}")
+
     # Use BF16 for Eagle3 midlayer drafts to match the HF checkpoint.
     # EagleModule::load will read these back as BF16 tensors.
     w_dtype = torch.bfloat16
@@ -433,6 +438,11 @@ def _convert_eagle3_midlayer(
 
     # LM head: ideally from base LM; otherwise synthetic.
     lm_head = _resolve_base_lm_head(base_model_dir, hidden_size, vocab_size, logger=log)
+    if lm_head.shape[0] != hidden_size:
+        raise RuntimeError(
+            f"LM head output dimension mismatch: "
+            f"Expected {hidden_size}, got {lm_head.shape[0]}"
+        )
     _write_tensor(lm_head, os.path.join(out_dir, "output.weight"), w_dtype)
 
     # Token embeddings: populate from base model if available, else zeros.

@@ -1942,6 +1942,8 @@ bool LlamaBatch::Forward(GenerationState& g)
 
     FT_CHECK(max_context_token_num_ >= max_batch_size_);
 
+    const int batch_size = state_->active_size;
+
     const bool eagle_enabled =
         param_.enable_speculative_decoding
         && (param_.spec_method == "eagle" || param_.spec_method == "eagle3");
@@ -2297,7 +2299,7 @@ bool LlamaBatch::Forward(GenerationState& g)
             spec_ctx.enable_eagle_target_tree = param_.enable_eagle_target_tree && model_->isTargetTreeDecodeEnabled();
             // Populate per-slot end_ids (first EOS id per request or -1).
             {
-                std::vector<int> host_end_ids(batch_size, -1);
+                std::vector<int> host_end_ids(max_batch_size_, -1);
                 for (int i = 0; i < batch_size; ++i) {
                     const auto* req = state_->requests[i].get();
                     if (req && !req->gen_cfg.eos_ids.empty()) {
@@ -2309,7 +2311,7 @@ bool LlamaBatch::Forward(GenerationState& g)
             }
             // Posterior/typical gating knobs (per TRT).
             {
-                std::vector<float> host_thr(batch_size, 1.0f);
+                std::vector<float> host_thr(max_batch_size_, 1.0f);
                 std::vector<float> host_alpha(batch_size, 1.0f);
                 std::vector<float> host_temp(batch_size, 1.0f);
                 for (int i = 0; i < batch_size; ++i) {
@@ -2319,12 +2321,12 @@ bool LlamaBatch::Forward(GenerationState& g)
                     }
                     host_temp[i] = req->gen_cfg.temperature;
                     // If posterior params are absent, default to 1.0 (no masking).
-                    if (!req->gen_cfg.posterior_thresholds.empty()) {
-                        host_thr[i] = req->gen_cfg.posterior_thresholds.front();
-                    }
-                    if (!req->gen_cfg.posterior_alphas.empty()) {
-                        host_alpha[i] = req->gen_cfg.posterior_alphas.front();
-                    }
+                    // if (!req->gen_cfg.posterior_thresholds.empty()) {
+                    //     host_thr[i] = req->gen_cfg.posterior_thresholds.front();
+                    // }
+                    // if (!req->gen_cfg.posterior_alphas.empty()) {
+                    //     host_alpha[i] = req->gen_cfg.posterior_alphas.front();
+                    // }
                 }
                 core::Copy(host_thr.data(), batch_size, eagle_posterior_thresholds_.data());
                 core::Copy(host_alpha.data(), batch_size, eagle_posterior_alphas_.data());

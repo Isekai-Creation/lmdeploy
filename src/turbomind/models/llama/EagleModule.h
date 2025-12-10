@@ -232,6 +232,7 @@ private:
     Tensor embed_input_scratch_;       // [batch, hidden] draft token embeddings
     Tensor embed_norm_scratch_;        // [batch, hidden] normalized embeddings
     Tensor logits_scratch_;
+    Tensor residual_to_ffn_dim_scratch_; // [batch, draft_hidden_units_] for residual conversion
 
     // Optional Eagle3 draft layer weights. When present, this structurally
     // groups the fused QKV / Wo and MLP weights into LlamaAttentionWeight /
@@ -240,6 +241,13 @@ private:
     std::unique_ptr<Eagle3DraftLayerWeight> eagle3_draft_layer_;
 
     friend class LlamaV2;
+
+    // Cached model dims / dtype
+    int      hidden_units_{0};        // legacy default (draft hidden unless overridden)
+    int      vocab_size_{0};
+    DataType weight_dtype_{kFloat16};
+    float rope_base_{10000.0f};
+    float rope_scale_{1.0f};
 
     // Debug views for eagle_forward_logits_debug / eagle_forward_debug.
     // These alias internal scratch buffers after the most recent forward
@@ -280,13 +288,8 @@ public:
                             LlamaLinear&  linear,
                             cudaStream_t  stream);
 
-    // Cached model dims / dtype
-    int      hidden_units_{0};        // legacy default (draft hidden unless overridden)
-    int      base_hidden_units_{0};   // attention/output hidden width
-    int      draft_hidden_units_{0};  // Eagle-3 midlayer hidden width
-    int      vocab_size_{0};
-    DataType weight_dtype_{kFloat16};
-    
+
+
     void initializeDefaultChoices();
 };
 

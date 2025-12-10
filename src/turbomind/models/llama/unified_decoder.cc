@@ -110,6 +110,8 @@ void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
 
 void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
                                   const Tensor& captured_hidden,
+                                  const Tensor& input_ids,
+                                  const Tensor& embed_tokens_weights,
                                   const Tensor& position_ids,
                                   const Tensor& packed_mask,
                                   const Tensor& tree_offsets,
@@ -157,6 +159,8 @@ void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
     // Attach position ids / masks to Eagle3 attention via optional params.
     eagle3_draft_layer_->Forward(input_hidden,
                                  captured_hidden,
+                                 input_ids,
+                                 embed_tokens_weights,
                                  position_ids,
                                  mask_tensor,
                                  tree_offsets,

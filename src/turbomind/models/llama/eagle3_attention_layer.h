@@ -12,32 +12,190 @@
 
 namespace turbomind {
 
-// Lightweight GEMM helpers implemented in eagle3_attention_kernels.cu.
-void launch_eagle3_matmul_rowmajor_half(const half_t* A,
-                                        const half_t* B,
-                                        half_t*       C,
-                                        int           M,
-                                        int           K,
-                                        int           N,
-                                        cudaStream_t  stream);
+namespace ft {
 
-#if ENABLE_BF16
-void launch_eagle3_matmul_rowmajor_bf16(const bfloat16_t* A,
-                                        const bfloat16_t* B,
-                                        bfloat16_t*       C,
-                                        int               M,
-                                        int               K,
-                                        int               N,
-                                        cudaStream_t      stream);
-#endif
 
-void launch_eagle3_matmul_rowmajor_float(const float* A,
-                                         const float* B,
-                                         float*       C,
-                                         int          M,
-                                         int          K,
-                                         int          N,
-                                         cudaStream_t stream);
+
+template<typename T>
+
+__global__ void apply_rope_kernel(T*       q_ptr,
+
+                                  T*       k_ptr,
+
+                                  int      token_num,
+
+                                  int      num_q_heads,
+
+                                  int      num_kv_heads,
+
+                                  int      head_dim,
+
+                                  int      q_len,
+
+                                  int      past_kv_len,
+
+                                  const int* position_ids,
+
+                                  float    rope_base,
+
+                                  float    rope_scale);
+
+
+
+template<typename T>
+
+__global__ void sdpa_kernel(const T* __restrict__ q_ptr,
+
+                            const T* __restrict__ k_ptr,
+
+                            const T* __restrict__ v_ptr,
+
+                            T* __restrict__       ctx_ptr,
+
+                            int                   token_num,
+
+                            int                   batch_size,
+
+                            int                   q_len,
+
+                            int                   kv_len,
+
+                            int                   num_q_heads,
+
+                            int                   num_kv_heads,
+
+                            int                   head_dim,
+
+                            int                   past_kv_len,
+
+                            const int*            position_ids,
+
+                            const int32_t*        packed_mask,
+
+                            int                   packed_stride,
+
+                            const int32_t*        runtime_offsets,
+
+                            const int32_t*        tree_offsets,
+
+                            const int32_t*        kv_lens_runtime,
+
+                            const int32_t*        successor_offsets,
+
+                            const int32_t*        successor_counts);
+
+
+
+template<typename T>
+
+__global__ void expand_kv_to_q_kernel(const T* __restrict__ kv,
+
+                                      T* __restrict__ q,
+
+                                      int batch,
+
+                                      int kv_heads,
+
+                                      int head_dim,
+
+                                      int group_size);
+
+
+
+template<typename T>
+
+void launch_apply_rope_kernel(T* q_ptr,
+
+                              T* k_ptr,
+
+                              int token_num,
+
+                              int num_q_heads,
+
+                              int num_kv_heads,
+
+                              int head_dim,
+
+                              int q_len,
+
+                              int past_kv_len,
+
+                              const Tensor* position_ids,
+
+                              float rope_base,
+
+                              float rope_scale,
+
+                              cudaStream_t stream);
+
+
+
+template<typename T>
+
+void launch_sdpa_kernel(const T* q_ptr,
+
+                        const T* k_ptr,
+
+                        const T* v_ptr,
+
+                        T*       ctx_ptr,
+
+                        int      token_num,
+
+                        int      batch_size,
+
+                        int      q_len,
+
+                        int      kv_len,
+
+                        int      num_q_heads,
+
+                        int      num_kv_heads,
+
+                        int      head_dim,
+
+                        int      past_kv_len,
+
+                        const Tensor* position_ids,
+
+                        const Tensor* packed_mask,
+
+                        int      packed_mask_stride,
+
+                        const Tensor* runtime_offsets,
+
+                        const Tensor* tree_offsets,
+
+                        const Tensor* kv_lens_runtime,
+
+                        const Tensor* successor_offsets,
+
+                        const Tensor* successor_counts,
+
+                        cudaStream_t stream);
+
+
+
+template<typename T>
+
+void launch_expand_kv_to_q_kernel(const Tensor& kv, Tensor& q_expanded, int kv_heads, int head_dim, int group_size, cudaStream_t stream);
+
+template<typename T>
+void launch_eagle3_matmul_rowmajor_dispatch(const T* A,
+                                            const T* B,
+                                            T*       C,
+                                            int      M,
+                                            int      K,
+                                            int      N,
+                                            cudaStream_t stream);
+
+
+
+}  // namespace ft
+
+
+
+
 
 struct Eagle3AttentionParam {
     // Input hidden after Eagle-3 pre-FC and norm.

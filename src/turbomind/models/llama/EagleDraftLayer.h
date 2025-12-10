@@ -16,15 +16,20 @@ struct Eagle3DraftLayerWeight {
     // (e.g. GPT‑OSS‑120B‑Eagle3 midlayer q/k/v/o projections). When not
     // initialised, the draft layer falls back to UnifiedAttentionLayer or
     // the shallow QKV path.
-    Eagle3AttentionWeight eagle3_attn;
-    Tensor               fc_weight;      // keep if your converter fills it
-    Tensor               hidden_norm;
-    Tensor               input_norm;
-    Tensor               post_attn_norm;
-    Tensor               output_norm;
-
-    Eagle3DraftLayerWeight() = default;
-};
+        Eagle3AttentionWeight eagle3_attn;
+        Tensor                fc_weight;      // keep if your converter fills it
+        Tensor                hidden_norm;
+        Tensor                input_norm;
+        Tensor                post_attn_norm;
+        Tensor                output_norm;
+    
+        int draft_hidden_dim;
+        int base_hidden_dim;
+        int head_num;
+        int kv_head_num;
+        int size_per_head;
+    
+        Eagle3DraftLayerWeight() = default;};
 
 class Eagle3DraftLayer {
 public:
@@ -36,6 +41,8 @@ public:
 
     void Forward(const Tensor& input_hidden,
                  const Tensor& captured_hidden,
+                 const Tensor& input_ids,
+                 const Tensor& embed_tokens_weights,
                  const Tensor& position_ids,
                      const Tensor& packed_mask,
                      const Tensor& tree_offsets,
@@ -71,7 +78,7 @@ private:
     int                    head_num_{0};
     int                    kv_head_num_{0};
     int                    size_per_head_{0};
-    bool attn_geom_ok_(int hidden_dim) const;
+    bool                   m_attn_geom_ok_{true}; // New member to track geometry compatibility
     bool is_qkv_compatible_() const;
     int draft_hidden_dim_{0};
     int base_hidden_dim_{0};

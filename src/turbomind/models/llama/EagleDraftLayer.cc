@@ -1,5 +1,3 @@
-// Copyright (c) OpenMMLab. All rights reserved.
-
 #include "src/turbomind/models/llama/EagleDraftLayer.h"
 
 #include <algorithm>
@@ -12,47 +10,6 @@
 #include "src/turbomind/models/llama/unified_attention_layer.h"
 #include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include "src/turbomind/kernels/gpt_kernels.h"
-
-namespace {
-
-template<typename T>
-__global__ void expand_kv_to_q_kernel(const T* __restrict__ kv,
-                                      T* __restrict__ q,
-                                      int batch,
-                                      int kv_heads,
-                                      int head_dim,
-                                      int group_size)
-{
-    // kv layout: [batch, kv_heads, head_dim]
-    // output q layout: [batch, kv_heads * group_size, head_dim]
-    int idx   = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * kv_heads * head_dim;
-    if (idx >= total) {
-        return;
-    }
-    int d      = idx % head_dim;
-    int kv_idx = (idx / head_dim) % kv_heads;
-    int b      = idx / (head_dim * kv_heads);
-
-    const T* src = kv + ((b * kv_heads + kv_idx) * head_dim + d);
-    T*       dst = q + ((b * kv_heads * group_size + kv_idx * group_size) * head_dim + d);
-    for (int g = 0; g < group_size; ++g) {
-        dst[g * head_dim] = *src;
-    }
-}
-
-template<typename T>
-void expand_kv_to_q(const Tensor& kv, Tensor& q_expanded, int kv_heads, int head_dim, int group_size, cudaStream_t stream)
-{
-    const int batch = kv.shape(0);
-    const int elems = batch * kv_heads * head_dim;
-    const int threads = 256;
-    const int blocks  = (elems + threads - 1) / threads;
-    expand_kv_to_q_kernel<<<blocks, threads, 0, stream>>>(
-        kv.data<T>(), q_expanded.data<T>(), batch, kv_heads, head_dim, group_size);
-}
-
-}  // namespace
 
 namespace turbomind {
 
@@ -72,14 +29,15 @@ Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
     eagle3_attn_layer_{eagle3_attn_layer},
     head_num_{0},
     kv_head_num_{0},
-    size_per_head_{0}
+    size_per_head_{0},
+    m_attn_geom_ok_{true}
 {
     if (weight_) {
-        head_num_      = weight_->attn.head_num;
-        kv_head_num_   = weight_->attn.kv_head_num;
-        size_per_head_ = weight_->attn.size_per_head;
-        draft_hidden_dim_ = weight_->attn.qkv.weight ? weight_->attn.qkv.weight.shape(0) / 2 : 0;
-        base_hidden_dim_  = weight_->attn.output.weight ? weight_->attn.output.weight.shape(1) : 0;
+        head_num_         = weight_->head_num;
+        kv_head_num_      = weight_->kv_head_num;
+        size_per_head_    = weight_->size_per_head;
+        draft_hidden_dim_ = weight_->draft_hidden_dim;
+        base_hidden_dim_  = weight_->base_hidden_dim;
     }
 }
 
@@ -107,52 +65,12 @@ bool Eagle3DraftLayer::is_qkv_compatible_() const
     return true;
 }
 
-// Validate QKV/Wo shapes instead of head_num * size_per_head gating.
-bool Eagle3DraftLayer::attn_geom_ok_(int hidden_dim) const
-{
-    const Tensor& qkv_w = weight_->attn.qkv.weight;
-    const Tensor& wo_w  = weight_->attn.output.weight;
-    if (!qkv_w || !wo_w || qkv_w.ndim() != 2 || wo_w.ndim() != 2) {
-        return false;
-    }
-    if (qkv_w.shape(1) <= 0 || wo_w.shape(0) <= 0 || wo_w.shape(1) <= 0) {
-        return false;
-    }
-    const int q_dim   = wo_w.shape(0);
-    const int kv_span = qkv_w.shape(1) - q_dim;
-    if (kv_span <= 0 || (kv_span % 2) != 0) {
-        return false;
-    }
-    // Wo output width must match the base hidden (residual) width when provided.
-    if (base_hidden_dim_ > 0 && wo_w.shape(1) != base_hidden_dim_) {
-        return false;
-    }
-    // Require QKV input width to be either draft_dim or 2 * draft_dim.
-    const int draft_dim = draft_hidden_dim_ > 0 ? draft_hidden_dim_ : hidden_dim;
-    if (qkv_w.shape(0) != draft_dim && qkv_w.shape(0) != 2 * draft_dim) {
-        return false;
-    }
-    return true;
-}
 
-void Eagle3DraftLayer::Forward(const Tensor& input_hidden, Tensor& output_hidden, cudaStream_t stream)
-{
-    Tensor empty;
-    Forward(input_hidden,
-            empty,
-            Tensor{},
-            Tensor{},
-            Tensor{},
-            Tensor{},
-            /*q_len=*/1,
-            /*kv_len=*/1,
-            /*past_kv_len=*/0,
-            output_hidden,
-            stream);
-}
 
 void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
                                const Tensor& captured_hidden,
+                               const Tensor& input_ids,
+                               const Tensor& embed_tokens_weights,
                                const Tensor& position_ids,
                                const Tensor& packed_mask,
                                const Tensor& tree_offsets,
@@ -199,6 +117,48 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     }
 
     const auto dtype = input_hidden.dtype();
+
+    // New code for embedding lookup and norm
+    Tensor embed_input_base_dim{{batch_size, base_hidden_dim_}, dtype, input_hidden.device()}; // Use base_hidden_dim_ here
+    Tensor embed_norm{{batch_size, draft_dim}, dtype, input_hidden.device()}; // Normed to draft_dim
+    bool have_embed = false;
+
+    if (input_ids && embed_tokens_weights && input_ids.size() == batch_size && embed_tokens_weights.ndim() == 2 && embed_tokens_weights.shape(1) == base_hidden_dim_) {
+        core::Buffer raw_ids(const_cast<void*>(input_ids.raw_data()), batch_size, kInt32, input_hidden.device());
+        core::Buffer_<int> token_ids(raw_ids);
+        core::Ref<Tensor>  embed_out(embed_input_base_dim); // Lookup into base_hidden_dim_ size
+        invokeEmbeddingLookup(embed_out, token_ids, embed_tokens_weights, stream);
+
+        // Convert from base_hidden_dim_ to draft_dim before RMSNorm
+        if (base_hidden_dim_ != draft_dim) {
+            Tensor temp_embed_for_norm{{batch_size, draft_dim}, dtype, input_hidden.device()};
+            check_cuda_error(cudaMemsetAsync(temp_embed_for_norm.raw_data(), 0, temp_embed_for_norm.byte_size(), stream));
+            const size_t elem_bytes = byte_size(dtype, 1);
+            const size_t src_stride = static_cast<size_t>(embed_input_base_dim.stride(0)) * elem_bytes;
+            const size_t dst_stride = static_cast<size_t>(temp_embed_for_norm.stride(0)) * elem_bytes;
+            const int    copy_cols  = std::min(base_hidden_dim_, draft_dim);
+
+            for (int b = 0; b < batch_size; ++b) {
+                const char* src_row = static_cast<const char*>(embed_input_base_dim.raw_data()) + static_cast<size_t>(b) * src_stride;
+                char*       dst_row = static_cast<char*>(temp_embed_for_norm.raw_data()) + static_cast<size_t>(b) * dst_stride;
+                check_cuda_error(cudaMemcpyAsync(
+                    dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+            }
+            invokeRMSNorm(embed_norm, temp_embed_for_norm, weight_->input_norm, rmsnorm_eps_, stream);
+        } else {
+            invokeRMSNorm(embed_norm, embed_input_base_dim, weight_->input_norm, rmsnorm_eps_, stream);
+        }
+        have_embed = true;
+    } else {
+        if (input_ids && !embed_tokens_weights) {
+            TM_LOG_WARNING("[EAGLE3][Draft] input_ids present but embed_tokens_weights missing; cannot use embedding for 2H QKV input.");
+        } else if (!input_ids && embed_tokens_weights) {
+            TM_LOG_WARNING("[EAGLE3][Draft] embed_tokens_weights present but input_ids missing; cannot use embedding for 2H QKV input.");
+        } else {
+             TM_LOG_WARNING("[EAGLE3][Draft] input_ids and embed_tokens_weights missing; cannot use embedding for 2H QKV input.");
+        }
+    }
+    // End new code
 
     auto norm_mismatch = [&](const Tensor& w, const char* name) -> bool {
         if (!w) {
@@ -252,8 +212,9 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     if (captured_hidden && captured_hidden.ndim() == 2 && captured_hidden.shape(0) == batch_size
         && captured_hidden.dtype() == dtype && weight_->fc_weight) {
         LlamaLinear& linear_fc = ffn_layer_->linear();
-        Tensor       fc_out{{batch_size, draft_dim}, dtype, input_hidden.device()};
-        linear_fc.Forward(captured_hidden, weight_->fc_weight, fc_out);
+        LlamaDenseWeight fc_w;
+        fc_w.weight = weight_->fc_weight;
+        Tensor fc_out = linear_fc.Forward(captured_hidden, fc_w);
         fc_norm = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
         invokeRMSNorm(fc_norm, fc_out, weight_->input_norm, rmsnorm_eps_, stream);
         have_fc = true;
@@ -269,6 +230,17 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     Tensor     qkv_input{{batch_size, qkv_in_dim}, dtype, input_hidden.device()};
     check_cuda_error(cudaMemsetAsync(qkv_input.raw_data(), 0, qkv_input.byte_size(), stream));
 
+    if (!expect_two_h) {
+        TM_LOG_WARNING(
+            "[EAGLE3][Draft] QKV input dimension (%d) is not 2 * draft_hidden (%d); "
+            "disabling Eagle3 attention for this layer.",
+            qkv_in_dim,
+            2 * draft_dim);
+        m_attn_geom_ok_ = false; // Set the flag
+        output_hidden = input_hidden; // Fallback to pass-through
+        return;
+    }
+
     const size_t elem_bytes    = byte_size(dtype, 1);
     const size_t src_row_bytes = static_cast<size_t>(hidden_norm.stride(0)) * elem_bytes;
     const size_t dst_row_bytes = static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
@@ -278,70 +250,27 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     const size_t fc_row_bytes = have_fc ? static_cast<size_t>(fc_norm.stride(0)) * elem_bytes : src_row_bytes;
     const char* fc_base       = have_fc ? static_cast<const char*>(fc_norm.raw_data()) : src_base;
 
-    if (expect_two_h) {
-        // Strict TRT packing: first half embedding_norm, second half FC_norm.
-        const size_t slice_bytes = static_cast<size_t>(draft_dim) * elem_bytes;
-        for (int b = 0; b < batch_size; ++b) {
-            char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-            const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-            check_cuda_error(
-                cudaMemcpyAsync(dst_row, src_row, slice_bytes, cudaMemcpyDeviceToDevice, stream));
+    // Strict TRT packing: first half embedding_norm, second half FC_norm.
+    const size_t slice_bytes = static_cast<size_t>(draft_dim) * elem_bytes;
+    for (int b = 0; b < batch_size; ++b) {
+        char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
+        const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
+        check_cuda_error(
+            cudaMemcpyAsync(dst_row, src_row, slice_bytes, cudaMemcpyDeviceToDevice, stream));
 
-            char* second_dst = dst_row + slice_bytes;
-            if (have_fc) {
-                const char* second_src = fc_base + static_cast<size_t>(b) * fc_row_bytes;
-                check_cuda_error(cudaMemcpyAsync(
-                    second_dst, second_src, slice_bytes, cudaMemcpyDeviceToDevice, stream));
-            }
-            else {
-                // No FC capture available; leave the second half zero but log once.
-                static bool logged_missing_fc = false;
-                if (!logged_missing_fc) {
-                    TM_LOG_WARNING(
-                        "[EAGLE3][Draft] FC capture missing; filling 2H QKV input second half with zeros.");
-                    logged_missing_fc = true;
-                }
-            }
+        char* second_dst = dst_row + slice_bytes;
+        if (have_fc) {
+            const char* second_src = fc_base + static_cast<size_t>(b) * fc_row_bytes;
+            check_cuda_error(cudaMemcpyAsync(
+                second_dst, second_src, slice_bytes, cudaMemcpyDeviceToDevice, stream));
         }
-    }
-    else {
-        // Fallback packing: copy as much as fits from hidden_norm then FC/hidden_norm.
-        const size_t copy_bytes = static_cast<size_t>(std::min(draft_dim, qkv_in_dim)) * elem_bytes;
-        for (int b = 0; b < batch_size; ++b) {
-            char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-            const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-            check_cuda_error(cudaMemcpyAsync(dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
-
-            if (qkv_in_dim > draft_dim) {
-                const size_t second_bytes = static_cast<size_t>(std::min(draft_dim, qkv_in_dim - draft_dim)) * elem_bytes;
-                char*        second_dst   = dst_row + static_cast<size_t>(draft_dim) * elem_bytes;
-                if (have_fc) {
-                    const char* second_src = fc_base + static_cast<size_t>(b) * fc_row_bytes;
-                    check_cuda_error(
-                        cudaMemcpyAsync(second_dst, second_src, second_bytes, cudaMemcpyDeviceToDevice, stream));
-                }
-                else {
-                    // No FC captured; zero-fill the second slice to maintain TRT packing semantics.
-                    static bool logged_missing_fc_fallback = false;
-                    if (!logged_missing_fc_fallback) {
-                        TM_LOG_WARNING(
-                            "[EAGLE3][Draft] FC capture missing; zero-filling 2H QKV fallback second slice.");
-                        logged_missing_fc_fallback = true;
-                    }
-                    check_cuda_error(cudaMemsetAsync(second_dst, 0, second_bytes, stream));
-                }
-                // Zero any remaining tail beyond the copied FC slice to avoid undefined data.
-                const size_t consumed = draft_dim + second_bytes / elem_bytes;
-                if (qkv_in_dim > consumed) {
-                    const size_t rem_bytes = static_cast<size_t>(qkv_in_dim - consumed) * elem_bytes;
-                    check_cuda_error(cudaMemsetAsync(
-                        dst_row + consumed * elem_bytes, 0, rem_bytes, stream));
-                }
-            }
-            else if (qkv_in_dim < draft_dim) {
-                const size_t rem_bytes = static_cast<size_t>(draft_dim - qkv_in_dim) * elem_bytes;
-                check_cuda_error(cudaMemsetAsync(
-                    dst_row + static_cast<size_t>(qkv_in_dim) * elem_bytes, 0, rem_bytes, stream));
+        else {
+            // No FC capture available; leave the second half zero but log once.
+            static bool logged_missing_fc = false;
+            if (!logged_missing_fc) {
+                TM_LOG_WARNING(
+                    "[EAGLE3][Draft] FC capture missing; filling 2H QKV input second half with zeros.");
+                logged_missing_fc = true;
             }
         }
     }
@@ -358,7 +287,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     const bool has_eagle3_layer = (eagle3_attn_layer_ != nullptr && weight_->eagle3_attn.is_initialized);
     const bool native_eagle3_ok = has_eagle3_layer && weight_->eagle3_attn.is_initialized
         && qkv_input.shape(1) == weight_->eagle3_attn.q_in && weight_->eagle3_attn.q_out > 0
-        && weight_->eagle3_attn.kv_out > 0;
+        && weight_->eagle3_attn.kv_out > 0 && m_attn_geom_ok_;
 
     static bool logged_invalid_geom = false;
 
@@ -404,8 +333,8 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         debug_attn_out_ = attn_out;
     }
 
-    // 3) FFN path: only valid when Wo_out matches draft_dim. Otherwise, return attn_out.
-    if (wo_out_dim != draft_dim || !ffn_layer_) {
+    // 3) FFN path: Ensure attn_out is converted to draft_dim before FFN.
+    if (!ffn_layer_) { // Still need to check if FFN is available
         output_hidden = attn_out;
         if (debug_enabled) {
             debug_ffn_out_         = Tensor{};
@@ -415,7 +344,30 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     }
 
     Tensor ffn_input{{batch_size, draft_dim}, dtype, input_hidden.device()};
-    invokeRMSNorm(ffn_input, attn_out, weight_->post_attn_norm, rmsnorm_eps_, stream);
+
+    // Convert attn_out (wo_out_dim = base_hidden_dim_) to ffn_input (draft_dim = draft_hidden_dim_).
+    const int current_attn_out_dim = base_hidden_dim_; // Use authoritative base_hidden_dim
+    const int target_ffn_in_dim = draft_dim; // Use authoritative draft_hidden_dim
+
+    if (current_attn_out_dim != target_ffn_in_dim) {
+        check_cuda_error(cudaMemsetAsync(ffn_input.raw_data(), 0, ffn_input.byte_size(), stream));
+        const size_t elem_bytes = byte_size(dtype, 1);
+        const size_t src_stride = static_cast<size_t>(attn_out.stride(0)) * elem_bytes;
+        const size_t dst_stride = static_cast<size_t>(ffn_input.stride(0)) * elem_bytes;
+        const int    copy_cols  = std::min(current_attn_out_dim, target_ffn_in_dim);
+
+        for (int b = 0; b < batch_size; ++b) {
+            const char* src_row = static_cast<const char*>(attn_out.raw_data()) + static_cast<size_t>(b) * src_stride;
+            char*       dst_row = static_cast<char*>(ffn_input.raw_data()) + static_cast<size_t>(b) * dst_stride;
+            check_cuda_error(cudaMemcpyAsync(
+                dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+    } else {
+        // If dimensions are the same, just copy attn_out to ffn_input
+        check_cuda_error(cudaMemcpyAsync(ffn_input.raw_data(), attn_out.raw_data(), attn_out.byte_size(), cudaMemcpyDeviceToDevice, stream));
+    }
+
+    invokeRMSNorm(ffn_input, ffn_input, weight_->post_attn_norm, rmsnorm_eps_, stream);
 
     // Ensure output buffer is allocated with the correct shape.
     if (!output_hidden || output_hidden.ndim() != 2 || output_hidden.shape(0) != batch_size

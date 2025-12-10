@@ -31,6 +31,8 @@ public:
 
     void ForwardDraft(const Tensor& input_hidden,
                       const Tensor& captured_hidden,
+                      const Tensor& input_ids,
+                      const Tensor& embed_tokens_weights,
                       const Tensor& position_ids,
                      const Tensor& packed_mask,
                      const Tensor& tree_offsets,
