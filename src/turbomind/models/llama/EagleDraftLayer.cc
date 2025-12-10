@@ -314,13 +314,34 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
 
             if (qkv_in_dim > draft_dim) {
                 const size_t second_bytes = static_cast<size_t>(std::min(draft_dim, qkv_in_dim - draft_dim)) * elem_bytes;
-                const char*  second_src   = fc_base + static_cast<size_t>(b) * fc_row_bytes;
-                check_cuda_error(cudaMemcpyAsync(
-                    dst_row + static_cast<size_t>(draft_dim) * elem_bytes,
-                    second_src,
-                    second_bytes,
-                    cudaMemcpyDeviceToDevice,
-                    stream));
+                char*        second_dst   = dst_row + static_cast<size_t>(draft_dim) * elem_bytes;
+                if (have_fc) {
+                    const char* second_src = fc_base + static_cast<size_t>(b) * fc_row_bytes;
+                    check_cuda_error(
+                        cudaMemcpyAsync(second_dst, second_src, second_bytes, cudaMemcpyDeviceToDevice, stream));
+                }
+                else {
+                    // No FC captured; zero-fill the second slice to maintain TRT packing semantics.
+                    static bool logged_missing_fc_fallback = false;
+                    if (!logged_missing_fc_fallback) {
+                        TM_LOG_WARNING(
+                            "[EAGLE3][Draft] FC capture missing; zero-filling 2H QKV fallback second slice.");
+                        logged_missing_fc_fallback = true;
+                    }
+                    check_cuda_error(cudaMemsetAsync(second_dst, 0, second_bytes, stream));
+                }
+                // Zero any remaining tail beyond the copied FC slice to avoid undefined data.
+                const size_t consumed = draft_dim + second_bytes / elem_bytes;
+                if (qkv_in_dim > consumed) {
+                    const size_t rem_bytes = static_cast<size_t>(qkv_in_dim - consumed) * elem_bytes;
+                    check_cuda_error(cudaMemsetAsync(
+                        dst_row + consumed * elem_bytes, 0, rem_bytes, stream));
+                }
+            }
+            else if (qkv_in_dim < draft_dim) {
+                const size_t rem_bytes = static_cast<size_t>(draft_dim - qkv_in_dim) * elem_bytes;
+                check_cuda_error(cudaMemsetAsync(
+                    dst_row + static_cast<size_t>(qkv_in_dim) * elem_bytes, 0, rem_bytes, stream));
             }
         }
     }
@@ -335,15 +356,11 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
 
     const bool has_attn_layer   = (attn_layer_ != nullptr);
     const bool has_eagle3_layer = (eagle3_attn_layer_ != nullptr && weight_->eagle3_attn.is_initialized);
-    const bool can_use_unified  = has_attn_layer && attn_geom_ok_(draft_dim) && weight_->attn.qkv.weight
-                                  && weight_->attn.output.weight
-                                  && weight_->attn.qkv.weight.shape(0) == draft_dim
-                                  && weight_->attn.qkv.weight.shape(1) == 3 * draft_dim
-                                  && weight_->attn.output.weight.shape(0) == draft_dim
-                                  && weight_->attn.output.weight.shape(1) == draft_dim;
     const bool native_eagle3_ok = has_eagle3_layer && weight_->eagle3_attn.is_initialized
         && qkv_input.shape(1) == weight_->eagle3_attn.q_in && weight_->eagle3_attn.q_out > 0
         && weight_->eagle3_attn.kv_out > 0;
+
+    static bool logged_invalid_geom = false;
 
     if (native_eagle3_ok) {
         Eagle3AttentionParam ep{};
@@ -364,72 +381,21 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         ep.batch_size         = batch_size;
         ep.q_len              = q_len > 0 ? q_len : 1;
         ep.kv_len             = kv_len > 0 ? kv_len : ep.q_len;
+        ep.rope_base          = weight_->eagle3_attn.rope_base > 0.f ? weight_->eagle3_attn.rope_base : 10000.f;
+        ep.rope_scale         = weight_->eagle3_attn.rope_scale > 0.f ? weight_->eagle3_attn.rope_scale : 1.f;
         ep.debug_qkv          = debug_enabled ? &debug_qkv_ : nullptr;
         ep.debug_attn_out     = debug_enabled ? &debug_attn_out_ : nullptr;
         eagle3_attn_layer_->Forward(ep);
         attn_out = ep.output;
         sync_check_cuda_error();
     }
-    else if (can_use_unified) {
-        UnifiedAttentionLayer::ForwardParam param{};
-        param.input    = qkv_input;
-        if (!attn_out || attn_out.shape(0) != batch_size || attn_out.shape(1) != wo_out_dim
-            || attn_out.dtype() != dtype || attn_out.device().type != input_hidden.device().type) {
-            attn_out = Tensor{{batch_size, wo_out_dim}, dtype, input_hidden.device()};
-        }
-        param.output   = attn_out;
-        param.weights  = &weight_->attn;
-        param.layer_id = 0;
-        param.q_len    = q_len > 0 ? q_len : 1;
-        param.kv_len   = kv_len > 0 ? kv_len : param.q_len;
-
-        attn_layer_->Forward(param);
-        sync_check_cuda_error();
-    }
-    else if (has_eagle3_layer && attn_geom_ok_(draft_dim)) {
-        Eagle3AttentionParam ep{};
-        ep.input        = qkv_input;
-        ep.output       = attn_out;
-        ep.attn_weights = &weight_->attn;
-        ep.weights      = &weight_->eagle3_attn;
-        ep.batch_size   = batch_size;
-        ep.layer_id     = 0;
-        ep.q_len        = q_len > 0 ? q_len : 1;
-        ep.kv_len       = kv_len > 0 ? kv_len : ep.q_len;
-        ep.past_kv_len  = past_kv_len;
-        ep.rope_base    = weight_->eagle3_attn.rope_base > 0.f ? weight_->eagle3_attn.rope_base : 10000.f;
-        ep.rope_scale   = weight_->eagle3_attn.rope_scale > 0.f ? weight_->eagle3_attn.rope_scale : 1.f;
-        ep.tree_offsets       = tree_offsets ? &tree_offsets : nullptr;
-        ep.runtime_offsets    = runtime_offsets ? &runtime_offsets : nullptr;
-        ep.kv_lens_runtime    = kv_lens_runtime ? &kv_lens_runtime : nullptr;
-        ep.successor_offsets = successor_offsets ? &successor_offsets : nullptr;
-        ep.successor_counts  = successor_counts ? &successor_counts : nullptr;
-        if (position_ids) {
-            ep.position_ids = &position_ids;
-        }
-        if (packed_mask) {
-            ep.packed_mask = &packed_mask;
-            ep.packed_mask_stride = (packed_mask.ndim() >= 2) ? packed_mask.shape(1) : 0;
-        }
-        if (debug_enabled) {
-            ep.debug_qkv      = &debug_qkv_;
-            ep.debug_attn_out = &debug_attn_out_;
-        }
-        eagle3_attn_layer_->Forward(ep);
-        sync_check_cuda_error();
-    }
     else {
-        if (has_attn_layer && !can_use_unified) {
+        if (!logged_invalid_geom) {
             TM_LOG_WARNING(
-                "[EAGLE3][Draft] invalid attention geometry (head_num=%d, size_per_head=%d, hidden_dim=%d); "
-                "falling back to pass-through until real Eagle3 attention is wired.",
-                head_num_,
-                size_per_head_,
-                draft_dim);
-        }
-        else if (debug_enabled) {
-            TM_LOG_WARNING(
-                "[EAGLE3][Draft] shallow pass-through attention path active; replace once Eagle3 kernels land.");
+                "[EAGLE3][Draft] invalid Eagle3 geometry (q_in=%d, expected=%d); skipping Eagle3 attention.",
+                qkv_input.shape(1),
+                weight_->eagle3_attn.q_in);
+            logged_invalid_geom = true;
         }
         attn_out = hidden_norm;
     }

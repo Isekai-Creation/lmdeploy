@@ -16,12 +16,15 @@ Usage example (from repo root):
 from __future__ import annotations
 
 import argparse
+import math
+from pathlib import Path
 from typing import Tuple
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from lmdeploy.turbomind.turbomind import _tm as _turbomind
+import yaml
 
 try:
     # Optional: LMDeploy PyTorchEngine comparison path.
@@ -104,6 +107,44 @@ def _build_hidden_and_capture_from_ids(
     return last_hidden, capture
 
 
+def _cpu_attn_ref(qkv_tm, attn_out_tm, cfg: dict) -> None:
+    """Optional tiny CPU ref on QKV when metadata is available."""
+    if qkv_tm is None or attn_out_tm is None:
+        return
+    try:
+        q_size = int(cfg.get("eagle_q_size", 0))
+        kv_size = int(cfg.get("eagle_kv_size", 0))
+        num_q_heads = int(cfg.get("eagle_num_heads", cfg.get("eagle_num_attention_heads", 0)))
+        num_kv_heads = int(cfg.get("eagle_num_kv_heads", 0))
+        head_dim = int(cfg.get("eagle_head_dim", 0))
+    except Exception:
+        return
+    if not (q_size and kv_size and num_q_heads and num_kv_heads and head_dim):
+        return
+
+    qkv_tm_t = torch.from_dlpack(qkv_tm.__dlpack__()).to(torch.float32)
+    attn_out_tm_t = torch.from_dlpack(attn_out_tm.__dlpack__()).to(torch.float32)
+    if qkv_tm_t.shape[0] != attn_out_tm_t.shape[0]:
+        return
+    B = qkv_tm_t.shape[0]
+    if qkv_tm_t.shape[1] < q_size + 2 * kv_size:
+        return
+    group = math.ceil(num_q_heads / num_kv_heads)
+    q = qkv_tm_t[:, :q_size].view(B, num_q_heads, head_dim)
+    k = qkv_tm_t[:, q_size : q_size + kv_size].view(B, num_kv_heads, head_dim)
+    v = qkv_tm_t[:, q_size + kv_size : q_size + 2 * kv_size].view(B, num_kv_heads, head_dim)
+    ctx = torch.zeros_like(q)
+    scale = 1.0 / math.sqrt(head_dim)
+    for b in range(B):
+        for h in range(num_q_heads):
+            kvh = min(num_kv_heads - 1, h // group)
+            score = (q[b, h] * k[b, kvh]).sum() * scale
+            w = torch.softmax(score.view(1), dim=-1)
+            ctx[b, h] = w * v[b, kvh]
+    ctx_flat = ctx.view(B, -1)
+    _stage_stats("ATTN_OUT_CPU_REF", ctx_flat, attn_out_tm_t)
+
+
 def run_compare(
     draft_dir: str,
     target_model_name: str,
@@ -113,6 +154,8 @@ def run_compare(
     cosine_tol: float = 0.0,
     max_abs_tol: float = 0.0,
     topk_overlap_tol: float = 0.0,
+    dump_debug: bool = False,
+    cpu_ref: bool = False,
 ) -> None:
     """Load HF Eagle3 + TurboMind draft and print basic alignment stats."""
     dev = torch.device(device)
@@ -189,7 +232,8 @@ def run_compare(
 
     if qkv_tm is not None:
         qkv_tm_t = torch.from_dlpack(qkv_tm.__dlpack__()).to(torch.float32)
-        print(f"QKV: shape={tuple(qkv_tm_t.shape)}, mean={qkv_tm_t.mean().item():.4f}, std={qkv_tm_t.std().item():.4f}")
+        if dump_debug:
+            print(f"QKV: shape={tuple(qkv_tm_t.shape)}, mean={qkv_tm_t.mean().item():.4f}, std={qkv_tm_t.std().item():.4f}")
     else:
         print("QKV: not available from TurboMind debug binding.")
 
@@ -226,19 +270,43 @@ def run_compare(
             raise AssertionError("No logits stats available to apply tolerances.")
         _, max_abs_diff, cos_val = logits_stats
         if cosine_tol and cos_val < cosine_tol:
-            raise AssertionError(f"cosine {cos_val:.4f} below tol {cosine_tol}")
+            raise AssertionError(f"logits cosine {cos_val:.4f} below tol {cosine_tol}")
         if max_abs_tol and max_abs_diff > max_abs_tol:
-            raise AssertionError(f"max_abs_diff {max_abs_diff:.4e} above tol {max_abs_tol}")
+            raise AssertionError(f"logits max_abs_diff {max_abs_diff:.4e} above tol {max_abs_tol}")
         if topk_overlap_tol and topk_overlap < topk_overlap_tol:
             raise AssertionError(
                 f"top{k} overlap {topk_overlap:.3f} below tol {topk_overlap_tol}"
             )
+        # Optional stagewise checks using same tolerances when HF refs exist.
+        if attn_stats is not None:
+            _, attn_max, attn_cos = attn_stats
+            if cosine_tol and attn_cos < cosine_tol:
+                raise AssertionError(f"attn_out cosine {attn_cos:.4f} below tol {cosine_tol}")
+            if max_abs_tol and attn_max > max_abs_tol:
+                raise AssertionError(f"attn_out max_abs_diff {attn_max:.4e} above tol {max_abs_tol}")
+        if pre_stats is not None:
+            _, pre_max, pre_cos = pre_stats
+            if cosine_tol and pre_cos < cosine_tol:
+                raise AssertionError(f"pre_head_hidden cosine {pre_cos:.4f} below tol {cosine_tol}")
+            if max_abs_tol and pre_max > max_abs_tol:
+                raise AssertionError(f"pre_head_hidden max_abs_diff {pre_max:.4e} above tol {max_abs_tol}")
 
     print(f"\nPrompt (unused for synthetic ids): {prompt!r}")
     print(f"argmax_match_rate={match_rate:.3f}")
     print(f"top{k}_overlap={topk_overlap:.3f}")
-    print(f"HF top1 IDs: {top1_hf.tolist()}")
-    print(f"TM top1 IDs: {top1_tm.tolist()}")
+    if dump_debug:
+        print(f"HF top1 IDs: {top1_hf.tolist()}")
+        print(f"TM top1 IDs: {top1_tm.tolist()}")
+
+    if cpu_ref:
+        cfg_yaml = Path(draft_dir) / "config.yaml"
+        cfg_dict = {}
+        if cfg_yaml.is_file():
+            try:
+                cfg_dict = yaml.safe_load(cfg_yaml.read_text())
+            except Exception:
+                cfg_dict = {}
+        _cpu_attn_ref(qkv_tm, attn_out_tm, cfg_dict)
 
 
 def run_lmdeploy_pytorch_compare(
@@ -367,6 +435,16 @@ def main() -> None:
         default=0.0,
         help="Optional top-k overlap tolerance on logits; raise if below.",
     )
+    parser.add_argument(
+        "--dump-debug",
+        action="store_true",
+        help="Print extra debug stats (QKV/top1 lists) for manual inspection.",
+    )
+    parser.add_argument(
+        "--cpu-ref",
+        action="store_true",
+        help="Run a tiny CPU attention reference when metadata is available.",
+    )
     args = parser.parse_args()
 
     capture_layers = tuple(int(x) for x in args.capture_layer_ids.split(",") if x != "")
@@ -380,6 +458,8 @@ def main() -> None:
         cosine_tol=args.cosine_tol,
         max_abs_tol=args.max_abs_tol,
         topk_overlap_tol=args.topk_overlap_tol,
+        dump_debug=args.dump_debug,
+        cpu_ref=args.cpu_ref,
     )
 
     # Optional LMDeploy PyTorchEngine comparison: compares the first new token

@@ -13,6 +13,10 @@
 
 #include "src/turbomind/utils/eagle_debug.h"
 
+#ifndef CUDART_INF_F
+#define CUDART_INF_F __int_as_float(0x7f800000)
+#endif
+
 namespace turbomind {
 namespace kernels {
 namespace speculative_decoding {
@@ -318,58 +322,66 @@ void launchPackAcceptedPathsKernel(
 
 namespace {
 
-__global__ void maskLogitsBasedOnEntropyKernel(
-    float**       logits_ptrs,
-    TokenIdType** output_id_ptrs,
-    bool*         skip_decode,
-    TokenIdType*  output_ids,
-    float*        runtime_top_p,
-    float const*  probs,
-    float const*  entropies,
-    int const*    generation_lengths,
-    float const*  posterior_thresholds,
-    float const*  posterior_alphas,
-    float const*  temperatures,
-    int const*    batch_slots,
-    int           batch_size,
-    int           max_tokens,
-    int           vocab_size)
+// Flat entropy/typical mask kernel:
+// - logits/probs: [rows, cols]
+// - entropies:    [rows]
+// - posterior_* / temperatures: per batch_slot
+// - skip_decode:  [rows] (precomputed)
+// - generation_lengths: [batch_size] (for safety)
+__global__ void maskLogitsEntropyFlatKernel(const float* logits,
+                                             const float* probs,
+                                             const float* entropies,
+                                             const float* posterior_thresholds,
+                                             const float* posterior_alphas,
+                                             const float* temperatures,
+                                             const bool*  skip_decode,
+                                             const int*   generation_lengths,
+                                             int          max_tokens,
+                                             int          rows,
+                                             int          cols,
+                                             float*       out_logits,
+                                             float*       runtime_top_p)
 {
-    const int vocab_idx = static_cast<int>(blockIdx.z * blockDim.x + threadIdx.x);
-    const int batch_idx = static_cast<int>(blockIdx.x);
-    const int token_idx = static_cast<int>(blockIdx.y);
-
-    if (batch_idx >= batch_size || token_idx >= max_tokens) {
+    const int row = static_cast<int>(blockIdx.y);
+    const int col = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows || col >= cols) {
         return;
     }
 
-    const int batch_slot = batch_slots ? batch_slots[batch_idx] : batch_idx;
-    if (batch_slot < 0 || batch_slot >= batch_size) {
+    const int batch_slot = (max_tokens > 0) ? (row / max_tokens) : 0;
+    const int token_idx  = (max_tokens > 0) ? (row % max_tokens) : row;
+
+    // Skip explicit-mask rows or padded positions.
+    if ((skip_decode && skip_decode[row]) ||
+        (generation_lengths && batch_slot >= 0 && token_idx >= generation_lengths[batch_slot])) {
         return;
     }
 
-    const bool valid = token_idx < generation_lengths[batch_slot] && vocab_idx < vocab_size;
+    // TRT-style posterior threshold: min(threshold, alpha * exp(-entropy)).
+    const float entropy_row = entropies ? entropies[row] : 0.0f;
+    const float posterior_threshold =
+        posterior_thresholds ? posterior_thresholds[batch_slot] : 1.0f;
+    const float posterior_alpha =
+        posterior_alphas ? posterior_alphas[batch_slot] : 1.0f;
 
-    if (vocab_idx == 0) {
+    const float thresh = fminf(posterior_threshold,
+                               posterior_alpha * expf(-entropy_row));
+
+    const float prob = probs[row * cols + col];
+    if (prob < thresh) {
+        // Mask out low-posterior logits.
+        out_logits[row * cols + col] = -CUDART_INF_F;
+    }
+    else if (out_logits != logits) {
+        // Preserve original logits if writing to a separate buffer.
+        out_logits[row * cols + col] = logits[row * cols + col];
+    }
+
+    // Per-row runtime_top_p: TRT uses this as a per-step top-p marker.
+    // Here we mirror the 0/1 behavior: 0 when temperature ~0, 1 otherwise.
+    if (runtime_top_p && col == 0) {
         const float temp = temperatures ? temperatures[batch_slot] : 1.0f;
-        runtime_top_p[batch_slot * max_tokens + token_idx] = (temp < 1e-6f) ? 0.0f : 1.0f;
-        output_id_ptrs[batch_slot * max_tokens + token_idx]
-            = output_ids + static_cast<size_t>(batch_slot) * max_tokens + token_idx;
-        skip_decode[batch_slot * max_tokens + token_idx] = !valid;
-    }
-
-    if (!valid) {
-        return;
-    }
-
-    const float posterior_threshold = posterior_thresholds ? posterior_thresholds[batch_slot] : 1.0f;
-    const float posterior_alpha     = posterior_alphas ? posterior_alphas[batch_slot] : 1.0f;
-    const float entropy             = entropies ? entropies[batch_slot * max_tokens + token_idx] : 0.0f;
-
-    const float prob   = probs[(batch_slot * max_tokens + token_idx) * vocab_size + vocab_idx];
-    const float thresh = fminf(posterior_threshold, posterior_alpha * expf(-entropy));
-    if (prob < thresh && logits_ptrs) {
-        logits_ptrs[batch_idx * max_tokens + token_idx][vocab_idx] = -CUDART_INF_F;
+        runtime_top_p[row] = (temp < 1e-6f) ? 0.0f : 1.0f;
     }
 }
 
@@ -377,49 +389,48 @@ __global__ void maskLogitsBasedOnEntropyKernel(
 
 void maskLogitsBasedOnEntropy(const EntropyMaskParams& params)
 {
-    if (!params.logits_ptrs || !params.probs || params.batch_size <= 0 || params.max_tokens <= 0
-        || params.vocab_size <= 0) {
+    if (!params.logits || !params.probs || params.rows <= 0 || params.cols <= 0) {
         return;
     }
 
     constexpr int BLOCK = 256;
-    const int     grid_z = (params.vocab_size + BLOCK - 1) / BLOCK;
-    dim3          grid(params.batch_size, params.max_tokens, grid_z);
+    const int     grid_x = (params.cols + BLOCK - 1) / BLOCK;
+    dim3          grid(grid_x, params.rows, 1);
+    dim3          block(BLOCK);
 
-    maskLogitsBasedOnEntropyKernel<<<grid, BLOCK, 0, params.stream>>>(
-        params.logits_ptrs,
-        params.output_id_ptrs,
-        params.skip_decode,
-        params.output_ids,
-        params.runtime_top_p,
+    maskLogitsEntropyFlatKernel<<<grid, block, 0, params.stream>>>(
+        params.logits,
         params.probs,
         params.entropies,
-        params.generation_lengths,
         params.posterior_thresholds,
         params.posterior_alphas,
         params.temperatures,
-        params.batch_slots,
-        params.batch_size,
+        params.skip_decode,
+        params.generation_lengths,
         params.max_tokens,
-        params.vocab_size);
+        params.rows,
+        params.cols,
+        params.logits_out ? params.logits_out : const_cast<float*>(params.logits),
+        params.runtime_top_p);
 }
 
-// Simple row-wise softmax + entropy for float logits.
+// Simple row-wise softmax + entropy for float logits (unchanged).
 namespace {
 __global__ void softmaxEntropyKernel(const float* logits,
                                      float*       probs,
                                      float*       entropy,
                                      int          cols)
 {
-    const int row = static_cast<int>(blockIdx.x);
+    const int row  = static_cast<int>(blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x);
+
+    using BlockReduce = cub::BlockReduce<float, 256>;
 
     // Max
     float local_max = -CUDART_INF_F;
     for (int i = lane; i < cols; i += blockDim.x) {
         local_max = fmaxf(local_max, logits[row * cols + i]);
     }
-    using BlockReduce = cub::BlockReduce<float, 256>;
     __shared__ typename BlockReduce::TempStorage max_storage;
     float max_val = BlockReduce(max_storage).Reduce(local_max, cub::Max());
     __syncthreads();
@@ -464,6 +475,96 @@ void invokeSoftmaxWithEntropy(const float* logits,
     dim3 block(256);
     softmaxEntropyKernel<<<grid, block, 0, stream>>>(logits, probs, entropy, cols);
 }
+
+// --- Row-wise argmax with skip_decode ---
+
+__global__ void argmaxRowsKernel(const float* logits,
+                                 int          rows,
+                                 int          cols,
+                                 const bool*  skip_decode,
+                                 int*         out)
+{
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    if (skip_decode && skip_decode[row]) {
+        out[row] = -1;
+        return;
+    }
+
+    float max_val = -CUDART_INF_F;
+    int   max_idx = 0;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float v = logits[row * cols + i];
+        if (v > max_val) {
+            max_val = v;
+            max_idx = i;
+        }
+    }
+    using BlockReduce = cub::BlockReduce<int2, 256>;
+    __shared__ typename BlockReduce::TempStorage storage;
+    int2 local{__float_as_int(max_val), max_idx};
+    auto op = [] __device__(int2 a, int2 b) {
+        return __int_as_float(a.x) >= __int_as_float(b.x) ? a : b;
+    };
+    int2 res = BlockReduce(storage).Reduce(local, op);
+    if (threadIdx.x == 0) {
+        out[row] = res.y;
+    }
+}
+
+void launch_argmax_rows(const float* logits,
+                        int          rows,
+                        int          cols,
+                        const bool*  skip_decode,
+                        int*         out,
+                        cudaStream_t stream)
+{
+    if (!logits || !out || rows <= 0 || cols <= 0) {
+        return;
+    }
+    dim3 grid(rows);
+    dim3 block(256);
+    argmaxRowsKernel<<<grid, block, 0, stream>>>(logits, rows, cols, skip_decode, out);
+}
+
+// --- skip_decode from generation_lengths ---
+
+__global__ void setSkipDecodeKernel(const int* generation_lengths,
+                                    int        batch_size,
+                                    int        max_tokens,
+                                    bool*      skip)
+{
+    const int row  = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int rows = batch_size * max_tokens;
+    if (row >= rows) {
+        return;
+    }
+    const int batch = row / max_tokens;
+    const int token = row % max_tokens;
+    bool      val   = false;
+    if (generation_lengths && batch < batch_size) {
+        val = (token >= generation_lengths[batch]);
+    }
+    skip[row] = val;
+}
+
+void launch_set_skip_decode(const int* generation_lengths,
+                            int        batch_size,
+                            int        max_tokens,
+                            bool*      skip_decode,
+                            cudaStream_t stream)
+{
+    if (!skip_decode || batch_size <= 0 || max_tokens <= 0) {
+        return;
+    }
+    const int rows   = batch_size * max_tokens;
+    const int block  = 256;
+    const int grid_x = (rows + block - 1) / block;
+    setSkipDecodeKernel<<<grid_x, block, 0, stream>>>(generation_lengths, batch_size, max_tokens, skip_decode);
+}
+
 
 namespace {
 

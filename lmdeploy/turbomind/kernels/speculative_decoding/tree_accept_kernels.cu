@@ -88,8 +88,9 @@ __global__ void treeAcceptByIdsWithPathsKernel(
 
             best_next_idx = node_idx;
 
+            // If draft is invalid (<0) or mismatched, stop.
             const bool is_eos = (end_ids != nullptr && target_tok == end_ids[slot]);
-            if (draft_tok != target_tok || is_eos) {
+            if (draft_tok < 0 || draft_tok != target_tok || is_eos) {
                 break;
             }
 

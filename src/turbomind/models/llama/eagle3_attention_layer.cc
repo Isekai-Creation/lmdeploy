@@ -56,9 +56,9 @@ __device__ inline float from_float<float>(float x)
     return x;
 }
 
-// Apply standard RoPE to Q/K in-place. Position ids are optional; when
-// absent we fall back to (past_kv_len + token_idx % q_len). When provided,
-// position_ids are treated as absolute and past_kv_len is not added again.
+// Apply TRT-style RoPE to Q/K in-place. Position ids are treated as absolute
+// (past_kv_len is not added twice); when missing we fall back to
+// past_kv_len + token_idx % q_len.
 template<typename T>
 __global__ void apply_rope_kernel(T*       q_ptr,
                                   T*       k_ptr,
@@ -86,16 +86,15 @@ __global__ void apply_rope_kernel(T*       q_ptr,
     // when position ids are not explicitly provided.
     const int base_pos =
         position_ids ? position_ids[token_id] : (past_kv_len + (q_len > 0 ? token_id % q_len : token_id));
-    const int pos = base_pos;
 
-    // TRT computes inv_freq = scale / (theta^(i / (dim/2))) and multiplies by
-    // the absolute position once. Mirror that here with rope_base/rope_scale.
+    // TRT computes inv_freq = rope_scale * (rope_base)^{-i/(dim/2)} with i the
+    // pair index. Multiply once by the absolute position.
     const int   pair_idx = d >> 1;  // even/odd pair index
     const float inv_freq =
-        rope_scale * powf(rope_base, -2.f * static_cast<float>(pair_idx) / static_cast<float>(head_dim));
-    const float angle = static_cast<float>(pos) * inv_freq;
-    const float cosv  = cosf(angle);
-    const float sinv  = sinf(angle);
+        rope_scale * powf(rope_base, -static_cast<float>(pair_idx) / (static_cast<float>(head_dim) * 0.5f));
+    const float angle = static_cast<float>(base_pos) * inv_freq;
+    float       sinv, cosv;
+    sincosf(angle, &sinv, &cosv);
 
     auto rotate = [&](T* base, int h, int head_count) {
         T* vec = base + (token_id * head_count + h) * head_dim;
@@ -161,33 +160,40 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
 
     const T* q = q_ptr + (token_idx * num_q_heads + head) * head_dim;
 
-    // Resolve slot-specific kv span using runtime or tree offsets.
-    int kv_start    = 0;
-    int kv_len_slot = kv_len;
+    // Resolve slot-specific KV span as the intersection of all provided
+    // offsets/masks. Start with the full kv range and clamp down.
+    int kv_start = 0;
+    int kv_end   = kv_len;
+    auto clamp_span = [&](int start, int end) {
+        kv_start = max(kv_start, start);
+        kv_end   = min(kv_end, end);
+    };
     if (runtime_offsets) {
-        const int start = runtime_offsets[batch];
-        const int end   = runtime_offsets[batch + 1];
-        kv_start        = start;
-        kv_len_slot     = max(0, min(kv_len, end - start));
+        clamp_span(runtime_offsets[batch], runtime_offsets[batch + 1]);
     }
-    else if (tree_offsets) {
-        const int start = tree_offsets[batch];
-        const int end   = tree_offsets[batch + 1];
-        kv_start        = start;
-        kv_len_slot     = max(0, min(kv_len, end - start));
+    if (tree_offsets) {
+        clamp_span(tree_offsets[batch], tree_offsets[batch + 1]);
     }
-    // Bound kv span by packed-mask coverage when provided.
-    if (packed_mask && packed_stride > 0) {
-        const int packed_cap = packed_stride * 32;
-        kv_len_slot          = max(0, min(kv_len_slot, packed_cap - kv_start));
+    if (successor_offsets) {
+        const int succ_start = successor_offsets[batch];
+        const int succ_end   = successor_counts ? (succ_start + successor_counts[batch])
+                                                : successor_offsets[batch + 1];
+        clamp_span(succ_start, succ_end);
     }
-    // Optional clamp by kv_lens_runtime semantics (exclude extra draft tokens).
+    // kv_lens_runtime excludes extra draft tokens (TRT semantics).
     if (kv_lens_runtime) {
-        const int runtime_len = kv_lens_runtime[batch];
-        kv_len_slot           = max(0, min(kv_len_slot, runtime_len - kv_start));
+        clamp_span(0, kv_lens_runtime[batch]);
+    }
+    // Packed mask bounds coverage to packed_stride * 32 tokens.
+    if (packed_mask && packed_stride > 0) {
+        clamp_span(kv_start, min(kv_end, packed_stride * 32));
     }
 
-    if (kv_len_slot <= 0) {
+    kv_start    = max(0, min(kv_start, kv_len));
+    kv_end      = max(kv_start, min(kv_end, kv_len));
+    int kv_len_slot = kv_end - kv_start;
+
+    if (kv_len_slot <= 0 || kv_start >= kv_len) {
         return;
     }
 
@@ -206,7 +212,7 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
             dot += to_float(q[d]) * to_float(k[d]);
         }
         // Causal guard: forbid attending beyond current q position.
-        const int pos_idx_k   = position_ids ? min(kv_token, token_num - 1) : kv_token;
+        const int pos_idx_k   = position_ids ? min(kv_start + j, token_num - 1) : (kv_start + j);
         const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
         if (kv_position > q_position) {
             dot = -1e20f;
@@ -264,7 +270,7 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
         for (int d = 0; d < head_dim; ++d) {
             dot += to_float(q[d]) * to_float(k[d]);
         }
-        const int pos_idx_k   = position_ids ? min(kv_token, token_num - 1) : kv_token;
+        const int pos_idx_k   = position_ids ? min(kv_start + j, token_num - 1) : (kv_start + j);
         const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
         if (kv_position > q_position) {
             dot = -1e20f;
@@ -683,10 +689,3 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 }
 
 }  // namespace turbomind
-    // Optional successor metadata (tree) to clamp kv span per slot.
-    if (successor_offsets && successor_counts) {
-        const int start = successor_offsets[batch];
-        const int end   = successor_offsets[batch + 1];
-        kv_start        = start;
-        kv_len_slot     = max(0, min(kv_len_slot, end - start));
-    }

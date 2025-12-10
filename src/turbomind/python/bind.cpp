@@ -23,6 +23,7 @@
 #include "src/turbomind/engine/model_request.h"
 #include "src/turbomind/models/llama/EagleModule.h"
 #include "src/turbomind/models/llama/EagleDraftLayer.h"
+#include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include "src/turbomind/models/llama/LlamaFfnLayer.h"
 #include "src/turbomind/models/llama/LlamaLinear.h"
 #include "src/turbomind/models/llama/context.h"
@@ -398,13 +399,13 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         ft::LlamaFfnLayer ffn_layer(model_param, ctx);
         const auto* draft_w = module.eagle3_draft_layer();
 
-        // In this offline helper we don't have a full UnifiedAttentionLayer
-        // instance or Eagle3AttentionLayer, so we pass nullptr for both.
-        // Eagle3DraftLayer will fall back to its guarded shallow path.
+        cudaDeviceProp prop{};
+        ft::check_cuda_error(cudaGetDeviceProperties(&prop, device_id));
+        ft::Eagle3AttentionLayer eagle3_attn_layer(&prop, stream);
         ft::Eagle3DraftLayer draft_layer(
             draft_w,
             /*attn_layer=*/nullptr,
-            /*eagle3_attn_layer=*/nullptr,
+            /*eagle3_attn_layer=*/&eagle3_attn_layer,
             &ffn_layer,
             /*rmsnorm_eps=*/1e-5f);
 

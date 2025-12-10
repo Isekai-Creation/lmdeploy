@@ -8,9 +8,9 @@ Status markers:
 - `[x]` implemented in this tree (may still need tuning)
 - `[ ]` not implemented / still to do
 
-Current progress (no stubs): **~89/100** toward full TRT‑LLM parity.
+Current progress (no stubs): **~91/100** toward full TRT‑LLM parity.
 - Geometry/export/shape guards are locked (B done).
-- Draft attention now runs real Q/K/V GEMMs + RoPE params + offset-aware SDPA + Wo, with q_len/kv_len/past_kv_len/packed_mask_stride/positions/runtime offsets/kv_lens_runtime plumbed; TRT RoPE math, tree mask parity, KV reuse, and debug validation still pending (A in progress).
+- Draft attention now runs real Q/K/V GEMMs + TRT-style RoPE params + successor/runtime/tree-offset-aware SDPA + Wo, with q_len/kv_len/past_kv_len/packed_mask_stride/positions/runtime offsets/kv_lens_runtime plumbed; tree mask parity, KV reuse, and validation still pending (A in progress).
 - Tree decode has per-node logits scaffold, packed-mask fallback, successor offsets/counts on device with validation, runtime offsets threaded into attention, and kv_lens_runtime propagated; successor/topK parity, acceptance alignment, and validation still pending (C in progress).
 
 Roles (for reference):

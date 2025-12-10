@@ -189,34 +189,47 @@ struct KVCacheRewindParams {
     cudaStream_t stream;
 };
 
+void invokeKVCacheRewind(KVCacheRewindParams const& params);
+
 struct EntropyMaskParams {
-    float**      logits_ptrs{nullptr};         // [batch, max_tokens]
-    TokenIdType** output_id_ptrs{nullptr};     // [batch, max_tokens]
-    bool*        skip_decode{nullptr};         // [batch, max_tokens]
-    TokenIdType* output_ids{nullptr};          // [batch, max_tokens]
-    float*       runtime_top_p{nullptr};       // [batch, max_tokens]
-    float const* probs{nullptr};               // [batch * max_tokens * vocab]
-    float const* entropies{nullptr};           // [batch, max_tokens]
-    int const*   generation_lengths{nullptr};  // [batch]
-    float const* posterior_thresholds{nullptr};  // [batch]
-    float const* posterior_alphas{nullptr};      // [batch]
-    float const* temperatures{nullptr};          // [batch]
-    int const*   batch_slots{nullptr};           // [batch]
+    // Flat view: rows = batch_size * max_tokens, cols = vocab_size_pad.
+    // Row index r corresponds to (batch_slot = r / max_tokens,
+    // token_idx = r % max_tokens).
+    float const* logits{nullptr};               // [rows, cols] input logits
+    float*       logits_out{nullptr};           // optional out (if null, in-place)
+
+    float const* probs{nullptr};                // [rows, cols] softmax probs
+    float const* entropies{nullptr};            // [rows] row-wise entropies
+
+    // Per-request thresholds/params (indexed by batch_slot).
+    float const* posterior_thresholds{nullptr}; // [batch_size]
+    float const* posterior_alphas{nullptr};     // [batch_size]
+    float const* temperatures{nullptr};         // [batch_size]
+
+    // Row-wise skip mask and per-request generation lengths.
+    // skip_decode[r] == true  -> row r is ignored.
+    // generation_lengths[batch_slot] gives valid token length.
+    const bool*  skip_decode{nullptr};          // [rows]
+    const int*   generation_lengths{nullptr};   // [batch_size]
+
+    // Optional per-row top-p state (mirrors TRT runtime_top_p semantics).
+    // If null, no top-p state is written.
+    float*       runtime_top_p{nullptr};        // [rows] optional
+
+    int          rows{0};                       // batch_size * max_tokens
+    int          cols{0};                       // vocab_size_pad
+    int          max_tokens{0};                 // tokens_per_seq
     int          batch_size{0};
-    int          max_tokens{0};
-    int          vocab_size{0};
+
     cudaStream_t stream{};
 };
 
+// Apply posterior/typical entropy-based masking to logits.
+// - logits/probs/entropies are flat [rows, cols]/[rows].
+// - Uses posterior_thresholds/posterior_alphas/temperatures per batch_slot.
+// - Respects skip_decode and generation_lengths, writes -inf into masked logits.
+// - If runtime_top_p != nullptr, writes per-row top-p marker (TRT-style 0/1).
 void maskLogitsBasedOnEntropy(const EntropyMaskParams& params);
-
-/**
- * @brief Rewind KV cache by marking blocks as free
- * 
- * Critical for memory efficiency - avoids complex page reuse logic.
- * Blocks are marked as available without actual memory operations.
- */
-void invokeKVCacheRewind(KVCacheRewindParams const& params);
 
 // Compute softmax + entropy per row. logits/probs layout: [rows, cols].
 void invokeSoftmaxWithEntropy(const float* logits,
@@ -225,6 +238,25 @@ void invokeSoftmaxWithEntropy(const float* logits,
                               int          rows,
                               int          cols,
                               cudaStream_t stream);
+
+// Argmax per row of a [rows, cols] matrix. Optional skip_decode masks rows
+// (out[row] = -1 when skip_decode[row] is true).
+void launch_argmax_rows(const float* logits,
+                        int          rows,
+                        int          cols,
+                        const bool*  skip_decode,
+                        int*         out,
+                        cudaStream_t stream);
+
+// Derive skip_decode mask from generation_lengths.
+// - rows = batch_size * max_tokens.
+// - skip_decode[r] = true when token_idx >= generation_lengths[batch_slot]
+//   (i.e. padded positions).
+void launch_set_skip_decode(const int* generation_lengths,
+                            int        batch_size,
+                            int        max_tokens,
+                            bool*      skip_decode,
+                            cudaStream_t stream);
 
 } // namespace speculative_decoding
 } // namespace kernels

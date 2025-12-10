@@ -3471,72 +3471,78 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     // Posterior/typical gating (entropy-based) on draft logits if provided.
     if (draft_logits && draft_logits.dtype() == kFloat32 && spec_ctx.d_posterior_thresholds
         && spec_ctx.d_posterior_alphas && spec_ctx.d_temperatures) {
-        // For now assume flat layout [batch, vocab] per slot; reuse tokens_per_seq as max_tokens.
-        const int max_tokens      = tokens_per_seq;
-        const int vocab_size_pad  = draft_logits.shape(1);
-        float**   logits_ptrs_dev = nullptr;
-        float**   out_ids_ptrs    = nullptr;
-        bool*     skip_decode     = nullptr;
-        float*    runtime_top_p   = nullptr;
+        // Flat layout: rows = batch_size * tokens_per_seq, cols = vocab_size_pad.
+        const int max_tokens     = tokens_per_seq;
+        const int vocab_size_pad = draft_logits.shape(1);
+        const int rows           = batch_size * max_tokens;
+        const int cols           = vocab_size_pad;
 
-        // Allocate small helper buffers on device.
-        check_cuda_error(cudaMalloc(&logits_ptrs_dev, sizeof(float*) * batch_size * max_tokens));
-        check_cuda_error(cudaMalloc(&out_ids_ptrs, sizeof(float*) * batch_size * max_tokens));
-        check_cuda_error(cudaMalloc(&skip_decode, sizeof(bool) * batch_size * max_tokens));
-        check_cuda_error(cudaMalloc(&runtime_top_p, sizeof(float) * batch_size * max_tokens));
+        // Helpers: probs [rows, cols], entropy [rows].
+        Tensor probs_dev{{rows, cols}, kFloat32, kDEVICE};
+        Tensor entropy_dev{{rows}, kFloat32, kDEVICE};
 
-        // Build logits_ptrs as contiguous rows in draft_logits.
-        std::vector<float*> h_logits_ptrs(static_cast<size_t>(batch_size * max_tokens), nullptr);
-        for (int b = 0; b < batch_size; ++b) {
-            for (int t = 0; t < max_tokens; ++t) {
-                h_logits_ptrs[b * max_tokens + t] =
-                    static_cast<float*>(draft_logits.raw_data()) + static_cast<size_t>(b) * vocab_size_pad;
-            }
-        }
-        check_cuda_error(cudaMemcpyAsync(
-            logits_ptrs_dev, h_logits_ptrs.data(), h_logits_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice, stream_));
+        // skip_decode[r] is true when row r is padded (token_idx >= sequence_length[batch_slot]).
+        bool* skip_decode = nullptr;
+        check_cuda_error(cudaMalloc(&skip_decode, sizeof(bool) * rows));
+        kernels::speculative_decoding::launch_set_skip_decode(
+            spec_ctx.d_sequence_lengths,  // [batch_size]
+            batch_size,
+            max_tokens,
+            skip_decode,
+            stream_);
 
-        // Entropy buffer: allocate and compute softmax+entropy for each row.
-        const size_t probs_elems = static_cast<size_t>(batch_size * max_tokens * vocab_size_pad);
-        float*       probs_dev   = nullptr;
-        float*       entropy_dev = nullptr;
-        check_cuda_error(cudaMalloc(&probs_dev, probs_elems * sizeof(float)));
-        check_cuda_error(cudaMalloc(&entropy_dev, static_cast<size_t>(batch_size * max_tokens) * sizeof(float)));
+        const float* logits_ptr = static_cast<const float*>(draft_logits.raw_data());
 
-        // Simple softmax + entropy per row.
-        invokeSoftmaxWithEntropy(static_cast<const float*>(draft_logits.raw_data()),
-                                 probs_dev,
-                                 entropy_dev,
-                                 batch_size * max_tokens,
-                                 vocab_size_pad,
-                                 stream_);
+        // Softmax + entropy per row (TRT-style).
+        kernels::speculative_decoding::invokeSoftmaxWithEntropy(
+            logits_ptr,
+            static_cast<float*>(probs_dev.raw_data()),
+            static_cast<float*>(entropy_dev.raw_data()),
+            rows,
+            cols,
+            stream_);
 
+        // Apply posterior/typical masking in-place on draft_logits.
         kernels::speculative_decoding::EntropyMaskParams mask_params{};
-        mask_params.logits_ptrs         = logits_ptrs_dev;
-        mask_params.output_id_ptrs      = out_ids_ptrs;
-        mask_params.skip_decode         = skip_decode;
-        mask_params.output_ids          = nullptr;
-        mask_params.runtime_top_p       = runtime_top_p;
-        mask_params.probs               = probs_dev;
-        mask_params.entropies           = entropy_dev;
-        mask_params.generation_lengths  = spec_ctx.d_sequence_lengths;
-        mask_params.posterior_thresholds = spec_ctx.d_posterior_thresholds;
-        mask_params.posterior_alphas    = spec_ctx.d_posterior_alphas;
-        mask_params.temperatures        = spec_ctx.d_temperatures;
-        mask_params.batch_slots         = nullptr;
-        mask_params.batch_size          = batch_size;
-        mask_params.max_tokens          = max_tokens;
-        mask_params.vocab_size          = vocab_size_pad;
-        mask_params.stream              = stream_;
+        mask_params.logits               = logits_ptr;
+        mask_params.logits_out           = nullptr;  // in-place
+        mask_params.probs                = static_cast<const float*>(probs_dev.raw_data());
+        mask_params.entropies            = static_cast<const float*>(entropy_dev.raw_data());
+        mask_params.posterior_thresholds = spec_ctx.d_posterior_thresholds;  // [batch_size]
+        mask_params.posterior_alphas     = spec_ctx.d_posterior_alphas;      // [batch_size]
+        mask_params.temperatures         = spec_ctx.d_temperatures;          // [batch_size]
+        mask_params.skip_decode          = skip_decode;                      // [rows]
+        mask_params.runtime_top_p        = nullptr;                          // optional, unused here
+        mask_params.generation_lengths   = spec_ctx.d_sequence_lengths;      // [batch_size]
+        mask_params.rows                 = rows;
+        mask_params.cols                 = cols;
+        mask_params.max_tokens           = max_tokens;
+        mask_params.batch_size           = batch_size;
+        mask_params.stream               = stream_;
 
         kernels::speculative_decoding::maskLogitsBasedOnEntropy(mask_params);
 
-        cudaFree(logits_ptrs_dev);
-        cudaFree(out_ids_ptrs);
+        // Regenerate draft_tokens using masked logits (Top-1) while honoring skip_decode.
+        if (buffers.inputs.draft_tokens) {
+            Tensor argmax_out{{rows}, kInt32, kDEVICE};
+            kernels::speculative_decoding::launch_argmax_rows(
+                logits_ptr,
+                rows,
+                cols,
+                skip_decode,
+                argmax_out.data<int>(),
+                stream_);
+
+            // Fill draft_tokens on device for downstream acceptance.
+            check_cuda_error(cudaMemcpyAsync(
+                buffers.inputs.draft_tokens,
+                argmax_out.raw_data(),
+                static_cast<size_t>(rows) * sizeof(int),
+                cudaMemcpyDeviceToDevice,
+                stream_));
+        }
+
         cudaFree(skip_decode);
-        cudaFree(runtime_top_p);
-        cudaFree(probs_dev);
-        cudaFree(entropy_dev);
     }
 
     // ========= Step 4: Device-side acceptance over tree paths =========
