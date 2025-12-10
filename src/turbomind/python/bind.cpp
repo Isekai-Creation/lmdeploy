@@ -34,21 +34,22 @@
 #include "src/turbomind/utils/eagle_debug.h"
 
 namespace py = pybind11;
-
 using namespace pybind11::literals;
 
-using ft::core::Tensor;
+// Now that ft is defined, use it for Tensor and TensorMap
+using Tensor = turbomind::core::Tensor;
+using TensorMap = turbomind::core::TensorMap;
+
 namespace eagle_kernels = turbomind::kernels::speculative_decoding;
 
 // prepare to bind container
-using TensorMap = ft::core::TensorMap;
 PYBIND11_MAKE_OPAQUE(TensorMap);
 static const char kDlTensorCapsuleName[] = "dltensor";
 
 DLDevice getDLDevice(const Tensor& tensor)
 {
     int device_id = 0;
-    if (tensor.device().type == ft::kDEVICE) {
+    if (tensor.device().type == turbomind::DeviceType::kDEVICE) {
         cudaPointerAttributes ptr_attr{};
         cudaPointerGetAttributes(&ptr_attr, tensor.raw_data());
         device_id = ptr_attr.device;
@@ -57,13 +58,13 @@ DLDevice getDLDevice(const Tensor& tensor)
     DLDevice device{kDLCPU, device_id};
 
     switch (tensor.device().type) {
-        case ft::kCPU:
+        case turbomind::DeviceType::kCPU:
             device.device_type = DLDeviceType::kDLCPU;
             break;
-        case ft::kCPUpinned:
+        case turbomind::DeviceType::kCPUpinned:
             device.device_type = DLDeviceType::kDLCUDAHost;
             break;
-        case ft::kDEVICE:
+        case turbomind::DeviceType::kDEVICE:
             device.device_type = DLDeviceType::kDLCUDA;
             break;
         default:
@@ -77,7 +78,7 @@ DLManagedTensor* TritonTensorToDLManagedTensor(Tensor& tensor)
 {
     DLDevice   device = getDLDevice(tensor);
     DLDataType data_type{0, 0, 1};
-    using ft::data_type_v;
+    using turbomind::data_type_v;
     switch (tensor.dtype()) {
         case data_type_v<bool>:
             data_type.code = DLDataTypeCode::kDLBool;
@@ -151,22 +152,22 @@ DLManagedTensor* TritonTensorToDLManagedTensor(Tensor& tensor)
                                }};
 }
 
-ft::DeviceType getMemoryType(DLDevice device)
+turbomind::DeviceType getMemoryType(DLDevice device)
 {
     switch (device.device_type) {
         case DLDeviceType::kDLCUDAHost:
-            return ft::DeviceType::kCPUpinned;
+            return turbomind::DeviceType::kCPUpinned;
         case DLDeviceType::kDLCUDA:
-            return ft::DeviceType::kDEVICE;
+            return turbomind::DeviceType::kDEVICE;
         case DLDeviceType::kDLCPU:
         default:
-            return ft::DeviceType::kCPU;
+            return turbomind::DeviceType::kCPU;
     }
 }
 
 turbomind::DataType getDataType(DLDataType data_type)
 {
-    using ft::data_type_v;
+    using turbomind::data_type_v;
     switch (data_type.code) {
         case DLDataTypeCode::kDLUInt:
             switch (data_type.bits) {
@@ -229,7 +230,7 @@ std::shared_ptr<Tensor> DLManagedTensorToTritonTensor(DLManagedTensor* tensor)
     auto  where     = getMemoryType(dl_tensor.device);
     auto  dtype     = getDataType(dl_tensor.dtype);
     assert(dl_tensor.ndim > 0);
-    std::vector<ft::core::ssize_t> shape(dl_tensor.shape, dl_tensor.shape + dl_tensor.ndim);
+    std::vector<turbomind::core::ssize_t> shape(dl_tensor.shape, dl_tensor.shape + dl_tensor.ndim);
 
     std::shared_ptr<void> ptr{dl_tensor.data, [tensor](void* p) {
                                   if (tensor->deleter) {
@@ -243,27 +244,27 @@ static void safe_memcpy(void* dst, const void* src, size_t size)
 {
     cudaPointerAttributes dat{};
     cudaPointerAttributes sat{};
-    ft::check_cuda_error(cudaPointerGetAttributes(&dat, dst));
-    ft::check_cuda_error(cudaPointerGetAttributes(&sat, src));
+    turbomind::check_cuda_error(cudaPointerGetAttributes(&dat, dst));
+    turbomind::check_cuda_error(cudaPointerGetAttributes(&sat, src));
     try {
         if (dat.devicePointer && sat.devicePointer) {
             // Both can be accessed from current context
-            ft::check_cuda_error(cudaMemcpy(dst, src, size, cudaMemcpyDefault));
+            turbomind::check_cuda_error(cudaMemcpy(dst, src, size, cudaMemcpyDefault));
         }
         else if (dat.type == cudaMemoryTypeDevice && sat.type == cudaMemoryTypeDevice) {
             if (dat.device != sat.device) {
                 // On different devices, try peer memcpy
-                ft::check_cuda_error(cudaMemcpyPeer(dst, dat.device, src, sat.device, size));
+                turbomind::check_cuda_error(cudaMemcpyPeer(dst, dat.device, src, sat.device, size));
             }
             else {
                 // Same device, switch to the device first (this is unlikely)
-                ft::CudaDeviceGuard guard(dat.device);
-                ft::check_cuda_error(cudaMemcpy(dst, src, size, cudaMemcpyDefault));
+                turbomind::CudaDeviceGuard guard(dat.device);
+                turbomind::check_cuda_error(cudaMemcpy(dst, src, size, cudaMemcpyDefault));
             }
         }
         else {
             // Unknown case, give it a try anyway
-            ft::check_cuda_error(cudaMemcpy(dst, src, size, cudaMemcpyDefault));
+            turbomind::check_cuda_error(cudaMemcpy(dst, src, size, cudaMemcpyDefault));
         }
     }
     catch (...) {
@@ -311,16 +312,16 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
                                             py::object         captured_hidden_obj)
 {
     int device_id = 0;
-    ft::CudaDeviceGuard device_guard(device_id);
+    turbomind::CudaDeviceGuard device_guard(device_id);
 
     // Set up a TurboMind core context with a DEVICE allocator and
     // stream so that Tensor allocations inside EagleModule and
     // core::Tensor use a valid DEVICE allocator. This mirrors the
     // pattern used by LlamaTritonModel / LlamaBatch.
-    ft::core::Stream    core_stream = ft::core::Stream::create();
-    ft::core::Allocator host_alloc{ft::kCPU};
-    ft::core::Allocator device_alloc{core_stream, /*use_default_pool=*/true};
-    ft::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
+    turbomind::core::Stream    core_stream = turbomind::core::Stream::create();
+    turbomind::core::Allocator host_alloc{turbomind::kCPU};
+    turbomind::core::Allocator device_alloc{core_stream, /*use_default_pool=*/true};
+    turbomind::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
 
     // Import hidden_states and captured_hidden via DLPack so we
     // can treat them as TurboMind Tensors on the current device.
@@ -346,12 +347,12 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     // Use the core Stream handle as the CUDA stream for this helper.
     cudaStream_t stream = core_stream.handle();
 
-    constexpr ft::EagleModule::SizeType kMaxDraftPathLen        = 16;
-    constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
-    constexpr ft::EagleModule::SizeType kMaxDecodingTokens      = 16;
-    constexpr ft::EagleModule::SizeType kMaxNonLeafNodes        = 32;
+    constexpr turbomind::EagleModule::SizeType kMaxDraftPathLen        = 16;
+    constexpr turbomind::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+    constexpr turbomind::EagleModule::SizeType kMaxDecodingTokens      = 16;
+    constexpr turbomind::EagleModule::SizeType kMaxNonLeafNodes        = 32;
 
-    ft::EagleModule module(
+    turbomind::EagleModule module(
         kMaxDraftPathLen,
         kMaxDecodingDraftTokens,
         kMaxDecodingTokens,
@@ -376,7 +377,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
 
     const int vocab_size = static_cast<int>(weights.lm_head.shape(1));
 
-    ft::LlamaLinear linear(stream);
+    turbomind::LlamaLinear linear(stream);
 
     Tensor logits;
     Tensor hidden_out;
@@ -386,6 +387,11 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     Tensor attn_out_dbg;
     Tensor ffn_out_dbg;
     Tensor pre_head_dbg;
+    Tensor qkv_dbg; // Declared outside if-block
+
+    // Declare draft_layer_ptr outside if-block
+    std::unique_ptr<turbomind::Eagle3DraftLayer> draft_layer_ptr;
+
 
     // When an Eagle3 draft layer is available, run the new
     // Eagle3DraftLayer path instead of the legacy EagleModule
@@ -393,16 +399,22 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     // same backend as UnifiedDecoder::ForwardDraft.
     if (use_eagle3_draft_layer) {
         // Minimal model/context wrappers needed for LlamaFfnLayer.
-        ft::ModelParam model_param{};
+        turbomind::ModelParam model_param{};
         model_param.hidden_units = static_cast<size_t>(hidden_units);
-        ft::Context ctx(device_id);
-        ft::LlamaFfnLayer ffn_layer(model_param, ctx);
-        const auto* draft_w = module.eagle3_draft_layer();
 
+        turbomind::Context ctx(device_id);
+        turbomind::LlamaFfnLayer ffn_layer(model_param, ctx);
+
+        const auto* draft_w = module.eagle3_draft_layer();
+        // For this standalone debug helper we do not have a
+        // UnifiedDecoder context or Eagle3 attention backend,
+        // so we pass null pointers and rely on the guarded
+        // single-position draft path.
         cudaDeviceProp prop{};
-        ft::check_cuda_error(cudaGetDeviceProperties(&prop, device_id));
-        ft::Eagle3AttentionLayer eagle3_attn_layer(&prop, stream);
-        ft::Eagle3DraftLayer draft_layer(
+        turbomind::check_cuda_error(cudaGetDeviceProperties(&prop, device_id));
+        turbomind::Eagle3AttentionLayer eagle3_attn_layer(&prop, stream);
+
+        draft_layer_ptr = std::make_unique<turbomind::Eagle3DraftLayer>(
             draft_w,
             /*attn_layer=*/nullptr,
             /*eagle3_attn_layer=*/&eagle3_attn_layer,
@@ -411,39 +423,39 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
 
         // Allocate output hidden buffer and run the draft layer.
         hidden_out = Tensor(
-            std::vector<ft::core::ssize_t>{batch_size, hidden_units},
+            std::vector<turbomind::core::ssize_t>{batch_size, hidden_units},
             hidden_tm->dtype(),
-            ft::kDEVICE);
+            turbomind::DeviceType::kDEVICE);
 
         // Call Eagle3DraftLayer::Forward with all 16 arguments.
         // Provide empty Tensors for arguments not directly available in debug binding.
-        draft_layer.Forward(*hidden_tm,      // input_hidden
-                            Tensor{},        // captured_hidden (empty)
-                            Tensor{},        // input_ids (empty)
-                            Tensor{},        // embed_tokens_weights (empty)
-                            Tensor{},        // position_ids (empty)
-                            Tensor{},        // packed_mask (empty)
-                            Tensor{},        // tree_offsets (empty)
-                            Tensor{},        // runtime_offsets (empty)
-                            Tensor{},        // kv_lens_runtime (empty)
-                            Tensor{},        // successor_offsets (empty)
-                            Tensor{},        // successor_counts (empty)
-                            1,               // q_len (default to 1)
-                            1,               // kv_len (default to 1)
-                            0,               // past_kv_len (default to 0)
-                            hidden_out,      // output_hidden
-                            stream);         // stream
-        ft::check_cuda_error(cudaStreamSynchronize(stream));
+        draft_layer_ptr->Forward(*hidden_tm,      // input_hidden
+                                 Tensor{},        // captured_hidden (empty)
+                                 Tensor{},        // input_ids (empty)
+                                 Tensor{},        // embed_tokens_weights (empty)
+                                 Tensor{},        // position_ids (empty)
+                                 Tensor{},        // packed_mask (empty)
+                                 Tensor{},        // tree_offsets (empty)
+                                 Tensor{},        // runtime_offsets (empty)
+                                 Tensor{},        // kv_lens_runtime (empty)
+                                 Tensor{},        // successor_offsets (empty)
+                                 Tensor{},        // successor_counts (empty)
+                                 1,               // q_len (default to 1)
+                                 1,               // kv_len (default to 1)
+                                 0,               // past_kv_len (default to 0)
+                                 hidden_out,      // output_hidden
+                                 stream);         // stream
+        turbomind::check_cuda_error(cudaStreamSynchronize(stream));
 
-        fc_out_dbg   = draft_layer.debug_fc_out();
-        attn_out_dbg = draft_layer.debug_attn_out();
-        Tensor qkv_dbg = draft_layer.debug_qkv();
-        ffn_out_dbg  = draft_layer.debug_ffn_out();
-        pre_head_dbg = draft_layer.debug_pre_head_hidden();
+        fc_out_dbg   = draft_layer_ptr->debug_fc_out();
+        attn_out_dbg = draft_layer_ptr->debug_attn_out();
+        qkv_dbg      = draft_layer_ptr->debug_qkv();
+        ffn_out_dbg  = draft_layer_ptr->debug_ffn_out();
+        pre_head_dbg = draft_layer_ptr->debug_pre_head_hidden();
 
         // Build a temporary LM head weight wrapper and project
         // to vocab using the same backend as EagleModule.
-        ft::LlamaDenseWeight lm_head_w;
+        turbomind::LlamaDenseWeight lm_head_w;
         const int lm_in  = hidden_units;
         const int lm_out = vocab_size;
         lm_head_w.emplace(lm_in, lm_out, weights.lm_head.dtype(), /*bias=*/false, weights.lm_head.dtype(), 1);
@@ -455,24 +467,24 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         lm_head_w.prepare(/*fused_moe=*/false);
 
         logits = Tensor(
-            std::vector<ft::core::ssize_t>{batch_size, vocab_size},
+            std::vector<turbomind::core::ssize_t>{batch_size, vocab_size},
             hidden_out.dtype(),
-            ft::kDEVICE);
+            turbomind::DeviceType::kDEVICE);
         linear.Forward(hidden_out, lm_head_w, logits);
-        ft::check_cuda_error(cudaStreamSynchronize(stream));
+        turbomind::check_cuda_error(cudaStreamSynchronize(stream));
     }
     else {
         // Compose a minimal Tensor for input_ids (unused by Eagle3).
         Tensor input_ids(
-            std::vector<ft::core::ssize_t>{batch_size},
-            ft::data_type_v<int32_t>,
-            ft::kDEVICE);
-        ft::check_cuda_error(
+            std::vector<turbomind::core::ssize_t>{batch_size},
+            turbomind::data_type_v<int32_t>,
+            turbomind::DeviceType::kDEVICE);
+        turbomind::check_cuda_error(
             cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
 
         // Enable EAGLE debug for this one call so EagleModule
         // records its intermediate tensors for comparison.
-        ft::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
+        turbomind::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
         module.forward(
             input_ids,
             *hidden_tm,
@@ -481,12 +493,12 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
             hidden_out,
             linear,
             stream);
-        ft::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
+        turbomind::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
 
-        ft::check_cuda_error(cudaStreamSynchronize(stream));
+        turbomind::check_cuda_error(cudaStreamSynchronize(stream));
     }
 
-    ft::check_cuda_error(cudaStreamSynchronize(stream));
+    turbomind::check_cuda_error(cudaStreamSynchronize(stream));
 
     // Expose logits plus a small set of intermediate tensors
     // so Python can perform stage-wise HF↔TM comparisons.
@@ -535,43 +547,43 @@ PYBIND11_MODULE(_turbomind, m)
     // functionality is layered on top of this core.
     // ------------------------------------------------------------------
 
-    py::class_<ft::RequestMetrics, std::shared_ptr<ft::RequestMetrics>>(m, "RequestMetrics")
+    py::class_<turbomind::RequestMetrics, std::shared_ptr<turbomind::RequestMetrics>>(m, "RequestMetrics")
         .def(py::init())
-        .def_readonly("enque_time", &ft::RequestMetrics::enque_time)
-        .def_readonly("scheduled_time", &ft::RequestMetrics::scheduled_time)
+        .def_readonly("enque_time", &turbomind::RequestMetrics::enque_time)
+        .def_readonly("scheduled_time", &turbomind::RequestMetrics::scheduled_time)
         // EAGLE3: expose speculative decoding metrics when available.
         .def_readonly("eagle_total_draft_tokens",
-                      &ft::RequestMetrics::eagle_total_draft_tokens)
+                      &turbomind::RequestMetrics::eagle_total_draft_tokens)
         .def_readonly("eagle_total_accepted_tokens",
-                      &ft::RequestMetrics::eagle_total_accepted_tokens)
-        .def_readonly("eagle_steps", &ft::RequestMetrics::eagle_steps)
+                      &turbomind::RequestMetrics::eagle_total_accepted_tokens)
+        .def_readonly("eagle_steps", &turbomind::RequestMetrics::eagle_steps)
         .def_readonly("eagle_total_rewound_tokens",
-                      &ft::RequestMetrics::eagle_total_rewound_tokens)
+                      &turbomind::RequestMetrics::eagle_total_rewound_tokens)
         .def_readonly("eagle_rewind_steps",
-                      &ft::RequestMetrics::eagle_rewind_steps)
+                      &turbomind::RequestMetrics::eagle_rewind_steps)
         .def_readonly("eagle_tree_draft_tokens",
-                      &ft::RequestMetrics::eagle_tree_draft_tokens)
+                      &turbomind::RequestMetrics::eagle_tree_draft_tokens)
         .def_readonly("eagle_tree_target_tokens",
-                      &ft::RequestMetrics::eagle_tree_target_tokens)
+                      &turbomind::RequestMetrics::eagle_tree_target_tokens)
         .def_readonly("eagle_tree_accepted_tokens",
-                      &ft::RequestMetrics::eagle_tree_accepted_tokens);
+                      &turbomind::RequestMetrics::eagle_tree_accepted_tokens);
 
-    py::class_<ft::ScheduleMetrics, std::shared_ptr<ft::ScheduleMetrics>>(m, "ScheduleMetrics")
+    py::class_<turbomind::ScheduleMetrics, std::shared_ptr<turbomind::ScheduleMetrics>>(m, "ScheduleMetrics")
         .def(py::init())
-        .def_readonly("total_seqs", &ft::ScheduleMetrics::total_seqs)
-        .def_readonly("active_seqs", &ft::ScheduleMetrics::active_seqs)
-        .def_readonly("waiting_seqs", &ft::ScheduleMetrics::waiting_seqs)
-        .def_readonly("total_blocks", &ft::ScheduleMetrics::total_blocks)
-        .def_readonly("active_blocks", &ft::ScheduleMetrics::active_blocks)
-        .def_readonly("cached_blocks", &ft::ScheduleMetrics::cached_blocks)
-        .def_readonly("free_blocks", &ft::ScheduleMetrics::free_blocks);
+        .def_readonly("total_seqs", &turbomind::ScheduleMetrics::total_seqs)
+        .def_readonly("active_seqs", &turbomind::ScheduleMetrics::active_seqs)
+        .def_readonly("waiting_seqs", &turbomind::ScheduleMetrics::waiting_seqs)
+        .def_readonly("total_blocks", &turbomind::ScheduleMetrics::total_blocks)
+        .def_readonly("active_blocks", &turbomind::ScheduleMetrics::active_blocks)
+        .def_readonly("cached_blocks", &turbomind::ScheduleMetrics::cached_blocks)
+        .def_readonly("free_blocks", &turbomind::ScheduleMetrics::free_blocks);
 
-    py::class_<ft::SessionParam>(m, "SessionParam")
+    py::class_<turbomind::SessionParam>(m, "SessionParam")
         .def(py::init([](uint64_t id, int step, bool start, bool end) {
                  if (!start && end) {
                      throw std::logic_error("unsupported arguments: start=false, end=true");
                  }
-                 ft::SessionParam param{};
+                 turbomind::SessionParam param{};
                  param.id         = id;
                  param.step       = step;
                  param.start_flag = start;
@@ -582,39 +594,39 @@ PYBIND11_MODULE(_turbomind, m)
              "step"_a,
              "start"_a,
              "end"_a)
-        .def_readwrite("id", &ft::SessionParam::id)
-        .def_readwrite("step", &ft::SessionParam::step)
-        .def_readwrite("start", &ft::SessionParam::start_flag)
-        .def_readwrite("end", &ft::SessionParam::end_flag);
+        .def_readwrite("id", &turbomind::SessionParam::id)
+        .def_readwrite("step", &turbomind::SessionParam::step)
+        .def_readwrite("start", &turbomind::SessionParam::start_flag)
+        .def_readwrite("end", &turbomind::SessionParam::end_flag);
 
-    py::class_<ft::GenerationConfig>(m, "GenerationConfig")
+    py::class_<turbomind::GenerationConfig>(m, "GenerationConfig")
         .def(py::init())
-        .def_readwrite("max_new_tokens", &ft::GenerationConfig::max_new_tokens)
-        .def_readwrite("min_new_tokens", &ft::GenerationConfig::min_new_tokens)
-        .def_readwrite("eos_ids", &ft::GenerationConfig::eos_ids)
-        .def_readwrite("stop_ids", &ft::GenerationConfig::stop_ids)
-        .def_readwrite("bad_ids", &ft::GenerationConfig::bad_ids)
-        .def_readwrite("top_p", &ft::GenerationConfig::top_p)
-        .def_readwrite("top_k", &ft::GenerationConfig::top_k)
-        .def_readwrite("min_p", &ft::GenerationConfig::min_p)
-        .def_readwrite("temperature", &ft::GenerationConfig::temperature)
-        .def_readwrite("repetition_penalty", &ft::GenerationConfig::repetition_penalty)
-        .def_readwrite("random_seed", &ft::GenerationConfig::random_seed)
-        .def_readwrite("output_logprobs", &ft::GenerationConfig::output_logprobs)
-        .def_readwrite("output_last_hidden_state", &ft::GenerationConfig::output_last_hidden_state)
-        .def_readwrite("output_logits", &ft::GenerationConfig::output_logits)
-        .def("__repr__", [](const ft::GenerationConfig& c) {
+        .def_readwrite("max_new_tokens", &turbomind::GenerationConfig::max_new_tokens)
+        .def_readwrite("min_new_tokens", &turbomind::GenerationConfig::min_new_tokens)
+        .def_readwrite("eos_ids", &turbomind::GenerationConfig::eos_ids)
+        .def_readwrite("stop_ids", &turbomind::GenerationConfig::stop_ids)
+        .def_readwrite("bad_ids", &turbomind::GenerationConfig::bad_ids)
+        .def_readwrite("top_p", &turbomind::GenerationConfig::top_p)
+        .def_readwrite("top_k", &turbomind::GenerationConfig::top_k)
+        .def_readwrite("min_p", &turbomind::GenerationConfig::min_p)
+        .def_readwrite("temperature", &turbomind::GenerationConfig::temperature)
+        .def_readwrite("repetition_penalty", &turbomind::GenerationConfig::repetition_penalty)
+        .def_readwrite("random_seed", &turbomind::GenerationConfig::random_seed)
+        .def_readwrite("output_logprobs", &turbomind::GenerationConfig::output_logprobs)
+        .def_readwrite("output_last_hidden_state", &turbomind::GenerationConfig::output_last_hidden_state)
+        .def_readwrite("output_logits", &turbomind::GenerationConfig::output_logits)
+        .def("__repr__", [](const turbomind::GenerationConfig& c) {
             std::ostringstream oss;
             oss << c;
             return oss.str();
         });
 
-    py::class_<ft::RequestState, std::unique_ptr<ft::RequestState>>(m, "RequestState")
-        .def_readonly("status", &ft::RequestState::status)
-        .def_readonly("seq_len", &ft::RequestState::seq_len);
+    py::class_<turbomind::RequestState, std::unique_ptr<turbomind::RequestState>>(m, "RequestState")
+        .def_readonly("status", &turbomind::RequestState::status)
+        .def_readonly("seq_len", &turbomind::RequestState::seq_len);
 
-    py::class_<ft::AtomicRequestState, std::shared_ptr<ft::AtomicRequestState>>(m, "AtomicRequestState")
-        .def("consume", [](ft::AtomicRequestState& s) { return s.exchange(nullptr); });
+    py::class_<turbomind::AtomicRequestState, std::shared_ptr<turbomind::AtomicRequestState>>(m, "AtomicRequestState")
+        .def("consume", [](turbomind::AtomicRequestState& s) { return s.exchange(nullptr); });
 
     // DataType / MemoryType enums
     {
@@ -638,7 +650,7 @@ PYBIND11_MODULE(_turbomind, m)
         py::enum_<turbomind::DeviceType>(m, "MemoryType")
             .value("MEMORY_CPU", turbomind::DeviceType::kCPU)
             .value("MEMORY_CPU_PINNED", turbomind::DeviceType::kCPUpinned)
-            .value("MEMORY_GPU", ft::DeviceType::kDEVICE);
+            .value("MEMORY_GPU", turbomind::DeviceType::kDEVICE);
     }
 
     // ------------------------------------------------------------------
@@ -689,7 +701,7 @@ PYBIND11_MODULE(_turbomind, m)
             if (!device_obj.attr("index").is_none()) {
                 device_index = device_obj.attr("index").cast<int>();
             }
-            ft::CudaDeviceGuard device_guard(device_index);
+            turbomind::CudaDeviceGuard device_guard(device_index);
 
             auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
                 auto ptr_obj = tensor.attr("data_ptr")();
@@ -717,7 +729,7 @@ PYBIND11_MODULE(_turbomind, m)
             }
 
             cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
+            turbomind::check_cuda_error(cudaStreamCreate(&stream));
 
             eagle_kernels::launchAcceptDraftTokensKernel(
                 output_ids_ptr,
@@ -735,8 +747,8 @@ PYBIND11_MODULE(_turbomind, m)
                 static_cast<eagle_kernels::SizeType>(max_path_len),
                 stream);
 
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamDestroy(stream));
         },
         "output_ids"_a,
         "draft_ids"_a,
@@ -780,7 +792,7 @@ PYBIND11_MODULE(_turbomind, m)
             if (!device_obj.attr("index").is_none()) {
                 device_index = device_obj.attr("index").cast<int>();
             }
-            ft::CudaDeviceGuard device_guard(device_index);
+            turbomind::CudaDeviceGuard device_guard(device_index);
 
             auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
                 auto ptr_obj = tensor.attr("data_ptr")();
@@ -800,7 +812,7 @@ PYBIND11_MODULE(_turbomind, m)
             }
 
             cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
+            turbomind::check_cuda_error(cudaStreamCreate(&stream));
 
             eagle_kernels::launchPackAcceptedPathsKernel(
                 accepted_lengths_cumsum_ptr,
@@ -815,8 +827,8 @@ PYBIND11_MODULE(_turbomind, m)
                 static_cast<eagle_kernels::SizeType>(max_path_len),
                 stream);
 
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamDestroy(stream));
         },
         "accepted_lengths_cumsum"_a,
         "paths_offsets"_a,
@@ -856,7 +868,7 @@ PYBIND11_MODULE(_turbomind, m)
             if (!device_obj.attr("index").is_none()) {
                 device_index = device_obj.attr("index").cast<int>();
             }
-            ft::CudaDeviceGuard device_guard(device_index);
+            turbomind::CudaDeviceGuard device_guard(device_index);
 
             auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
                 auto ptr_obj = tensor.attr("data_ptr")();
@@ -872,7 +884,7 @@ PYBIND11_MODULE(_turbomind, m)
             void** kv_cache_blocks_ptr = nullptr;
 
             cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
+            turbomind::check_cuda_error(cudaStreamCreate(&stream));
 
             eagle_kernels::KVCacheRewindParams params{};
             params.kv_cache_blocks    = kv_cache_blocks_ptr;
@@ -888,8 +900,8 @@ PYBIND11_MODULE(_turbomind, m)
 
             eagle_kernels::invokeKVCacheRewind(params);
 
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamDestroy(stream));
         },
         "rewind_lengths"_a,
         "batch_slots"_a,
@@ -936,7 +948,7 @@ PYBIND11_MODULE(_turbomind, m)
             if (!device_obj.attr("index").is_none()) {
                 device_index = device_obj.attr("index").cast<int>();
             }
-            ft::CudaDeviceGuard device_guard(device_index);
+            turbomind::CudaDeviceGuard device_guard(device_index);
 
             auto get_int32_ptr = [](py::object const& tensor) -> eagle_kernels::SizeType* {
                 auto ptr_obj = tensor.attr("data_ptr")();
@@ -963,7 +975,7 @@ PYBIND11_MODULE(_turbomind, m)
             }
 
             cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
+            turbomind::check_cuda_error(cudaStreamCreate(&stream));
 
             eagle_kernels::invokeTreeAcceptByIdsWithPaths(
                 draft_ids_ptr,
@@ -981,8 +993,8 @@ PYBIND11_MODULE(_turbomind, m)
                 accepted_tokens_ptr,
                 stream);
 
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamDestroy(stream));
         },
         "draft_ids"_a,
         "target_ids"_a,
@@ -1017,19 +1029,19 @@ PYBIND11_MODULE(_turbomind, m)
             }
 
             int device_id = 0;
-            ft::CudaDeviceGuard device_guard(device_id);
+            turbomind::CudaDeviceGuard device_guard(device_id);
 
             cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
+            turbomind::check_cuda_error(cudaStreamCreate(&stream));
 
             // Use small but non-trivial limits; the concrete shapes
             // are driven by the draft model config in model_dir.
-            constexpr ft::EagleModule::SizeType kMaxDraftPathLen       = 16;
-            constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
-            constexpr ft::EagleModule::SizeType kMaxDecodingTokens     = 16;
-            constexpr ft::EagleModule::SizeType kMaxNonLeafNodes       = 32;
+            constexpr turbomind::EagleModule::SizeType kMaxDraftPathLen       = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxDecodingTokens     = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxNonLeafNodes       = 32;
 
-            ft::EagleModule module(
+            turbomind::EagleModule module(
                 kMaxDraftPathLen,
                 kMaxDecodingDraftTokens,
                 kMaxDecodingTokens,
@@ -1049,26 +1061,26 @@ PYBIND11_MODULE(_turbomind, m)
 
             // Allocate synthetic hidden states and input IDs on device.
             Tensor hidden_states(
-                std::vector<ft::core::ssize_t>{batch_size, hidden_units},
-                ft::data_type_v<ft::half_t>,
-                ft::kDEVICE);
+                std::vector<turbomind::core::ssize_t>{batch_size, hidden_units},
+                turbomind::data_type_v<turbomind::half_t>,
+                turbomind::DeviceType::kDEVICE);
             Tensor input_ids(
-                std::vector<ft::core::ssize_t>{batch_size},
-                ft::data_type_v<int32_t>,
-                ft::kDEVICE);
+                std::vector<turbomind::core::ssize_t>{batch_size},
+                turbomind::data_type_v<int32_t>,
+                turbomind::DeviceType::kDEVICE);
 
-            ft::check_cuda_error(
+            turbomind::check_cuda_error(
                 cudaMemsetAsync(hidden_states.raw_data(), 0, hidden_states.byte_size(), stream));
-            ft::check_cuda_error(
+            turbomind::check_cuda_error(
                 cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
 
-            ft::LlamaLinear linear(stream);
+            turbomind::LlamaLinear linear(stream);
 
             Tensor logits_1;
             Tensor hidden_1;
             module.forward(input_ids, hidden_states, logits_1, hidden_1, linear, stream);
 
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
 
             void* logits_ptr_1 = logits_1.raw_data();
             void* hidden_ptr_1 = hidden_1.raw_data();
@@ -1077,8 +1089,8 @@ PYBIND11_MODULE(_turbomind, m)
             Tensor hidden_2;
             module.forward(input_ids, hidden_states, logits_2, hidden_2, linear, stream);
 
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamDestroy(stream));
 
             const bool reuse_logits = logits_ptr_1 == logits_2.raw_data();
             const bool reuse_hidden = hidden_ptr_1 == hidden_2.raw_data();
@@ -1112,17 +1124,19 @@ PYBIND11_MODULE(_turbomind, m)
             }
 
             int device_id = 0;
-            ft::CudaDeviceGuard device_guard(device_id);
+            turbomind::CudaDeviceGuard device_guard(device_id);
 
             cudaStream_t stream{};
-            ft::check_cuda_error(cudaStreamCreate(&stream));
+            turbomind::check_cuda_error(cudaStreamCreate(&stream));
 
-            constexpr ft::EagleModule::SizeType kMaxDraftPathLen       = 16;
-            constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
-            constexpr ft::EagleModule::SizeType kMaxDecodingTokens     = 16;
-            constexpr ft::EagleModule::SizeType kMaxNonLeafNodes       = 32;
+            // Use small but non-trivial limits; the concrete shapes
+            // are driven by the draft model config in model_dir.
+            constexpr turbomind::EagleModule::SizeType kMaxDraftPathLen       = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxDecodingTokens     = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxNonLeafNodes       = 32;
 
-            ft::EagleModule module(
+            turbomind::EagleModule module(
                 kMaxDraftPathLen,
                 kMaxDecodingDraftTokens,
                 kMaxDecodingTokens,
@@ -1140,46 +1154,47 @@ PYBIND11_MODULE(_turbomind, m)
             const int hidden_units = static_cast<int>(weights.embed_tokens.shape(1));
             const int vocab_size   = static_cast<int>(weights.lm_head.shape(1));
 
+            // Allocate synthetic hidden states and input IDs on device.
             Tensor hidden_states(
-                std::vector<ft::core::ssize_t>{batch_size, hidden_units},
-                ft::data_type_v<ft::half_t>,
-                ft::kDEVICE);
+                std::vector<turbomind::core::ssize_t>{batch_size, hidden_units},
+                turbomind::data_type_v<turbomind::half_t>,
+                turbomind::DeviceType::kDEVICE);
             Tensor input_ids(
-                std::vector<ft::core::ssize_t>{batch_size},
-                ft::data_type_v<int32_t>,
-                ft::kDEVICE);
+                std::vector<turbomind::core::ssize_t>{batch_size},
+                turbomind::data_type_v<int32_t>,
+                turbomind::DeviceType::kDEVICE);
 
-            ft::check_cuda_error(
+            turbomind::check_cuda_error(
                 cudaMemsetAsync(hidden_states.raw_data(), 0, hidden_states.byte_size(), stream));
-            ft::check_cuda_error(
+            turbomind::check_cuda_error(
                 cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
 
-            ft::LlamaLinear linear(stream);
+            turbomind::LlamaLinear linear(stream);
 
             Tensor logits;
             Tensor hidden;
 
             // Warmup one run.
             module.forward(input_ids, hidden_states, logits, hidden, linear, stream);
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
 
             cudaEvent_t start, stop;
-            ft::check_cuda_error(cudaEventCreate(&start));
-            ft::check_cuda_error(cudaEventCreate(&stop));
+            turbomind::check_cuda_error(cudaEventCreate(&start));
+            turbomind::check_cuda_error(cudaEventCreate(&stop));
 
-            ft::check_cuda_error(cudaEventRecord(start, stream));
+            turbomind::check_cuda_error(cudaEventRecord(start, stream));
             for (int i = 0; i < iters; ++i) {
                 module.forward(input_ids, hidden_states, logits, hidden, linear, stream);
             }
-            ft::check_cuda_error(cudaEventRecord(stop, stream));
-            ft::check_cuda_error(cudaEventSynchronize(stop));
+            turbomind::check_cuda_error(cudaEventRecord(stop, stream));
+            turbomind::check_cuda_error(cudaEventSynchronize(stop));
 
             float elapsed_ms = 0.0f;
-            ft::check_cuda_error(cudaEventElapsedTime(&elapsed_ms, start, stop));
+            turbomind::check_cuda_error(cudaEventElapsedTime(&elapsed_ms, start, stop));
 
-            ft::check_cuda_error(cudaEventDestroy(start));
-            ft::check_cuda_error(cudaEventDestroy(stop));
-            ft::check_cuda_error(cudaStreamDestroy(stream));
+            turbomind::check_cuda_error(cudaEventDestroy(start));
+            turbomind::check_cuda_error(cudaEventDestroy(stop));
+            turbomind::check_cuda_error(cudaStreamDestroy(stream));
 
             const double avg_ms_per_forward = static_cast<double>(elapsed_ms) / static_cast<double>(iters);
             const double tokens_per_forward = static_cast<double>(batch_size);
@@ -1207,16 +1222,16 @@ PYBIND11_MODULE(_turbomind, m)
         "eagle_forward_logits_debug",
         [](const std::string& model_dir, py::object hidden_states_obj, py::object captured_hidden_obj) {
             int device_id = 0;
-            ft::CudaDeviceGuard device_guard(device_id);
+            turbomind::CudaDeviceGuard device_guard(device_id);
 
             // Set up a TurboMind core context with a DEVICE allocator and
             // stream so that Tensor allocations inside EagleModule and
             // core::Tensor use a valid DEVICE allocator. This mirrors the
             // pattern used by LlamaTritonModel / LlamaBatch.
-            ft::core::Stream    core_stream = ft::core::Stream::create();
-            ft::core::Allocator host_alloc{ft::kCPU};
-            ft::core::Allocator device_alloc{core_stream, /*use_default_pool=*/true};
-            ft::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
+            turbomind::core::Stream    core_stream = turbomind::core::Stream::create();
+            turbomind::core::Allocator host_alloc{turbomind::kCPU};
+            turbomind::core::Allocator device_alloc{core_stream, /*use_default_pool=*/true};
+            turbomind::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
 
             // Import hidden_states and captured_hidden via DLPack so we
             // can treat them as TurboMind Tensors on the current device.
@@ -1242,12 +1257,12 @@ PYBIND11_MODULE(_turbomind, m)
             // Use the core Stream handle as the CUDA stream for this helper.
             cudaStream_t stream = core_stream.handle();
 
-            constexpr ft::EagleModule::SizeType kMaxDraftPathLen       = 16;
-            constexpr ft::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
-            constexpr ft::EagleModule::SizeType kMaxDecodingTokens     = 16;
-            constexpr ft::EagleModule::SizeType kMaxNonLeafNodes       = 32;
+            constexpr turbomind::EagleModule::SizeType kMaxDraftPathLen       = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxDecodingDraftTokens = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxDecodingTokens     = 16;
+            constexpr turbomind::EagleModule::SizeType kMaxNonLeafNodes       = 32;
 
-            ft::EagleModule module(
+            turbomind::EagleModule module(
                 kMaxDraftPathLen,
                 kMaxDecodingDraftTokens,
                 kMaxDecodingTokens,
@@ -1272,7 +1287,7 @@ PYBIND11_MODULE(_turbomind, m)
 
             const int vocab_size = static_cast<int>(weights.lm_head.shape(1));
 
-            ft::LlamaLinear linear(stream);
+            turbomind::LlamaLinear linear(stream);
 
             Tensor logits;
             Tensor hidden_out;
@@ -1282,6 +1297,11 @@ PYBIND11_MODULE(_turbomind, m)
             Tensor attn_out_dbg;
             Tensor ffn_out_dbg;
             Tensor pre_head_dbg;
+            Tensor qkv_dbg; // Declared outside if-block
+
+            // Declare draft_layer_ptr outside if-block
+            std::unique_ptr<turbomind::Eagle3DraftLayer> draft_layer_ptr;
+
 
             // When an Eagle3 draft layer is available, run the new
             // Eagle3DraftLayer path instead of the legacy EagleModule
@@ -1289,53 +1309,63 @@ PYBIND11_MODULE(_turbomind, m)
             // same backend as UnifiedDecoder::ForwardDraft.
             if (use_eagle3_draft_layer) {
                 // Minimal model/context wrappers needed for LlamaFfnLayer.
-                ft::ModelParam model_param{};
+                turbomind::ModelParam model_param{};
                 model_param.hidden_units = static_cast<size_t>(hidden_units);
 
-                ft::Context ctx(device_id);
-                ft::LlamaFfnLayer ffn_layer(model_param, ctx);
+                turbomind::Context ctx(device_id);
+                turbomind::LlamaFfnLayer ffn_layer(model_param, ctx);
 
                 const auto* draft_w = module.eagle3_draft_layer();
                 // For this standalone debug helper we do not have a
                 // UnifiedDecoder context or Eagle3 attention backend,
                 // so we pass null pointers and rely on the guarded
                 // single-position draft path.
-                ft::Eagle3DraftLayer draft_layer(
+                cudaDeviceProp prop{};
+                turbomind::check_cuda_error(cudaGetDeviceProperties(&prop, device_id));
+                turbomind::Eagle3AttentionLayer eagle3_attn_layer(&prop, stream);
+
+                draft_layer_ptr = std::make_unique<turbomind::Eagle3DraftLayer>(
                     draft_w,
                     /*attn_layer=*/nullptr,
-                    /*eagle3_attn_layer=*/nullptr,
+                    /*eagle3_attn_layer=*/&eagle3_attn_layer,
                     &ffn_layer,
                     /*rmsnorm_eps=*/1e-5f);
 
                 // Allocate output hidden buffer and run the draft layer.
                 hidden_out = Tensor(
-                    std::vector<ft::core::ssize_t>{batch_size, hidden_units},
+                    std::vector<turbomind::core::ssize_t>{batch_size, hidden_units},
                     hidden_tm->dtype(),
-                    ft::kDEVICE);
+                    turbomind::DeviceType::kDEVICE);
 
-                draft_layer.Forward(*hidden_tm,
-                                    /*captured_hidden=*/Tensor{},
-                                    /*position_ids=*/Tensor{},
-                                    /*packed_mask=*/Tensor{},
-                                    /*tree_offsets=*/Tensor{},
-                                    /*runtime_offsets=*/Tensor{},
-                                    /*successor_offsets=*/Tensor{},
-                                    /*successor_counts=*/Tensor{},
-                                    /*q_len=*/1,
-                                    /*kv_len=*/1,
-                                    /*past_kv_len=*/0,
-                                    hidden_out,
-                                    stream);
-                ft::check_cuda_error(cudaStreamSynchronize(stream));
+                // Call Eagle3DraftLayer::Forward with all 16 arguments.
+                // Provide empty Tensors for arguments not directly available in debug binding.
+                draft_layer_ptr->Forward(*hidden_tm,      // input_hidden
+                                 Tensor{},        // captured_hidden (empty)
+                                 Tensor{},        // input_ids (empty)
+                                 Tensor{},        // embed_tokens_weights (empty)
+                                 Tensor{},        // position_ids (empty)
+                                 Tensor{},        // packed_mask (empty)
+                                 Tensor{},        // tree_offsets (empty)
+                                 Tensor{},        // runtime_offsets (empty)
+                                 Tensor{},        // kv_lens_runtime (empty)
+                                 Tensor{},        // successor_offsets (empty)
+                                 Tensor{},        // successor_counts (empty)
+                                 1,               // q_len (default to 1)
+                                 1,               // kv_len (default to 1)
+                                 0,               // past_kv_len (default to 0)
+                                 hidden_out,      // output_hidden
+                                 stream);         // stream
+                turbomind::check_cuda_error(cudaStreamSynchronize(stream));
 
-                fc_out_dbg   = draft_layer.debug_fc_out();
-                attn_out_dbg = draft_layer.debug_attn_out();
-                ffn_out_dbg  = draft_layer.debug_ffn_out();
-                pre_head_dbg = draft_layer.debug_pre_head_hidden();
+                fc_out_dbg   = draft_layer_ptr->debug_fc_out();
+                attn_out_dbg = draft_layer_ptr->debug_attn_out();
+                qkv_dbg      = draft_layer_ptr->debug_qkv();
+                ffn_out_dbg  = draft_layer_ptr->debug_ffn_out();
+                pre_head_dbg = draft_layer_ptr->debug_pre_head_hidden();
 
                 // Build a temporary LM head weight wrapper and project
                 // to vocab using the same backend as EagleModule.
-                ft::LlamaDenseWeight lm_head_w;
+                turbomind::LlamaDenseWeight lm_head_w;
                 const int lm_in  = hidden_units;
                 const int lm_out = vocab_size;
                 lm_head_w.emplace(lm_in, lm_out, weights.lm_head.dtype(), /*bias=*/false, weights.lm_head.dtype(), 1);
@@ -1347,24 +1377,24 @@ PYBIND11_MODULE(_turbomind, m)
                 lm_head_w.prepare(/*fused_moe=*/false);
 
                 logits = Tensor(
-                    std::vector<ft::core::ssize_t>{batch_size, vocab_size},
+                    std::vector<turbomind::core::ssize_t>{batch_size, vocab_size},
                     hidden_out.dtype(),
-                    ft::kDEVICE);
+                    turbomind::DeviceType::kDEVICE);
                 linear.Forward(hidden_out, lm_head_w, logits);
-                ft::check_cuda_error(cudaStreamSynchronize(stream));
+                turbomind::check_cuda_error(cudaStreamSynchronize(stream));
             }
             else {
                 // Compose a minimal Tensor for input_ids (unused by Eagle3).
                 Tensor input_ids(
-                    std::vector<ft::core::ssize_t>{batch_size},
-                    ft::data_type_v<int32_t>,
-                    ft::kDEVICE);
-                ft::check_cuda_error(
+                    std::vector<turbomind::core::ssize_t>{batch_size},
+                    turbomind::data_type_v<int32_t>,
+                    turbomind::DeviceType::kDEVICE);
+                turbomind::check_cuda_error(
                     cudaMemsetAsync(input_ids.raw_data(), 0, input_ids.byte_size(), stream));
 
                 // Enable EAGLE debug for this one call so EagleModule
                 // records its intermediate tensors for comparison.
-                ft::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
+                turbomind::setEagleDebugFlags(/*eagle_debug=*/true, /*eagle_metrics_debug=*/false);
                 module.forward(
                     input_ids,
                     *hidden_tm,
@@ -1373,12 +1403,12 @@ PYBIND11_MODULE(_turbomind, m)
                     hidden_out,
                     linear,
                     stream);
-                ft::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
+                turbomind::setEagleDebugFlags(/*eagle_debug=*/false, /*eagle_metrics_debug=*/false);
 
-                ft::check_cuda_error(cudaStreamSynchronize(stream));
+                turbomind::check_cuda_error(cudaStreamSynchronize(stream));
             }
 
-            ft::check_cuda_error(cudaStreamSynchronize(stream));
+            turbomind::check_cuda_error(cudaStreamSynchronize(stream));
 
             // Expose logits plus a small set of intermediate tensors
             // so Python can perform stage-wise HF↔TM comparisons.
@@ -1392,15 +1422,14 @@ PYBIND11_MODULE(_turbomind, m)
                 if (attn_out_dbg) {
                     out["attn_out"] = attn_out_dbg;
                 }
+                if (qkv_dbg.size() > 0) { // Check if the Tensor is valid
+                    out["qkv"] = qkv_dbg;
+                }
                 if (ffn_out_dbg) {
                     out["ffn_out"] = ffn_out_dbg;
                 }
                 if (pre_head_dbg) {
                     out["pre_head_hidden"] = pre_head_dbg;
-                }
-                // Optional QKV capture from Eagle3 attention.
-                if (Tensor qkv = draft_layer.debug_qkv()) {
-                    out["qkv"] = qkv;
                 }
             }
             else {
@@ -1510,14 +1539,14 @@ PYBIND11_MODULE(_turbomind, m)
 
     py::bind_map<TensorMap, std::shared_ptr<TensorMap>>(m, "TensorMap");
 
-    using ft::ModelRequest;
+    using turbomind::ModelRequest;
     py::class_<ModelRequest>(m, "ModelRequest")
         .def(
             "forward",
             [](ModelRequest*               model_request,
                std::shared_ptr<TensorMap>  input_tensors,
-               const ft::SessionParam&     session,
-               const ft::GenerationConfig& gen_cfg,
+               const turbomind::SessionParam&     session,
+               const turbomind::GenerationConfig& gen_cfg,
                bool                        stream_output,
                bool                        enable_metrics,
                std::function<void()>       cb) {
@@ -1571,7 +1600,7 @@ PYBIND11_MODULE(_turbomind, m)
             "grammar"_a);
 
     // transformer model
-    using ft::LlamaTritonModel;
+    using turbomind::LlamaTritonModel;
     py::class_<LlamaTritonModel, std::shared_ptr<LlamaTritonModel>>(m, "AbstractTransformerModel")
         .def_static(
             "create_llama_model",
