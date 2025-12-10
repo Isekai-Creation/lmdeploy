@@ -35,6 +35,8 @@ __global__ void acceptDraftTokensKernel(
     SizeType*          sequence_lengths,
     SizeType const*    paths,
     SizeType const*    best_path_ids,
+    TokenIdType const* end_ids,
+    bool*              finished_states,
     SizeType const*    batch_slots,
     SizeType           batch_size,
     SizeType           max_batch_size,
@@ -58,14 +60,17 @@ __global__ void acceptDraftTokensKernel(
     int best_path = best_path_ids[slot];
 
     // A negative best_path_id conventionally means "no best path".
-    if (best_path < 0 || best_path >= max_draft_tokens) {
+    if (best_path < 0 || best_path >= max_draft_tokens) { // max_draft_tokens here should be max_decoding_tokens (tree width)
         accepted_lengths[slot] = 0;
+        if (finished_states && end_ids) { // Mark finished if no end_ids provided, mimicking TRT's behavior for tree roots.
+            finished_states[slot] = true;
+        }
         return;
     }
     
     // Walk the path and accept matching tokens
     int accepted = 0;
-    for (int i = 0; i < max_draft_tokens; ++i) {
+    for (int i = 0; i < max_path_len; ++i) { // Loop over max_path_len
         // Get path index for this position
         const int path_idx = paths[static_cast<size_t>(slot) * max_draft_tokens * max_path_len
                                   + static_cast<size_t>(best_path) * max_path_len + i];
@@ -74,7 +79,7 @@ __global__ void acceptDraftTokensKernel(
             // End-of-path sentinel.
             break;
         }
-        if (path_idx >= max_draft_tokens) {
+        if (path_idx >= max_draft_tokens) { // path_idx needs to be valid for draft_ids/target_ids
             // Out-of-range path index – treat as terminator to avoid
             // reading past the end of draft/target arrays.
             break;
@@ -85,6 +90,20 @@ __global__ void acceptDraftTokensKernel(
             = draft_ids[static_cast<size_t>(slot) * max_draft_tokens + path_idx];
         const int target_token
             = target_ids[static_cast<size_t>(slot) * max_draft_tokens + path_idx];
+
+        // Stop if draft token is invalid (TRT's semantics for non-generated tokens)
+        if (draft_token < 0) {
+            break;
+        }
+
+        // Check for target EOS.
+        bool target_is_eos = false;
+        if (end_ids) {
+            const int current_eos_id = end_ids[slot]; // Corrected: use slot for end_ids
+            if (current_eos_id >= 0 && target_token == current_eos_id) {
+                target_is_eos = true;
+            }
+        }
         
         if (draft_token == target_token) {
             // Accept token
@@ -92,6 +111,9 @@ __global__ void acceptDraftTokensKernel(
                 output_ids[static_cast<size_t>(slot) * max_seq_len + seq_len + accepted]
                     = draft_token;
                 accepted++;
+            }
+            if (target_is_eos) {
+                break; // Stop accepting if target is EOS.
             }
         } else {
             // Rejection: stop here, but add the correct target token
@@ -103,6 +125,8 @@ __global__ void acceptDraftTokensKernel(
             break;
         }
     }
+
+
     
     // Update metadata
     accepted_lengths[slot] = accepted;
@@ -126,6 +150,8 @@ void acceptDraftTokens(AcceptDraftTokensParams<T> const& params) {
             params.sequence_lengths,
             params.paths,
             params.best_path_ids,
+            params.end_ids,
+            params.finished_states,
             params.batch_slots,
             params.batch_size,
             params.max_batch_size,
@@ -150,6 +176,8 @@ void launchAcceptDraftTokensKernel(
     SizeType*          sequence_lengths,
     SizeType const*    paths,
     SizeType const*    best_path_ids,
+    TokenIdType const* end_ids,
+    bool*              finished_states,
     SizeType const*    batch_slots,
     SizeType           batch_size,
     SizeType           max_batch_size,
@@ -166,8 +194,8 @@ void launchAcceptDraftTokensKernel(
     params.sequence_lengths = sequence_lengths;
     params.paths            = paths;
     params.best_path_ids    = best_path_ids;
-    params.end_ids          = nullptr;
-    params.finished_states  = nullptr;
+    params.end_ids          = end_ids;
+    params.finished_states  = finished_states;
     params.batch_slots      = batch_slots;
     params.batch_size       = batch_size;
     params.max_batch_size   = max_batch_size;

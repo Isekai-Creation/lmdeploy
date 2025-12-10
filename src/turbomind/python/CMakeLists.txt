@@ -14,11 +14,36 @@ endif()
 
 pybind11_add_module(${PROJECT_NAME} bind.cpp)
 target_link_libraries(${PROJECT_NAME} PRIVATE LlamaTritonBackend)
+
+set(DEST_DIR "${CMAKE_SOURCE_DIR}/lmdeploy/turbomind")
+set(TARGET_FILE_NAME "$<TARGET_FILE_NAME:${PROJECT_NAME}>")
+set(TARGET_FILE "$<TARGET_FILE:${PROJECT_NAME}>")
+
+message(STATUS "DEBUG: Source file for _turbomind: ${TARGET_FILE}")
+message(STATUS "DEBUG: Destination directory for _turbomind: ${DEST_DIR}")
+message(STATUS "DEBUG: Destination file name for _turbomind: ${TARGET_FILE_NAME}")
+
+
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_14)
 
 pybind11_add_module(_xgrammar xgrammar_bind.cpp)
 target_link_libraries(_xgrammar PRIVATE core xgrammar)
 target_compile_features(_xgrammar PRIVATE cxx_std_14)
+
+# Explicitly copy the built .so files to the correct Python package subdirectory
+add_custom_command(TARGET _turbomind POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:_turbomind>
+    ${CMAKE_SOURCE_DIR}/lmdeploy/turbomind/$<TARGET_FILE_NAME:_turbomind>
+    COMMENT "Copying _turbomind.so to lmdeploy/turbomind"
+)
+
+add_custom_command(TARGET _xgrammar POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:_xgrammar>
+    ${CMAKE_SOURCE_DIR}/lmdeploy/turbomind/$<TARGET_FILE_NAME:_xgrammar>
+    COMMENT "Copying _xgrammar.so to lmdeploy/turbomind"
+)
 
 if (CALL_FROM_SETUP_PY)
   string(REPLACE "." ";" _ver ${CMAKE_CUDA_COMPILER_VERSION})

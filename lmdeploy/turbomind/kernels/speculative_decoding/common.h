@@ -81,6 +81,8 @@ void launchAcceptDraftTokensKernel(
     SizeType*          sequence_lengths,
     SizeType const*    paths,
     SizeType const*    best_path_ids,
+    TokenIdType const* end_ids,
+    bool*              finished_states,
     SizeType const*    batch_slots,
     SizeType           batch_size,
     SizeType           max_batch_size,

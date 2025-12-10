@@ -672,6 +672,8 @@ PYBIND11_MODULE(_turbomind, m)
            py::object                   sequence_lengths,
            py::object                   paths,
            py::object                   best_path_ids,
+           py::object                   end_ids_opt,
+           py::object                   finished_states_opt,
            py::object                   batch_slots_opt) {
             // Infer basic shapes from tensors.
             auto draft_shape  = draft_ids.attr("shape").cast<py::tuple>();
@@ -715,6 +717,12 @@ PYBIND11_MODULE(_turbomind, m)
                 return reinterpret_cast<eagle_kernels::TokenIdType*>(ptr_val);
             };
 
+            auto get_bool_ptr = [](py::object const& tensor) -> bool* {
+                auto ptr_obj = tensor.attr("data_ptr")();
+                auto ptr_val = ptr_obj.cast<uintptr_t>();
+                return reinterpret_cast<bool*>(ptr_val);
+            };
+
             eagle_kernels::TokenIdType* output_ids_ptr       = get_token_ptr(output_ids);
             eagle_kernels::TokenIdType* draft_ids_ptr        = get_token_ptr(draft_ids);
             eagle_kernels::TokenIdType* target_ids_ptr       = get_token_ptr(target_ids);
@@ -722,6 +730,16 @@ PYBIND11_MODULE(_turbomind, m)
             eagle_kernels::SizeType*    sequence_lengths_ptr = get_int32_ptr(sequence_lengths);
             eagle_kernels::SizeType*    paths_ptr            = get_int32_ptr(paths);
             eagle_kernels::SizeType*    best_path_ids_ptr    = get_int32_ptr(best_path_ids);
+
+            eagle_kernels::TokenIdType* end_ids_ptr = nullptr;
+            if (!end_ids_opt.is_none()) {
+                end_ids_ptr = get_token_ptr(end_ids_opt);
+            }
+
+            bool* finished_states_ptr = nullptr;
+            if (!finished_states_opt.is_none()) {
+                finished_states_ptr = get_bool_ptr(finished_states_opt);
+            }
 
             eagle_kernels::SizeType* batch_slots_ptr = nullptr;
             if (!batch_slots_opt.is_none()) {
@@ -739,6 +757,8 @@ PYBIND11_MODULE(_turbomind, m)
                 sequence_lengths_ptr,
                 paths_ptr,
                 best_path_ids_ptr,
+                end_ids_ptr,
+                finished_states_ptr,
                 batch_slots_ptr,
                 static_cast<eagle_kernels::SizeType>(batch_size),
                 static_cast<eagle_kernels::SizeType>(max_batch_size),
@@ -757,6 +777,8 @@ PYBIND11_MODULE(_turbomind, m)
         "sequence_lengths"_a,
         "paths"_a,
         "best_path_ids"_a,
+        "end_ids"_a = py::none(),
+        "finished_states"_a = py::none(),
         "batch_slots"_a = py::none());
 
     // EAGLE A21/A22: prototype path-pack bindings – see EAGLE_TODO.md (🧪, GPU/CI validation pending).

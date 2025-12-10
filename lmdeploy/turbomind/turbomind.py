@@ -43,9 +43,9 @@ from .supported_models import is_supported
 # leave `_tm` / `_xgr` as `None`. Callers that require the backend should
 # explicitly assert that `_tm` is not None.
 try:  # pragma: no cover - backend availability is environment-dependent
-    from lmdeploy.lib import _turbomind as _tm  # type: ignore[attr-defined]
-    from lmdeploy.lib import _xgrammar as _xgr  # type: ignore[attr-defined]
-except Exception:  # noqa: BLE001
+    from . import _turbomind as _tm
+    from . import _xgrammar as _xgr
+except ImportError:
     _tm = None
     _xgr = None
 
