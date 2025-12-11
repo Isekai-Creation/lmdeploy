@@ -3,14 +3,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(_turbomind LANGUAGES CXX CUDA)
 
-find_package(pybind11 CONFIG)
-if(NOT pybind11_FOUND)
-    execute_process(COMMAND "pybind11-config" "--cmakedir"
-                    RESULT_VARIABLE _COMMAND_SUCCESS
-                    OUTPUT_VARIABLE pybind11_DIR
-                    OUTPUT_STRIP_TRAILING_WHITESPACE)
-    find_package(pybind11 CONFIG)
-endif()
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-m" "pybind11" "--cmakedir"
+                RESULT_VARIABLE _COMMAND_SUCCESS
+                OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(pybind11_DIR "${PYBIND11_CMAKE_DIR}") # Set pybind11_DIR explicitly
+find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(${PROJECT_NAME} bind.cpp)
 target_link_libraries(${PROJECT_NAME} PRIVATE LlamaTritonBackend)
