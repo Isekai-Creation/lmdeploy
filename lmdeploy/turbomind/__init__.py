@@ -23,6 +23,6 @@ def bootstrap():
 
 bootstrap()
 
-from .turbomind import TurboMind, update_parallel_config  # noqa: E402
+from .turbomind import TurboMind, update_parallel_config, _tm  # noqa: E402
 
-__all__ = ["TurboMind", "update_parallel_config"]
+__all__ = ["TurboMind", "update_parallel_config", "_tm"]
