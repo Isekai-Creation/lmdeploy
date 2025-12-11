@@ -43,11 +43,13 @@ def get_output_model_registered_name_and_config(model_path: str, model_format: s
         dtype (str): the data type of the model's weights and activations
         group_size (int): the size of group used by awq model
     """
+    print(f"DEBUG(get_output_model_registered_name_and_config): initial group_size={group_size}")
     register_name = 'tm'
 
     has_bf16 = is_bf16_supported()
 
     model_arch, model_config = get_model_arch(model_path)
+    print(f"DEBUG(get_output_model_registered_name_and_config): model_arch={model_arch}, model_config={model_config}")
 
     # infer dtype from device and model config
     if dtype == 'auto':
@@ -70,12 +72,16 @@ def get_output_model_registered_name_and_config(model_path: str, model_format: s
 
     config = TurbomindModelConfig.from_dict()
 
+    print(f"DEBUG(get_output_model_registered_name_and_config): before _get_and_verify_max_len, model_config={model_config}")
     session_len = _get_and_verify_max_len(model_config, None)
+    print(f"DEBUG(get_output_model_registered_name_and_config): session_len={session_len}")
 
     if model_format in ['awq', 'gptq']:
         weight_type = 'int4'
         dtype = 'float16'  # force float16 for GPTQ/AWQ weights
+        print(f"DEBUG(get_output_model_registered_name_and_config): before group_size assignment for awq/gptq, group_size={group_size}")
         group_size = 128 if group_size == 0 else group_size
+        print(f"DEBUG(get_output_model_registered_name_and_config): after group_size assignment for awq/gptq, group_size={group_size}")
     elif model_format == 'fp8':
         weight_type = 'fp8'
         group_size = 128
@@ -96,6 +102,8 @@ def get_output_model_registered_name_and_config(model_path: str, model_format: s
     config.model_config.model_format = model_format
     config.model_config.group_size = group_size
     config.model_config.session_len = session_len
+
+    print(f"DEBUG(get_output_model_registered_name_and_config): returning config.model_config.group_size={config.model_config.group_size}, session_len={config.model_config.session_len}")
 
     return register_name, config
 

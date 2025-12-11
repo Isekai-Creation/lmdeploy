@@ -101,6 +101,9 @@ LlamaV2::LlamaV2(DataType                     dtype,
     engine_param_(engine)
 {
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TM_LOG_INFO("[LlamaV2] enable_speculative_decoding=%d spec_method=%s",
+                engine.enable_speculative_decoding,
+                engine.spec_method.c_str());
 
     // Propagate EAGLE debug/metrics flags derived from SpeculativeConfig
     // into the global helpers used by EagleModule and related kernels so
@@ -3486,12 +3489,6 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
                 stream_);
 
-            float* runtime_top_p = nullptr;
-
-            check_cuda_error(cudaMalloc(&runtime_top_p, sizeof(float) * rows));
-
-    
-
             const float* logits_ptr = static_cast<const float*>(draft_logits.raw_data());
 
     
@@ -3534,7 +3531,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
             mask_params.skip_decode          = skip_decode;                      // [rows]
 
-            mask_params.runtime_top_p        = runtime_top_p;                    // optional, unused here
+            mask_params.runtime_top_p        = nullptr;                          // optional, unused here
 
             mask_params.generation_lengths   = spec_ctx.d_sequence_lengths;      // [batch_size]
 
@@ -3595,8 +3592,6 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     
 
             cudaFree(skip_decode);
-
-            cudaFree(runtime_top_p);
 
         }
 

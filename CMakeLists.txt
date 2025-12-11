@@ -26,7 +26,9 @@ endif ()
 find_package(CUDAToolkit REQUIRED)
 
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11")
-  add_definitions("-DENABLE_BF16")
+  # Enable BF16 support in all translation units. Use an explicit
+  # =1 value so `#if ENABLE_BF16` evaluates as true.
+  add_definitions(-DENABLE_BF16=1)
 endif()
 
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)

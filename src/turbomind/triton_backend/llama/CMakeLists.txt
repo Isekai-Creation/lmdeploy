@@ -22,7 +22,6 @@ set(llama_triton_backend_files
     ../../models/llama/eagle3_attention_kernels.cu
 )
 
-find_package(CUDAToolkit REQUIRED)
 add_library(LlamaTritonBackend STATIC ${llama_triton_backend_files})
 set_property(TARGET LlamaTritonBackend PROPERTY POSITION_INDEPENDENT_CODE ON)
 

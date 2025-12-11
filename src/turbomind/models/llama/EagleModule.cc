@@ -170,7 +170,13 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         }
     }
 
-    base_hidden_units_  = model_config["eagle_base_hidden"] ? model_config["eagle_base_hidden"].as<int>() : hidden_units;
+    // Track the model's working hidden width (e.g. 2880 for GPT-OSS-120B)
+    // separately from the Eagle3 attention width (e.g. eagle_q_size_ = 4096).
+    // The former is used for FC / capture geometry and LM head, while the
+    // latter is captured via eagle_q_size_ and attn_hidden_units.
+    const int config_base_hidden = model_config["eagle_base_hidden"] ? model_config["eagle_base_hidden"].as<int>() : attn_hidden_units;
+
+    base_hidden_units_  = hidden_units;
     draft_hidden_units_ = model_config["eagle_draft_hidden"]
         ? model_config["eagle_draft_hidden"].as<int>()
         : (eagle_qkv_in_dim_ > 0 ? eagle_qkv_in_dim_ / 2 : hidden_units);
@@ -185,8 +191,11 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         eagle_mode_ = EagleMode::kEagleNet;
     }
 
-    // Keep the base hidden width for the target model; draft-specific tensors
-    // explicitly use draft_hidden_units_ below.
+    // Keep hidden_units_ aligned with the model_config hidden width so it
+    // matches the runtime hidden-state dimension coming from LlamaV2 /
+    // UnifiedDecoder. Draft-specific tensors explicitly use
+    // draft_hidden_units_ below, and attention uses base_hidden_units_ when
+    // Eagle3 geometry is present.
     hidden_units_ = hidden_units;
     hidden_units  = hidden_units_;
     vocab_size_   = vocab_size;
@@ -228,8 +237,10 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     if (eagle3) {
         // For Eagle3 we require full geometry to be present and
-        // consistent with the config; otherwise the draft head is
-        // considered unusable for this engine.
+        // consistent with the draft hidden size exported by the
+        // converter. Geometry checks must line up with the HF
+        // Eagle3 midlayer (fc + Q/K/V/O) instead of assuming legacy
+        // base-hidden layouts.
         if (eagle_q_size_ <= 0 || eagle_kv_size_ <= 0 || eagle_qkv_in_dim_ <= 0 || eagle_fc_in_dim_ <= 0) {
             logEagleError(
                 "Eagle3 config.yaml is missing required geometry "
@@ -254,21 +265,14 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 draft_hidden_units_);
             success = false;
         }
-        if (!eagle_capture_layers_cfg_.empty()) {
-            const int expected_fc_in = static_cast<int>(eagle_capture_layers_cfg_.size()) * base_hidden_units_;
-            if (eagle_fc_in_dim_ > 0 && eagle_fc_in_dim_ != expected_fc_in) {
-                TM_LOG_ERROR(
-                    "[EAGLE][EAGLE3][EagleModule::load] fc_in_dim (%d) != capture_layers (%zu) * base_hidden (%d); "
-                    "refusing to enable Eagle3 draft because capture ordering/width drifted from config.",
-                    eagle_fc_in_dim_,
-                    eagle_capture_layers_cfg_.size(),
-                    base_hidden_units_);
-                success = false;
-            }
-        }
-        else {
-            // Capture layers must be present for Eagle3 to be meaningful; treat absence as fatal to avoid
-            // running with an undefined FC input width.
+        // For Eagle3 we no longer require fc_in_dim to equal
+        // capture_layers * base_hidden_units_. The converter encodes
+        // fc_in_dim relative to draft_hidden (e.g. 3 * 2880 for
+        // GPT‑OSS‑120B‑Eagle3), and UnifiedDecoder is responsible for
+        // providing a captured_hidden_states buffer that matches this
+        // dimension when Eagle3 is active. Keep capture_layers only as
+        // a sanity check that some capture configuration exists.
+        if (eagle_capture_layers_cfg_.empty()) {
             logEagleError(
                 "[EAGLE][EAGLE3][EagleModule::load] eagle_capture_layers missing in config.yaml; "
                 "disabling Eagle3 draft to avoid geometry drift.");
@@ -276,19 +280,23 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         }
     }
 
-    weights_.embed_tokens = Tensor{Layout({vocab_size, base_hidden_units_}), dtype, kDEVICE};
+    // Token embeddings live in the same hidden space as the base model
+    // hidden states (hidden_units_).
+    weights_.embed_tokens = Tensor{Layout({vocab_size, hidden_units_}), dtype, kDEVICE};
 
     // Legacy shallow FC reduces captured features to the draft hidden width.
     // Legacy FC path stays in draft-hidden space.
     weights_.fc = Tensor{Layout({draft_hidden_units_ * 2, draft_hidden_units_}), dtype, kDEVICE};
 
     // Eagle3-specific FC weight that consumes the full concatenated
-    // multi-layer hidden (e.g. 3 * hidden) before attention.
+    // multi-layer hidden (e.g. 3 * draft_hidden_units_) before attention.
     if (eagle3 && eagle_fc_in_dim_ > 0) {
         weights_.eagle_fc = Tensor{Layout({eagle_fc_in_dim_, draft_hidden_units_}), dtype, kDEVICE};
     }
 
-    // Layer weights (single EagleNet / Eagle3 shallow layer)
+    // Layer weights (single EagleNet / Eagle3 shallow layer). Norms operate
+    // in the same hidden space as the model hidden states (hidden_units_ /
+    // draft_hidden_units_).
     weights_.input_norm  = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
     weights_.hidden_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
 
@@ -311,15 +319,19 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 
     weights_.attn_qkv = Tensor{Layout({qkv_in_dim, qkv_out_dim}), dtype, kDEVICE};
     // Wo projects back to base_hidden to align with target model width.
-    weights_.attn_o   = Tensor{Layout({q_size, base_hidden_units_}), dtype, kDEVICE};
+    weights_.attn_o    = Tensor{Layout({q_size, base_hidden_units_}), dtype, kDEVICE};
+    // This norm is used in the Eagle3 draft layer and therefore stays in
+    // draft-hidden space.
     weights_.attn_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
 
     // Draft FFN stays in draft_hidden space.
     weights_.mlp_gate_up = Tensor{Layout({intermediate_size * 2, draft_hidden_units_}), dtype, kDEVICE};
     weights_.mlp_down    = Tensor{Layout({intermediate_size, draft_hidden_units_}), dtype, kDEVICE};
 
+    // Output norm and LM head operate in the same hidden space as the base
+    // model hidden states (hidden_units_ / draft_hidden_units_).
     weights_.output_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
-    weights_.lm_head     = Tensor{Layout({base_hidden_units_, vocab_size}), dtype, kDEVICE};
+    weights_.lm_head     = Tensor{Layout({draft_hidden_units_, vocab_size}), dtype, kDEVICE};
 
     // Optional native Eagle3 attention projections (non‑LLaMA geometry).
     // Only allocate these when we have full Eagle3 geometry; otherwise
@@ -329,11 +341,11 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         // midlayer.self_attn.q_proj.weight: [q_out, q_in]   = [eagle_q_size_, eagle_qkv_in_dim_]
         // midlayer.self_attn.k_proj.weight: [kv_out, q_in]  = [eagle_kv_size_, eagle_qkv_in_dim_]
         // midlayer.self_attn.v_proj.weight: [kv_out, q_in]  = [eagle_kv_size_, eagle_qkv_in_dim_]
-        // midlayer.self_attn.o_proj.weight: [q_in, q_out]   = [eagle_qkv_in_dim_, eagle_q_size_]
+        // midlayer.self_attn.o_proj.weight: [hidden, q_out] = [draft_hidden_units_, eagle_q_size_]
         weights_.eagle_q_proj = Tensor{Layout({eagle_q_size_, eagle_qkv_in_dim_}), dtype, kDEVICE};
         weights_.eagle_k_proj = Tensor{Layout({eagle_kv_size_, eagle_qkv_in_dim_}), dtype, kDEVICE};
         weights_.eagle_v_proj = Tensor{Layout({eagle_kv_size_, eagle_qkv_in_dim_}), dtype, kDEVICE};
-        weights_.eagle_o_proj = Tensor{Layout({eagle_qkv_in_dim_, eagle_q_size_}), dtype, kDEVICE};
+        weights_.eagle_o_proj = Tensor{Layout({draft_hidden_units_, eagle_q_size_}), dtype, kDEVICE};
     }
 
     weights_.is_initialized = true;
@@ -845,14 +857,14 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                 }
                 if (ew.is_initialized
                     && (!ew.o_proj || ew.o_proj.ndim() != 2
-                        || ew.o_proj.shape(0) != eagle_qkv_in_dim_
+                        || ew.o_proj.shape(0) != draft_hidden_units_
                         || ew.o_proj.shape(1) != eagle_q_size_)) {
                     TM_LOG_WARNING(
                         "[EAGLE3][EagleModule::load] o_proj shape [%d,%d] "
                         "!= [%d,%d]; disabling Eagle3 attention for this engine.",
                         ew.o_proj ? ew.o_proj.shape(0) : -1,
                         ew.o_proj ? ew.o_proj.shape(1) : -1,
-                        eagle_qkv_in_dim_,
+                        draft_hidden_units_,
                         eagle_q_size_);
                     ew.is_initialized = false;
                 }

@@ -196,11 +196,11 @@ private:
 
     EagleMode eagle_mode_{EagleMode::kEagleNet};
 
-    // Base / draft hidden sizes. base_hidden_units_ tracks the target
-    // model hidden width (e.g. 4096 for GPT-OSS-120B) while
-    // draft_hidden_units_ tracks the Eagle-3 midlayer FC output width
-    // (e.g. 2880). hidden_units_ remains aligned to base_hidden_units_
-    // for legacy callers.
+    // Base / draft hidden sizes. base_hidden_units_ tracks the runtime
+    // hidden width used by the decoder (e.g. 2880 for GPT-OSS-120B),
+    // while draft_hidden_units_ tracks the Eagle-3 midlayer FC output
+    // width (e.g. 2880). hidden_units_ mirrors hidden_units from
+    // config.yaml so that debug helpers can report it directly.
     int base_hidden_units_{0};
     int draft_hidden_units_{0};
     int eagle_q_size_{0};

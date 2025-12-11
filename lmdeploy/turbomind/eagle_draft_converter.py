@@ -601,21 +601,22 @@ def _convert_eagle3_midlayer(
         geo = _infer_eagle3_geometry(shards, hidden_size, logger=log)
         eagle_q_size = int(geo.get("eagle_q_size", 0))
         eagle_qkv_in_dim = int(geo.get("eagle_qkv_in_dim", 0))
+        eagle_draft_hidden = int(geo.get("eagle_draft_hidden", 0))
 
-        if eagle_q_size <= 0 or eagle_qkv_in_dim <= 0:
+        if eagle_q_size <= 0 or eagle_qkv_in_dim <= 0 or eagle_draft_hidden <= 0:
             raise RuntimeError(
                 f"Eagle-3 draft geometry could not be inferred for {hf_dir!r}; "
-                f"missing eagle_q_size/eagle_qkv_in_dim metadata."
+                f"missing eagle_q_size/eagle_qkv_in_dim/eagle_draft_hidden metadata."
             )
 
         if q_mid.shape != (eagle_q_size, eagle_qkv_in_dim) \
            or k_mid.shape[1] != eagle_qkv_in_dim \
            or v_mid.shape[1] != eagle_qkv_in_dim \
-           or o_mid.shape != (eagle_qkv_in_dim, eagle_q_size):
+           or o_mid.shape != (eagle_draft_hidden, eagle_q_size):
             raise RuntimeError(
                 "Eagle-3 draft Q/K/V/O shapes do not match expected geometry; refusing to export. "
                 f"Expected q=({eagle_q_size}, {eagle_qkv_in_dim}), "
-                f"k/v second dim={eagle_qkv_in_dim}, o=({eagle_qkv_in_dim}, {eagle_q_size}); "
+                f"k/v second dim={eagle_qkv_in_dim}, o=({eagle_draft_hidden}, {eagle_q_size}); "
                 f"got q={tuple(q_mid.shape)}, k={tuple(k_mid.shape)}, "
                 f"v={tuple(v_mid.shape)}, o={tuple(o_mid.shape)}"
             )
@@ -668,7 +669,9 @@ def _convert_eagle3_midlayer(
     eagle_q_size = int(geo.get("eagle_q_size", 0))
     eagle_kv_size = int(geo.get("eagle_kv_size", 0))
     eagle_qkv_in_dim = int(geo.get("eagle_qkv_in_dim", 0))
-    base_hidden = int(geo.get("eagle_base_hidden", q_mid.shape[0]))
+    # For the fused Wo we want to project from attention space back into
+    # the base model hidden width (hidden_size), not the Eagle3 q_size.
+    base_hidden = hidden_size
 
     if eagle_q_size <= 0 or eagle_kv_size <= 0 or eagle_qkv_in_dim <= 0:
         raise RuntimeError(

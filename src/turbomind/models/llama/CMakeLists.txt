@@ -3,8 +3,6 @@
 cmake_minimum_required(VERSION 3.8)
 
 
-find_package(CUDAToolkit REQUIRED)
-
 add_library(Llama STATIC
         LlamaV2.cc
         LlamaBatch.cc

@@ -381,6 +381,9 @@ __global__ void maskLogitsEntropyFlatKernel(const float* logits,
 
     // skip masked or padded rows
     if ((skip_decode && skip_decode[row]) || (generation_lengths && token_idx >= generation_lengths[batch_slot])) {
+        if (runtime_top_p && col == 0) {
+            runtime_top_p[row] = 0.0f;
+        }
         return;
     }
 

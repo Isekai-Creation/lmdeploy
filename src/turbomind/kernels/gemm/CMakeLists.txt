@@ -28,7 +28,11 @@ add_library(gemm2
         kernel/sm70_884_4.cu
         kernel/sm70_884_8.cu
         kernel/sm70_884_16.cu
-        kernel/sm90_64n32_8.cu
+        # NOTE: sm90_64n32_8.cu uses tensormap.replace, which is not
+        # supported on plain sm_90 in some CUDA 12 toolchains (e.g. this
+        # environment). Excluding it avoids ptxas errors while leaving
+        # other GEMM kernels available.
+        # kernel/sm90_64n32_8.cu
         cublas.cu
         moe_utils_v2.cu
         test/test_utils.cu

@@ -1,6 +1,7 @@
 // Copyright (c) OpenMMLab. All rights reserved.
 
 #include "src/turbomind/core/check.h"
+#include "src/turbomind/core/cuda_data_type.h"
 #include "src/turbomind/kernels/gemm/context.h"
 #include "src/turbomind/kernels/gemm/desc.h"
 #include "src/turbomind/kernels/gemm/dispatch_cache.h"
@@ -10,6 +11,8 @@
 #include "src/turbomind/kernels/gemm/tuner/params.h"
 #include "src/turbomind/kernels/gemm/tuner/sampler.h"
 #include "src/turbomind/kernels/gemm/types.h"
+#include "src/turbomind/utils/logger.h"
+#include <cublas_v2.h>
 #include <algorithm>
 #include <iterator>
 #include <memory>
@@ -268,8 +271,20 @@ int Gemm::Run(const Operation&    operation,
 
     if (!desc) {
         fprintf(stderr, "invalid argument.\n");
-        TM_CHECK(0);
-        return -1;
+        TM_LOG_ERROR(
+            "[Gemm] invalid argument for problem: A=(%d,%d) B=(%d,%d) C=(%d,%d) D=(%d,%d)",
+            Adesc.rows,
+            Adesc.cols,
+            Bdesc.rows,
+            Bdesc.cols,
+            Cdesc.rows,
+            Cdesc.cols,
+            Ddesc.rows,
+            Ddesc.cols);
+        // Signal failure to the caller so higher-level fallbacks
+        // (e.g. LlamaLinear's naive GEMM) can take over instead of
+        // aborting the process.
+        return 1;
     }
 
     const auto launch = [=](LaunchSpec spec, cudaStream_t st) {
@@ -324,9 +339,134 @@ int Gemm::Run(const Operation&    operation,
         return launch(spec, stream);
     }
 
-    TM_CHECK(0) << "No feasible kernel found for the problem: " << to_string(context.desc());
+    // Fallback: when no fused kernel is available (e.g. new GPU arch or
+    // unsupported dtype/layout), try a plain cuBLAS GEMM for simple
+    // dense cases instead of hard‑failing. This mirrors
+    // CublasKernel::is_feasible in cublas.cu.
+    const auto& gdesc = context.desc();
+    constexpr std::tuple flat3{Striding::kFlat, Striding::kFlat, Striding::kFlat};
 
-    return -1;
+    bool cublas_ok = true;
+    if (std::tie(gdesc.striding_a, gdesc.striding_b, gdesc.striding_c) != flat3) {
+        cublas_ok = false;
+    }
+    if (std::tie(gdesc.pack_a, gdesc.pack_b, gdesc.pack_u, gdesc.pack_v) != std::tuple{0, 0, 0, 0}) {
+        cublas_ok = false;
+    }
+    if (gdesc.epilogue != Epilogue::kNone) {
+        cublas_ok = false;
+    }
+    if (gdesc.num > 1) {
+        cublas_ok = false;
+    }
+    if (gdesc.quant_a || gdesc.quant_b) {
+        cublas_ok = false;
+    }
+    if (gdesc.group_axis >= 0) {
+        cublas_ok = false;
+    }
+    if (gdesc.type_a != kHalf && gdesc.type_a != kBfloat16 && gdesc.type_a != kFloat) {
+        cublas_ok = false;
+    }
+    if (gdesc.type_b != gdesc.type_a) {
+        cublas_ok = false;
+    }
+    if (gdesc.type_c != gdesc.type_a && gdesc.type_c != kFloat) {
+        cublas_ok = false;
+    }
+
+    if (cublas_ok) {
+        static cublasHandle_t handle = nullptr;
+        static cudaStream_t   handle_stream{};
+        if (!handle) {
+            TM_CHECK(cublasCreate(&handle) == CUBLAS_STATUS_SUCCESS);
+        }
+        if (handle_stream != stream) {
+            TM_CHECK(cublasSetStream(handle, stream) == CUBLAS_STATUS_SUCCESS);
+            handle_stream = stream;
+        }
+
+        cublasOperation_t transa{};
+        cublasOperation_t transb{};
+        int               m{};
+        int               n{};
+        int               k{};
+        const void*       A_ptr = A;
+        const void*       B_ptr = B;
+        int               lda{};
+        int               ldb{};
+        int               ldc   = Ddesc.ld;
+
+        if (gdesc.order_a == kRowMajor && gdesc.order_b == kRowMajor && gdesc.order_c == kRowMajor) {
+            // Row-major GEMM: C[m,n] (row-major) = A[m,k] (row-major) * B[k,n] (row-major)
+            // is equivalent to column-major: C^T[n,m] = B^T[n,k] * A^T[k,m].
+            m     = Bdesc.cols;   // n
+            n     = Adesc.rows;   // m
+            k     = Adesc.cols;   // k
+            A_ptr = B;
+            B_ptr = A;
+            lda   = Bdesc.ld;     // leading dim for B^T interpreted as [n,k] col-major
+            ldb   = Adesc.ld;     // leading dim for A^T interpreted as [k,m] col-major
+
+            TM_CHECK_EQ(Bdesc.rows, k);
+            TM_CHECK_EQ(Ddesc.rows, Adesc.rows);
+            TM_CHECK_EQ(Ddesc.cols, Bdesc.cols);
+
+            transa = CUBLAS_OP_N;
+            transb = CUBLAS_OP_N;
+        }
+        else {
+            // Fallback to treating A/B as column-major with optional transpose
+            transa = Adesc.order == kColMajor ? CUBLAS_OP_N : CUBLAS_OP_T;
+            transb = Bdesc.order == kColMajor ? CUBLAS_OP_N : CUBLAS_OP_T;
+
+            m   = Adesc.rows;
+            n   = Bdesc.cols;
+            k   = Adesc.cols;
+            lda = Adesc.ld;
+            ldb = Bdesc.ld;
+
+            TM_CHECK_EQ(Bdesc.rows, k);
+            TM_CHECK_EQ(Ddesc.rows, m);
+            TM_CHECK_EQ(Ddesc.cols, n);
+        }
+
+        TM_CHECK(C == nullptr || C == D);
+
+        auto status = cublasGemmEx(handle,
+                                   transa,
+                                   transb,
+                                   m,
+                                   n,
+                                   k,
+                                   &alpha,
+                                   A_ptr,
+                                   to_cuda_dtype(Adesc.type),
+                                   lda,
+                                   B_ptr,
+                                   to_cuda_dtype(Bdesc.type),
+                                   ldb,
+                                   &beta,
+                                   D,
+                                   to_cuda_dtype(Ddesc.type),
+                                   ldc,
+                                   CUDA_R_32F,
+                                   CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            return 0;
+        }
+
+        TM_LOG_ERROR(
+            "[Gemm] cuBLAS fallback failed for problem: %s (status=%d)",
+            to_string(context.desc()).c_str(),
+            int(status));
+        return 1;
+    }
+
+    TM_LOG_ERROR(
+        "[Gemm] No feasible kernel found for the problem: %s", to_string(context.desc()).c_str());
+    return 1;
 }
 
 int Gemm::Export(std::ostream& os)

@@ -78,7 +78,7 @@ private:
     int                    head_num_{0};
     int                    kv_head_num_{0};
     int                    size_per_head_{0};
-    bool                   m_attn_geom_ok_{true}; // New member to track geometry compatibility
+    bool                   attn_geom_ok_{true};
     bool is_qkv_compatible_() const;
     int draft_hidden_dim_{0};
     int base_hidden_dim_{0};

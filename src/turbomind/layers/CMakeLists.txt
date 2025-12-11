@@ -16,7 +16,6 @@ cmake_minimum_required(VERSION 3.8)
 
 add_subdirectory(sampling_layers)
 
-find_package(CUDAToolkit REQUIRED)
 add_library(DynamicDecodeLayer STATIC DynamicDecodeLayer.cc)
 set_property(TARGET DynamicDecodeLayer PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET DynamicDecodeLayer PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)

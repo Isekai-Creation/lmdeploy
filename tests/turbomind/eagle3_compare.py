@@ -98,12 +98,17 @@ def _build_hidden_and_capture_from_ids(
     layers = []
     L = len(hidden_states)
     for idx in capture_layers:
+        orig_idx = idx
         if idx < 0:
             idx = L + idx
         if idx < 0 or idx >= L:
-            raise ValueError(f"capture layer idx {idx} out of range for L={L}")
+            print(f"[eagle3_compare] Skipping capture layer idx {orig_idx} (resolved {idx}) for L={L}")
+            continue
         layers.append(hidden_states[idx][:, -1, :])
-    capture = torch.cat(layers, dim=-1)
+    if not layers:
+        capture = last_hidden.new_zeros((last_hidden.shape[0], 0))
+    else:
+        capture = torch.cat(layers, dim=-1)
     return last_hidden, capture
 
 

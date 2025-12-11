@@ -39,7 +39,11 @@ from .supported_models import is_supported
 
 # TODO: find another way import _turbomind
 lmdeploy_dir = osp.split(lmdeploy.__file__)[0]
-sys.path.append(osp.join(lmdeploy_dir, "lib"))
+lib_dir = osp.join(lmdeploy_dir, "lib")
+if lib_dir not in sys.path:
+    # Prepend so that the freshly built extension in lmdeploy/lib
+    # takes precedence over any older _turbomind modules on sys.path.
+    sys.path.insert(0, lib_dir)
 import _turbomind as _tm  # noqa: E402
 import _xgrammar as _xgr  # noqa: E402
 
@@ -176,6 +180,30 @@ class TurboMind:
         _engine_config = copy.deepcopy(engine_config)
         if _engine_config is None:
             _engine_config = TurbomindEngineConfig()
+
+        # Optional override to force prefix caching on without requiring
+        # every caller (e.g. benchmark scripts) to pass the flag explicitly.
+        # This respects the user request to enable prefix caching globally
+        # while avoiding direct modifications to benchmark_speculative.py.
+        force_prefix_env = os.getenv("TM_FORCE_PREFIX_CACHING", "").strip().lower()
+        if force_prefix_env in ("1", "true", "yes", "on"):
+            _engine_config.enable_prefix_caching = True
+
+        # Optional override for KV cache memory fraction. This allows
+        # callers (or wrapper scripts) to cap TurboMind's KV cache
+        # usage without modifying benchmark scripts. When set to a
+        # float in (0, 1], it is treated as a fraction of free GPU
+        # memory reserved for KV cache (e.g. 0.75 -> 75%).
+        cache_frac_env = os.getenv("TM_CACHE_MAX_ENTRY_COUNT", "").strip()
+        if cache_frac_env:
+            try:
+                cache_frac = float(cache_frac_env)
+                if cache_frac > 0:
+                    _engine_config.cache_max_entry_count = cache_frac
+            except ValueError:
+                # Ignore malformed overrides and keep the existing value.
+                pass
+
         if _engine_config.max_batch_size is None:
             _engine_config.max_batch_size = get_max_batch_size("cuda")
         assert _engine_config.max_batch_size > 0, (

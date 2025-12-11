@@ -37,6 +37,25 @@ template<typename T>
 void GuidedDecodeUpdateLayer<T>::Forward(TensorMap& args)
 {
     TM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    // If no guided decoders are active for this batch, skip the update
+    // entirely. This avoids unnecessary device-to-host copies and
+    // prevents guided-decoding book-keeping from interfering with
+    // speculative decoding when no matchers are configured.
+    if (matchers_.empty()) {
+        return;
+    }
+    bool has_matcher = false;
+    for (const auto& m : matchers_) {
+        if (m) {
+            has_matcher = true;
+            break;
+        }
+    }
+    if (!has_matcher) {
+        return;
+    }
+
     Tensor_<T>    logits     = args.at("logits");
     Tensor_<int>  output_ids = args.at("output_ids");
     const int     step       = *args.at("step").data<int>();

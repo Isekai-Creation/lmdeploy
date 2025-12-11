@@ -169,6 +169,7 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
     const int token_idx = idx / num_q_heads;
     const int batch     = q_len > 0 ? token_idx / q_len : 0;
     const int q_pos     = q_len > 0 ? token_idx % q_len : token_idx;
+    const int q_token_offset = token_idx;
 
     const int group_size = num_kv_heads > 0 ? (num_q_heads + num_kv_heads - 1) / num_kv_heads : 1;
     const int kv_head    = head / group_size;
@@ -203,27 +204,27 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
         clamp_span(kv_start, min(kv_end, packed_stride * 32));
     }
 
-    kv_start    = max(0, min(kv_start, kv_len));
-    kv_end      = max(0, min(kv_end, kv_len)); // Corrected max(kv_start, ...) to max(0, ...)
-    int kv_len_slot = kv_end - kv_start;
+    kv_start        = max(0, min(kv_start, kv_len));
+    kv_end          = max(0, min(kv_end, kv_len));
+    const int kv_len_slot = kv_end - kv_start;
 
-    if (kv_len_slot <= 0) { // kv_start >= kv_len implies kv_len_slot <= 0
+    if (kv_len_slot <= 0) {
         return;
     }
 
-    const int pos_idx_q  = position_ids ? min(token_idx, token_num - 1) : token_idx;
+    const int pos_idx_q  = position_ids ? min(q_token_offset, token_num - 1) : q_token_offset;
     const int q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start + q_pos);
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
 
     float max_score = -1e20f;
     for (int j = 0; j < kv_len_slot; ++j) {
-        const int k_token_offset = batch * kv_len + (kv_start + j); // Offset into k_ptr's linear memory
-        const T*  k        = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim; // Corrected K pointer calculation
-        float     dot      = 0.f;
+        const int k_token_offset = batch * kv_len + (kv_start + j);
+        const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+        float     dot            = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             dot += to_float(q[d]) * to_float(k[d]);
         }
-        const int pos_idx_k   = position_ids ? min(kv_start + j, token_num - 1) : (kv_start + j);
+        const int pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
         const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
         if (kv_position > q_position) {
             dot = -1e20f;
@@ -242,12 +243,12 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
     float sum_exp = 0.f;
     for (int j = 0; j < kv_len_slot; ++j) {
         const int k_token_offset = batch * kv_len + (kv_start + j);
-        const T*  k        = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
-        float     dot      = 0.f;
+        const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+        float     dot            = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             dot += to_float(q[d]) * to_float(k[d]);
         }
-        const int pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset; // Corrected kv_token to k_token_offset
+        const int pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
         const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
         if (kv_position > q_position) {
             dot = -1e20f;
@@ -273,13 +274,13 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
     for (int j = 0; j < kv_len_slot; ++j) {
         const int k_token_offset = batch * kv_len + (kv_start + j);
         const int v_token_offset = batch * kv_len + (kv_start + j); // Assuming V has same indexing as K
-        const T*  k        = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
-        const T*  v        = v_ptr + (v_token_offset * num_kv_heads + kv_head) * head_dim;
-        float     dot      = 0.f;
+        const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+        const T*  v              = v_ptr + (v_token_offset * num_kv_heads + kv_head) * head_dim;
+        float     dot            = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             dot += to_float(q[d]) * to_float(k[d]);
         }
-        const int pos_idx_k   = position_ids ? min(kv_start + j, token_num - 1) : (kv_start + j);
+        const int pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
         const int kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
         if (kv_position > q_position) {
             dot = -1e20f;

@@ -156,13 +156,19 @@ except Exception as e:
 EOF
 
 ###############################################
-# 7. Build wheel for Kaggle / distribution
+# 7. Optional wheel build (disabled by default)
 ###############################################
 
-echo ">>> Building wheel..."
-mkdir -p dist
-pip wheel . -w dist
+# By default we only build and install the package so that the C++
+# extension and Python bindings are usable immediately. Building a
+# wheel can be memory‑intensive on some environments, so it is gated
+# behind TM_BUILD_WHEEL=1.
+if [[ "${TM_BUILD_WHEEL:-0}" == "1" ]]; then
+  echo ">>> Building wheel..."
+  mkdir -p dist
+  pip wheel . -w dist
 
-echo ">>> Done. Wheel(s) built in:"
-realpath dist
-ls -lh dist
+  echo ">>> Done. Wheel(s) built in:"
+  realpath dist
+  ls -lh dist
+fi

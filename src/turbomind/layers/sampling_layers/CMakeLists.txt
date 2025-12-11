@@ -14,8 +14,6 @@
 
 cmake_minimum_required(VERSION 3.8)
 
-find_package(CUDAToolkit REQUIRED)
-
 add_library(LogitsProcessorLayer STATIC LogitsProcessorLayer.cc)
 set_property(TARGET LogitsProcessorLayer PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET LogitsProcessorLayer PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)

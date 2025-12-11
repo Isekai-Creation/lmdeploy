@@ -8,6 +8,14 @@
 #include <cstdint>
 #include <type_traits>
 
+// Ensure BF16 support is available in all TurboMind translation units
+// even when the build system does not explicitly define ENABLE_BF16.
+// This keeps `#if ENABLE_BF16` guards consistent and allows BF16 paths
+// (e.g. Eagle3 attention) to be compiled by default on modern GPUs.
+#ifndef ENABLE_BF16
+#define ENABLE_BF16 1
+#endif
+
 // forward declarations for CUDA floating point types
 struct __half;
 struct __nv_bfloat16;

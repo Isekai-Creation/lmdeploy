@@ -58,7 +58,7 @@ def _build_eagle3_stub(draft_dir: Path,
         "midlayer.self_attn.q_proj.weight": arange((q_size, qkv_in_dim)),
         "midlayer.self_attn.k_proj.weight": arange((kv_size, qkv_in_dim)),
         "midlayer.self_attn.v_proj.weight": arange((kv_size, qkv_in_dim)),
-        "midlayer.self_attn.o_proj.weight": arange((qkv_in_dim, q_size)),
+        "midlayer.self_attn.o_proj.weight": arange((draft_hidden, q_size)),
     }
     save_file(tensors, draft_dir / "model.safetensors")
 
@@ -120,7 +120,9 @@ def test_eagle3_converter_exports_expected_geometry(tmp_path):
     assert wo_path.exists()
 
     qkv_checksum = expect_size(qkv_path, qkv_in_dim * qkv_out_dim)
-    wo_checksum = expect_size(wo_path, base_hidden * base_hidden)
+    # Wo projects from attention space (q_size == base_hidden in this
+    # synthetic fixture) back to the base model hidden_size (draft_hidden).
+    wo_checksum = expect_size(wo_path, base_hidden * draft_hidden)
     assert qkv_checksum != 0
     assert wo_checksum != 0
 
@@ -134,7 +136,7 @@ def test_eagle3_converter_exports_expected_geometry(tmp_path):
         ("eagle3.q_proj.weight", (base_hidden, qkv_in_dim)),
         ("eagle3.k_proj.weight", (kv_size, qkv_in_dim)),
         ("eagle3.v_proj.weight", (kv_size, qkv_in_dim)),
-        ("eagle3.o_proj.weight", (qkv_in_dim, base_hidden)),
+        ("eagle3.o_proj.weight", (draft_hidden, base_hidden)),
     ]:
         path = out_dir / name
         assert path.exists()

@@ -36,7 +36,21 @@
 namespace py = pybind11;
 using namespace pybind11::literals;
 
-// Now that ft is defined, use it for Tensor and TensorMap
+using turbomind::AtomicRequestState;
+using turbomind::DataType;
+using turbomind::DeviceType;
+using turbomind::GenerationConfig;
+using turbomind::ModelRequest;
+using turbomind::RequestMetrics;
+using turbomind::RequestState;
+using turbomind::ScheduleMetrics;
+using turbomind::SessionParam;
+
+using turbomind::core::Allocator;
+using turbomind::core::ContextGuard;
+using turbomind::core::Device;
+using turbomind::core::Layout;
+using turbomind::core::Stream;
 using Tensor = turbomind::core::Tensor;
 using TensorMap = turbomind::core::TensorMap;
 
@@ -152,20 +166,27 @@ DLManagedTensor* TritonTensorToDLManagedTensor(Tensor& tensor)
                                }};
 }
 
-turbomind::DeviceType getMemoryType(DLDevice device)
+DeviceType getMemoryType(DLDevice device)
 {
     switch (device.device_type) {
         case DLDeviceType::kDLCUDAHost:
-            return turbomind::DeviceType::kCPUpinned;
+            return DeviceType::kCPUpinned;
         case DLDeviceType::kDLCUDA:
-            return turbomind::DeviceType::kDEVICE;
+            return DeviceType::kDEVICE;
         case DLDeviceType::kDLCPU:
         default:
-            return turbomind::DeviceType::kCPU;
+            return DeviceType::kCPU;
     }
 }
 
-turbomind::DataType getDataType(DLDataType data_type)
+Device getDevice(DLDevice device)
+{
+    const auto type = getMemoryType(device);
+    const int  id   = type == DeviceType::kDEVICE ? device.device_id : -1;
+    return Device{type, id};
+}
+
+DataType getDataType(DLDataType data_type)
 {
     using turbomind::data_type_v;
     switch (data_type.code) {
@@ -227,17 +248,18 @@ turbomind::DataType getDataType(DLDataType data_type)
 std::shared_ptr<Tensor> DLManagedTensorToTritonTensor(DLManagedTensor* tensor)
 {
     auto& dl_tensor = tensor->dl_tensor;
-    auto  where     = getMemoryType(dl_tensor.device);
+    auto  device    = getDevice(dl_tensor.device);
     auto  dtype     = getDataType(dl_tensor.dtype);
     assert(dl_tensor.ndim > 0);
     std::vector<turbomind::core::ssize_t> shape(dl_tensor.shape, dl_tensor.shape + dl_tensor.ndim);
+    Layout                                 layout{shape};
 
-    std::shared_ptr<void> ptr{dl_tensor.data, [tensor](void* p) {
+    std::shared_ptr<void> ptr{dl_tensor.data, [tensor](void*) {
                                   if (tensor->deleter) {
                                       tensor->deleter(tensor);
                                   }
                               }};
-    return std::make_shared<Tensor>(ptr, std::move(shape), dtype, where);
+    return std::make_shared<Tensor>(ptr, std::move(layout), dtype, device);
 }
 
 static void safe_memcpy(void* dst, const void* src, size_t size)
@@ -320,7 +342,10 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
     // pattern used by LlamaTritonModel / LlamaBatch.
     turbomind::core::Stream    core_stream = turbomind::core::Stream::create();
     turbomind::core::Allocator host_alloc{turbomind::kCPU};
-    turbomind::core::Allocator device_alloc{core_stream, /*use_default_pool=*/true};
+    // For this debug helper, favor a simple device allocator backed
+    // by cudaMalloc/cudaFree to avoid potential invalid-context
+    // interactions with the pooled allocator.
+    turbomind::core::Allocator device_alloc{turbomind::kDEVICE};
     turbomind::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
 
     // Import hidden_states and captured_hidden via DLPack so we
@@ -362,7 +387,6 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
 
     auto const& weights = module.getWeights();
     if (!weights.embed_tokens || !weights.lm_head) {
-        cudaStreamDestroy(stream);
         throw std::runtime_error(
             "EagleModule weights not initialized; check draft model directory");
     }
@@ -531,8 +555,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
         out["pre_head_hidden"] = module.debug_pre_head_hidden();
     }
 
-    // Clean up the core stream before returning.
-    cudaStreamDestroy(stream);
+    // core_stream and its underlying CUDA stream are cleaned up by RAII.
     return out;
 }
 }  // namespace
@@ -547,43 +570,36 @@ PYBIND11_MODULE(_turbomind, m)
     // functionality is layered on top of this core.
     // ------------------------------------------------------------------
 
-    py::class_<turbomind::RequestMetrics, std::shared_ptr<turbomind::RequestMetrics>>(m, "RequestMetrics")
+    py::class_<RequestMetrics, std::shared_ptr<RequestMetrics>>(m, "RequestMetrics")
         .def(py::init())
-        .def_readonly("enque_time", &turbomind::RequestMetrics::enque_time)
-        .def_readonly("scheduled_time", &turbomind::RequestMetrics::scheduled_time)
+        .def_readonly("enque_time", &RequestMetrics::enque_time)
+        .def_readonly("scheduled_time", &RequestMetrics::scheduled_time)
         // EAGLE3: expose speculative decoding metrics when available.
-        .def_readonly("eagle_total_draft_tokens",
-                      &turbomind::RequestMetrics::eagle_total_draft_tokens)
-        .def_readonly("eagle_total_accepted_tokens",
-                      &turbomind::RequestMetrics::eagle_total_accepted_tokens)
-        .def_readonly("eagle_steps", &turbomind::RequestMetrics::eagle_steps)
-        .def_readonly("eagle_total_rewound_tokens",
-                      &turbomind::RequestMetrics::eagle_total_rewound_tokens)
-        .def_readonly("eagle_rewind_steps",
-                      &turbomind::RequestMetrics::eagle_rewind_steps)
-        .def_readonly("eagle_tree_draft_tokens",
-                      &turbomind::RequestMetrics::eagle_tree_draft_tokens)
-        .def_readonly("eagle_tree_target_tokens",
-                      &turbomind::RequestMetrics::eagle_tree_target_tokens)
-        .def_readonly("eagle_tree_accepted_tokens",
-                      &turbomind::RequestMetrics::eagle_tree_accepted_tokens);
+        .def_readonly("eagle_total_draft_tokens", &RequestMetrics::eagle_total_draft_tokens)
+        .def_readonly("eagle_total_accepted_tokens", &RequestMetrics::eagle_total_accepted_tokens)
+        .def_readonly("eagle_steps", &RequestMetrics::eagle_steps)
+        .def_readonly("eagle_total_rewound_tokens", &RequestMetrics::eagle_total_rewound_tokens)
+        .def_readonly("eagle_rewind_steps", &RequestMetrics::eagle_rewind_steps)
+        .def_readonly("eagle_tree_draft_tokens", &RequestMetrics::eagle_tree_draft_tokens)
+        .def_readonly("eagle_tree_target_tokens", &RequestMetrics::eagle_tree_target_tokens)
+        .def_readonly("eagle_tree_accepted_tokens", &RequestMetrics::eagle_tree_accepted_tokens);
 
-    py::class_<turbomind::ScheduleMetrics, std::shared_ptr<turbomind::ScheduleMetrics>>(m, "ScheduleMetrics")
+    py::class_<ScheduleMetrics, std::shared_ptr<ScheduleMetrics>>(m, "ScheduleMetrics")
         .def(py::init())
-        .def_readonly("total_seqs", &turbomind::ScheduleMetrics::total_seqs)
-        .def_readonly("active_seqs", &turbomind::ScheduleMetrics::active_seqs)
-        .def_readonly("waiting_seqs", &turbomind::ScheduleMetrics::waiting_seqs)
-        .def_readonly("total_blocks", &turbomind::ScheduleMetrics::total_blocks)
-        .def_readonly("active_blocks", &turbomind::ScheduleMetrics::active_blocks)
-        .def_readonly("cached_blocks", &turbomind::ScheduleMetrics::cached_blocks)
-        .def_readonly("free_blocks", &turbomind::ScheduleMetrics::free_blocks);
+        .def_readonly("total_seqs", &ScheduleMetrics::total_seqs)
+        .def_readonly("active_seqs", &ScheduleMetrics::active_seqs)
+        .def_readonly("waiting_seqs", &ScheduleMetrics::waiting_seqs)
+        .def_readonly("total_blocks", &ScheduleMetrics::total_blocks)
+        .def_readonly("active_blocks", &ScheduleMetrics::active_blocks)
+        .def_readonly("cached_blocks", &ScheduleMetrics::cached_blocks)
+        .def_readonly("free_blocks", &ScheduleMetrics::free_blocks);
 
-    py::class_<turbomind::SessionParam>(m, "SessionParam")
+    py::class_<SessionParam>(m, "SessionParam")
         .def(py::init([](uint64_t id, int step, bool start, bool end) {
                  if (!start && end) {
                      throw std::logic_error("unsupported arguments: start=false, end=true");
                  }
-                 turbomind::SessionParam param{};
+                 SessionParam param{};
                  param.id         = id;
                  param.step       = step;
                  param.start_flag = start;
@@ -594,39 +610,39 @@ PYBIND11_MODULE(_turbomind, m)
              "step"_a,
              "start"_a,
              "end"_a)
-        .def_readwrite("id", &turbomind::SessionParam::id)
-        .def_readwrite("step", &turbomind::SessionParam::step)
-        .def_readwrite("start", &turbomind::SessionParam::start_flag)
-        .def_readwrite("end", &turbomind::SessionParam::end_flag);
+        .def_readwrite("id", &SessionParam::id)
+        .def_readwrite("step", &SessionParam::step)
+        .def_readwrite("start", &SessionParam::start_flag)
+        .def_readwrite("end", &SessionParam::end_flag);
 
-    py::class_<turbomind::GenerationConfig>(m, "GenerationConfig")
+    py::class_<GenerationConfig>(m, "GenerationConfig")
         .def(py::init())
-        .def_readwrite("max_new_tokens", &turbomind::GenerationConfig::max_new_tokens)
-        .def_readwrite("min_new_tokens", &turbomind::GenerationConfig::min_new_tokens)
-        .def_readwrite("eos_ids", &turbomind::GenerationConfig::eos_ids)
-        .def_readwrite("stop_ids", &turbomind::GenerationConfig::stop_ids)
-        .def_readwrite("bad_ids", &turbomind::GenerationConfig::bad_ids)
-        .def_readwrite("top_p", &turbomind::GenerationConfig::top_p)
-        .def_readwrite("top_k", &turbomind::GenerationConfig::top_k)
-        .def_readwrite("min_p", &turbomind::GenerationConfig::min_p)
-        .def_readwrite("temperature", &turbomind::GenerationConfig::temperature)
-        .def_readwrite("repetition_penalty", &turbomind::GenerationConfig::repetition_penalty)
-        .def_readwrite("random_seed", &turbomind::GenerationConfig::random_seed)
-        .def_readwrite("output_logprobs", &turbomind::GenerationConfig::output_logprobs)
-        .def_readwrite("output_last_hidden_state", &turbomind::GenerationConfig::output_last_hidden_state)
-        .def_readwrite("output_logits", &turbomind::GenerationConfig::output_logits)
-        .def("__repr__", [](const turbomind::GenerationConfig& c) {
+        .def_readwrite("max_new_tokens", &GenerationConfig::max_new_tokens)
+        .def_readwrite("min_new_tokens", &GenerationConfig::min_new_tokens)
+        .def_readwrite("eos_ids", &GenerationConfig::eos_ids)
+        .def_readwrite("stop_ids", &GenerationConfig::stop_ids)
+        .def_readwrite("bad_ids", &GenerationConfig::bad_ids)
+        .def_readwrite("top_p", &GenerationConfig::top_p)
+        .def_readwrite("top_k", &GenerationConfig::top_k)
+        .def_readwrite("min_p", &GenerationConfig::min_p)
+        .def_readwrite("temperature", &GenerationConfig::temperature)
+        .def_readwrite("repetition_penalty", &GenerationConfig::repetition_penalty)
+        .def_readwrite("random_seed", &GenerationConfig::random_seed)
+        .def_readwrite("output_logprobs", &GenerationConfig::output_logprobs)
+        .def_readwrite("output_last_hidden_state", &GenerationConfig::output_last_hidden_state)
+        .def_readwrite("output_logits", &GenerationConfig::output_logits)
+        .def("__repr__", [](const GenerationConfig& c) {
             std::ostringstream oss;
             oss << c;
             return oss.str();
         });
 
-    py::class_<turbomind::RequestState, std::unique_ptr<turbomind::RequestState>>(m, "RequestState")
-        .def_readonly("status", &turbomind::RequestState::status)
-        .def_readonly("seq_len", &turbomind::RequestState::seq_len);
+    py::class_<RequestState, std::unique_ptr<RequestState>>(m, "RequestState")
+        .def_readonly("status", &RequestState::status)
+        .def_readonly("seq_len", &RequestState::seq_len);
 
-    py::class_<turbomind::AtomicRequestState, std::shared_ptr<turbomind::AtomicRequestState>>(m, "AtomicRequestState")
-        .def("consume", [](turbomind::AtomicRequestState& s) { return s.exchange(nullptr); });
+    py::class_<AtomicRequestState, std::shared_ptr<AtomicRequestState>>(m, "AtomicRequestState")
+        .def("consume", [](AtomicRequestState& s) { return s.exchange(nullptr); });
 
     // DataType / MemoryType enums
     {
@@ -1483,16 +1499,6 @@ PYBIND11_MODULE(_turbomind, m)
         "hidden_states"_a,
         "captured_hidden"_a);
 
-    // Alias specifically for Eagle3 draft debug. This uses the same
-    // implementation as `eagle_forward_logits_debug` but provides a
-    // dedicated entry point for Eagle3 comparison tooling.
-    m.def(
-        "eagle3_forward_debug",
-        &EagleForwardLogitsDebugImpl,
-        "model_dir"_a,
-        "hidden_states"_a,
-        "captured_hidden"_a);
-
     // tensor
     //
     // Expose core::Tensor so it can be used as the value type in
@@ -1561,14 +1567,13 @@ PYBIND11_MODULE(_turbomind, m)
 
     py::bind_map<TensorMap, std::shared_ptr<TensorMap>>(m, "TensorMap");
 
-    using turbomind::ModelRequest;
     py::class_<ModelRequest>(m, "ModelRequest")
         .def(
             "forward",
             [](ModelRequest*               model_request,
                std::shared_ptr<TensorMap>  input_tensors,
-               const turbomind::SessionParam&     session,
-               const turbomind::GenerationConfig& gen_cfg,
+               const SessionParam&         session,
+               const GenerationConfig&     gen_cfg,
                bool                        stream_output,
                bool                        enable_metrics,
                std::function<void()>       cb) {

@@ -828,7 +828,9 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
     }
 
     // Per-request EOS id for EAGLE acceptance (first eos id or -1).
-    eagle_end_ids_ = {max_batch_size_, kDEVICE};
+    // These live on device memory; initialize them via cudaMemcpyAsync
+    // rather than std::fill_n on raw device pointers.
+    eagle_end_ids_             = {max_batch_size_, kDEVICE};
     eagle_posterior_thresholds_ = {max_batch_size_, kDEVICE};
     eagle_posterior_alphas_     = {max_batch_size_, kDEVICE};
     eagle_temperatures_         = {max_batch_size_, kDEVICE};
@@ -836,10 +838,35 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
     // Multi-token per-slot kill switch, initially all zero (multi-token
     // enabled). Length is fixed to `max_batch_size_`.
     eagle_disable_multitoken_slot_.assign(max_batch_size_, 0);
-    std::fill_n(eagle_end_ids_.data(), max_batch_size_, -1);
-    std::fill_n(eagle_posterior_thresholds_.data(), max_batch_size_, 1.0f);
-    std::fill_n(eagle_posterior_alphas_.data(), max_batch_size_, 1.0f);
-    std::fill_n(eagle_temperatures_.data(), max_batch_size_, 1.0f);
+
+    {
+        // Host-side staging buffers for device initialization.
+        std::vector<int>   h_end_ids(max_batch_size_, -1);
+        std::vector<float> h_thresholds(max_batch_size_, 1.0f);
+        std::vector<float> h_alphas(max_batch_size_, 1.0f);
+        std::vector<float> h_temps(max_batch_size_, 1.0f);
+
+        check_cuda_error(cudaMemcpyAsync(eagle_end_ids_.raw_data(),
+                                         h_end_ids.data(),
+                                         sizeof(int) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+        check_cuda_error(cudaMemcpyAsync(eagle_posterior_thresholds_.raw_data(),
+                                         h_thresholds.data(),
+                                         sizeof(float) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+        check_cuda_error(cudaMemcpyAsync(eagle_posterior_alphas_.raw_data(),
+                                         h_alphas.data(),
+                                         sizeof(float) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+        check_cuda_error(cudaMemcpyAsync(eagle_temperatures_.raw_data(),
+                                         h_temps.data(),
+                                         sizeof(float) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+    }
 }
 
 void LlamaBatch::AllocSymmBuffers()

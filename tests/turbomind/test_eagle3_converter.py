@@ -21,20 +21,23 @@ def _make_eagle3_hf_fixture(root: Path) -> tuple[Path, Path]:
     num_heads = 2
     inter_size = 8
 
-    # Eagle-3-style midlayer geometry (q_out, q_in) and (kv_out, q_in).
+    # Eagle-3-style midlayer geometry with 2H QKV layout:
+    # q_proj: [q_out, 2 * hidden_size]
+    # k/v_proj: [kv_out, 2 * hidden_size]
+    # o_proj: [hidden_size, q_out]
     eagle_q_size = 8
     eagle_kv_size = 4
-    eagle_qkv_in_dim = 12  # e.g. 3 * hidden_size
+    eagle_qkv_in_dim = 2 * hidden_size
 
     # HF-style config.json for the draft model.
     cfg = {
+        "model_type": "gpt_oss",
         "hidden_size": hidden_size,
         "vocab_size": vocab_size,
         "num_attention_heads": num_heads,
         "intermediate_size": inter_size,
     }
-    (hf_dir / "config.json").write_text(torch.to_json(torch.tensor(0)).replace("0", "0"), encoding="utf-8")
-    # Overwrite with a plain JSON dump to avoid depending on transformers internals.
+    # Write a minimal HF-style config.json without depending on torch internals.
     import json
 
     (hf_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
@@ -53,7 +56,7 @@ def _make_eagle3_hf_fixture(root: Path) -> tuple[Path, Path]:
             eagle_kv_size, eagle_qkv_in_dim, dtype=torch.bfloat16
         ),
         "midlayer.self_attn.o_proj.weight": torch.zeros(
-            eagle_qkv_in_dim, eagle_q_size, dtype=torch.bfloat16
+            hidden_size, eagle_q_size, dtype=torch.bfloat16
         ),
         "midlayer.mlp.gate_proj.weight": torch.zeros(inter_size, hidden_size, dtype=torch.bfloat16),
         "midlayer.mlp.up_proj.weight": torch.zeros(inter_size, hidden_size, dtype=torch.bfloat16),
@@ -112,7 +115,9 @@ def test_eagle3_converter_exports_native_qkv_with_expected_shapes(tmp_path):
 
     assert mc["eagle_q_size"] == 8
     assert mc["eagle_kv_size"] == 4
-    assert mc["eagle_qkv_in_dim"] == 12
+    draft_hidden = mc["eagle_draft_hidden"]
+    expected_qkv_in_dim = 2 * draft_hidden
+    assert mc["eagle_qkv_in_dim"] == expected_qkv_in_dim
 
     # Each Eagle-3 attention weight file should exist and have the right size
     # in elements (bf16 written as raw int16).
@@ -123,8 +128,7 @@ def test_eagle3_converter_exports_native_qkv_with_expected_shapes(tmp_path):
         # bf16 written as int16 => 2 bytes per element.
         assert bytes_on_disk == expected_elems * 2
 
-    _check_weight(out_dir / "eagle3.q_proj.weight", 8, 12)
-    _check_weight(out_dir / "eagle3.k_proj.weight", 4, 12)
-    _check_weight(out_dir / "eagle3.v_proj.weight", 4, 12)
-    _check_weight(out_dir / "eagle3.o_proj.weight", 12, 8)
-
+    _check_weight(out_dir / "eagle3.q_proj.weight", 8, expected_qkv_in_dim)
+    _check_weight(out_dir / "eagle3.k_proj.weight", 4, expected_qkv_in_dim)
+    _check_weight(out_dir / "eagle3.v_proj.weight", 4, expected_qkv_in_dim)
+    _check_weight(out_dir / "eagle3.o_proj.weight", draft_hidden, 8)

@@ -230,24 +230,27 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         sync_check_cuda_error();
     };
 
-    if (dtype == kFloat16) {
-        do_forward(half_t{});
-    }
-#if ENABLE_BF16
-    else if (dtype == kBfloat16) {
+    // Prefer native BF16 path when available, then FP16, then FP32.
+    if (dtype == kBfloat16) {
         do_forward(bfloat16_t{});
     }
-#endif
+    else if (dtype == kFloat16) {
+        do_forward(half_t{});
+    }
 #if ENABLE_FP32
     else if (dtype == kFloat32) {
         do_forward(float{});
     }
-    else
 #endif
-    {
+    else {
         TM_LOG_WARNING(
-            "[EAGLE3][Attention][fallback] unsupported Eagle3Attention dtype=%s; treating as pass-through.",
-            to_string(dtype));
+            "[EAGLE3][Attention][fallback] unsupported Eagle3Attention dtype=%s "
+            "(code=%d, kBfloat16=%d, kFloat16=%d, kFloat32=%d); treating as pass-through.",
+            to_string(dtype),
+            static_cast<int>(dtype),
+            static_cast<int>(kBfloat16),
+            static_cast<int>(kFloat16),
+            static_cast<int>(kFloat32));
         param.output = param.input;
     }
 }

@@ -30,7 +30,7 @@ Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
     head_num_{0},
     kv_head_num_{0},
     size_per_head_{0},
-    m_attn_geom_ok_{true}
+    attn_geom_ok_{true}
 {
     if (weight_) {
         head_num_         = weight_->head_num;
@@ -105,6 +105,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     debug_ffn_out_         = Tensor{};
     debug_pre_head_hidden_ = Tensor{};
     debug_qkv_             = Tensor{};
+    attn_geom_ok_          = true;
 
     const int batch_size   = input_hidden.shape(0);
     const int hidden_dim   = input_hidden.shape(1);          // incoming hidden (base)
@@ -209,15 +210,24 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     // Optional FC branch for 2H packing (embedding_norm + FC_norm).
     Tensor fc_norm;
     bool   have_fc = false;
-    if (captured_hidden && captured_hidden.ndim() == 2 && captured_hidden.shape(0) == batch_size
+    if (ffn_layer_ && captured_hidden && captured_hidden.ndim() == 2 && captured_hidden.shape(0) == batch_size
         && captured_hidden.dtype() == dtype && weight_->fc_weight) {
-        LlamaLinear& linear_fc = ffn_layer_->linear();
+        LlamaLinear&    linear_fc = ffn_layer_->linear();
         LlamaDenseWeight fc_w;
         fc_w.weight = weight_->fc_weight;
         Tensor fc_out = linear_fc.Forward(captured_hidden, fc_w);
-        fc_norm = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
+        fc_norm       = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
         invokeRMSNorm(fc_norm, fc_out, weight_->input_norm, rmsnorm_eps_, stream);
         have_fc = true;
+    }
+    else if (!ffn_layer_ && captured_hidden && weight_->fc_weight) {
+        static bool logged_missing_ffn_fc = false;
+        if (!logged_missing_ffn_fc) {
+            TM_LOG_WARNING(
+                "[EAGLE3][Draft][fallback] FC capture available but ffn_layer_ is null; "
+                "skipping FC branch and using attention-only draft.");
+            logged_missing_ffn_fc = true;
+        }
     }
 
     // Build 2H QKV input for Eagle-3 attention. TRT packs
@@ -231,12 +241,12 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     check_cuda_error(cudaMemsetAsync(qkv_input.raw_data(), 0, qkv_input.byte_size(), stream));
 
     if (!expect_two_h) {
-        TM_LOG_WARNING(
+        TM_LOG_ERROR(
             "[EAGLE3][Draft] QKV input dimension (%d) is not 2 * draft_hidden (%d); "
             "disabling Eagle3 attention for this layer.",
             qkv_in_dim,
             2 * draft_dim);
-        m_attn_geom_ok_ = false; // Set the flag
+        attn_geom_ok_ = false;
         output_hidden = input_hidden; // Fallback to pass-through
         return;
     }
@@ -287,7 +297,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     const bool has_eagle3_layer = (eagle3_attn_layer_ != nullptr && weight_->eagle3_attn.is_initialized);
     const bool native_eagle3_ok = has_eagle3_layer && weight_->eagle3_attn.is_initialized
         && qkv_input.shape(1) == weight_->eagle3_attn.q_in && weight_->eagle3_attn.q_out > 0
-        && weight_->eagle3_attn.kv_out > 0 && m_attn_geom_ok_;
+        && weight_->eagle3_attn.kv_out > 0 && attn_geom_ok_;
 
     static bool logged_invalid_geom = false;
 
@@ -343,13 +353,17 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         return;
     }
 
-    Tensor ffn_input{{batch_size, draft_dim}, dtype, input_hidden.device()};
+    Tensor ffn_input;
 
-    // Convert attn_out (wo_out_dim = base_hidden_dim_) to ffn_input (draft_dim = draft_hidden_dim_).
-    const int current_attn_out_dim = base_hidden_dim_; // Use authoritative base_hidden_dim
-    const int target_ffn_in_dim = draft_dim; // Use authoritative draft_hidden_dim
+    // Convert attn_out to ffn_input (draft_dim = draft_hidden_dim_). Prefer
+    // the actual attn_out width when available, falling back to the
+    // configured base_hidden_dim_ only as a sanity default.
+    const int current_attn_out_dim =
+        (attn_out.ndim() == 2 && attn_out.shape(1) > 0) ? attn_out.shape(1) : base_hidden_dim_;
+    const int target_ffn_in_dim = draft_dim;  // Use authoritative draft_hidden_dim
 
     if (current_attn_out_dim != target_ffn_in_dim) {
+        ffn_input = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
         check_cuda_error(cudaMemsetAsync(ffn_input.raw_data(), 0, ffn_input.byte_size(), stream));
         const size_t elem_bytes = byte_size(dtype, 1);
         const size_t src_stride = static_cast<size_t>(attn_out.stride(0)) * elem_bytes;
@@ -362,9 +376,12 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
             check_cuda_error(cudaMemcpyAsync(
                 dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
         }
-    } else {
-        // If dimensions are the same, just copy attn_out to ffn_input
-        check_cuda_error(cudaMemcpyAsync(ffn_input.raw_data(), attn_out.raw_data(), attn_out.byte_size(), cudaMemcpyDeviceToDevice, stream));
+    }
+    else {
+        // When attention output already matches the draft dimension, just
+        // reuse the buffer directly to avoid an unnecessary device-to-device
+        // memcpy and potential CUDA argument issues.
+        ffn_input = attn_out;
     }
 
     invokeRMSNorm(ffn_input, ffn_input, weight_->post_attn_norm, rmsnorm_eps_, stream);
