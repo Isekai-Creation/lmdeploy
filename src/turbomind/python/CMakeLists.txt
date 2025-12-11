@@ -30,20 +30,7 @@ pybind11_add_module(_xgrammar xgrammar_bind.cpp)
 target_link_libraries(_xgrammar PRIVATE core xgrammar)
 target_compile_features(_xgrammar PRIVATE cxx_std_14)
 
-# Explicitly copy the built .so files to the correct Python package subdirectory
-add_custom_command(TARGET _turbomind POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_FILE:_turbomind>
-    ${CMAKE_SOURCE_DIR}/lmdeploy/turbomind/$<TARGET_FILE_NAME:_turbomind>
-    COMMENT "Copying _turbomind.so to lmdeploy/turbomind"
-)
 
-add_custom_command(TARGET _xgrammar POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_FILE:_xgrammar>
-    ${CMAKE_SOURCE_DIR}/lmdeploy/turbomind/$<TARGET_FILE_NAME:_xgrammar>
-    COMMENT "Copying _xgrammar.so to lmdeploy/turbomind"
-)
 
 if (CALL_FROM_SETUP_PY)
   string(REPLACE "." ";" _ver ${CMAKE_CUDA_COMPILER_VERSION})

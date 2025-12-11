@@ -2979,6 +2979,12 @@ void LlamaBatch::InitializeBufferAndKVCache()
 
     AllocSymmBuffers();
 
+    TM_LOG_ERROR("AllocateBuffer: max_batch_size_=%lld, session_len_=%lld, model_->attn_param_.cache_bloc
+k_seq_len=%d",
+                 max_batch_size_,
+                 session_len_,
+                 model_->attn_param_.cache_block_seq_len);
+
     AllocateBuffer(max_batch_size_, session_len_, model_->attn_param_.cache_block_seq_len);
 
     // Allow the model to observe the live SequenceManager so that
