@@ -37,12 +37,8 @@ from lmdeploy.utils import get_logger, get_max_batch_size, get_model
 from .deploy.config import TurbomindModelConfig
 from .supported_models import is_supported
 
-import lmdeploy
-# TODO: find another way import _turbomind
-lmdeploy_dir = osp.split(lmdeploy.__file__)[0]
-sys.path.append(osp.join(lmdeploy_dir, 'lib'))
-import _turbomind as _tm  # noqa: E402
-import _xgrammar as _xgr  # noqa: E402
+from lmdeploy.lib import _turbomind as _tm
+from lmdeploy.lib import _xgrammar as _xgr
 
 
 from .tokenizer_info import TokenizerInfo  # noqa: E402
