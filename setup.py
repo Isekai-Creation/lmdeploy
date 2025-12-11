@@ -204,6 +204,24 @@ if _is_turbomind_enabled():
                 '-DUSE_NVTX=' + ('OFF' if os.name == 'nt' else 'ON'),
             ],
         ),
+        cmake_build_extension.CMakeExtension(
+            name='_xgrammar',
+            install_prefix='lmdeploy/lib',
+            cmake_depends_on=['pybind11'],
+            source_dir=str(Path(__file__).parent.absolute()),
+            cmake_generator=None if os.name == 'nt' else 'Ninja',
+            cmake_build_type=os.getenv('CMAKE_BUILD_TYPE', 'RelWithDebInfo'),
+            cmake_configure_options=[
+                f'-DPython3_ROOT_DIR={Path(sys.prefix)}',
+                f'-DPYTHON_EXECUTABLE={Path(sys.executable)}',
+                '-DCALL_FROM_SETUP_PY:BOOL=ON',
+                '-DBUILD_SHARED_LIBS:BOOL=OFF',
+                # Select the bindings implementation
+                '-DBUILD_PY_FFI=ON',
+                '-DBUILD_MULTI_GPU=' + ('OFF' if os.name == 'nt' else 'ON'),
+                '-DUSE_NVTX=' + ('OFF' if os.name == 'nt' else 'ON'),
+            ],
+        ),
     ]
     extra_deps = get_turbomind_deps()
     cmdclass = dict(build_ext=cmake_build_extension.BuildExtension, )
