@@ -2979,10 +2979,10 @@ void LlamaBatch::InitializeBufferAndKVCache()
 
     AllocSymmBuffers();
 
-    TM_LOG_ERROR("AllocateBuffer: max_batch_size_=%lld, session_len_=%lld, model_->attn_param_.cache_block_seq_len=%d",
-                 max_batch_size_,
-                 session_len_,
-                 model_->attn_param_.cache_block_seq_len);
+    FT_CHECK(max_batch_size_ > 0 && session_len_ > 0 && model_->attn_param_.cache_block_seq_len > 0)
+        << "Invalid parameters for AllocateBuffer: max_batch_size_=" << max_batch_size_
+        << ", session_len_=" << session_len_
+        << ", model_->attn_param_.cache_block_seq_len=" << model_->attn_param_.cache_block_seq_len;
 
     AllocateBuffer(max_batch_size_, session_len_, model_->attn_param_.cache_block_seq_len);
 
