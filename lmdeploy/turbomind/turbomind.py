@@ -37,17 +37,11 @@ from lmdeploy.utils import get_logger, get_max_batch_size, get_model
 from .deploy.config import TurbomindModelConfig
 from .supported_models import is_supported
 
-# Import the compiled TurboMind backend if available. In environments where
-# the `_turbomind` extension is not built (e.g. unit tests that only exercise
-# Python-side helpers such as `_get_metrics`), we degrade gracefully and
-# leave `_tm` / `_xgr` as `None`. Callers that require the backend should
-# explicitly assert that `_tm` is not None.
-import sys
-import traceback
-
-# Force the same import that works in your test snippet.
-from lmdeploy.lib import _turbomind as _tm
-from lmdeploy.lib import _xgrammar as _xgr
+# TODO: find another way import _turbomind
+lmdeploy_dir = osp.split(lmdeploy.__file__)[0]
+sys.path.append(osp.join(lmdeploy_dir, 'lib'))
+import _turbomind as _tm  # noqa: E402
+import _xgrammar as _xgr  # noqa: E402
 
 
 from .tokenizer_info import TokenizerInfo  # noqa: E402
