@@ -43,8 +43,8 @@ from .supported_models import is_supported
 # leave `_tm` / `_xgr` as `None`. Callers that require the backend should
 # explicitly assert that `_tm` is not None.
 try:  # pragma: no cover - backend availability is environment-dependent
-    from . import _turbomind as _tm
-    from . import _xgrammar as _xgr
+    import _turbomind as _tm
+    import _xgrammar as _xgr
 except ImportError:
     _tm = None
     _xgr = None
