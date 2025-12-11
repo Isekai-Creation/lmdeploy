@@ -506,10 +506,22 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     bool lm_head_ok     = load_with_variants(weights_.lm_head, "output.weight");
     success &= output_norm_ok && lm_head_ok;
 
-    // Prepare LM head wrapper for LlamaLinear.
+    // Prepare LM head wrapper for LlamaLinear. The input dim for the
+    // draft LM head is taken from the first dimension of the loaded
+    // weight tensor to avoid geometry mismatches when the draft head
+    // lives in draft_hidden space (e.g. 2880) instead of the decoder
+    // hidden width.
     if (weights_.lm_head) {
-        lm_head_weight_.emplace(
-            this->hidden_units_, this->vocab_size_, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
+        int lm_in  = this->hidden_units_;
+        int lm_out = this->vocab_size_;
+        if (weights_.lm_head.ndim() == 2) {
+            lm_in  = weights_.lm_head.shape(0);
+            lm_out = weights_.lm_head.shape(1);
+        }
+        lm_head_input_dim_ = lm_in;
+        vocab_size_        = lm_out;
+
+        lm_head_weight_.emplace(lm_in, lm_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
         lm_head_weight_.weight      = weights_.lm_head.borrow();
         lm_head_weight_.bias        = {};
         lm_head_weight_.data_type   = weight_dtype_;
@@ -738,69 +750,12 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             const int attn_o_expected_out = base_hidden_units_;
             check_shape_2d_attn(weights_.attn_o, attn_o_expected_in, attn_o_expected_out, "attn_o", attn_ok);
 
-            // Prepare a draft-layer LlamaAttentionWeight only when the
-            // Eagle3 fused QKV / Wo geometry can be mapped into the
-            // standard attention layout; otherwise we rely on the
-            // existing shallow linearised path.
-            if (draft_ok && attn_ok) {
-                const int  kv_head_num = head_num;  // same head count for KV
-                const bool bias        = false;
-                const bool qk_norm     = false;
-                MLAParam   mla_param{};
-
-                const int attn_hidden_units = head_num * head_dim;  // attention space (e.g. 4096)
-
-                new (&eagle3_draft_layer_->attn) LlamaAttentionWeight(attn_hidden_units,
-                                                                    head_dim,
-                                                                    head_num,
-                                                                    kv_head_num,
-                                                                    mla_param,
-                                                                    bias,
-                                                                    qk_norm,
-                                                                    /*tp_size=*/1,
-                                                                    /*tp_rank=*/0,
-                                                                    weight_dtype_,
-                                                                    weight_dtype_,
-                                                                    /*group_size=*/1,
-                                                                    /*window_size=*/0,
-                                                                    /*sink=*/false);
-                auto& attn_w = eagle3_draft_layer_->attn;
-                bool  mapped_ok = true;
-
-                // We want LlamaAttentionWeight.qkv.weight to be [attn_hidden_units, 3 * attn_hidden_units]
-                // but the Eagle3 converter exported attn_qkv as [qkv_in_dim, q_size + 2 * kv_size].
-                // For real MHA, you should export Eagle3 attn_qkv in the same layout as Llama attention:
-                //   qkv: [attn_hidden_units, 3 * attn_hidden_units]
-                //   output: [attn_hidden_units, draft_hidden_units]
-                // Once converter is updated, this mapping becomes a strict shape check:
-                if (attn_w.qkv.weight
-                    && attn_w.qkv.weight.shape(0) == weights_.attn_qkv.shape(0)
-                    && attn_w.qkv.weight.shape(1) == weights_.attn_qkv.shape(1)) {
-                    attn_w.qkv.weight = weights_.attn_qkv.borrow();
-                } else {
-                    TM_LOG_WARNING(
-                        "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.qkv shape "
-                        "incompatible with Eagle3 attn_qkv; Eagle3 draft will use shallow attention.");
-                    mapped_ok = false;
-                }
-
-                if (attn_w.output.weight
-                    && attn_w.output.weight.shape(0) == weights_.attn_o.shape(0)
-                    && attn_w.output.weight.shape(1) == weights_.attn_o.shape(1)) {
-                    attn_w.output.weight = weights_.attn_o.borrow();
-                } else {
-                    TM_LOG_WARNING(
-                        "[EAGLE][Eagle3DraftLayer][fallback] LlamaAttentionWeight.output shape "
-                        "incompatible with Eagle3 attn_o; Eagle3 draft will use shallow attention.");
-                    mapped_ok = false;
-                }
-
-                if (mapped_ok) {
-                    eagle3_draft_layer_->attn.prepare();
-                }
-                // If mapped_ok is false, runtime fallback in Eagle3DraftLayer::Forward will
-                // handle this by using shallow QKV / pass-through for the step.
-            }
+            // For Eagle3 GPT-OSS we rely on the dedicated Eagle3Attention
+            // backend instead of trying to reshape the fused QKV / Wo
+            // weights into a LLaMA-style LlamaAttentionWeight. The shallow
+            // path continues to use attn_qkv / attn_o via LlamaLinear, so
+            // we skip constructing a draft LlamaAttentionWeight here to
+            // avoid misleading shape-mismatch warnings.
         }
 
         // Native Eagle3 attention geometry (non‑LLaMA). When available, we
@@ -1245,8 +1200,17 @@ void EagleModule::forward(const Tensor& input_ids,
 
     // Ensure LM head wrapper is ready (defensive in case load() was skipped)
     if (!lm_head_prepared_ && weights_.lm_head) {
+        int lm_in  = this->hidden_units_;
+        int lm_out = this->vocab_size_;
+        if (weights_.lm_head.ndim() == 2) {
+            lm_in  = weights_.lm_head.shape(0);
+            lm_out = weights_.lm_head.shape(1);
+        }
+        lm_head_input_dim_ = lm_in;
+        vocab_size_        = lm_out;
+
         lm_head_weight_.emplace(
-            this->hidden_units_, this->vocab_size_, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
+            lm_in, lm_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
         lm_head_weight_.weight      = weights_.lm_head.borrow();
         lm_head_weight_.bias        = {};
         lm_head_weight_.data_type   = weight_dtype_;
@@ -1671,7 +1635,57 @@ void EagleModule::forward(const Tensor& input_ids,
 
     Tensor& logits = logits_scratch_;
 
-    linear.Forward(output_hidden_states, lm_head_weight_, /*output=*/logits);
+    // Ensure LM head input geometry matches the LM head weight. When the
+    // hidden width coming from the shallow Eagle3 block differs from the
+    // LM head input dimension (e.g. 4096 vs 2880), convert by truncating
+    // or zero‑padding to avoid invalid GEMM shapes.
+    Tensor* lm_input = &output_hidden_states;
+    const int lm_in  = lm_head_input_dim_ > 0 ? lm_head_input_dim_ : output_hidden_states.shape(1);
+
+    if (output_hidden_states.ndim() != 2 || output_hidden_states.shape(0) != batch_size) {
+        TM_LOG_WARNING(
+            "[EAGLE][LMHead] unexpected hidden shape [%d,%d]; skipping logits computation",
+            output_hidden_states.ndim() >= 1 ? output_hidden_states.shape(0) : -1,
+            output_hidden_states.ndim() >= 2 ? output_hidden_states.shape(1) : -1);
+        return;
+    }
+
+    if (output_hidden_states.shape(1) != lm_in) {
+        const auto lm_dtype   = output_hidden_states.dtype();
+        const auto lm_device  = output_hidden_states.device();
+        const bool need_scratch =
+            !lm_head_input_scratch_ || lm_head_input_scratch_.dtype() != lm_dtype
+            || lm_head_input_scratch_.device().type != lm_device.type
+            || lm_head_input_scratch_.shape(0) < batch_size
+            || lm_head_input_scratch_.shape(1) != lm_in;
+        if (need_scratch) {
+            lm_head_input_scratch_ = Tensor{Layout({batch_size, lm_in}), lm_dtype, lm_device.type};
+        }
+
+        check_cuda_error(cudaMemsetAsync(lm_head_input_scratch_.raw_data(),
+                                         0,
+                                         lm_head_input_scratch_.byte_size(),
+                                         stream));
+
+        const int    src_cols   = output_hidden_states.shape(1);
+        const int    copy_cols  = std::min(src_cols, lm_in);
+        const size_t elem_bytes = byte_size(lm_dtype, 1);
+        const size_t src_stride = static_cast<size_t>(output_hidden_states.stride(0)) * elem_bytes;
+        const size_t dst_stride = static_cast<size_t>(lm_head_input_scratch_.stride(0)) * elem_bytes;
+
+        for (int b = 0; b < batch_size; ++b) {
+            const char* src_row =
+                static_cast<const char*>(output_hidden_states.raw_data()) + static_cast<size_t>(b) * src_stride;
+            char* dst_row =
+                static_cast<char*>(lm_head_input_scratch_.raw_data()) + static_cast<size_t>(b) * dst_stride;
+            check_cuda_error(cudaMemcpyAsync(
+                dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+
+        lm_input = &lm_head_input_scratch_;
+    }
+
+    linear.Forward(*lm_input, lm_head_weight_, /*output=*/logits);
     output_logits = logits;
 
     if (isEagleDebugEnabled()) {

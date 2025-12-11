@@ -181,6 +181,7 @@ private:
 
     // Draft LM head formatted for LlamaLinear
     LlamaDenseWeight lm_head_weight_;
+    int              lm_head_input_dim_{0};
     bool             lm_head_prepared_{false};
 
     // Draft mode and geometry metadata. For legacy EagleNet drafts we
@@ -233,6 +234,7 @@ private:
     Tensor embed_norm_scratch_;        // [batch, hidden] normalized embeddings
     Tensor logits_scratch_;
     Tensor residual_to_ffn_dim_scratch_; // [batch, draft_hidden_units_] for residual conversion
+    Tensor lm_head_input_scratch_;       // [batch, lm_head_input_dim_] for LM head matmul
 
     // Optional Eagle3 draft layer weights. When present, this structurally
     // groups the fused QKV / Wo and MLP weights into LlamaAttentionWeight /

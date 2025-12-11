@@ -108,6 +108,8 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
     Tensor v{{token_num, kv_out_dim}, dtype, param.input.device()};
     Tensor ctx{{token_num, q_out_dim}, dtype, param.input.device()};
 
+    static bool logged_active_path = false;
+
     auto do_forward = [&](auto tag) {
         using T = decltype(tag);
         const T* x_ptr  = param.input.data<T>();
@@ -117,6 +119,21 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         auto matmul = [&](const T* A, const T* B, T* C, int M, int K, int N) {
             ft::launch_eagle3_matmul_rowmajor_dispatch(A, B, C, M, K, N, stream_);
         };
+
+        if (!logged_active_path) {
+            TM_LOG_INFO(
+                "[EAGLE3][Attention] running native Eagle3Attention with dtype=%s "
+                "(token_num=%d, q_in=%d, q_out=%d, kv_out=%d, q_heads=%d, kv_heads=%d, head_dim=%d)",
+                to_string(dtype),
+                token_num,
+                q_in_dim,
+                q_out_dim,
+                kv_out_dim,
+                num_q_heads,
+                num_kv_heads,
+                head_dim);
+            logged_active_path = true;
+        }
 
         // Q/K/V projections.
         matmul(x_ptr, wq_ptr, q.data<T>(), token_num, q_in_dim, q_out_dim);
@@ -189,6 +206,10 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         // fall back to native o_proj otherwise.
         const Tensor* wo = param.attn_weights ? &param.attn_weights->output.weight : nullptr;
         if (!wo || !(*wo)) {
+            // Fall back to native Eagle3 o_proj when LLaMA-style Wo is
+            // not provided. o_proj is stored in [draft_hidden, q_out]
+            // row-major layout, so we treat its rows as output_dim and
+            // its columns as input_dim.
             wo = &w.o_proj;
         }
 
@@ -199,12 +220,16 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             return;
         }
 
-        const int wo_in  = wo->shape(0);
-        const int wo_out = wo->shape(1);
+        // Interpret Wo in standard row-major [output_dim, input_dim]
+        // form so that MatmulRowMajorKernel sees B as [N,K] with
+        // K = q_out_dim and N = draft_hidden (or base hidden) width.
+        const int wo_out = wo->shape(0);  // output dim (e.g. draft_hidden)
+        const int wo_in  = wo->shape(1);  // input dim  (q_out_dim)
+
         if (wo_in != q_out_dim) {
             TM_LOG_WARNING(
-                "[EAGLE3][Attention][fallback] Wo shape mismatch (Wo=[%d,%d], q_out=%d); "
-                "returning context.",
+                "[EAGLE3][Attention][fallback] Wo shape mismatch (Wo=[%d,%d], expected input=%d); "
+                "returning context without projection.",
                 wo_in,
                 wo_out,
                 q_out_dim);
@@ -226,7 +251,12 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             param.output = Tensor{{token_num, wo_out}, ctx.dtype(), ctx.device()};
         }
 
-        ft::launch_eagle3_matmul_rowmajor_dispatch(ctx.data<T>(), wo->data<T>(), param.output.data<T>(), token_num, wo_in, wo_out, stream_);
+        // C[M,N] = A[M,K] @ B[N,K]^T with:
+        //   A = ctx         [token_num, q_out_dim]
+        //   B = Wo          [wo_out, q_out_dim]
+        //   C = output      [token_num, wo_out]
+        ft::launch_eagle3_matmul_rowmajor_dispatch(
+            ctx.data<T>(), wo->data<T>(), param.output.data<T>(), token_num, wo_in, wo_out, stream_);
         sync_check_cuda_error();
     };
 
