@@ -757,6 +757,8 @@ PYBIND11_MODULE(_turbomind, m)
                 sequence_lengths_ptr,
                 paths_ptr,
                 best_path_ids_ptr,
+                nullptr, // end_ids
+                nullptr, // finished_states
                 batch_slots_ptr,
                 static_cast<eagle_kernels::SizeType>(batch_size),
                 static_cast<eagle_kernels::SizeType>(max_batch_size),
