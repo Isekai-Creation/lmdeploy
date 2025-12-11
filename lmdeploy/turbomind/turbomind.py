@@ -46,18 +46,8 @@ import sys
 import traceback
 
 # Force the same import that works in your test snippet.
-try:
-    from lmdeploy.lib import _turbomind as _tm
-    from lmdeploy.lib import _xgrammar as _xgr
-except Exception as e:
-    # Make the failure loud instead of silently setting _tm=None
-    print(
-        "[EAGLE][TurboMind] Failed to import lmdeploy.lib._turbomind:",
-        repr(e),
-        file=sys.stderr,
-    )
-    traceback.print_exc()
-    raise
+from lmdeploy.lib import _turbomind as _tm
+from lmdeploy.lib import _xgrammar as _xgr
 
 
 from .tokenizer_info import TokenizerInfo  # noqa: E402
