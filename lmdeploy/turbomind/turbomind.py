@@ -42,12 +42,23 @@ from .supported_models import is_supported
 # Python-side helpers such as `_get_metrics`), we degrade gracefully and
 # leave `_tm` / `_xgr` as `None`. Callers that require the backend should
 # explicitly assert that `_tm` is not None.
-try:  # pragma: no cover - backend availability is environment-dependent
-    import _turbomind as _tm
-    import _xgrammar as _xgr
-except ImportError:
-    _tm = None
-    _xgr = None
+import sys
+import traceback
+
+# Force the same import that works in your test snippet.
+try:
+    from lmdeploy.lib import _turbomind as _tm
+    from lmdeploy.lib import _xgrammar as _xgr
+except Exception as e:
+    # Make the failure loud instead of silently setting _tm=None
+    print(
+        "[EAGLE][TurboMind] Failed to import lmdeploy.lib._turbomind:",
+        repr(e),
+        file=sys.stderr,
+    )
+    traceback.print_exc()
+    raise
+
 
 from .tokenizer_info import TokenizerInfo  # noqa: E402
 
