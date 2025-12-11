@@ -366,6 +366,12 @@ class TurboMind:
 
         self._postprocess_config(tm_model.tm_config, engine_config)
 
+        if _tm is None:
+            raise RuntimeError(
+                "lmdeploy.turbomind.turbomind: _turbomind extension is None. "
+                "This indicates the C++/CUDA extension failed to import; "
+                "check that lmdeploy.lib._turbomind imports correctly in this environment."
+            )
         model_comm = _tm.AbstractTransformerModel.create_llama_model(
             model_dir="",
             config=yaml.safe_dump(self.config_dict),
