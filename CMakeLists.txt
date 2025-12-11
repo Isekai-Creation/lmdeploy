@@ -338,6 +338,23 @@ link_directories(
   ${COMMON_LIB_DIRS}
 )
 
+# Ensure CUDA::cuda_driver exists even if FindCUDAToolkit wasn't called.
+# On environments like Kaggle we may only have libcuda.so on the system.
+if(NOT TARGET CUDA::cuda_driver)
+  find_library(CUDA_DRIVER_LIB cuda)
+  if(CUDA_DRIVER_LIB)
+    add_library(CUDA::cuda_driver INTERFACE IMPORTED)
+    # Link the system libcuda into this pseudo-target
+    set_target_properties(CUDA::cuda_driver PROPERTIES
+      INTERFACE_LINK_LIBRARIES "${CUDA_DRIVER_LIB}")
+  else()
+    message(WARNING
+      "libcuda (driver library) not found; creating empty CUDA::cuda_driver target. "
+      "Some GPU functionality may be unavailable.")
+    add_library(CUDA::cuda_driver INTERFACE IMPORTED)
+  endif()
+endif()
+
 add_subdirectory(src)
 
 # if(BUILD_TEST)
