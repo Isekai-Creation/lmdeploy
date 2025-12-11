@@ -521,6 +521,8 @@ class Response:
         fields.extend(_format_tensor("logits", self.logits))
         fields.extend(_format_tensor("last_hidden_state", self.last_hidden_state))
         fields.extend(_format_tensor("routed_experts", self.routed_experts))
+        if self.req_metrics is not None:
+            fields.append(f"req_metrics={self.req_metrics}")
         return "\n".join(fields)
 
 
@@ -579,11 +581,31 @@ class RequestMetrics:
     Attributes:
         token_timestamp: A wall-clock time when a token is generated.
         engine_events: List of engine events during inference.
+        enque_time: when a request is enqued (microseconds since Unix epoch).
+        scheduled_time: when a request is scheduled for inference (microseconds since Unix epoch).
+        eagle_total_draft_tokens: total number of draft tokens proposed.
+        eagle_total_accepted_tokens: total number of draft tokens accepted.
+        eagle_steps: number of speculative steps taken.
+        eagle_total_rewound_tokens: total number of tokens rewound from KV cache.
+        eagle_rewind_steps: number of steps where KV rewind was applied.
+        eagle_tree_draft_tokens: total number of tree draft tokens proposed.
+        eagle_tree_target_tokens: total number of tree target tokens evaluated.
+        eagle_tree_accepted_tokens: total number of accepted tokens along tree paths.
     """
 
     token_timestamp: float = 0.0
     engine_events: List[EngineEvent] = field(default_factory=list)
     spec_info: Optional[Dict[str, Any]] = None
+    enque_time: int = 0
+    scheduled_time: int = 0
+    eagle_total_draft_tokens: int = 0
+    eagle_total_accepted_tokens: int = 0
+    eagle_steps: int = 0
+    eagle_total_rewound_tokens: int = 0
+    eagle_rewind_steps: int = 0
+    eagle_tree_draft_tokens: int = 0
+    eagle_tree_target_tokens: int = 0
+    eagle_tree_accepted_tokens: int = 0
 
 
 @dataclass
