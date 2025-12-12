@@ -43,9 +43,11 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
         moe_ffn_layer_ = std::make_unique<MoeFfnLayer>(model, moe, engine, ctx);
     }
 
-    if (std::accumulate(model.inter_size.begin(), model.inter_size.end(), 0LL)) {
-        ffn_layer_ = std::make_unique<LlamaFfnLayer>(model, ctx);
-    }
+    // Always construct a usable FFN backend so that Eagle3 draft layers
+    // can rely on a full 2H (embedding_norm + FC_norm) path instead of
+    // silently degrading to attention-only drafts when inter_size happens
+    // to be zero or omitted in the model config.
+    ffn_layer_ = std::make_unique<LlamaFfnLayer>(model, ctx);
 
     // Enable multi-layer hidden capture for Eagle3 when requested by the
     // engine. For Eagle3 we follow the TensorRT-LLM convention and capture
@@ -78,28 +80,21 @@ void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
 {
     eagle3_draft_weight_ = w;
 
-    if (w && attn_layer_) {
-        // FFN backend is optional here; Eagle3DraftLayer will skip the
-        // FFN path when ffn_layer_ is null and behave as an attention-only
-        // draft layer. This is preferable to disabling the draft layer
-        // outright, as it keeps Eagle3 structurally active.
+    if (w && attn_layer_ && ffn_layer_) {
+        // With a valid FFN backend, enable the full Eagle3 draft layer
+        // (attention + FFN) and avoid the older attention-only shallow
+        // fallback that masked real Eagle3 issues.
         eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayer>(
             w,
             attn_layer_.get(),
             eagle3_attn_layer_.get(),
-            ffn_layer_ ? ffn_layer_.get() : nullptr,
+            ffn_layer_.get(),
             rmsnorm_eps_);
-
-        if (!ffn_layer_) {
-            TM_LOG_WARNING(
-                "[UnifiedDecoder][EAGLE3][fallback] ffn_layer_ is null; "
-                "Eagle3 draft will run without FFN (attention-only).");
-        }
-    }
-    else {
+    } else {
         TM_LOG_WARNING(
             "[UnifiedDecoder][EAGLE3][fallback] draft layer disabled "
-            "(weights=%p, attn_layer=%p, eagle3_attn_layer=%p, ffn_layer=%p)",
+            "(weights=%p, attn_layer=%p, eagle3_attn_layer=%p, ffn_layer=%p); "
+            "Eagle3 speculative decoding will fall back to baseline.",
             static_cast<const void*>(w),
             static_cast<void*>(attn_layer_.get()),
             static_cast<void*>(eagle3_attn_layer_.get()),

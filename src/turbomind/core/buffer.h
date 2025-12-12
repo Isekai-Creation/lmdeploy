@@ -76,10 +76,28 @@ public:
             }
         }
 
+        // Lazily allocate storage when the buffer was default-constructed
+        // but later used as a destination (e.g. for Clear/Copy). This
+        // avoids hard failures from TM_CHECK_NOTNULL in optional scratch
+        // paths while still keeping non-zero sized buffers backed by real
+        // storage.
+        if (!data_) {
+            if (size_ > 0) {
+                auto alloc = Context::alloc(device_);
+                auto bytes = turbomind::byte_size(dtype_, size_);
+                data_      = {alloc->allocate(bytes), [=](auto p) { alloc->deallocate(p, bytes); }};
+                base_      = 0;
+            }
+            else {
+                // Zero-sized, typeless buffer – treat as an empty view.
+                return nullptr;
+            }
+        }
+
         // Use the buffer's own dtype for byte offset computation.
         // FP16 and BF16 are both 16‑bit wide, so the reinterpretation
         // above remains layout‑compatible.
-        return (T*)((char*)TM_CHECK_NOTNULL(data_).get() + turbomind::byte_size(dtype_, base_));
+        return (T*)((char*)data_.get() + turbomind::byte_size(dtype_, base_));
     }
 
     template<class T>
@@ -90,7 +108,18 @@ public:
 
     void* raw_data(ssize_t offset = 0)
     {
-        return (char*)TM_CHECK_NOTNULL(data_).get() + turbomind::byte_size(dtype_, base_ + offset);
+        if (!data_) {
+            if (size_ > 0) {
+                auto alloc = Context::alloc(device_);
+                auto bytes = turbomind::byte_size(dtype_, size_);
+                data_      = {alloc->allocate(bytes), [=](auto p) { alloc->deallocate(p, bytes); }};
+                base_      = 0;
+            }
+            else {
+                return nullptr;
+            }
+        }
+        return (char*)data_.get() + turbomind::byte_size(dtype_, base_ + offset);
     }
 
     const void* raw_data(ssize_t offset = 0) const

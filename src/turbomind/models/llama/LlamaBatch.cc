@@ -1044,7 +1044,16 @@ void LlamaBatch::collectEagleStepHostState(const GenerationState& g,
         h_finished_slots.resize(batch_size);
     }
 
-    core::Copy(token_ids_buf_.data() + (g.step - 1) * batch_size, batch_size, h_token_ids.data());
+    // When g.step == 0 there is no "previous" base token row to copy.
+    // In that case, treat the token ids as unknown for this step and
+    // skip the device-to-host copy to avoid reading out-of-bounds
+    // from token_ids_buf_.
+    if (g.step > 0) {
+        core::Copy(token_ids_buf_.data() + (g.step - 1) * batch_size, batch_size, h_token_ids.data());
+    }
+    else {
+        std::fill_n(h_token_ids.data(), batch_size, -1);
+    }
     // finished_buf_ is a device buffer of bools; std::vector<bool> has a
     // specialized representation, so we cannot copy into it directly via
     // core::Copy. Use a temporary byte buffer and then map to bools.

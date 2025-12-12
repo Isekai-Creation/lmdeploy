@@ -15,8 +15,6 @@ Eagle3AttentionLayer::Eagle3AttentionLayer(const cudaDeviceProp* prop, cudaStrea
 
 void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 {
-    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
     if (!param.input || !param.weights || !param.weights->is_initialized) {
         TM_LOG_WARNING(
             "[EAGLE3][Attention][fallback] invalid Eagle3AttentionParam; "
@@ -122,8 +120,9 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 
         if (!logged_active_path) {
             TM_LOG_INFO(
-                "[EAGLE3][Attention] running native Eagle3Attention with dtype=%s "
-                "(token_num=%d, q_in=%d, q_out=%d, kv_out=%d, q_heads=%d, kv_heads=%d, head_dim=%d)",
+                "[EAGLE3][Attention][stage] begin native Eagle3 attention "
+                "(dtype=%s, token_num=%d, q_in=%d, q_out=%d, kv_out=%d, q_heads=%d, kv_heads=%d, head_dim=%d, "
+                "q_len=%d, kv_len=%d, group_size=%d)",
                 to_string(dtype),
                 token_num,
                 q_in_dim,
@@ -131,7 +130,10 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                 kv_out_dim,
                 num_q_heads,
                 num_kv_heads,
-                head_dim);
+                head_dim,
+                q_len,
+                kv_len,
+                group_size);
             logged_active_path = true;
         }
 
@@ -257,6 +259,12 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         //   C = output      [token_num, wo_out]
         ft::launch_eagle3_matmul_rowmajor_dispatch(
             ctx.data<T>(), wo->data<T>(), param.output.data<T>(), token_num, wo_in, wo_out, stream_);
+        TM_LOG_INFO(
+            "[EAGLE3][Attention][stage] completed native Eagle3 attention "
+            "(token_num=%d, q_out=%d, wo_out=%d)",
+            token_num,
+            q_out_dim,
+            wo_out);
         sync_check_cuda_error();
     };
 

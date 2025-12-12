@@ -62,6 +62,19 @@ bool loadTensorFromFile(Tensor& tensor, const std::string& path)
 
 }  // namespace
 
+// Coarse-grained progress logger for Eagle3 pipeline bring-up. This is
+// defined at translation-unit scope so other EAGLE call sites (e.g.
+// LlamaV2's dynamicDecodeWithSpecMulti) can reuse the same milestones.
+// It is gated on the global EAGLE debug flag so normal inference runs
+// are not flooded with logs.
+void logEagleProgress(int percent, const char* stage)
+{
+    if (!isEagleDebugEnabled()) {
+        return;
+    }
+    TM_LOG_WARNING("[EAGLE][Progress] %3d%% %s", percent, stage);
+}
+
 EagleModule::EagleModule(SizeType max_draft_path_len,
                          SizeType max_decoding_draft_tokens,
                          SizeType max_decoding_tokens,
@@ -89,6 +102,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 {
     enabled_ = false;
     bool success = true;
+
+    logEagleProgress(5, "Begin EagleModule::load (parsing config.yaml)");
 
     const std::string config_path = model_dir + "/config.yaml";
     YAML::Node        config;
@@ -234,6 +249,9 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     weight_dtype_ = dtype;
 
     const bool eagle3 = eagle_mode_ == EagleMode::kEagle3;
+
+    logEagleProgress(10, eagle3 ? "Parsed Eagle3 geometry from config.yaml"
+                                : "Parsed legacy Eagle geometry from config.yaml");
 
     if (eagle3) {
         // For Eagle3 we require full geometry to be present and
@@ -865,6 +883,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
             // Disable only the Eagle3 draft layer; keep EAGLE enabled and
             // fall back to the legacy shallow block + output_norm path.
             eagle3_draft_layer_.reset();
+        } else {
+            logEagleProgress(40, "Prepared Eagle3DraftLayer weights (FFN + norms + native attention)");
         }
     }
 
@@ -923,6 +943,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     }
 
     enabled_ = true;
+    logEagleProgress(50, "EagleModule draft weights loaded and validated");
     TM_LOG_INFO(
         "[EAGLE] EagleModule draft model loaded successfully: hidden_units=%d vocab_size=%d", hidden_units_, vocab_size_);
 }

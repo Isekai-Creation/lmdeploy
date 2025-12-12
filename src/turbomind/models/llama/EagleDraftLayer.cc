@@ -119,6 +119,19 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
 
     const auto dtype = input_hidden.dtype();
 
+    if (debug_enabled) {
+        TM_LOG_INFO(
+            "[EAGLE3][Draft][stage] begin Eagle3DraftLayer::Forward "
+            "(batch=%d, hidden_dim=%d, draft_dim=%d, base_hidden_dim=%d, q_len=%d, kv_len=%d, past_kv_len=%d)",
+            batch_size,
+            hidden_dim,
+            draft_dim,
+            base_hidden_dim_,
+            q_len,
+            kv_len,
+            past_kv_len);
+    }
+
     // New code for embedding lookup and norm
     Tensor embed_input_base_dim{{batch_size, base_hidden_dim_}, dtype, input_hidden.device()}; // Use base_hidden_dim_ here
     Tensor embed_norm{{batch_size, draft_dim}, dtype, input_hidden.device()}; // Normed to draft_dim
@@ -302,6 +315,16 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     static bool logged_invalid_geom = false;
 
     if (native_eagle3_ok) {
+        if (debug_enabled) {
+            TM_LOG_INFO(
+                "[EAGLE3][Draft][stage] running Eagle3AttentionLayer::Forward "
+                "(q_in=%d, q_out=%d, kv_out=%d, head_num=%d, kv_head_num=%d)",
+                weight_->eagle3_attn.q_in,
+                weight_->eagle3_attn.q_out,
+                weight_->eagle3_attn.kv_out,
+                weight_->eagle3_attn.num_q_heads,
+                weight_->eagle3_attn.num_kv_heads);
+        }
         Eagle3AttentionParam ep{};
         ep.input              = qkv_input;
         ep.output             = attn_out;
@@ -419,6 +442,7 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
 
     if (debug_enabled) {
         debug_pre_head_hidden_ = output_hidden;
+        TM_LOG_INFO("[EAGLE3][Draft][stage] completed Eagle3DraftLayer::Forward");
     }
 }
 

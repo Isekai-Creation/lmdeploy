@@ -63,6 +63,11 @@ using SizeType32 = int32_t;
 
 using eagle::TokenIdType;
 
+// Forward declaration for the coarse-grained EAGLE progress logger
+// defined in EagleModule.cc so we can reuse the same milestone markers
+// from LlamaV2 without introducing a new public header.
+void logEagleProgress(int percent, const char* stage);
+
 /// TODO: Padded vocab size should also be divisible by 8
 inline int pad_vocab_size(int vocab_size, int tp)
 {
@@ -116,6 +121,9 @@ LlamaV2::LlamaV2(DataType                     dtype,
     }
 
     unified_decoder_ = std::make_unique<UnifiedDecoder>(model, engine, attn, moe, lora, ctx);
+    if (engine.enable_speculative_decoding && (engine.spec_method == "eagle" || engine.spec_method == "eagle3")) {
+        logEagleProgress(20, "Constructed UnifiedDecoder for EAGLE speculative path");
+    }
 
     // using float to avoid data overflow
     dynamic_decode_ = std::make_unique<DynamicDecodeLayer>(
@@ -3118,6 +3126,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                  batch_size,
                  tokens_per_seq,
                  total_draft);
+    logEagleProgress(60, "EAGLE3 draft logits + tokens ready for tree build");
 
     // ========= Step 1: Build EAGLE tree from draft tokens =========
     const int num_draft_tokens = total_draft;
@@ -3175,6 +3184,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     TM_LOG_DEBUG("[LlamaV2][EAGLE] Built tree with %d paths, max_depth=%d",
                  num_paths,
                  max_path_len);
+    logEagleProgress(70, "EAGLE3 speculative tree constructed for this step");
 
     // ========= Step 2: Mirror tokens and paths into EagleBuffers =========
     cudaMemcpyAsync(eagle_buffers_->inputs.draft_tokens,
@@ -3435,6 +3445,8 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         static_cast<int32_t>(
             engine_param_.spec_max_draft_path_len),
         stream_);
+
+    logEagleProgress(80, "EAGLE3 leaf + packed masks generated for this step");
 
     sync_check_cuda_error();
 
@@ -3831,6 +3843,8 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                    effective_draft_tokens,
                    acceptance_rate * 100.0f);
 
+    logEagleProgress(90, "EAGLE3 tree acceptance + KV planning completed for this step");
+
     float h_acceptance_rate = acceptance_rate;
     cudaMemcpyAsync(
         eagle_buffers_->outputs.acceptance_rate,
@@ -4046,6 +4060,8 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     // lengths for this step. This keeps partial-KV length tracking in
     // sync with DynamicDecodeLayer and EAGLE acceptance.
     updateSpecPVAfterAcceptance(sequence_length, batch_size, spec_ctx.sequences, &committed_lengths);
+
+    logEagleProgress(100, "Completed EAGLE3 speculative decode step (tails committed)");
 }
 
 void LlamaV2::getEagleAcceptanceForStep(std::vector<int>& accepted_lens,
