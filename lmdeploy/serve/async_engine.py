@@ -435,11 +435,13 @@ class AsyncEngine(LogitsMixin):
         self.request_logger = RequestLogger(max_log_len)
         self.internal_thread = _EventLoopThread(daemon=True)
         self.limiter: asyncio.Semaphore = None
-        self.num_spec_token = (
-            0
-            if backend == "turbomind" or speculative_config is None
-            else speculative_config.num_speculative_tokens
-        )
+        # Track the speculative step size for metrics. For TurboMind, this
+        # is driven by SpeculativeConfig when present; for non-speculative
+        # runs it remains 0.
+        if speculative_config is not None:
+            self.num_spec_token = speculative_config.num_speculative_tokens
+        else:
+            self.num_spec_token = 0
 
         # build stat loggers
         self._build_stat_loggers()

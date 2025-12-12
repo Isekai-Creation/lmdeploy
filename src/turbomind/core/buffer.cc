@@ -72,15 +72,8 @@ void Copy(const Buffer& a, Ref<Buffer> b_)
 
 void* Copy(const void* a, ssize_t n, void* b, const Stream& stream)
 {
-    // When EAGLE debug is enabled, log raw Copy calls so we can track
-    // which host/device transfers are associated with speculative
-    // decoding stages. This is especially useful for tracing illegal
-    // memory accesses in EAGLE-specific paths without affecting other
-    // callers.
-    if (turbomind::isEagleDebugEnabled()) {
-        TM_LOG_WARNING("[EAGLE][CopyDBG] Copy(a=%p, b=%p, n=%zd)", a, b, (ssize_t)n);
-    }
-    check_cuda_error(cudaMemcpyAsync(b, a, n, cudaMemcpyDefault, stream.handle()));
+    auto err = cudaMemcpyAsync(b, a, n, cudaMemcpyDefault, stream.handle());
+    check_cuda_error(err);
     return (char*)b + n;
 }
 

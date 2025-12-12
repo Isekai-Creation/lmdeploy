@@ -364,6 +364,27 @@ void LlamaBatch::ProcessInferRequests(const Requests& reqs, std::vector<Signal>&
         if (model_->attn_param_.rope.type == RopeType::kMrope) {
             TM_CHECK(r->session.start_flag) << "Mrope doesn't support interactive chat";
             if (r->inputs.count("mrope_position_ids")) {
+                if (turbomind::isEagleDebugEnabled()
+                    && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:mrope_pos_ids] idx=%d a=%p b=%p n=%d",
+                        idx,
+                        r->inputs.at("mrope_position_ids").data<int>(),
+                        state.mrope.position_ids.data() + idx * state.mrope.position_ids.shape(1),
+                        input_length * 3);
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:mrope_pos_delta] idx=%d a=%p b=%p n=%d",
+                        idx,
+                        r->inputs.at("mrope_position_delta").data<int>(),
+                        state.mrope.position_delta.data() + idx,
+                        1);
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:mrope_length] idx=%d a=%p b=%p n=%d",
+                        idx,
+                        r->inputs.at("mrope_length").data<int>(),
+                        state.mrope.length.data() + idx,
+                        1);
+                }
                 core::Copy(r->inputs.at("mrope_position_ids").data<int>(),
                            input_length * 3,
                            state.mrope.position_ids.data() + idx * state.mrope.position_ids.shape(1));
@@ -1049,6 +1070,17 @@ void LlamaBatch::collectEagleStepHostState(const GenerationState& g,
     // skip the device-to-host copy to avoid reading out-of-bounds
     // from token_ids_buf_.
     if (g.step > 0) {
+        if (isEagleDebugEnabled() && tp_rank_ == 0
+            && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:collect_step_tokens] step=%d batch=%d src_row=%d a=%p b=%p n=%d",
+                g.step,
+                batch_size,
+                g.step - 1,
+                token_ids_buf_.data() + (g.step - 1) * batch_size,
+                h_token_ids.data(),
+                batch_size);
+        }
         core::Copy(token_ids_buf_.data() + (g.step - 1) * batch_size, batch_size, h_token_ids.data());
     }
     else {
@@ -1324,12 +1356,8 @@ void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
         return;
     }
 
-    core::Copy(h_block_tables_storage.data(),
-               h_block_tables_storage.size(),
-               eagle_kv_block_tables_.data());
-    core::Copy(batch_slots_storage.data(),
-               batch_slots_storage.size(),
-               eagle_kv_batch_slots_.data());
+    core::Copy(h_block_tables_storage.data(), h_block_tables_storage.size(), eagle_kv_block_tables_.data());
+    core::Copy(batch_slots_storage.data(), batch_slots_storage.size(), eagle_kv_batch_slots_.data());
 
     // Optional: build a flat view over BlockManager's KV blocks so the
     // rewind kernel can null-out pointers for rewound blocks.
@@ -1379,9 +1407,17 @@ void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
     if (h_rewind_lengths_storage.size() < static_cast<size_t>(max_batch_size)) {
         h_rewind_lengths_storage.resize(max_batch_size);
     }
-    core::Copy(eagle_kv_rewind_lengths_.data(),
-               max_batch_size,
-               h_rewind_lengths_storage.data());
+    if (isEagleDebugEnabled() && tp_rank_ == 0
+        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][CopySITE:kv_rewind_lengths] step=%d max_batch=%d a=%p b=%p n=%d",
+            g.step,
+            max_batch_size,
+            eagle_kv_rewind_lengths_.data(),
+            h_rewind_lengths_storage.data(),
+            max_batch_size);
+    }
+    core::Copy(eagle_kv_rewind_lengths_.data(), max_batch_size, h_rewind_lengths_storage.data());
     check_cuda_error(cudaStreamSynchronize(stream_));
 
     const int active_size = state_->active_size;
@@ -1630,6 +1666,17 @@ void LlamaBatch::OutputLastHiddenState(const Tensor& hidden_states, int first, i
                 // Skip previous chunks
                 int dst_base = std::max(0, cache_len - (history_len + offset));
 
+                if (turbomind::isEagleDebugEnabled()) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:last_hidden_state] src_base=%d dst_base=%d valid_len=%d a=%p "
+                        "b=%p bytes=%zu",
+                        src_base,
+                        dst_base,
+                        valid_len,
+                        src_buf.raw_data(src_base * model_->hidden_units_),
+                        dst_buf.raw_data(dst_base * model_->hidden_units_),
+                        byte_size(data_type, valid_len * model_->hidden_units_));
+                }
                 core::Copy(src_buf.raw_data(src_base * model_->hidden_units_),
                            byte_size(data_type, valid_len * model_->hidden_units_),
                            dst_buf.raw_data(dst_base * model_->hidden_units_));
@@ -1736,6 +1783,15 @@ void LlamaBatch::Finish(GenerationState& g, std::vector<Signal>& signals)
         for (int i = 0; i < batch_size; ++i) {
             // ss << (i ? ", " : "") << "(" << state_->h_context_length[i] << "," << state_->h_finished[i] << ")";
             std::vector<int> tokens(state_->h_context_length[i]);
+            if (turbomind::isEagleDebugEnabled()) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][CopySITE:dump_tokens_i] i=%d session_len=%d len=%zu a=%p b=%p",
+                    i,
+                    session_len_,
+                    tokens.size(),
+                    state_->output_ids.data() + i * session_len_,
+                    tokens.data());
+            }
             core::Copy(state_->output_ids.data() + i * session_len_, tokens.size(), tokens.data());
             cudaStreamSynchronize(stream_);
             std::stringstream ss;
@@ -1806,6 +1862,15 @@ auto LlamaBatch::Interrupt(int index, bool force_stop) -> Signal
 
     if (debug_ && tp_rank_ == 0) {
         std::vector<int> tokens(state_->h_context_length[index]);
+        if (turbomind::isEagleDebugEnabled()) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:dump_tokens_index] index=%d session_len=%d len=%zu a=%p b=%p",
+                index,
+                session_len_,
+                tokens.size(),
+                state_->output_ids.data() + index * session_len_,
+                tokens.data());
+        }
         core::Copy(state_->output_ids.data() + index * session_len_, tokens.size(), tokens.data());
         cudaStreamSynchronize(stream_);
         std::stringstream ss;
@@ -1835,6 +1900,14 @@ auto LlamaBatch::Interrupt(int index, bool force_stop) -> Signal
         // Save random state in host memory
         seq.random_state.resize(sizeof(curandState_t));
         // This async copy must be synchronized by the caller
+        if (turbomind::isEagleDebugEnabled()) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:curand_state_seq] index=%d a=%p b=%p n=%d",
+                index,
+                (curandState_t*)state_->curand_state.data() + index,
+                (curandState_t*)seq.random_state.data(),
+                1);
+        }
         core::Copy((curandState_t*)state_->curand_state.data() + index, 1, (curandState_t*)seq.random_state.data());
 
         // Set unlock flag for corresponding blocks, will be unlocked in the next `Materialize()`
@@ -2342,6 +2415,16 @@ bool LlamaBatch::Forward(GenerationState& g)
                         host_end_ids[i] = req->gen_cfg.eos_ids.front();
                     }
                 }
+                if (isEagleDebugEnabled() && tp_rank_ == 0
+                    && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:eagle_end_ids_step] step=%d batch=%d a=%p b=%p n=%d",
+                        g.step,
+                        batch_size,
+                        host_end_ids.data(),
+                        eagle_end_ids_.data(),
+                        batch_size);
+                }
                 core::Copy(host_end_ids.data(), batch_size, eagle_end_ids_.data());
                 spec_ctx.d_end_ids = eagle_end_ids_.data();
             }
@@ -2363,6 +2446,29 @@ bool LlamaBatch::Forward(GenerationState& g)
                     // if (!req->gen_cfg.posterior_alphas.empty()) {
                     //     host_alpha[i] = req->gen_cfg.posterior_alphas.front();
                     // }
+                }
+                if (isEagleDebugEnabled() && tp_rank_ == 0) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_thr_step] step=%d batch=%d a=%p b=%p n=%d",
+                        g.step,
+                        batch_size,
+                        host_thr.data(),
+                        eagle_posterior_thresholds_.data(),
+                        batch_size);
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_alpha_step] step=%d batch=%d a=%p b=%p n=%d",
+                        g.step,
+                        batch_size,
+                        host_alpha.data(),
+                        eagle_posterior_alphas_.data(),
+                        batch_size);
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:eagle_temperature_step] step=%d batch=%d a=%p b=%p n=%d",
+                        g.step,
+                        batch_size,
+                        host_temp.data(),
+                        eagle_temperatures_.data(),
+                        batch_size);
                 }
                 core::Copy(host_thr.data(), batch_size, eagle_posterior_thresholds_.data());
                 core::Copy(host_alpha.data(), batch_size, eagle_posterior_alphas_.data());
@@ -2465,6 +2571,16 @@ bool LlamaBatch::Forward(GenerationState& g)
 
     if (debug_ && tp_rank_ == 0) {
         std::vector<int> curr(active_size);
+        if (isEagleDebugEnabled()) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:debug_step_tokens] step=%d active_size=%d src_row=%d a=%p b=%p n=%d",
+                g.step,
+                active_size,
+                g.step,
+                token_ids_buf_.data() + g.step * active_size,
+                curr.data(),
+                active_size);
+        }
         core::Copy(token_ids_buf_.data() + g.step * active_size, active_size, curr.data());
         cudaStreamSynchronize(stream_);
         std::stringstream scurr;
@@ -2742,6 +2858,15 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
     // tokens as part of the sequence history on the next step. Only the
     // first `batch_size` entries are relevant for this mini-batch.
     std::vector<int> h_seq_lengths(batch_size);
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][CopySITE:seq_lengths_d2h] step=%d batch=%d a=%p b=%p n=%d",
+            g.step,
+            batch_size,
+            sequence_lengths_.data(),
+            h_seq_lengths.data(),
+            batch_size);
+    }
     core::Copy(sequence_lengths_.data(), batch_size, h_seq_lengths.data());
     check_cuda_error(cudaStreamSynchronize(stream_));
 
@@ -2752,6 +2877,15 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
         }
     }
 
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][CopySITE:seq_lengths_h2d] step=%d batch=%d a=%p b=%p n=%d",
+            g.step,
+            batch_size,
+            h_seq_lengths.data(),
+            sequence_lengths_.data(),
+            batch_size);
+    }
     core::Copy(h_seq_lengths.data(), batch_size, sequence_lengths_.data());
     check_cuda_error(cudaStreamSynchronize(stream_));
 

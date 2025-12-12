@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import json
+import os
 import os.path as osp
 from collections import deque
 from dataclasses import dataclass
@@ -394,19 +395,50 @@ class GptOssTokenizer(HuggingFaceTokenizer):
         encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
         self.role = Role.ASSISTANT
         self.parser = partial(StreamableParser, encoding, role=Role.ASSISTANT)
+        # Allow turning off Harmony parsing entirely when running offline
+        # benchmarks or when the model does not emit well-formed Harmony
+        # headers. When disabled, detokenization falls back to the generic
+        # HuggingFace path and never raises HarmonyError.
+        env_flag = os.getenv('LMDEPLOY_DISABLE_HARMONY', '').strip().lower()
+        self._disable_harmony = env_flag in ('1', 'true', 'yes', 'on')
 
     def detokenize_incrementally(self,
                                  all_input_ids: Sequence[int],
                                  state: DetokenizeState,
                                  skip_special_tokens: bool = True,
                                  spaces_between_special_tokens: bool = True):
+        # When Harmony parsing is disabled (or fails), fall back to the
+        # generic HuggingFace incremental detokenizer so that offline
+        # pipelines never crash with HarmonyError.
+        if self._disable_harmony:
+            return super(GptOssTokenizer, self).detokenize_incrementally(
+                all_input_ids,
+                state,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+
         if not hasattr(state, 'stream'):
             state.stream = self.parser()
 
         response = ''
         stream = state.stream
         for token_id in all_input_ids[state.ids_offset:]:
-            stream.process(token_id)
+            try:
+                stream.process(token_id)
+            except Exception as e:  # pragma: no cover - defensive against HarmonyError
+                # On any Harmony parsing failure, log once via the tokenizer
+                # logger and switch to the generic detokenizer for the rest
+                # of this sequence to avoid repeated exceptions.
+                self.logger.warning(f'GptOssTokenizer Harmony parsing failed: {e}; '
+                                    'falling back to generic detokenization.')
+                self._disable_harmony = True
+                return super(GptOssTokenizer, self).detokenize_incrementally(
+                    all_input_ids,
+                    state,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                )
             if stream.current_channel in ['final', 'analysis'] and stream.current_role == self.role:
                 response += stream.last_content_delta or ''
 

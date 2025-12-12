@@ -4,6 +4,7 @@
 
 #include "src/turbomind/core/allocator.h"
 #include "src/turbomind/core/check.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind::core {
 
@@ -47,6 +48,11 @@ public:
     {
         void* ptr{};
         check_cuda_error(cudaMallocFromPoolAsync(&ptr, size, pool_, stream_.handle()));
+        // Allocation debug logging is gated separately from general
+        // EAGLE debug to avoid flooding logs during normal runs.
+        if (turbomind::isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALLOC_DEBUG")) {
+            TM_LOG_WARNING("[EAGLE][AllocDBG:pool] size=%zd ptr=%p", (ssize_t)size, ptr);
+        }
         return ptr;
     }
 
@@ -83,6 +89,9 @@ public:
     {
         void* ptr{};
         check_cuda_error(cudaMalloc(&ptr, size));
+        if (turbomind::isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALLOC_DEBUG")) {
+            TM_LOG_WARNING("[EAGLE][AllocDBG:cuda] size=%zd ptr=%p", (ssize_t)size, ptr);
+        }
         return ptr;
     }
 

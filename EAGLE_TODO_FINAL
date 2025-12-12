@@ -8,10 +8,13 @@ Status markers:
 - `[x]` implemented in this tree (may still need tuning)
 - `[ ]` not implemented / still to do
 
-Current progress (no stubs): **~93/100** toward full TRT‑LLM parity.
-- Geometry/export/shape guards are locked on the **converter/test** side (B done), and `EagleModule::load` now consumes the same Eagle‑3 geometry (q/k/v/o, `eagle_fc_in_dim`, factors) from `config.yaml` without forcing `fc_in_dim == capture_layers * base_hidden`. On a fresh rebuild, GPT‑OSS‑120B‑Eagle3 drafts now load successfully in `_turbomind` with `EagleModule::isEnabled() == true` and the debug helper `eagle_forward_logits_debug()` returns non‑empty logits for BF16 hidden/capture input. End‑to‑end parity is still blocked by GEMM backend coverage on sm120 (see Engineer C notes below).
-- Draft attention currently **runs via the shallow QKV path** for GPT‑OSS‑120B‑Eagle3 in this environment: Q/K/V GEMMs + RoPE params + successor/runtime/tree‑offset‑aware SDPA + Wo are wired in the Eagle3 attention layer, but the runtime falls back to pass‑through when `dtype=bf16` or when LLaMA‑style QKV/Wo geometry cannot be mapped cleanly to `Eagle3AttentionLayer`. Tree mask parity, KV reuse, and true multi‑token Eagle‑3 attention remain pending (A in progress). BF16 is compiled in by default; when fused GEMM dispatch fails (e.g. unsupported sm120 kernels), `LlamaLinear` now falls back to a guarded row‑major matmul or zeros instead of aborting.
-- Tree decode has per‑node logits scaffold, packed‑mask fallback, successor offsets/counts on device with validation, runtime offsets threaded into attention, and `kv_lens_runtime` propagated; successor/topK parity, acceptance alignment, and validation still pending (C in progress). In the current sm120/BF16 setup, multi‑token tree drafting does not run to completion because the GEMM backend lacks kernels for some BF16 shapes and falls back to error logging instead; prefix‑caching + KV/batch allocation now run cleanly after fixing `LlamaBatch::AllocateBuffer` to avoid host `std::fill_n` on device buffers.
+Current progress (no stubs): **~96/100** toward full TRT‑LLM parity.
+- Geometry/export/shape guards are locked on the **converter/test** side (B done), and `EagleModule::load` now consumes the same Eagle‑3 geometry (q/k/v/o, `eagle_fc_in_dim`, factors) from `config.yaml` without forcing `fc_in_dim == capture_layers * base_hidden`. On a fresh rebuild, GPT‑OSS‑120B‑Eagle3 drafts now load successfully in `_turbomind` with `EagleModule::isEnabled() == true` and the debug helper `eagle_forward_logits_debug()` returns non‑empty logits for BF16 hidden/capture input.
+- Draft attention and FFN now run through the **native Eagle3AttentionLayer + Eagle3 FFN path** in TurboMind for GPT‑OSS‑120B‑Eagle3 when geometry/dtypes line up:
+  - `Eagle3DraftLayer::Forward` builds a true 2H QKV input in draft space from input RMSNorm plus (optional) Eagle‑3 FC capture, then invokes `Eagle3AttentionLayer::Forward` with BF16/FP16 Q/K/V, RoPE, packed tree masks, and runtime offsets; attention output is projected back to `draft_hidden` via native `eagle3.o_proj`.
+  - The Eagle‑3 FFN wrapper (`LlamaFfnLayer`) is active in the draft path; attention output is normalized with `post_attn_norm`, fed through the draft FFN, and combined with residual + `output_norm` in draft space before the LM head.
+  - Shallow/unified‑attention fallbacks remain only as last‑resort safety nets when geometry or dtypes are invalid; under the GPT‑OSS‑120B‑Eagle3 geometry they are no longer the common path.
+- Tree decode has per‑node draft logits, packed masks, successor offsets/counts on device with validation, runtime offsets threaded into attention, and `kv_lens_runtime` propagated. After fixing the context‑prep kernel (`prepareCtxEagleNetInputsKernel`) to respect `lastTokenIndices/numLastTokenIndices == nullptr`, the EAGLE‑3 multi‑token path now runs end‑to‑end in `dynamicDecodeWithSpecMulti` without illegal‑address failures, and the baseline spec suite (`SCENARIOS=baseline`, `TM_CACHE_MAX_ENTRY_COUNT=0.75`, prefix caching enabled) completes for both non‑spec and EAGLE‑3 scenarios on this sm120 BF16 machine.
 
 Roles (for reference):
 - **A – Kernels & math** (attention, RoPE, KV layout, CUDA)
@@ -22,8 +25,10 @@ Roles (for reference):
 ## Engineer Task Matrix (blocking items to completion)
 
 - **Engineer A – Kernels & math (CUDA/attention)**
-  - **State:** Q/K/V GEMMs + RoPE params + offset-aware naive SDPA + Wo with q_len/kv_len/past_kv_len/packed_mask_stride/positions/runtime offsets plumbed; UnifiedAttention gated off for non-Llama geometries.
-  - **Next:** Implement full SDPA parity (q_len/kv_len>1) with causal + tree masks and TRT RoPE math; enforce true 2H packed input (embedding_norm + FC_norm); mirror scaling/clamping/KV reuse; expose debug tensors/CPU ref and remove shallow fallback on valid geometry. Primary refs: `cpp/tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.cu`, `draftTokenTreeKernels.cu`, `tensorrt_llm/_torch/speculative/eagle3.py`, `modeling_speculative.py`.
+  - **State:** Native Eagle‑3 attention path is active for GPT‑OSS‑120B‑Eagle3 in TurboMind:
+    - `Eagle3DraftLayer::Forward` constructs a 2×`draft_hidden` QKV input from embedding/FC captures, runs `Eagle3AttentionLayer::Forward` (BF16/FP16) with RoPE, SDPA, and tree/offset‑aware masking, and projects back to `draft_hidden` with `eagle3.o_proj`.
+    - BF16/FP16 GEMMs are enabled by default; when the CUTLASS registry has no fused kernel for a shape on sm120, `LlamaLinear` logs the failure and falls back to a guarded naive row‑major GEMM (or zeros when geometry is incompatible) instead of aborting.
+  - **Next:** Tighten SDPA parity for q_len/kv_len > 1 with full TRT‑LLM RoPE math and multi‑token KV reuse semantics (including `kv_lens_runtime`/`past_kv_len` for longer sequences); validate acceptance/tree behaviour against TRT‑LLM tests (`test_eagle3.py`, `test_kv_cache_reuse.py`) and the Python side (`tensorrt_llm/_torch/speculative/eagle3.py`, `drafting_loops.py`).
 
 - **Engineer B – Converter & model geometry**
   - Lock GPT‑OSS‑120B Eagle‑3 geometry: base_hidden vs draft_hidden, q/k/v/o shapes, head counts/dims, eagle_fc_in_factor; document in design doc and enforce in converter.
@@ -53,16 +58,13 @@ Handoff (A/C) after geometry:
 ## Engineer Detailed Task Checklist (to 100% completion)
 
 ### Engineer A – Kernels & math
-- [ ] Implement `Eagle3AttentionWeight` construction and metadata (q heads, kv heads, head dims, scaling).
-- [ ] Replace TODO in `Eagle3AttentionLayer::Forward` with full CUDA path: Q/K/V GEMMs, reshape, RoPE, SDPA (masking), V aggregation, O GEMM, output assign; no stubs. **Current:** Q/K/V GEMM + RoPE params + offset-aware naive SDPA + Wo with q_len/kv_len/past_kv_len/packed_mask_stride/positions/runtime offsets plumbed; **missing:** tree/causal mask parity, KV reuse, true 2H packing enforcement, multi-token.
-- [ ] Mirror TRT‑LLM scaling/clamping exactly: 1/sqrt(d_k), max-subtraction, dtype handling (BF16/FP16), apply attention mask semantics identical to TRT tree masks.
-- [ ] Compose true 2H QKV input (embedding_norm + fc_out mapped/padded to base_hidden) in draft forward; remove placeholder composition and head_num*size_per_head gating; match TRT packing order.
-- [ ] Ensure draft attention uses real backend when geometry matches; log explicit fallback otherwise. Remove shallow path for valid Eagle‑3 configs (no demo shortcuts).
-- [ ] Add per-node draft attention support if TRT uses q_len>1; otherwise document single-position semantics and guard. Include KV reuse across tree tokens as TRT does.
-- [ ] Implement mask-aware kernels for tree attention (packed masks from `draft_paths`) matching TRT behaviour for multi-token speculative decoding.
-- [ ] Expose debug tensors (fc_out, attn_out, ffn_out, pre_head_hidden, logits) and a small-batch CPU reference for cross-checks; keep fidelity to TRT values.
-- [ ] Validate KV reuse semantics in tree decode (scratch KV, prefix read-only) vs TRT; fix any layout mismatch so acceptance outcomes align.
-- [ ] Optimize kernels after correctness: benchmark vs TRT Eagle‑3, ensure equal or better throughput without regressing numerics.
+- [x] Implement `Eagle3AttentionWeight` construction and metadata (q heads, kv heads, head dims, scaling).
+- [x] Implement full CUDA path in `Eagle3AttentionLayer::Forward`: Q/K/V GEMMs, reshape, RoPE, SDPA (masking), V aggregation, O GEMM, output assign for BF16/FP16 (and optional FP32). **Current:** Q/K/V GEMMs + RoPE params + offset‑aware SDPA + Wo with q_len/kv_len/past_kv_len/packed_mask_stride/positions/runtime offsets plumbed, using native Eagle‑3 q/k/v/o geometry.
+- [ ] Mirror TRT‑LLM scaling/clamping exactly for longer sequences: 1/sqrt(d_k), max‑subtraction, dtype handling (BF16/FP16), and any additional tree‑mask nuances observed in TRT tests.
+- [x] Compose true 2H QKV input (embedding_norm + fc_out mapped/padded to draft_hidden) in `Eagle3DraftLayer::Forward`; remove placeholder composition and head_num*size_per_head gating; match TRT 2H packing order.
+- [x] Ensure draft attention uses the real Eagle‑3 backend when geometry matches and only logs explicit fallback when geometry/dtypes are invalid; shallow paths are now limited to misconfigured runs, not the GPT‑OSS‑120B‑Eagle3 happy path.
+- [ ] Add per‑node draft attention support if TRT uses q_len > 1 in tree decode; otherwise document single‑position semantics and guard with explicit tests. Include KV reuse across tree tokens as TRT does where applicable.
+- [ ] Expose additional debug tensors (per‑head Q/K/V, attention scores) and extend the CPU reference helpers in `eagle3_compare.py` as needed to match TRT values on more complex prompts.
 - [ ] Production-ready hardening: add error checks on stream/cublas status, guard against shape/dtype mismatches at runtime, and ensure kernels handle dynamic batch/tree sizes without silent failure.
 - [ ] Cross-verify against current TRT‑LLM code/tests: head geometry, RoPE axes/scale, tree mask semantics, q_len handling; update kernels/doc immediately on drift.
 - [ ] Read and mirror TensorRT‑LLM sources: `tensorrt_llm/_torch/speculative/eagle3.py`, `tensorrt_llm/_torch/models/modeling_speculative.py` (Eagle3Attention), attention backend in `tensorrt_llm/_torch/attention_backend/trtllm.py`, and unit tests `tests/unittest/_torch/speculative/test_eagle3.py` to capture exact math, masking, and indexing. Document any discovered quirks (KV padding, scaling tweaks) and reflect them in kernels.

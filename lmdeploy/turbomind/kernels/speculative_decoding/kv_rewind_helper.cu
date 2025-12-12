@@ -90,7 +90,15 @@ void computeAndInvokeKVCacheRewind(
 
     // Copy host rewind lengths to device buffer.
     const size_t bytes = static_cast<size_t>(n) * sizeof(SizeType);
-    cudaMemcpyAsync(d_rewind_lengths, rewind_lengths.data(), bytes, cudaMemcpyHostToDevice, stream);
+    auto err = cudaMemcpyAsync(d_rewind_lengths, rewind_lengths.data(), bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess && ::turbomind::isEagleKVDebugEnabled()) {
+        std::fprintf(stderr,
+                     "[EAGLE][KVRewind] cudaMemcpyAsync rewind_lengths failed: err=%d (%s) ptr=%p bytes=%zu\n",
+                     static_cast<int>(err),
+                     cudaGetErrorString(err),
+                     static_cast<const void*>(rewind_lengths.data()),
+                     bytes);
+    }
 
     KVCacheRewindParams params{};
     params.kv_cache_blocks   = d_kv_cache_blocks;
@@ -105,6 +113,15 @@ void computeAndInvokeKVCacheRewind(
     params.stream            = stream;
 
     invokeKVCacheRewind(params);
+    if (::turbomind::isEagleKVDebugEnabled()) {
+        auto kerr = cudaGetLastError();
+        if (kerr != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[EAGLE][KVRewind] invokeKVCacheRewind kernel error: err=%d (%s)\n",
+                         static_cast<int>(kerr),
+                         cudaGetErrorString(kerr));
+        }
+    }
 }
 
 }  // namespace speculative_decoding

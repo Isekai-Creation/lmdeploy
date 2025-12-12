@@ -120,13 +120,19 @@ __global__ void prepareCtxEagleNetInputsKernel(
         hiddenStatesIndices[outputStartPos + ti] = hiddenStateIdx;
     }
     
-    // Set metadata
-    eagleNetContextLengths[bid] = numDecodingTokens;
+    // Set metadata. Some integration paths (e.g. TurboMind) may pass
+    // nullptr for lastTokenIndices/numLastTokenIndices when they only
+    // need the per-batch sequence/context lengths and not the explicit
+    // last-token index array. Guard these stores accordingly to avoid
+    // illegal memory access when those outputs are unused.
+    eagleNetContextLengths[bid]  = numDecodingTokens;
     eagleNetSequenceLengths[bid] = oldSequenceLength + numDecodingTokens;
-    lastTokenIndices[bid] = outputStartPos + numDecodingTokens;
+    if (lastTokenIndices) {
+        lastTokenIndices[bid] = outputStartPos + numDecodingTokens;
+    }
     
     // Last thread writes total count
-    if (bid == batchSize - 1) {
+    if (numLastTokenIndices && bid == batchSize - 1) {
         numLastTokenIndices[0] = batchSize;
     }
 }

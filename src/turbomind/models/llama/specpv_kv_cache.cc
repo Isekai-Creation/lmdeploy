@@ -416,7 +416,6 @@ void PartialKVCache::refresh_retrieval(int         layer_idx,
     Tensor host_q{{B, H, Q, D}, kv_dtype_, kCPU};
     Tensor host_k{{B, H, L, D}, kv_dtype_, kCPU};
     Tensor host_v{{B, H, L, D}, kv_dtype_, kCPU};
-
     core::Copy(query_states, host_q);
     core::Copy(key_states, host_k);
     core::Copy(value_states, host_v);

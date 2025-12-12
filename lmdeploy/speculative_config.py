@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Speculative decoding configuration for LMDeploy engines."""
 
+import os
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 import warnings
@@ -108,6 +109,19 @@ class SpeculativeConfig:
 
     def __post_init__(self):
         """Validate configuration and set sensible defaults."""
+        # Optional environment override for num_speculative_tokens so that
+        # callers like benchmark_speculative.py can sweep different values
+        # (2, 3, 4, 5, ...) without modifying their scripts.
+        env_num = os.getenv("TM_NUM_SPEC_TOKENS", "").strip()
+        if env_num:
+            try:
+                override = int(env_num)
+                if override > 0:
+                    self.num_speculative_tokens = override
+            except ValueError:
+                # Ignore malformed overrides and keep the configured value.
+                pass
+
         valid_methods = [
             "draft_target",  # TurboMind only
             "eagle",  # PyTorch

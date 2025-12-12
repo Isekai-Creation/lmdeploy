@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "src/turbomind/core/core.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 

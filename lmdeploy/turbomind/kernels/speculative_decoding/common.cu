@@ -433,6 +433,19 @@ void maskLogitsBasedOnEntropy(const EntropyMaskParams& p)
                                                              p.cols,
                                                              p.logits_out ? p.logits_out : const_cast<float*>(p.logits),
                                                              p.runtime_top_p);
+    if (::turbomind::isEagleDebugEnabled()) {
+        auto err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[EAGLE][EntropyMask] kernel error: err=%d (%s) rows=%d cols=%d max_tokens=%d batch=%d\n",
+                         static_cast<int>(err),
+                         cudaGetErrorString(err),
+                         p.rows,
+                         p.cols,
+                         p.max_tokens,
+                         p.batch_size);
+        }
+    }
 }
 
 // Simple row-wise softmax + entropy for float logits (unchanged).
@@ -495,6 +508,17 @@ void invokeSoftmaxWithEntropy(const float* logits,
     dim3 grid(rows);
     dim3 block(256);
     softmaxEntropyKernel<<<grid, block, 0, stream>>>(logits, probs, entropy, cols);
+    if (::turbomind::isEagleDebugEnabled()) {
+        auto err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[EAGLE][SoftmaxEntropy] kernel error: err=%d (%s) rows=%d cols=%d\n",
+                         static_cast<int>(err),
+                         cudaGetErrorString(err),
+                         rows,
+                         cols);
+        }
+    }
 }
 
 // --- Row-wise argmax with skip_decode ---
@@ -548,6 +572,17 @@ void launch_argmax_rows(const float* logits,
     dim3 grid(rows);
     dim3 block(256);
     argmaxRowsKernel<<<grid, block, 0, stream>>>(logits, rows, cols, skip_decode, out);
+    if (::turbomind::isEagleDebugEnabled()) {
+        auto err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[EAGLE][ArgmaxRows] kernel error: err=%d (%s) rows=%d cols=%d\n",
+                         static_cast<int>(err),
+                         cudaGetErrorString(err),
+                         rows,
+                         cols);
+        }
+    }
 }
 
 // --- skip_decode from generation_lengths ---
@@ -584,6 +619,18 @@ void launch_set_skip_decode(const int* generation_lengths,
     const int block  = 256;
     const int grid_x = (rows + block - 1) / block;
     setSkipDecodeKernel<<<grid_x, block, 0, stream>>>(generation_lengths, batch_size, max_tokens, skip_decode);
+    if (::turbomind::isEagleDebugEnabled()) {
+        auto err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[EAGLE][SetSkipDecode] kernel error: err=%d (%s) rows=%d batch=%d max_tokens=%d\n",
+                         static_cast<int>(err),
+                         cudaGetErrorString(err),
+                         rows,
+                         batch_size,
+                         max_tokens);
+        }
+    }
 }
 
 

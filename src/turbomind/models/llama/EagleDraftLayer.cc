@@ -10,6 +10,7 @@
 #include "src/turbomind/models/llama/unified_attention_layer.h"
 #include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include "src/turbomind/kernels/gpt_kernels.h"
+#include "src/turbomind/kernels/gemm/types.h"
 
 namespace turbomind {
 
@@ -225,13 +226,63 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     bool   have_fc = false;
     if (ffn_layer_ && captured_hidden && captured_hidden.ndim() == 2 && captured_hidden.shape(0) == batch_size
         && captured_hidden.dtype() == dtype && weight_->fc_weight) {
-        LlamaLinear&    linear_fc = ffn_layer_->linear();
+        LlamaLinear&     linear_fc = ffn_layer_->linear();
         LlamaDenseWeight fc_w;
-        fc_w.weight = weight_->fc_weight;
-        Tensor fc_out = linear_fc.Forward(captured_hidden, fc_w);
-        fc_norm       = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
-        invokeRMSNorm(fc_norm, fc_out, weight_->input_norm, rmsnorm_eps_, stream);
-        have_fc = true;
+
+        // Construct a minimal dense weight wrapper around the Eagle3 FC
+        // tensor so that LlamaLinear can run a standard row-major GEMM
+        // without relying on any quantization metadata. Geometry:
+        //   captured_hidden: [batch_size, eagle_fc_in_dim]
+        //   fc_weight:       [eagle_fc_in_dim, draft_dim]
+        const Tensor& fc_tensor = weight_->fc_weight;
+        const int     fc_in     = fc_tensor.ndim() == 2 ? fc_tensor.shape(0) : 0;
+        const int     fc_out    = fc_tensor.ndim() == 2 ? fc_tensor.shape(1) : 0;
+
+        if (fc_in > 0 && fc_out == draft_dim && captured_hidden.shape(1) == fc_in) {
+            fc_w.data_type   = dtype;
+            fc_w.input_type  = dtype;
+            fc_w.weight_type = dtype;
+            fc_w.input_dim   = fc_in;
+            fc_w.output_dim  = fc_out;
+            fc_w.group_size  = 1;
+
+            fc_w.weight = fc_tensor.borrow();
+            fc_w.bias   = {};
+
+            fc_w.weight_quant = {};
+            fc_w.input_quant  = {};
+            fc_w.weight_quant.type = gemm::QuantType::kNone;
+            fc_w.input_quant.type  = gemm::QuantType::kNone;
+
+            fc_w.epilogue = Epilogue::kNone;
+
+            fc_w.k_desc       = {};
+            fc_w.k_desc.type  = dtype;
+            fc_w.k_desc.order = gemm::kRowMajor;
+            fc_w.k_desc.rows  = fc_in;
+            fc_w.k_desc.cols  = fc_out;
+            fc_w.k_desc.ld    = fc_out;
+            fc_w.k_desc.pack  = 0;
+            fc_w.k_desc.num   = 0;
+            fc_w.k_desc.offsets = nullptr;
+            fc_w.k_desc.idxs    = nullptr;
+
+            fc_w.q_desc = {};
+
+            Tensor fc_out = linear_fc.Forward(captured_hidden, fc_w);
+            fc_norm       = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
+            invokeRMSNorm(fc_norm, fc_out, weight_->input_norm, rmsnorm_eps_, stream);
+            have_fc = true;
+        }
+        else {
+            TM_LOG_WARNING(
+                "[EAGLE3][Draft][fallback] fc_weight geometry (%d,%d) or captured_hidden width (%d) "
+                "incompatible with draft_dim=%d; skipping FC branch.",
+                fc_in,
+                fc_out,
+                captured_hidden.shape(1),
+                draft_dim);
+        }
     }
     else if (!ffn_layer_ && captured_hidden && weight_->fc_weight) {
         static bool logged_missing_ffn_fc = false;

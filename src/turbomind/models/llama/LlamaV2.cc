@@ -2051,6 +2051,12 @@ void LlamaV2::prepareEagleContextInputs(int batch_size)
     params.stream           = stream_;
 
     kernels::eagle::invokePrepareCtxEagleNetInputs(params);
+    // In EAGLE debug mode, surface any kernel errors from the context
+    // prep path immediately so that illegal memory accesses are attributed
+    // to the correct stage rather than leaking into later alloc/copy calls.
+    if (isEagleDebugEnabled()) {
+        sync_check_cuda_error();
+    }
 }
 
 void LlamaV2::Forward(Buffer_<int>     input_ids,

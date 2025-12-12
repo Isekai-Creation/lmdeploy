@@ -350,9 +350,6 @@ int Gemm::Run(const Operation&    operation,
     if (std::tie(gdesc.striding_a, gdesc.striding_b, gdesc.striding_c) != flat3) {
         cublas_ok = false;
     }
-    if (std::tie(gdesc.pack_a, gdesc.pack_b, gdesc.pack_u, gdesc.pack_v) != std::tuple{0, 0, 0, 0}) {
-        cublas_ok = false;
-    }
     if (gdesc.epilogue != Epilogue::kNone) {
         cublas_ok = false;
     }
@@ -362,7 +359,10 @@ int Gemm::Run(const Operation&    operation,
     if (gdesc.quant_a || gdesc.quant_b) {
         cublas_ok = false;
     }
-    if (gdesc.group_axis >= 0) {
+    // Allow grouped descriptors to use the cuBLAS fallback when they
+    // effectively represent a single GEMM (num == 1). For true grouped
+    // problems (num > 1), keep using the fused kernels only.
+    if (gdesc.group_axis >= 0 && gdesc.num > 1) {
         cublas_ok = false;
     }
     if (gdesc.type_a != kHalf && gdesc.type_a != kBfloat16 && gdesc.type_a != kFloat) {
