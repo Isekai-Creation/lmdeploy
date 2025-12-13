@@ -144,14 +144,27 @@ beat baseline, not only 4–5.
 - `[~]` Re‑run:
   - `SCENARIOS=baseline,single,large-context ./run_spec_suite.sh`
   - For each context (8K/16K/32K) and `num_spec_tokens ∈ {2,3,4,5}`.
-- Current observations after dense BF16 GMMA + initial tuning:
-  - 32K single:
-    - Baseline ≈112 tok/s; `num_spec_tokens=3` ≈100 tok/s (slightly slower),
-      `num_spec_tokens=5` still slower than baseline in untuned runs, but can
-      approach ≈1× when using a tuned dispatch cache.
-  - 16K batch4 and 8K batch8:
-    - Baseline is still far ahead; EAGLE3 remains <1× for all tested
-      `num_spec_tokens`, indicating pipeline (tree/tail) overhead dominates.
+- Current observations after dense BF16 GMMA + initial tuning + Eagle3
+  gemm2 wiring on this sm120 box (prefix caching 0.75, Harmony disabled):
+  - 32K single (`results/20251213_023905`):
+    - Baseline: throughput_tokens_per_sec.mean ≈ **115.6 tok/s**.
+    - Speculative:
+      - `num_spec_tokens=2`: ≈ **30.9 tok/s**, mean_accept_len ≈ 2.33.
+      - `num_spec_tokens=3`: ≈ **111.6 tok/s**, mean_accept_len ≈ 3.22
+        (now ~0.97× baseline, improved from ~0.93× before gemm2 wiring).
+      - `num_spec_tokens=4`: ≈ **56.7 tok/s**, mean_accept_len ≈ 4.57.
+      - `num_spec_tokens=5`: ≈ **11.3 tok/s**, mean_accept_len ≈ 3.83.
+  - 16K batch4 (`results/20251213_024340`):
+    - Baseline_Batch4_Context16K:
+      - throughput_tokens_per_sec.mean ≈ **333.3 tok/s**.
+    - Speculative_Batch4_Context16K:
+      - `num_spec_tokens=2`: ≈ **107.9 tok/s**, mean_accept_len ≈ 2.0.
+      - `num_spec_tokens=3`: ≈ **165.2 tok/s**, mean_accept_len ≈ 3.08.
+      - `num_spec_tokens=4`: ≈ **169.1 tok/s**, mean_accept_len ≈ 2.13.
+      - `num_spec_tokens=5`: ≈ **181.1 tok/s**, mean_accept_len ≈ 2.33.
+    - EAGLE3 remains <1× baseline on 16K batch4; acceptance is healthy, so
+      the remaining gap is dominated by draft compute + SDPA + tail/pipeline
+      structure rather than pure GEMM throughput.
 - Targets remain:
   - 2–3‑token EAGLE3 should at least match or beat baseline at 8K/16K.
   - 2–3‑token EAGLE3 at 32K should reach **2–3×** baseline once kernels

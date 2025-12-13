@@ -4,7 +4,11 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cub/cub.cuh>
+#include <cstdlib>
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/kernels/gemm/gemm.h"
+#include "src/turbomind/kernels/gemm/types.h"
+#include "src/turbomind/core/data_type.h"
 
 namespace turbomind {
 namespace ft {
@@ -137,6 +141,171 @@ __global__ void apply_rope_kernel(T*       q_ptr,
     }
 }
 
+template<typename T, int kMaxHeadDim>
+__global__ void sdpa_streaming_kernel(const T* __restrict__ q_ptr,
+                                      const T* __restrict__ k_ptr,
+                                      const T* __restrict__ v_ptr,
+                                      T* __restrict__       ctx_ptr,
+                                      int                   token_num,
+                                      int                   batch_size,
+                                      int                   q_len,
+                                      int                   kv_len,
+                                      int                   num_q_heads,
+                                      int                   num_kv_heads,
+                                      int                   head_dim,
+                                      int                   past_kv_len,
+                                      const int*            position_ids,
+                                      const int32_t*        packed_mask,
+                                      int                   packed_stride,
+                                      const int32_t*        runtime_offsets,
+                                      const int32_t*        tree_offsets,
+                                      const int32_t*        kv_lens_runtime,
+                                      const int32_t*        successor_offsets,
+                                      const int32_t*        successor_counts)
+{
+    const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = token_num * num_q_heads;
+    if (idx >= total) {
+        return;
+    }
+
+    const int head      = idx % num_q_heads;
+    const int token_idx = idx / num_q_heads;
+    const int batch     = q_len > 0 ? token_idx / q_len : 0;
+    const int q_pos     = q_len > 0 ? token_idx % q_len : token_idx;
+    const int q_token_offset = token_idx;
+
+    const int group_size = num_kv_heads > 0 ? (num_q_heads + num_kv_heads - 1) / num_kv_heads : 1;
+    const int kv_head    = head / group_size;
+    if (kv_head >= num_kv_heads) {
+        return;
+    }
+
+    const T* q = q_ptr + (token_idx * num_q_heads + head) * head_dim;
+
+    int kv_start = 0;
+    int kv_end   = kv_len;
+    auto clamp_span = [&](int start, int end) {
+        kv_start = max(kv_start, start);
+        kv_end   = min(kv_end, end);
+    };
+    if (runtime_offsets) {
+        clamp_span(runtime_offsets[batch], runtime_offsets[batch + 1]);
+    }
+    if (tree_offsets) {
+        clamp_span(tree_offsets[batch], tree_offsets[batch + 1]);
+    }
+    if (successor_offsets) {
+        const int succ_start = successor_offsets[batch];
+        const int succ_end   = successor_counts ? (succ_start + successor_counts[batch])
+                                                : successor_offsets[batch + 1];
+        clamp_span(succ_start, succ_end);
+    }
+    if (kv_lens_runtime) {
+        clamp_span(0, kv_lens_runtime[batch]);
+    }
+    if (packed_mask && packed_stride > 0) {
+        clamp_span(kv_start, min(kv_end, packed_stride * 32));
+    }
+
+    kv_start        = max(0, min(kv_start, kv_len));
+    kv_end          = max(0, min(kv_end, kv_len));
+    const int kv_len_slot = kv_end - kv_start;
+
+    if (kv_len_slot <= 0) {
+        return;
+    }
+
+    const int   pos_idx_q  = position_ids ? min(q_token_offset, token_num - 1) : q_token_offset;
+    const int   q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start + q_pos);
+    const float inv_sqrt   = rsqrtf(static_cast<float>(head_dim));
+
+    if (head_dim > kMaxHeadDim) {
+        return;
+    }
+
+    // Cache Q in registers to avoid reloading it from global memory for
+    // every KV position. head_dim is small (e.g. 64), so this is cheap.
+    float q_reg[kMaxHeadDim];
+    float ctx_acc[kMaxHeadDim];
+    for (int d = 0; d < head_dim; ++d) {
+        q_reg[d]  = to_float(q[d]);
+        ctx_acc[d] = 0.f;
+    }
+
+    float m     = -1e20f;
+    float sum_w = 0.f;
+
+    for (int j = 0; j < kv_len_slot; ++j) {
+        const int k_token_offset = batch * kv_len + (kv_start + j);
+        const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+
+        float dot = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += q_reg[d] * to_float(k[d]);
+        }
+
+        const int   pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
+        const int   kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
+        bool        allowed_pos = kv_position <= q_position;
+        if (!allowed_pos) {
+            continue;
+        }
+
+        if (packed_mask && packed_stride > 0) {
+            const int     j_off_mask = kv_start + j;
+            const int32_t mask_val   = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+            const bool    allowed    = (mask_val >> (j_off_mask & 31)) & 1;
+            if (!allowed) {
+                continue;
+            }
+        }
+
+        const float score = dot * inv_sqrt;
+
+        if (sum_w == 0.f && m <= -1e19f) {
+            // First valid element.
+            const int v_token_offset = batch * kv_len + (kv_start + j);
+            const T*  v              = v_ptr + (v_token_offset * num_kv_heads + kv_head) * head_dim;
+
+            m     = score;
+            sum_w = 1.f;
+            for (int d = 0; d < head_dim; ++d) {
+                ctx_acc[d] = to_float(v[d]);
+            }
+            continue;
+        }
+
+        if (score <= m) {
+            const float e = __expf(score - m);
+            sum_w += e;
+
+            const int v_token_offset = batch * kv_len + (kv_start + j);
+            const T*  v              = v_ptr + (v_token_offset * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                ctx_acc[d] += e * to_float(v[d]);
+            }
+        }
+        else {
+            const float e = __expf(m - score);
+            sum_w = sum_w * e + 1.f;
+
+            const int v_token_offset = batch * kv_len + (kv_start + j);
+            const T*  v              = v_ptr + (v_token_offset * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                ctx_acc[d] = ctx_acc[d] * e + to_float(v[d]);
+            }
+            m = score;
+        }
+    }
+
+    T* ctx = ctx_ptr + (token_idx * num_q_heads + head) * head_dim;
+    const float inv_sum = sum_w > 0.f ? (1.f / sum_w) : 0.f;
+    for (int d = 0; d < head_dim; ++d) {
+        ctx[d] = from_float<T>(ctx_acc[d] * inv_sum);
+    }
+}
+
 template<typename T>
 __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
                             const T* __restrict__ k_ptr,
@@ -212,10 +381,11 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
         return;
     }
 
-    const int pos_idx_q  = position_ids ? min(q_token_offset, token_num - 1) : q_token_offset;
-    const int q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start + q_pos);
-    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
+    const int   pos_idx_q  = position_ids ? min(q_token_offset, token_num - 1) : q_token_offset;
+    const int   q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start + q_pos);
+    const float inv_sqrt   = rsqrtf(static_cast<float>(head_dim));
 
+    // Three-pass implementation: max-score, sum-exp, then context accumulation.
     float max_score = -1e20f;
     for (int j = 0; j < kv_len_slot; ++j) {
         const int k_token_offset = batch * kv_len + (kv_start + j);
@@ -414,26 +584,55 @@ void launch_sdpa_kernel(const T* q_ptr,
     const int32_t* succ_cnt =
         (successor_counts && successor_counts->dtype() == kInt32) ? successor_counts->data<int32_t>() : nullptr;
 
-    sdpa_kernel<T><<<grid, kBlock, 0, stream>>>(q_ptr,
-                                                k_ptr,
-                                                v_ptr,
-                                                ctx_ptr,
-                                                token_num,
-                                                batch_size,
-                                                q_len,
-                                                kv_len,
-                                                num_q_heads,
-                                                num_kv_heads,
-                                                head_dim,
-                                                past_kv_len,
-                                                pos_ptr,
-                                                packed,
-                                                packed_stride_val,
-                                                runtime,
-                                                tree,
-                                                kv_runtime,
-                                                succ_off,
-                                                succ_cnt);
+    constexpr int kMaxHeadDim = 256;
+    const char*   env         = std::getenv("TM_ENABLE_EAGLE3_SDPA_STREAMING");
+    const bool    use_streaming =
+        (env && env[0] != '\0' && head_dim <= kMaxHeadDim && head_dim > 0 && head_dim <= kMaxHeadDim);
+
+    if (use_streaming) {
+        sdpa_streaming_kernel<T, kMaxHeadDim><<<grid, kBlock, 0, stream>>>(q_ptr,
+                                                                           k_ptr,
+                                                                           v_ptr,
+                                                                           ctx_ptr,
+                                                                           token_num,
+                                                                           batch_size,
+                                                                           q_len,
+                                                                           kv_len,
+                                                                           num_q_heads,
+                                                                           num_kv_heads,
+                                                                           head_dim,
+                                                                           past_kv_len,
+                                                                           pos_ptr,
+                                                                           packed,
+                                                                           packed_stride_val,
+                                                                           runtime,
+                                                                           tree,
+                                                                           kv_runtime,
+                                                                           succ_off,
+                                                                           succ_cnt);
+    }
+    else {
+        sdpa_kernel<T><<<grid, kBlock, 0, stream>>>(q_ptr,
+                                                    k_ptr,
+                                                    v_ptr,
+                                                    ctx_ptr,
+                                                    token_num,
+                                                    batch_size,
+                                                    q_len,
+                                                    kv_len,
+                                                    num_q_heads,
+                                                    num_kv_heads,
+                                                    head_dim,
+                                                    past_kv_len,
+                                                    pos_ptr,
+                                                    packed,
+                                                    packed_stride_val,
+                                                    runtime,
+                                                    tree,
+                                                    kv_runtime,
+                                                    succ_off,
+                                                    succ_cnt);
+    }
 }
 
 template<typename T>
@@ -448,6 +647,145 @@ void launch_expand_kv_to_q_kernel(const Tensor& kv, Tensor& q_expanded, int kv_h
 }
 
 // Global launchers
+namespace {
+
+struct Eagle3GemmWorkspace {
+    gemm::Gemm     gemm;
+    gemm::Workspace workspace{};
+    bool           initialized{false};
+};
+
+inline Eagle3GemmWorkspace& get_eagle3_gemm_workspace()
+{
+    static Eagle3GemmWorkspace ws;
+    return ws;
+}
+
+template<typename T>
+bool launch_eagle3_matmul_gemm(const T* A,
+                               const T* B,
+                               T*       C,
+                               int      M,
+                               int      K,
+                               int      N,
+                               cudaStream_t stream)
+{
+    using namespace gemm;
+
+    if (M == 0 || K == 0 || N == 0) {
+        return true;
+    }
+
+    const int sm = getSMVersion();
+    if (!(std::is_same_v<T, half_t>
+#if ENABLE_BF16
+          || std::is_same_v<T, bfloat16_t>
+#endif
+          )
+        || sm < 120) {
+        return false;
+    }
+
+    auto& ctx = get_eagle3_gemm_workspace();
+    if (!ctx.initialized) {
+        ctx.workspace.barriers_size   = Gemm::kBarriersSize;
+        ctx.workspace.partials_size   = Gemm::kPartialsSize;
+        ctx.workspace.tensormaps_size = 8192 * 128;
+
+        check_cuda_error(cudaMalloc(&ctx.workspace.barriers, ctx.workspace.barriers_size));
+        check_cuda_error(cudaMalloc(&ctx.workspace.partials, ctx.workspace.partials_size));
+        check_cuda_error(cudaMalloc(&ctx.workspace.tensormaps, ctx.workspace.tensormaps_size));
+        check_cuda_error(cudaMemsetAsync(ctx.workspace.barriers, 0, ctx.workspace.barriers_size, stream));
+        check_cuda_error(cudaMalloc(&ctx.workspace.flags, sizeof(int)));
+
+        ctx.initialized = true;
+    }
+
+    Operation op{};
+    op.dispatch        = DispatchPolicy::kReuse;
+    op.epilogue        = Epilogue::kNone;
+    op.quant_a         = QuantDesc{QuantType::kNone, 0};
+    op.quant_b         = QuantDesc{QuantType::kNone, 0};
+    op.batch_dim       = 0;
+
+    MatrixLayout Adesc{};
+    Adesc.type   = data_type_v<T>;
+    Adesc.order  = kRowMajor;
+    Adesc.rows   = M;
+    Adesc.cols   = K;
+    Adesc.ld     = K;
+    Adesc.pack   = 0;
+    Adesc.num    = 0;
+    Adesc.offsets = nullptr;
+    Adesc.idxs    = nullptr;
+
+    MatrixLayout Bdesc{};
+    Bdesc.type   = data_type_v<T>;
+    Bdesc.order  = kColMajor;
+    Bdesc.rows   = K;
+    Bdesc.cols   = N;
+    Bdesc.ld     = K;
+    Bdesc.pack   = 0;
+    Bdesc.num    = 0;
+    Bdesc.offsets = nullptr;
+    Bdesc.idxs    = nullptr;
+
+    MatrixLayout Cdesc{};
+    Cdesc.type   = data_type_v<T>;
+    Cdesc.order  = kRowMajor;
+    Cdesc.rows   = M;
+    Cdesc.cols   = N;
+    Cdesc.ld     = N;
+    Cdesc.pack   = 0;
+    Cdesc.num    = 0;
+    Cdesc.offsets = nullptr;
+    Cdesc.idxs    = nullptr;
+
+    const void* A_ptr = static_cast<const void*>(A);
+    const void* B_ptr = static_cast<const void*>(B);
+    void*       D_ptr = static_cast<void*>(C);
+
+    const void* U_ptr = nullptr;
+    const void* V_ptr = nullptr;
+    MatrixLayout Udesc{};
+    MatrixLayout Vdesc{};
+
+    const void* C_in_ptr = nullptr;
+
+    const int ec = ctx.gemm.Run(op,
+                                1.0f,
+                                A_ptr,
+                                Adesc,
+                                U_ptr,
+                                Udesc,
+                                B_ptr,
+                                Bdesc,
+                                V_ptr,
+                                Vdesc,
+                                0.0f,
+                                C_in_ptr,
+                                Cdesc,
+                                D_ptr,
+                                Cdesc,
+                                ctx.workspace,
+                                stream);
+
+    if (ec != 0) {
+        TM_LOG_ERROR(
+            "[EAGLE3][GEMM][fallback] Gemm::Run failed with error=%d for shape M=%d K=%d N=%d; "
+            "falling back to naive row-major kernel.",
+            ec,
+            M,
+            K,
+            N);
+        return false;
+    }
+
+    return true;
+}
+
+}  // namespace
+
 template<typename T>
 void launch_eagle3_matmul_rowmajor_dispatch(const T* A,
                                             const T* B,
@@ -457,7 +795,9 @@ void launch_eagle3_matmul_rowmajor_dispatch(const T* A,
                                             int      N,
                                             cudaStream_t stream)
 {
-    launch_matmul_rowmajor_impl<T>(A, B, C, M, K, N, stream);
+    if (!launch_eagle3_matmul_gemm<T>(A, B, C, M, K, N, stream)) {
+        launch_matmul_rowmajor_impl<T>(A, B, C, M, K, N, stream);
+    }
 }
 
 

@@ -132,4 +132,153 @@ void invokeLengthCriterion(bool*        finished,  //
     length_criterion<<<grid, block, 0, stream>>>(finished, sequence_limit_length, batch_size, beam_width, step);
 }
 
+namespace {
+
+struct TailParams {
+    int*       output_ids;
+    int*       sequence_length;
+    bool*      finished;
+    const int* sequence_limit_length;
+
+    const int* forced_tokens;
+    const int* forced_lengths;
+    int*       committed_lengths;
+
+    const int* eos_ids;
+    const int* eos_counts;
+
+    int batch_size;
+    int max_tail_len;
+    int max_seq_len;
+    int max_eos_per_slot;
+    int step;
+};
+
+__global__ void apply_forced_tail_kernel(TailParams params)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= params.batch_size) {
+        return;
+    }
+
+    bool finished = params.finished ? params.finished[i] : false;
+    int  seq_len  = params.sequence_length ? params.sequence_length[i] : 0;
+
+    const int limit = params.sequence_limit_length ? params.sequence_limit_length[i] : 0;
+
+    int tail_len = params.forced_lengths ? params.forced_lengths[i] : 0;
+    if (finished || tail_len <= 0 || params.max_tail_len <= 0) {
+        if (params.committed_lengths) {
+            params.committed_lengths[i] = 0;
+        }
+        return;
+    }
+
+    if (tail_len > params.max_tail_len) {
+        tail_len = params.max_tail_len;
+    }
+
+    int committed = 0;
+
+    for (int t = 0; t < tail_len; ++t) {
+        if (finished) {
+            break;
+        }
+
+        const int pos = params.step + 1 + t;
+        if (pos < 0 || pos >= params.max_seq_len) {
+            break;
+        }
+
+        if (limit > 0 && pos >= limit) {
+            finished = true;
+            break;
+        }
+
+        const int value =
+            params.forced_tokens ? params.forced_tokens[i * params.max_tail_len + t] : -1;
+
+        if (params.output_ids) {
+            params.output_ids[pos * params.batch_size + i] = value;
+        }
+
+        ++seq_len;
+        ++committed;
+
+        if (limit > 0 && seq_len >= limit) {
+            finished = true;
+            break;
+        }
+
+        const int eos_count = params.eos_counts ? params.eos_counts[i] : 0;
+        if (params.eos_ids && eos_count > 0 && params.max_eos_per_slot > 0) {
+            const int base = i * params.max_eos_per_slot;
+            for (int k = 0; k < eos_count && k < params.max_eos_per_slot; ++k) {
+                const int eos = params.eos_ids[base + k];
+                if (value == eos) {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (params.sequence_length) {
+        params.sequence_length[i] = seq_len;
+    }
+    if (params.finished) {
+        params.finished[i] = finished;
+    }
+    if (params.committed_lengths) {
+        params.committed_lengths[i] = committed;
+    }
+}
+
+}  // namespace
+
+void invokeApplyForcedTail(const int*   forced_tokens,
+                           const int*   forced_lengths,
+                           int*         output_ids,
+                           int*         sequence_length,
+                           bool*        finished,
+                           const int*   sequence_limit_length,
+                           const int*   eos_ids,
+                           const int*   eos_counts,
+                           int          max_eos_per_slot,
+                           int*         committed_lengths,
+                           int          batch_size,
+                           int          max_tail_len,
+                           int          max_seq_len,
+                           int          step,
+                           cudaStream_t stream)
+{
+    TM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    if (!forced_tokens || !forced_lengths || batch_size <= 0 || max_tail_len <= 0 || max_seq_len <= 0) {
+        return;
+    }
+
+    TailParams params{};
+    params.output_ids            = output_ids;
+    params.sequence_length       = sequence_length;
+    params.finished              = finished;
+    params.sequence_limit_length = sequence_limit_length;
+    params.forced_tokens         = forced_tokens;
+    params.forced_lengths        = forced_lengths;
+    params.committed_lengths     = committed_lengths;
+    params.eos_ids               = eos_ids;
+    params.eos_counts            = eos_counts;
+    params.batch_size            = batch_size;
+    params.max_tail_len          = max_tail_len;
+    params.max_seq_len           = max_seq_len;
+    params.max_eos_per_slot      = max_eos_per_slot;
+    params.step                  = step;
+
+    const int block = 256;
+    const int grid  = (batch_size + block - 1) / block;
+
+    apply_forced_tail_kernel<<<grid, block, 0, stream>>>(params);
+    sync_check_cuda_error();
+}
+
 }  // namespace turbomind

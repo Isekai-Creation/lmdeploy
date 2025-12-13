@@ -88,6 +88,15 @@ struct AttentionParams {
     float* partial_O;
     float* partial_ML;
 
+    const int32_t* spec_kv_start_per_token{nullptr};
+    const int32_t* spec_kv_len_per_token{nullptr};
+    const int32_t* spec_token2seq{nullptr};
+    const int32_t* spec_runtime_offsets{nullptr};
+    const int32_t* spec_tree_offsets{nullptr};
+    const int32_t* spec_successor_offsets{nullptr};
+    const int32_t* spec_successor_counts{nullptr};
+    int            spec_tree_batch_size{0};
+
     // context parallel
     int                 cp_rank{0};
     cutlass::FastDivmod cp_size{1};
