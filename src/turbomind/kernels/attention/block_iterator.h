@@ -12,12 +12,14 @@ struct BlockIterator {
 
     BlockHead block_head_;
     char**    block_ptrs_;
+    char**    scale_block_ptrs_{};
 
     char* block_{};
     int   block_id_{};
     int   block_ti_{};
 
-    __device__ BlockIterator(BlockHead block_head, char** block_ptrs): block_head_{block_head}, block_ptrs_{block_ptrs}
+    __device__ BlockIterator(BlockHead block_head, char** block_ptrs, char** scale_block_ptrs):
+        block_head_{block_head}, block_ptrs_{block_ptrs}, scale_block_ptrs_{scale_block_ptrs}
     {
     }
 
@@ -66,6 +68,7 @@ struct BlockIteratorFactory {
 
     BlockLayout_ block_layout_;
     char**       block_ptrs_;
+    char**       scale_block_ptrs_;
     const int*   cu_block_nums_;
     int          layer_idx_;
 
@@ -73,9 +76,10 @@ struct BlockIteratorFactory {
     {
         block::Head<T, Tkv, BlockLayout> head{block_layout_, layer_idx_, head_idx};
 
-        char** block_ptrs = block_ptrs_ + cu_block_nums_[batch_idx];
+        char** block_ptrs       = block_ptrs_ + cu_block_nums_[batch_idx];
+        char** scale_block_ptrs = scale_block_ptrs_ ? scale_block_ptrs_ + cu_block_nums_[batch_idx] : nullptr;
 
-        return BlockIterator<block::Head<T, Tkv, BlockLayout>, CTA_S>{head, block_ptrs};
+        return BlockIterator<block::Head<T, Tkv, BlockLayout>, CTA_S>{head, block_ptrs, scale_block_ptrs};
     }
 };
 
@@ -90,6 +94,7 @@ struct CreateCacheIterFactory<CacheIterFactory, std::void_t<typename CacheIterFa
         return {
             BlockLayout{BlockConfig{param.num_kv_heads, param.block_iter_params.block_len}},
             param.block_iter_params.block_ptrs,
+            param.block_iter_params.scale_block_ptrs,
             param.block_iter_params.cu_block_nums,
             param.block_iter_params.layer_id,
         };

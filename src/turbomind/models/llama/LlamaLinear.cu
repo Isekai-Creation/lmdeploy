@@ -15,6 +15,7 @@
 #include "src/turbomind/models/llama/LlamaLinear.h"
 
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 
@@ -259,22 +260,15 @@ struct LlamaLinear::Impl {
             desc_D.offsets = const_cast<int*>(offsets.data());
         }
 
-        if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_GEMM_SHAPE_LOG")) {
+        if (isEnvVarEnabled("LMDEPLOY_EAGLE_GEMM_SHAPE_LOG")) {
             static int logged = 0;
-            // Log only a limited number of shapes to avoid console spam.
             if (logged < 64) {
-                TM_LOG_INFO(
-                    "[EAGLE3][GEMM] op=MxKxN(%d,%d,%d) dtype=%d weight_dtype=%d input_dtype=%d orderA=%d "
-                    "orderB=%d orderD=%d",
-                    desc_A.rows,
-                    desc_A.cols,
-                    desc_D.cols,
-                    static_cast<int>(dense.data_type),
-                    static_cast<int>(dense.weight_type),
-                    static_cast<int>(dense.input_type),
-                    static_cast<int>(desc_A.order),
-                    static_cast<int>(desc_B.order),
-                    static_cast<int>(desc_D.order));
+                logEagleGemmShape("LLAMA_LINEAR",
+                                  desc_A.rows,
+                                  desc_A.cols,
+                                  desc_D.cols,
+                                  static_cast<int>(dense.data_type),
+                                  desc_A.order == kRowMajor ? "row_major" : "col_major");
                 ++logged;
             }
         }
@@ -308,6 +302,18 @@ struct LlamaLinear::Impl {
             if (no_quant && (dense.data_type == kBfloat16 || dense.data_type == kFloat16)
                 && dense.data_type == dense.weight_type && dense.data_type == dense.input_type
                 && desc_A.order == kRowMajor && desc_B.order == kRowMajor && desc_D.order == kRowMajor) {
+                const bool perf_mode = isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
+                const char* current_tag = eagleCurrentGemmTag();
+                if (perf_mode && current_tag && std::strncmp(current_tag, "EAGLE3_", 7) == 0) {
+                    TM_LOG_ERROR(
+                        "[LlamaLinear][fallback] GEMM fallback in PERF_MODE for Eagle3 tag=%s "
+                        "M=%d K=%d N=%d; aborting.",
+                        current_tag,
+                        desc_A.rows,
+                        desc_A.cols,
+                        desc_D.cols);
+                    std::abort();
+                }
                 TM_LOG_ERROR(
                     "[LlamaLinear][fallback] GEMM failed for dtype=%d; falling back to naive row-major matmul.",
                     static_cast<int>(dense.data_type));

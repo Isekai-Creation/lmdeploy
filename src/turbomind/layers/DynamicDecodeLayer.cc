@@ -169,12 +169,28 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
 
     int max_seq_len   = 0;
     int stride_batch  = 0;
+    const auto is_perf_mode = []() {
+        const char* v = std::getenv("LMDEPLOY_EAGLE_PERF_MODE");
+        if (!v || !v[0]) {
+            return false;
+        }
+        return !(v[0] == '0' && v[1] == '\0');
+    };
+
     if (output_ids.ndim() >= 2) {
         // Normal case: output_ids is [max_seq_len, stride_batch, ...]
         max_seq_len  = output_ids.shape(0);
         stride_batch = (output_ids.ndim() >= 2) ? output_ids.shape(1) : batch_size;
     }
     else {
+        if (is_perf_mode()) {
+            TM_LOG_ERROR(
+                "%s: PERF_MODE requires output_ids to have ndim>=2; got ndim=%d. "
+                "Caller must provide explicit 2D/3D layout; aborting.",
+                __PRETTY_FUNCTION__,
+                output_ids.ndim());
+            std::abort();
+        }
         // Flat layout: infer [max_seq_len, stride_batch] from total size.
         // Prefer the engine's max_batch_size_ as the physical stride,
         // falling back to the logical batch_size only when that matches.

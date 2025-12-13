@@ -174,6 +174,10 @@ struct LlamaFfnWeight: core::Module {
     bool is_fused_silu{};
 
     int tp_rank{};
+
+    // Optional debug identifier used by Eagle3 draft wiring so that FFN
+    // GEMMs can be attributed unambiguously in logging and fallback paths.
+    const char* debug_name{nullptr};
 };
 
 struct MoeFfnWeight: core::Module {

@@ -13,6 +13,7 @@
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 #include <cublas_v2.h>
 #include <algorithm>
 #include <iterator>
@@ -224,6 +225,23 @@ struct Gemm::Impl {
     LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size, size_t partials_size)
     {
         const auto& desc = ctx.desc();
+        const bool  perf_mode =
+            ::turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
+        const char* current_tag = ::turbomind::eagleCurrentGemmTag();
+        const bool  is_eagle3_tag =
+            current_tag && std::strncmp(current_tag, "EAGLE3_", 7) == 0;
+
+        auto abort_if_eagle3_perf_generic = [&]() {
+            if (perf_mode && is_eagle3_tag) {
+                TM_LOG_ERROR(
+                    "[Gemm2] Eagle3 GEMM dispatched without tuned cache entry in PERF_MODE "
+                    "(tag=%s problem=%s); aborting.",
+                    current_tag,
+                    to_string(desc).c_str());
+                std::abort();
+            }
+        };
+
         if (policy & DispatchPolicy::kReuse) {
             if (auto spec = cache_.LowerBound(desc)) {
                 return *spec;
@@ -232,15 +250,18 @@ struct Gemm::Impl {
                 std::cerr << "Failed to find a feasible kernel in the cache, will dispatch by heuristic: "
                           << to_string(ctx.desc()) << std::endl;
             }
+            abort_if_eagle3_perf_generic();
         }
 
         if (auto spec = cache_.Find(desc)) {
+            abort_if_eagle3_perf_generic();
             return *spec;
         }
 
         auto specs = Find(ctx, barriers_size, partials_size, 1);
         if (!specs.empty()) {
             cache_.Insert(desc, specs.front());
+            abort_if_eagle3_perf_generic();
             return specs.front();
         }
         return {};

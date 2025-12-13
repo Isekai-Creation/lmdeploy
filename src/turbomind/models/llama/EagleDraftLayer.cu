@@ -446,7 +446,17 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
 
             fc_w.q_desc = {};
 
-            Tensor fc_out = linear_fc.Forward(captured_hidden, fc_w);
+            if (isEnvVarEnabled("LMDEPLOY_EAGLE_GEMM_SHAPE_LOG")) {
+                logEagleGemmShape("EAGLE3_FC",
+                                  batch_size,
+                                  fc_in,
+                                  fc_out,
+                                  static_cast<int>(dtype),
+                                  "row_major");
+            }
+
+            EagleGemmTagGuard gemm_guard("EAGLE3_FC");
+            Tensor            fc_out = linear_fc.Forward(captured_hidden, fc_w);
             fc_norm       = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
             invokeRMSNorm(fc_norm, fc_out, weight_->input_norm, rmsnorm_eps_, stream);
             have_fc = true;

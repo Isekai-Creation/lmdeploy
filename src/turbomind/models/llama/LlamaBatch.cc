@@ -631,7 +631,8 @@ void LlamaBatch::Initialize(GenerationState& g)
         // Prepare intermediate buffers
         h_cu_block_counts_[0] = 0;
 
-        auto block_ptrs = h_block_ptrs_.data();
+        auto block_ptrs       = h_block_ptrs_.data();
+        auto scale_block_ptrs = h_scale_block_ptrs_.data();
 
         const int batch_size = state_->active_size;
 
@@ -644,12 +645,22 @@ void LlamaBatch::Initialize(GenerationState& g)
             block_ptrs = std::transform(seq.blocks.cbegin(), seq.blocks.cend(), block_ptrs, [&](int block_id) {
                 return reinterpret_cast<uintptr_t>(sequence_manager_->GetBlockPtr(block_id));
             });
+
+            if (sequence_manager_->GetScaleBlockPtr(0)) {
+                scale_block_ptrs =
+                    std::transform(seq.blocks.cbegin(), seq.blocks.cend(), scale_block_ptrs, [&](int block_id) {
+                        return reinterpret_cast<uintptr_t>(sequence_manager_->GetScaleBlockPtr(block_id));
+                    });
+            }
         }
 
         static_assert(sizeof(uintptr_t) == sizeof(void*));
 
         Copy(h_cu_block_counts_, batch_size + 1, cu_block_counts_);
         Copy(h_block_ptrs_, h_cu_block_counts_[batch_size], block_ptrs_);
+        if (sequence_manager_->GetScaleBlockPtr(0)) {
+            Copy(h_scale_block_ptrs_, h_cu_block_counts_[batch_size], scale_block_ptrs_);
+        }
     }
 
     const int batch_size = state_->active_size;
@@ -793,8 +804,9 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
 
     sequence_lengths_ = {batchxbeam, kDEVICE};
 
-    cu_block_counts_ = {batch_size + 1, kDEVICE};
-    block_ptrs_      = {max_batch_block_count, kDEVICE};
+    cu_block_counts_  = {batch_size + 1, kDEVICE};
+    block_ptrs_       = {max_batch_block_count, kDEVICE};
+    scale_block_ptrs_ = {max_batch_block_count, kDEVICE};
 
     sampled_logprobs_ = {batchxbeam * kMaxLogProb, kDEVICE};
     sampled_indexes_  = {batchxbeam * kMaxLogProb, kDEVICE};
@@ -840,6 +852,7 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
     h_input_length_buf_ = {batch_size, kCPUpinned};
     h_cu_block_counts_  = {batch_size + 1, kCPUpinned};
     h_block_ptrs_       = {(ssize_t)max_batch_block_count, kCPUpinned};
+    h_scale_block_ptrs_ = {(ssize_t)max_batch_block_count, kCPUpinned};
 
     for (auto& s : states_) {
         s.h_prompt_length  = {batch_size, kCPUpinned};
@@ -1035,6 +1048,28 @@ void LlamaBatch::disableEagleMultitokenForSlot(int slot, const char* reason)
     }
 
     eagle_disable_multitoken_slot_[slot] = 1;
+
+    static std::atomic<int> disabled_finished{0};
+    static std::atomic<int> disabled_other{0};
+
+    const bool perf_mode = isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
+    const bool is_finished_reason =
+        (reason != nullptr) && (std::strstr(reason, "finished slot") != nullptr);
+
+    if (is_finished_reason) {
+        ++disabled_finished;
+    }
+    else {
+        ++disabled_other;
+        if (perf_mode) {
+            TM_LOG_ERROR(
+                "[LlamaBatch][EAGLE][fatal] disableEagleMultitokenForSlot called for non-terminal slot=%d "
+                "reason=\"%s\" in PERF_MODE; aborting.",
+                slot,
+                reason ? reason : "(null)");
+            std::abort();
+        }
+    }
 
     if (tp_rank_ == 0) {
         TM_LOG_WARNING(
@@ -1557,6 +1592,7 @@ void LlamaBatch::FreeBuffer()
     sequence_lengths_    = {};
     cu_block_counts_     = {};
     block_ptrs_          = {};
+    scale_block_ptrs_    = {};
     sampled_logprobs_    = {};
     sampled_indexes_     = {};
     sampled_nums_        = {};
@@ -2349,13 +2385,20 @@ bool LlamaBatch::Forward(GenerationState& g)
 
         auto hidden_states = symm_hidden_states_buf_.slice(0, global_token_num);
 
+        // Scale block pointers are only populated when FP4 KV is active; in
+        // all other modes we pass an empty Buffer which UnifiedDecoder will
+        // treat as null.
+        Buffer kv_scale_block_ptrs;
+        if (sequence_manager_ && sequence_manager_->GetScaleBlockPtr(0)) {
+            kv_scale_block_ptrs = scale_block_ptrs_;
+        }
+
         model_->Forward(input_ids_buf_.slice(0, sum_q),  // temp
                         hidden_states,                   // temp
                         decoder_output_buf_.slice(first, mini_batch_size),
                         block_ptrs_,
+                        kv_scale_block_ptrs,
                         cu_block_counts_.slice(first, mini_batch_size + 1),
-                        h_input_length_buf_.slice(first, mini_batch_size),
-                        state_->h_context_length.slice(first, mini_batch_size),
                         rope_theta_.slice(first, mini_batch_size),
                         &mrope,
                         symm_partial_ML_,
@@ -3187,19 +3230,20 @@ void LlamaBatch::Warmup()
                 TM_LOG_INFO("[Gemm2] %d", token_num);
             }
 
-            int  input_length     = token_num;
             auto local_token_nums = AllGather(comm_.h_dp_group, token_num);
 
             const auto bsz = 1;
 
-            // A single sequence containing `token_num` prefill tokens
+            // A single sequence containing `token_num` prefill tokens. Use a
+            // pure prefill-style call into the decoder (decode_num=0,
+            // prefil_num=1) with no mrope or lora mask.
+            Buffer kv_scale_block_ptrs;
             model_->Forward(input_ids_buf.slice(0, token_num),
                             symm_hidden_states_buf_.slice(0, token_num * param_.attn_dp_size),
                             decoder_output_buf_.slice(0, bsz),
                             block_ptrs_,
+                            kv_scale_block_ptrs,
                             cu_block_counts_.slice(0, bsz + 1),
-                            Buffer{&input_length, 1, kCPU},
-                            Buffer{&input_length, 1, kCPU},
                             rope_theta_.slice(0, bsz),
                             nullptr,  // mrope
                             symm_partial_ML_,
@@ -3207,7 +3251,7 @@ void LlamaBatch::Warmup()
                             Buffer{local_token_nums.data(), (int)local_token_nums.size(), kCPU},
                             Buffer{},
                             0,
-                            bsz,
+                            1,
                             nullptr);
         }
 
@@ -3242,15 +3286,88 @@ void LlamaBatch::InitializeBufferAndKVCache()
     const int dbits = byte_size(data_type_, 8);
 
     const auto quant_policy = model_->param_.quant_policy;
-    const int  elem_bits    = quant_policy ? quant_policy : dbits;
+
+    int sm_version = 0;
+    if (context_) {
+        sm_version = context_->device_prop.major * 10 + context_->device_prop.minor;
+    }
+
+    const KvCacheMode kv_mode = GetKvCacheMode(quant_policy, sm_version);
+
+    int q_bits = dbits;
+    int t_bits = 0;
+    size_t scale_block_size = 0;
+
+    switch (kv_mode) {
+        case KvCacheMode::kInt8:
+            q_bits = 8;
+            t_bits = dbits;
+            break;
+        case KvCacheMode::kInt4:
+            q_bits = 4;
+            t_bits = dbits;
+            break;
+        case KvCacheMode::kFp4Mx:
+            // MXFP4 KV cache: 4-bit payload with a separate per-16-element
+            // scale pool. The data pool layout uses q_bits=4, t_bits=0 so
+            // there is no per-token (scale, zero) region inside the main
+            // KV blocks.
+            q_bits = 4;
+            t_bits = 0;
+
+            // Each FP4 block stores per-16-element scales for both K and V:
+            //   scales_per_head   = head_dim / 16
+            //   bytes_per_token   = 2 * scales_per_head  (K scales, then V)
+            //   block_size_scales = layer_num * kv_head_num * block_seq_len
+            //                       * bytes_per_token
+            {
+                const int head_dim = static_cast<int>(model_->size_per_head_);
+                FT_CHECK(head_dim % 16 == 0);
+                const int scales_per_head   = head_dim / 16;
+                const int bytes_per_token   = 2 * scales_per_head;
+                const int kv_head_num       = static_cast<int>(model_->local_kv_head_num_);
+                const int layer_num         = static_cast<int>(model_->layer_num_);
+                scale_block_size            = static_cast<size_t>(layer_num)
+                                   * static_cast<size_t>(kv_head_num)
+                                   * static_cast<size_t>(cache_block_seq_len)
+                                   * static_cast<size_t>(bytes_per_token);
+            }
+            break;
+        case KvCacheMode::kFp4Nv:
+            // NVFP4 path is kept logically separate and currently falls back
+            // to an unquantized KV layout until true NVFP4 (FP8 E4M3 scales)
+            // is wired end-to-end. No separate scale pool is allocated.
+            q_bits = dbits;
+            t_bits = 0;
+            break;
+        case KvCacheMode::kNone:
+        default:
+            q_bits = dbits;
+            t_bits = 0;
+            break;
+    }
 
     SequenceManager::BlockConfig block_config{
         (int)model_->size_per_head_,
         (int)model_->local_kv_head_num_,
         cache_block_seq_len,
-        elem_bits == dbits ? 0 : dbits,
-        elem_bits,
+        t_bits,
+        q_bits,
     };
+
+    bool enable_prefix_caching = param_.enable_prefix_caching;
+    if (scale_block_size > 0 && enable_prefix_caching) {
+        // Prefix caching relies on BlockTrie and currently only supports
+        // a single KV pool. Until BlockTrie is extended to understand a
+        // paired data+scale KV layout, disable prefix caching when FP4 KV
+        // cache is active to avoid mismatched allocations between pools.
+        enable_prefix_caching = false;
+        if (tp_rank_ == 0) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][FP4] Prefix caching is not yet supported with FP4 KV cache; "
+                "disabling prefix caching for this engine.");
+        }
+    }
 
     const auto get_free_size = [&] {  //
         size_t free{}, total{};
@@ -3294,11 +3411,12 @@ void LlamaBatch::InitializeBufferAndKVCache()
                                                 block_config,
                                                 cache_block_budget,
                                                 param_.cache_chunk_size,
-                                                param_.enable_prefix_caching,
+                                                enable_prefix_caching,
                                                 tp_rank_,
                                                 param_.attn_cp_size,
                                                 core::Context::alloc(kDEVICE),
-                                                get_free_size});
+                                                get_free_size,
+                                                scale_block_size});
 
     // Cache basic KV layout parameters for EAGLE KV rewind integration.
     kv_block_size_         = cache_block_seq_len;

@@ -138,8 +138,12 @@ void UnifiedAttentionLayer::Initialize(TensorMap& args)
     finished_  = args.at("finished").buffer();
     rope_base_ = args.at("rope_base").buffer();
 
-    cu_block_nums_ = args.at("cu_block_nums").buffer();
-    kv_block_ptrs_ = args.at("kv_block_ptrs").buffer();
+    cu_block_nums_       = args.at("cu_block_nums").buffer();
+    kv_block_ptrs_       = args.at("kv_block_ptrs").buffer();
+    kv_scale_block_ptrs_ = Buffer_<uintptr_t>{};
+    if (auto it = args.find("kv_scale_block_ptrs"); it != args.end()) {
+        kv_scale_block_ptrs_ = it->second.buffer();
+    }
 
     partial_ML_ = args.at("partial_ML").borrow();
 
@@ -285,11 +289,15 @@ Tensor UnifiedAttentionLayer::core_attention(Tensor& qkv, const ForwardParam& p,
             }
         }
 
-        // Decoding use only
-        params.block_iter_params = BlockIteratorParams{(char**)kv_block_ptrs_.data(),  //
-                                                       cu_block_nums_.data() + offset,
-                                                       layer_id,
-                                                       (int)param_.cache_block_seq_len};
+        // Decoding use only. For FP4 KV cache modes a parallel scale pool
+        // can be provided via block_iter_params.scale_block_ptrs; for
+        // existing int4/int8/unquantized modes this remains null.
+        params.block_iter_params =
+            BlockIteratorParams{(char**)kv_block_ptrs_.data(),  //
+                                kv_scale_block_ptrs_ ? (char**)kv_scale_block_ptrs_.data() : nullptr,
+                                cu_block_nums_.data() + offset,
+                                layer_id,
+                                (int)param_.cache_block_seq_len};
 
         // Prefilling use only
         const int sum_k_len       = h_cu_k_len_[offset + prefil_num_] - h_cu_k_len_[offset];

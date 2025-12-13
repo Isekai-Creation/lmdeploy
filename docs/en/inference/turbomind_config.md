@@ -107,8 +107,9 @@ Since k/v block is the smallest granularity for reuse in prefix caching, if the 
 
 ### kv quantization and inference switch
 
-- `quant_policy=4` means 4bit k/v quantization and inference
-- `quant_policy=8` indicates 8bit k/v quantization and inference
+- `quant_policy=4` means 4bit **integer** k/v quantization and inference
+- `quant_policy=8` indicates 8bit **integer** k/v quantization and inference
+- `quant_policy=16` enables FP4 (NVFP4/MXFP4) k/v cache on supported GPUs
 
 Please refer to [kv quant](../quantization/kv_quant.md) for detailed guide.
 

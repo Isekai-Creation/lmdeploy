@@ -139,6 +139,7 @@ void TestBlocks(const thrust::universal_vector<T>& k_cache,        // [B, H, S, 
     for (int i = 0; i < 1; ++i) {
         // (B, 2, H, S, D) -> blocks
         invokeProcessKV_v2(k_ptrs.data().get(),
+                           nullptr,
                            kv_cache.data().get(),
                            kv_cache.data().get() + head_num * seq_len * head_dim,
                            (T*)nullptr,
@@ -414,6 +415,7 @@ int test_attention()
     params.max_k_len  = kContextLen;
 
     params.block_iter_params = BlockIteratorParams{k_ptrs.data().get(),  //
+                                                   nullptr,
                                                    cu_block_cnts.data().get(),
                                                    0,
                                                    kBlockSz};

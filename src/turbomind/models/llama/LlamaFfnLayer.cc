@@ -21,6 +21,7 @@
 #include "src/turbomind/kernels/activation.h"
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/utils/anomaly_handler.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 
@@ -29,6 +30,12 @@ void LlamaFfnLayer::forward(ForwardParam param)
     NvtxScope scope("ffn");
 
     const auto& mlp = *param.weights;
+
+    const bool is_eagle3_ffn =
+        (mlp.debug_name != nullptr) && std::strncmp(mlp.debug_name, "EAGLE3", 6) == 0;
+    const bool log_gemm_shapes =
+        is_eagle3_ffn && isEnvVarEnabled("LMDEPLOY_EAGLE_GEMM_SHAPE_LOG");
+    const int dtype_int = static_cast<int>(mlp.output.data_type);
 
     const int token_num  = param.input.shape(0);
     const int inter_size = mlp.inter_size;
@@ -40,7 +47,14 @@ void LlamaFfnLayer::forward(ForwardParam param)
     Tensor inter;
 
     if (mlp.fused_gating_intermediate.weight) {
-        auto mix = linear_.Forward(param.input, mlp.fused_gating_intermediate);
+        if (log_gemm_shapes) {
+            const int m = token_num;
+            const int k = mlp.fused_gating_intermediate.input_dim;
+            const int n = mlp.fused_gating_intermediate.output_dim;
+            logEagleGemmShape("EAGLE3_FFN_FUSED_GATE_UP", m, k, n, dtype_int, "row_major");
+        }
+        EagleGemmTagGuard tag_guard(is_eagle3_ffn ? "EAGLE3_FFN" : nullptr);
+        auto              mix = linear_.Forward(param.input, mlp.fused_gating_intermediate);
         sync_check_cuda_error();
 
         gating = mix.slice({0, 0}, {(int)token_num, inter_size});
@@ -49,11 +63,33 @@ void LlamaFfnLayer::forward(ForwardParam param)
         }
     }
     else {
-        gating = linear_.Forward(param.input, mlp.gating);
+        if (log_gemm_shapes && mlp.gating) {
+            logEagleGemmShape("EAGLE3_FFN_GATE",
+                              token_num,
+                              mlp.gating.input_dim,
+                              mlp.gating.output_dim,
+                              dtype_int,
+                              "row_major");
+        }
+        {
+            EagleGemmTagGuard tag_guard(is_eagle3_ffn ? "EAGLE3_FFN" : nullptr);
+            gating = linear_.Forward(param.input, mlp.gating);
+        }
         sync_check_cuda_error();
         TM_DEBUG_TENSOR(gating, Concat("w1", layer_id), 3);
 
-        inter = linear_.Forward(param.input, mlp.intermediate);
+        if (log_gemm_shapes && mlp.intermediate) {
+            logEagleGemmShape("EAGLE3_FFN_UP",
+                              token_num,
+                              mlp.intermediate.input_dim,
+                              mlp.intermediate.output_dim,
+                              dtype_int,
+                              "row_major");
+        }
+        {
+            EagleGemmTagGuard tag_guard(is_eagle3_ffn ? "EAGLE3_FFN" : nullptr);
+            inter = linear_.Forward(param.input, mlp.intermediate);
+        }
         sync_check_cuda_error();
         TM_DEBUG_TENSOR(inter, Concat("w3", layer_id), 3);
     }
@@ -67,6 +103,15 @@ void LlamaFfnLayer::forward(ForwardParam param)
 
     {  // w2(x)
         NvtxScope scope("w2");
+        if (log_gemm_shapes && mlp.output) {
+            logEagleGemmShape("EAGLE3_FFN_DOWN",
+                              token_num,
+                              mlp.output.input_dim,
+                              mlp.output.output_dim,
+                              dtype_int,
+                              "row_major");
+        }
+        EagleGemmTagGuard tag_guard(is_eagle3_ffn ? "EAGLE3_FFN" : nullptr);
         linear_.Forward(gating, mlp.output, param.output);
         sync_check_cuda_error();
     }

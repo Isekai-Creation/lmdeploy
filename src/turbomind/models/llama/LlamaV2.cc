@@ -372,6 +372,13 @@ LlamaV2::LlamaV2(DataType                     dtype,
 
 bool LlamaV2::isSpecPVEnabled() const noexcept
 {
+    // FP4 KV cache is not yet supported by SpecPV partial-KV integration.
+    // When FP4 KV is active we hard-disable SpecPV to avoid flattening
+    // from an unsupported FP4 KV layout.
+    if (param_.quant_policy & QuantPolicy::kCacheKVFp4) {
+        return false;
+    }
+
     return engine_param_.enable_specpv && specpv_supported_ && isTargetTreeDecodeEnabled()
            && static_cast<bool>(specpv_kv_cache_);
 }
@@ -2084,9 +2091,8 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
                       Tensor           hidden_states_out,
                       Tensor           decoder_out,
                       Buffer           kv_block_ptrs,
+                      Buffer           kv_scale_block_ptrs,
                       Buffer           cu_block_nums,
-                      Buffer_<int>     h_input_length,
-                      Buffer_<int>     h_context_length,
                       Buffer           rope_base,
                       MropeRope*       mrope,
                       Tensor           partial_ML,
@@ -2160,27 +2166,12 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
         }
     }
 
-    bool have_embeddings = false;
-    if (token_num) {
-        // Copy input embeddings from corresponding sequences
-        updateEmbedding((char*)input_embeds.raw_data(),
-                        h_input_length.size(),
-                        h_input_length.data(),
-                        sequences,
-                        token_num,
-                        lora_mask ? lora_mask.data<int>() : nullptr,
-                        &have_embeddings);
-        sync_check_cuda_error();
-    }
-
     TM_DEBUG_TENSOR(input_embeds, "embeddings", 1);
 
     TensorMap args{{"decoder_input", input_embeds},
                    {"decoder_output", hidden_states_out.view({-1, (int)hidden_units_}).borrow()},
                    {"last_token_hidden_units", decoder_out},
                    {"output_norm_weight", weights_->output_norm_weight},
-                   {"h_q_len", h_input_length},
-                   {"h_k_len", h_context_length},
                    {"finished", finished},
                    {"decode_num", Buffer{&decode_num, 1, kCPU}},
                    {"prefil_num", Buffer{&prefil_num, 1, kCPU}},
@@ -2189,6 +2180,10 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
                    {"cu_block_nums", cu_block_nums},
                    {"kv_block_ptrs", kv_block_ptrs},
                    {"local_token_nums", local_token_nums}};
+
+    if (kv_scale_block_ptrs) {
+        args.insert({"kv_scale_block_ptrs", kv_scale_block_ptrs});
+    }
 
     // When running Eagle3 speculative decoding with TurboMind we ask
     // UnifiedDecoder to capture last-token hidden states from a small
@@ -2256,6 +2251,20 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
         return false;
     }
     if (layer_idx < 0 || layer_idx >= static_cast<int>(layer_num_)) {
+        return false;
+    }
+
+    // FP4 KV cache flattening is not yet implemented. When FP4 KV is
+    // active (MXFP4/NVFP4 family), SpecPV must fall back to the full-KV
+    // path rather than attempting to materialize a dense [B,H,S,D] view.
+    if (param_.quant_policy & QuantPolicy::kCacheKVFp4) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer does not support FP4 KV cache yet "
+            "(quant_policy has kCacheKVFp4); disabling SpecPV for this engine.");
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
         return false;
     }
 
@@ -2838,6 +2847,34 @@ void LlamaV2::dynamicDecodeMultiStep(Buffer             token_ids,
     NvtxScope scope("dynamicDecodeMultiStep");
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
+    Tensor     output_ids_tensor;
+    const bool perf_mode  = turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
+    const int  batch_size = logits.shape(0);
+    TM_CHECK(batch_size > 0);
+    if (perf_mode) {
+        const ssize_t total_tokens = token_ids.size();
+        TM_CHECK(total_tokens > 0);
+        TM_CHECK_EQ(total_tokens % batch_size, 0);
+        const ssize_t max_seq_len = total_tokens / batch_size;
+
+        core::Layout layout({max_seq_len, batch_size});
+        output_ids_tensor = Tensor{token_ids, layout};
+
+        static bool logged_layout = false;
+        if (!logged_layout) {
+            TM_LOG_INFO("[PERF_MODE] output_ids ndim=%d max_seq_len=%zd stride_batch=%d",
+                        output_ids_tensor.ndim(),
+                        max_seq_len,
+                        batch_size);
+            logged_layout = true;
+        }
+    }
+    else {
+        // Non-PERF_MODE: retain legacy 1D semantics; DynamicDecodeLayer
+        // can still infer layout when needed.
+        output_ids_tensor = Tensor{token_ids};
+    }
+
     TensorMap args{
         {"logits", logits},
         {"step", Buffer{&step, 1, kCPU}},
@@ -2846,7 +2883,7 @@ void LlamaV2::dynamicDecodeMultiStep(Buffer             token_ids,
         {"init_context_length", init_context_length},
         {"context_length", context_length},
         {"prompt_length", prompt_length},
-        {"output_ids", token_ids},             // inout
+        {"output_ids", output_ids_tensor},     // inout
         {"finished", finished},                // inout
         {"sequence_length", sequence_length},  // inout
         {"curand_state", curand_state},        // inout

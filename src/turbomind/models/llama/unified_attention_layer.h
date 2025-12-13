@@ -141,6 +141,7 @@ private:
 
     Buffer_<int>       cu_block_nums_;
     Buffer_<uintptr_t> kv_block_ptrs_;
+    Buffer_<uintptr_t> kv_scale_block_ptrs_;
     ///////////////////////////////////////////////////////
 };
 

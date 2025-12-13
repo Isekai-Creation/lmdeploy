@@ -83,7 +83,8 @@ public:
                              int                rank,
                              int                attn_cp_size,
                              core::Allocator    allocator,
-                             GetFreeMemSize     get_free_size);
+                             GetFreeMemSize     get_free_size,
+                             size_t             scale_block_size = 0);
 
     SequenceManager(const SequenceManager&)     = delete;
     SequenceManager(SequenceManager&&) noexcept = default;
@@ -167,6 +168,18 @@ public:
     // return #total_seq, #active_seq, #cached_seq
     std::tuple<int, int, int> seq_stats() const noexcept;
 
+    // Optional: bind a secondary BlockManager that stores FP4/NVFP4
+    // per-block scale factors. When present, all allocation / lock /
+    // unlock / eviction operations are mirrored onto this manager
+    // using the same block ids so that data and scale pools form a
+    // single logical allocation unit.
+    void AttachScaleBlockManager(std::shared_ptr<BlockManager> scale_block_manager);
+
+    [[nodiscard]] void* GetScaleBlockPtr(int block_id)
+    {
+        return scale_block_manager_ ? scale_block_manager_->block(block_id).data : nullptr;
+    }
+
 private:
     void Erase(std::map<uint64_t, Sequence>::iterator& it);
 
@@ -198,6 +211,11 @@ private:
     std::map<uint64_t, Sequence> sequences_;
 
     std::shared_ptr<BlockManager> block_manager_;
+    // Optional FP4/NVFP4 scale pool. When non-null, this BlockManager
+    // must have the same max_block_count() as block_manager_, and all
+    // block ids managed by SequenceManager are interpreted identically
+    // in both pools.
+    std::shared_ptr<BlockManager> scale_block_manager_;
     std::shared_ptr<BlockTrie>    block_trie_;
 
     BlockIds unlocked_;

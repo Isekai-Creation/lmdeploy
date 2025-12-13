@@ -19,6 +19,7 @@ struct LinearIteratorParams {
 
 struct BlockIteratorParams {
     char**     block_ptrs;
+    char**     scale_block_ptrs;
     const int* cu_block_nums;
     int        layer_id;
     int        block_len;

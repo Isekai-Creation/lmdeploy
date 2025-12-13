@@ -31,8 +31,11 @@ constexpr auto get_kv_type(std::integral_constant<int, is_kv_int8>)
 template<class T>
 void dispatchDecoding(const AttentionParams<T>& params)
 {
-    const bool is_kv_int8     = params.quant_policy & QuantPolicy::kCacheKVInt8;
-    const bool is_kv_int4     = params.quant_policy & QuantPolicy::kCacheKVInt4;
+    const KvCacheMode kv_mode = GetKvCacheMode(params.quant_policy, params.arch);
+
+    const bool is_kv_int8 = kv_mode == KvCacheMode::kInt8;
+    const bool is_kv_int4 = kv_mode == KvCacheMode::kInt4;
+    const bool is_kv_fp4  = kv_mode == KvCacheMode::kFp4Mx;  // MXFP4 only; NVFP4 falls back to base KV for now.
     const int  query_group_sz = params.num_heads / params.num_kv_heads;
 
     using namespace attention;
@@ -76,6 +79,9 @@ void dispatchDecoding(const AttentionParams<T>& params)
 
     auto dispatch_kv = [&](auto arch, const auto dim) -> bool {
         FT_CHECK(!(is_kv_int4 && is_kv_int8));
+        FT_CHECK_WITH_INFO(!is_kv_fp4,
+                           "[decoding][FP4] FP4 KV cache decode path is not implemented yet; "
+                           "please disable FP4 KV or use a non-FP4 quant_policy.");
         if (is_kv_int4) {
             return dispatch_h(arch, uint4_t{}, dim);
         }

@@ -6,6 +6,7 @@
 #include <cub/cub.cuh>
 #include <cstdlib>
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/core/data_type.h"
@@ -16,9 +17,15 @@ namespace ft {
 // Tunable constants for Eagle3 FMHA. These are kept modest to
 // balance parallelism and resource usage while enabling multi-CTA
 // tiling over long KV spans.
-constexpr int kEagle3FmhaBlockSize = 64;   // threads per CTA in FMHA kernels
-constexpr int kEagle3FmhaMaxHeadDim = 128; // maximum head_dim supported by FMHA path
-constexpr int kEagle3FmhaMaxTiles   = 8;   // max tiles per (token, head) for multi-CTA KV
+constexpr int kEagle3FmhaBlockSizeMax = 256;   // max threads per CTA in FMHA kernels
+constexpr int kEagle3FmhaMaxHeadDim   = 128;   // maximum head_dim supported by FMHA path
+constexpr int kEagle3FmhaMaxTiles     = 8;     // max tiles per (token, head) for multi-CTA KV
+
+// Optional global tile statistics for debugging / perf analysis.
+// When TM_EAGLE3_FMHA_TILE_STATS is enabled, we count total tiles
+// processed and how many were skipped due to fully-masked KV spans.
+__device__ unsigned long long g_eagle3_fmha_tiles_total  = 0;
+__device__ unsigned long long g_eagle3_fmha_tiles_skipped = 0;
 
 namespace { // anonymous namespace for device helpers
 
@@ -534,7 +541,7 @@ __global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
         return;
     }
 
-    constexpr int kBlockLocal = kEagle3FmhaBlockSize;
+    const int     kBlockLocal = blockDim.x;
     const int     tid         = threadIdx.x;
     if (tid >= kBlockLocal) {
         return;
@@ -617,10 +624,19 @@ __global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
     }
 
     // Shared buffers for this CTA.
-    __shared__ float s_max[kBlockLocal];
-    __shared__ float s_sum[kBlockLocal];
-    __shared__ float s_ctx[kMaxHeadDim][kBlockLocal];
-    __shared__ int   s_tile_has_any;
+    __shared__ float         s_max[kEagle3FmhaBlockSizeMax];
+    __shared__ float         s_sum[kEagle3FmhaBlockSizeMax];
+    __shared__ float         s_ctx[kMaxHeadDim][kEagle3FmhaBlockSizeMax];
+    __shared__ int           s_tile_has_any;
+
+    // Count this tile for tile statistics when TM_EAGLE3_FMHA_TILE_STATS
+    // is enabled. We cannot query the env var from device code, so the
+    // host side is responsible for deciding whether to read these
+    // counters; here we simply always increment them and leave it to
+    // the host to ignore them when the env is unset.
+    if (tid == 0) {
+        atomicAdd(&g_eagle3_fmha_tiles_total, 1ull);
+    }
 
     // If a packed mask is present, cheaply detect tiles that have no
     // allowed KV positions at all and neutral-fill them so that phase-2
@@ -659,6 +675,7 @@ __global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
 
             s_tile_has_any = any;
             if (!any) {
+                atomicAdd(&g_eagle3_fmha_tiles_skipped, 1ull);
                 partial_m[idx_tile] = -1e20f;
                 partial_l[idx_tile] = 0.f;
                 for (int d = 0; d < head_dim; ++d) {

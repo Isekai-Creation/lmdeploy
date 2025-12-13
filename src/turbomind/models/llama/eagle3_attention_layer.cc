@@ -13,6 +13,11 @@
 
 namespace turbomind {
 
+namespace ft {
+extern __device__ unsigned long long g_eagle3_fmha_tiles_total;
+extern __device__ unsigned long long g_eagle3_fmha_tiles_skipped;
+}  // namespace ft
+
 Eagle3AttentionLayer::Eagle3AttentionLayer(const cudaDeviceProp* prop, cudaStream_t stream):
     stream_{stream},
     device_prop_{prop}
@@ -326,6 +331,69 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                         std::abort();
                     }
                 }
+
+                // Optional packed-mask coverage invariant: when a packed
+                // mask is present and the KV span length is non-zero, we
+                // expect at least one allowed position in the span. If
+                // the mask is all-zero over [start, start+len), we are
+                // doing useless work or have inconsistent metadata.
+                if (param.packed_mask && param.packed_mask_stride > 0) {
+                    const int32_t* d_mask = param.packed_mask->data<int32_t>();
+                    const int      stride = param.packed_mask_stride;
+                    std::vector<int32_t> h_mask(static_cast<size_t>(token_num) * stride, 0);
+
+                    check_cuda_error(cudaMemcpyAsync(h_mask.data(),
+                                                     d_mask,
+                                                     static_cast<size_t>(token_num * stride) * sizeof(int32_t),
+                                                     cudaMemcpyDeviceToHost,
+                                                     stream_));
+                    check_cuda_error(cudaStreamSynchronize(stream_));
+
+                    for (int idx = 0; idx < token_num; ++idx) {
+                        const int start = h_kv_start[idx];
+                        const int len   = h_kv_len[idx];
+                        if (len <= 0) {
+                            continue;
+                        }
+                        const int end = start + len;
+                        if (start < 0 || end > kv_len) {
+                            continue;
+                        }
+
+                        const int word_start = start / 32;
+                        const int word_end   = (end + 31) / 32;
+                        const int row_off    = idx * stride;
+
+                        bool any = false;
+                        for (int w = word_start; w < word_end && !any; ++w) {
+                            const int32_t mask_val = h_mask[row_off + w];
+                            if (mask_val == 0) {
+                                continue;
+                            }
+                            const int bit_lo = (w == word_start) ? (start & 31) : 0;
+                            const int bit_hi = (w == word_end - 1) ? ((end - 1) & 31) : 31;
+                            const int bit_count = bit_hi - bit_lo + 1;
+                            const uint32_t mask = (bit_count >= 32)
+                                                      ? 0xFFFFFFFFu
+                                                      : ((static_cast<uint32_t>(1u) << bit_count) - 1u) << bit_lo;
+                            if ((static_cast<uint32_t>(mask_val) & mask) != 0u) {
+                                any = true;
+                            }
+                        }
+
+                        if (!any) {
+                            TM_LOG_WARNING(
+                                "[EAGLE3][Attention][kv-span] span has no allowed positions under packed mask "
+                                "(token=%d start=%d len=%d kv_len=%d packed_stride=%d)",
+                                idx,
+                                start,
+                                len,
+                                kv_len,
+                                stride);
+                            std::abort();
+                        }
+                    }
+                }
             }
 
             AttentionParams<T> fmha{};
@@ -374,22 +442,52 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                     kv_tile = v;
                 }
             }
+            else {
+                // Heuristic default for sm120: use smaller KV tiles for
+                // large-context batch runs so that multi-CTA work is
+                // better balanced, and a slightly larger tile for small
+                // batches to reduce scheduling overhead.
+                if (batch_size >= 4 && kv_len >= 8192) {
+                    kv_tile = 64;
+                }
+                else {
+                    kv_tile = 128;
+                }
+            }
+            int max_tiles_cap = 8;
+            if (const char* env = std::getenv("TM_EAGLE3_FMHA_MAX_TILES")) {
+                int v = std::atoi(env);
+                if (v > 0) {
+                    max_tiles_cap = v;
+                }
+            }
             const int max_tiles_est = kv_tile > 0 ? (kv_len + kv_tile - 1) / kv_tile : 1;
-            const int fmha_tiles    = std::max(1, std::min(max_tiles_est, kEagle3FmhaMaxTiles));
+            const int fmha_tiles    = std::max(1, std::min(max_tiles_est, max_tiles_cap));
             const int total_fmha    = token_num * num_q_heads;
+            static bool logged_fmha_cfg = false;
+            if (!logged_fmha_cfg && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE")) {
+                TM_LOG_INFO(
+                    "[EAGLE3][FMHA_CFG] batch=%d kv_len=%d kv_tile=%d max_tiles_cap=%d fmha_tiles=%d",
+                    batch_size,
+                    kv_len,
+                    kv_tile,
+                    max_tiles_cap,
+                    fmha_tiles);
+                logged_fmha_cfg = true;
+            }
             if (total_fmha > 0) {
                 const size_t partial_count   = static_cast<size_t>(total_fmha) * fmha_tiles;
                 const size_t partial_m_bytes = partial_count * sizeof(float);
                 const size_t partial_l_bytes = partial_count * sizeof(float);
                 const size_t partial_o_bytes = partial_count * static_cast<size_t>(head_dim) * sizeof(float);
 
-                if (!fmha_partial_m_.data() || fmha_partial_m_.nbytes() < partial_m_bytes) {
+                if (!fmha_partial_m_ || fmha_partial_m_.byte_size() < partial_m_bytes) {
                     fmha_partial_m_ = core::Tensor{{static_cast<int>(partial_count)}, kFloat32, param.input.device()};
                 }
-                if (!fmha_partial_l_.data() || fmha_partial_l_.nbytes() < partial_l_bytes) {
+                if (!fmha_partial_l_ || fmha_partial_l_.byte_size() < partial_l_bytes) {
                     fmha_partial_l_ = core::Tensor{{static_cast<int>(partial_count)}, kFloat32, param.input.device()};
                 }
-                if (!fmha_partial_o_.data() || fmha_partial_o_.nbytes() < partial_o_bytes) {
+                if (!fmha_partial_o_ || fmha_partial_o_.byte_size() < partial_o_bytes) {
                     fmha_partial_o_ = core::Tensor{
                         {static_cast<int>(partial_count * static_cast<size_t>(head_dim))}, kFloat32, param.input.device()};
                 }

@@ -9,6 +9,7 @@ namespace turbomind {
 
 template<class T>
 void invokeProcessKV_v2(char**                 blocks,
+                        char**                 scale_blocks,
                         const T*               k,
                         const T*               v,
                         const T*               k_bias,
@@ -30,12 +31,14 @@ void invokeProcessKV_v2(char**                 blocks,
                         int                    head_dim,
                         int                    batch_size,
                         int                    quant_policy,
+                        int                    arch,
                         cudaStream_t           stream = {});
 
 template<class T>
 void invokeProcessKV_v2_(const AttentionParams<T>& params)
 {
     invokeProcessKV_v2((char**)params.block_iter_params.block_ptrs,
+                       (char**)params.block_iter_params.scale_block_ptrs,
                        params.k,
                        params.v,
                        params.k_bias,
@@ -57,6 +60,7 @@ void invokeProcessKV_v2_(const AttentionParams<T>& params)
                        params.size_per_head,
                        params.batch_size,
                        params.quant_policy,
+                       params.arch,
                        params.stream);
 }
 

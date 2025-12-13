@@ -311,7 +311,11 @@ private:
     ///////////////////////////////////////////////////////////////////
     // k/v cache block buffers
     Buffer_<int>       cu_block_counts_;
+    // Device-side per-block KV data pointers for the current batch.
     Buffer_<uintptr_t> block_ptrs_;
+    // Device-side per-block FP4 scale pointers (only populated when FP4
+    // KV cache is active; otherwise empty).
+    Buffer_<uintptr_t> scale_block_ptrs_;
 
     // EAGLE KV rewind integration (Engineer B scope)
     int           kv_block_size_{};          // tokens per KV block
@@ -363,8 +367,10 @@ private:
     Buffer_<int> h_input_length_buf_;
     Buffer_<int> h_seq_limit_len_;
 
+    // Host-side per-block KV pointers and optional FP4 scale pointers.
     Buffer_<int>       h_cu_block_counts_;
     Buffer_<uintptr_t> h_block_ptrs_;
+    Buffer_<uintptr_t> h_scale_block_ptrs_;
 
     Buffer_<uint64_t> h_random_seed_;
     Buffer_<uint64_t> d_random_seed_;

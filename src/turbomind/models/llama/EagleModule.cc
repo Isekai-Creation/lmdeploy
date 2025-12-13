@@ -685,6 +685,7 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
                                                        group_size,
                                                        ActivationType::kSilu,
                                                        /*fuse_silu_act=*/true);
+        eagle3_draft_layer_->ffn.debug_name = "EAGLE3_FFN";
 
         eagle3_draft_layer_->ffn.fused_gating_intermediate.weight = weights_.mlp_gate_up.borrow();
         eagle3_draft_layer_->ffn.output.weight                    = weights_.mlp_down.borrow();
@@ -1180,6 +1181,7 @@ void EagleModule::forward(const Tensor& input_ids,
     const Tensor& hidden_states = last_hidden_states;
     const int     batch_size    = hidden_states.shape(0);
     const int     hidden_dim    = hidden_states.shape(1);
+    const bool    is_eagle3     = eagle_mode_ == EagleMode::kEagle3;
 
     if (hidden_dim != hidden_units_) {
         TM_LOG_WARNING("[EAGLE] hidden_units mismatch in forward: got %d, expected %d",
@@ -1706,7 +1708,18 @@ void EagleModule::forward(const Tensor& input_ids,
         lm_input = &lm_head_input_scratch_;
     }
 
-    linear.Forward(*lm_input, lm_head_weight_, /*output=*/logits);
+    if (isEnvVarEnabled("LMDEPLOY_EAGLE_GEMM_SHAPE_LOG")) {
+        logEagleGemmShape("EAGLE3_LM_HEAD",
+                          lm_input->shape(0),
+                          lm_head_weight_.input_dim,
+                          lm_head_weight_.output_dim,
+                          static_cast<int>(lm_head_weight_.data_type),
+                          "row_major");
+    }
+    {
+        EagleGemmTagGuard guard("EAGLE3_LM_HEAD");
+        linear.Forward(*lm_input, lm_head_weight_, /*output=*/logits);
+    }
     output_logits = logits;
 
     if (isEagleDebugEnabled()) {

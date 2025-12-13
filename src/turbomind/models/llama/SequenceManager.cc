@@ -36,7 +36,8 @@ SequenceManager::SequenceManager(size_t             layer_num,
                                  int                rank,
                                  int                attn_cp_size,
                                  core::Allocator    allocator,
-                                 GetFreeMemSize     get_free_size):
+                                 GetFreeMemSize     get_free_size,
+                                 size_t             scale_block_size):
     block_seq_len_(block_config.block_len_), rank_(rank), attn_cp_size_(attn_cp_size)
 {
     block::Layout layout{block_config};
@@ -45,6 +46,21 @@ SequenceManager::SequenceManager(size_t             layer_num,
     size_t block_size = layout.block_size(layer_num);
 
     block_manager_ = std::make_shared<BlockManager>(block_size, block_count, chunk_size, allocator, get_free_size);
+
+    // Optional parallel scale pool for FP4 KV cache modes. When present, it
+    // must mirror the data pool's max_block_count()/chunk_size so that both
+    // pools share the same paging structure. When `block_count` is specified
+    // as a ratio (< 1.0), we reuse the realized max_block_count() from the
+    // data pool for the scale pool to keep block ids aligned.
+    if (scale_block_size > 0) {
+        double scale_block_count = block_count;
+        if (block_count < 1.) {
+            scale_block_count = static_cast<double>(block_manager_->max_block_count());
+        }
+        scale_block_manager_ =
+            std::make_shared<BlockManager>(scale_block_size, scale_block_count, chunk_size, allocator, get_free_size);
+    }
+
     if (enable_prefix_caching) {
         block_trie_ = std::make_shared<BlockTrie>(block_config.block_len_, block_manager_);
     }
@@ -177,6 +193,9 @@ void SequenceManager::VerifyAndLockCached(const Sequences& sequences)
         seq.status    = Sequence::kLocked;
     }
     block_manager_->Lock(blocks);
+    if (scale_block_manager_ && !blocks.empty()) {
+        scale_block_manager_->Lock(blocks);
+    }
 }
 
 void SequenceManager::UnlockBlocks(const BlockIds& ids)
@@ -194,17 +213,27 @@ void SequenceManager::UnlockBlocks(const BlockIds& ids)
     // then unlock them.
     block_manager_->Touch(ids);
     block_manager_->Unlock(ids);
+    if (scale_block_manager_) {
+        scale_block_manager_->Touch(ids);
+        scale_block_manager_->Unlock(ids);
+    }
 }
 
 void SequenceManager::CommitUnlockAndFree()
 {
     if (!unlocked_.empty()) {
         block_manager_->Unlock(unlocked_);
+        if (scale_block_manager_) {
+            scale_block_manager_->Unlock(unlocked_);
+        }
         unlocked_.clear();
     }
 
     if (!freed_.empty()) {
         block_manager_->Free(freed_);
+        if (scale_block_manager_) {
+            scale_block_manager_->Free(freed_);
+        }
         freed_.clear();
     }
 }
@@ -214,6 +243,9 @@ void SequenceManager::UpdateAndSetUnlock(const Sequence& sequence)
     FT_CHECK(sequence.status != Sequence::kCached);
     auto& seq = const_cast<Sequence&>(sequence);
     block_manager_->Touch(seq.blocks);
+    if (scale_block_manager_) {
+        scale_block_manager_->Touch(seq.blocks);
+    }
     unlocked_.insert(unlocked_.end(), seq.blocks.begin(), seq.blocks.end());
     seq.status = Sequence::kCached;
 }
@@ -448,6 +480,9 @@ void SequenceManager::PrefixMatch(Sequences& sequences)
         std::tie(block_ids, unique_ids) = block_trie_->Match(seq);
 
         block_manager_->Lock(block_ids);
+        if (scale_block_manager_ && !block_ids.empty()) {
+            scale_block_manager_->Lock(block_ids);
+        }
         int valid = block_ids.size();
         if (rank_ == 0) {
             TM_LOG_INFO("[SeqMgr][match] ID %llu, hit blocks %d, cache_len %d", seq.id, valid, seq.cache_len);
@@ -549,6 +584,9 @@ auto SequenceManager::Materialize(Sequences                    sequences,
     // evict cached blocks -> free
     if (schedule.evict) {
         block_manager_->Evict(schedule.evict);
+        if (scale_block_manager_) {
+            scale_block_manager_->Evict(schedule.evict);
+        }
     }
 
     // allocate & assign blocks
@@ -557,6 +595,15 @@ auto SequenceManager::Materialize(Sequences                    sequences,
         UniqueIds unique_ids;
         if (schedule.allocate) {
             std::tie(block_ids, unique_ids) = block_manager_->Allocate(schedule.allocate);
+            if (scale_block_manager_) {
+                // Mirror allocation in the scale pool so that both pools
+                // maintain identical active/cached/free sets and block ID
+                // domains. We intentionally ignore the secondary unique IDs:
+                // SequenceManager's cache validation relies on the data
+                // pool's unique IDs only.
+                auto [scale_ids, _] = scale_block_manager_->Allocate(schedule.allocate);
+                FT_CHECK(scale_ids == block_ids);
+            }
         }
         AssignAndActivate(schedule.active, schedule.block_counts, block_ids, unique_ids);
     }
@@ -577,6 +624,14 @@ auto SequenceManager::Materialize(Sequences                    sequences,
     }
 
     return outcome;
+}
+
+void SequenceManager::AttachScaleBlockManager(std::shared_ptr<BlockManager> scale_block_manager)
+{
+    scale_block_manager_ = std::move(scale_block_manager);
+    if (scale_block_manager_) {
+        FT_CHECK(scale_block_manager_->max_block_count() == block_manager_->max_block_count());
+    }
 }
 
 std::tuple<int, int, int> SequenceManager::seq_stats() const noexcept
