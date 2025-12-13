@@ -180,4 +180,23 @@ using Config_F16_g = Sm80_s16816<Arch,
                                  raster_order,                     // raster order
                                  0>;                               // group axis
 
+// Dense (non-packed) FP16/BF16 kernels: A/B are plain row-major tensors
+// with no quantization or operand packing. These cover layouts where
+// GemmDesc.pack_a/pack_b/pack_u/pack_v are all zero (e.g. dense BF16
+// weights on Eagle3 draft / FFN / LM-head paths).
+template<class Arch, class T, Order raster_order>
+using Config_F16_dense = Sm80_s16816<Arch,
+                                     T,                               // mma dtype
+                                     kColMajor,                       // mma iter order
+                                     Operand_A<T, kRowMajor>,         // A
+                                     Transform_Default,               // transform A
+                                     VoidOperand,                     // U
+                                     Operand_B<T, kRowMajor>,         // B (no pack)
+                                     Transform_Default,               // transform B
+                                     VoidOperand,                     // V
+                                     kRowMajor,                       // order_C
+                                     T,                               // Tc
+                                     raster_order,                    // raster order
+                                     -1>;                             // group axis (non-grouped)
+
 }  // namespace turbomind::gemm::sm80_s16816

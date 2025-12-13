@@ -385,9 +385,26 @@ void LlamaBatch::ProcessInferRequests(const Requests& reqs, std::vector<Signal>&
                         state.mrope.length.data() + idx,
                         1);
                 }
-                core::Copy(r->inputs.at("mrope_position_ids").data<int>(),
-                           input_length * 3,
-                           state.mrope.position_ids.data() + idx * state.mrope.position_ids.shape(1));
+                {
+                    const int dst_stride = state.mrope.position_ids.shape(1);
+                    const int req_elems  = input_length * 3;
+                    const int n_elems    = std::min(req_elems, dst_stride);
+                    if (n_elems > 0) {
+                        if (turbomind::isEagleDebugEnabled()
+                            && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG") && req_elems > dst_stride) {
+                            TM_LOG_WARNING(
+                                "[LlamaBatch][EAGLE][mrope_pos_ids][clamp] idx=%d req_elems=%d dst_stride=%d; clamping "
+                                "copy to n=%d",
+                                idx,
+                                req_elems,
+                                dst_stride,
+                                n_elems);
+                        }
+                        core::Copy(r->inputs.at("mrope_position_ids").data<int>(),
+                                   n_elems,
+                                   state.mrope.position_ids.data() + idx * dst_stride);
+                    }
+                }
                 core::Copy(
                     r->inputs.at("mrope_position_delta").data<int>(), 1, state.mrope.position_delta.data() + idx);
                 core::Copy(r->inputs.at("mrope_length").data<int>(), 1, state.mrope.length.data() + idx);
@@ -888,6 +905,40 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
                                          cudaMemcpyHostToDevice,
                                          stream_));
     }
+
+    if (turbomind::isEagleDebugEnabled() && tp_rank_ == 0
+        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALLOC_DEBUG")) {
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] token_ids_buf_ ptr=%p size=%zd",
+                       token_ids_buf_.data(),
+                       token_ids_buf_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] sequence_lengths_ ptr=%p size=%zd",
+                       sequence_lengths_.data(),
+                       sequence_lengths_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] seq_limit_len_ ptr=%p size=%zd",
+                       seq_limit_len_.data(),
+                       seq_limit_len_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] h_output_ids_ ptr=%p size=%zd",
+                       h_output_ids_.data(),
+                       h_output_ids_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_kv_rewind_lengths_ ptr=%p size=%zd",
+                       eagle_kv_rewind_lengths_.data(),
+                       eagle_kv_rewind_lengths_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_kv_block_tables_ ptr=%p size=%zd",
+                       eagle_kv_block_tables_.data(),
+                       eagle_kv_block_tables_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_end_ids_ ptr=%p size=%zd",
+                       eagle_end_ids_.data(),
+                       eagle_end_ids_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_posterior_thresholds_ ptr=%p size=%zd",
+                       eagle_posterior_thresholds_.data(),
+                       eagle_posterior_thresholds_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_posterior_alphas_ ptr=%p size=%zd",
+                       eagle_posterior_alphas_.data(),
+                       eagle_posterior_alphas_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_temperatures_ ptr=%p size=%zd",
+                       eagle_temperatures_.data(),
+                       eagle_temperatures_.size());
+    }
 }
 
 void LlamaBatch::AllocSymmBuffers()
@@ -1205,6 +1256,7 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
         const int kv_draft_len    = planned_tokens_per_seq;
         const int kv_accepted_len = std::max(1, std::min(accepted_len, kv_draft_len));
         const int rewind_len      = std::max(0, kv_draft_len - kv_accepted_len);
+        const int committed_extras = std::max(0, kv_accepted_len - 1);
 
         kv_draft_lengths[i]    = kv_draft_len;
         kv_accepted_lengths[i] = kv_accepted_len;
@@ -1215,6 +1267,14 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
         req->metrics->eagle_total_draft_tokens += planned_tokens_per_seq;
         req->metrics->eagle_total_accepted_tokens += raw_accepted_len;
         req->metrics->eagle_steps += 1;
+        req->metrics->eagle_max_tokens_per_seq =
+            std::max(req->metrics->eagle_max_tokens_per_seq, static_cast<int64_t>(planned_tokens_per_seq));
+        req->metrics->eagle_max_accepted_len =
+            std::max(req->metrics->eagle_max_accepted_len, static_cast<int64_t>(kv_accepted_len));
+        if (kv_accepted_len >= 2) {
+            req->metrics->eagle_steps_accept_ge2 += 1;
+        }
+        req->metrics->eagle_total_committed_extras += committed_extras;
 
         // When target-tree decode is enabled for this engine, also track
         // tree-aware metrics so benchmarks can distinguish how many tokens
@@ -1356,8 +1416,38 @@ void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
         return;
     }
 
-    core::Copy(h_block_tables_storage.data(), h_block_tables_storage.size(), eagle_kv_block_tables_.data());
-    core::Copy(batch_slots_storage.data(), batch_slots_storage.size(), eagle_kv_batch_slots_.data());
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(h_block_tables_storage.size());
+        const ssize_t dev_elems  = eagle_kv_block_tables_.size();
+        const ssize_t n_elems    = std::min(host_elems, dev_elems);
+        if (n_elems > 0) {
+            if (isEagleDebugEnabled() && tp_rank_ == 0 && host_elems > dev_elems
+                && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][kv_block_tables][clamp] host_elems=%zd dev_elems=%zd; clamping copy to n=%zd",
+                    host_elems,
+                    dev_elems,
+                    n_elems);
+            }
+            core::Copy(h_block_tables_storage.data(), n_elems, eagle_kv_block_tables_.data());
+        }
+    }
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(batch_slots_storage.size());
+        const ssize_t dev_elems  = eagle_kv_batch_slots_.size();
+        const ssize_t n_elems    = std::min(host_elems, dev_elems);
+        if (n_elems > 0) {
+            if (isEagleDebugEnabled() && tp_rank_ == 0 && host_elems > dev_elems
+                && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][kv_batch_slots][clamp] host_elems=%zd dev_elems=%zd; clamping copy to n=%zd",
+                    host_elems,
+                    dev_elems,
+                    n_elems);
+            }
+            core::Copy(batch_slots_storage.data(), n_elems, eagle_kv_batch_slots_.data());
+        }
+    }
 
     // Optional: build a flat view over BlockManager's KV blocks so the
     // rewind kernel can null-out pointers for rewound blocks.
@@ -1417,7 +1507,26 @@ void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
             h_rewind_lengths_storage.data(),
             max_batch_size);
     }
-    core::Copy(eagle_kv_rewind_lengths_.data(), max_batch_size, h_rewind_lengths_storage.data());
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(h_rewind_lengths_storage.size());
+        const ssize_t dev_elems  = eagle_kv_rewind_lengths_.size();
+        const ssize_t req_elems  = static_cast<ssize_t>(max_batch_size);
+        const ssize_t n_elems    = std::min(req_elems, std::min(host_elems, dev_elems));
+        if (n_elems > 0) {
+            if (isEagleDebugEnabled() && tp_rank_ == 0 && req_elems > dev_elems
+                && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][kv_rewind_lengths][clamp] req_elems=%zd dev_elems=%zd; clamping copy to n=%zd",
+                    req_elems,
+                    dev_elems,
+                    n_elems);
+            }
+            core::Copy(eagle_kv_rewind_lengths_.data(), n_elems, h_rewind_lengths_storage.data());
+        }
+        if (n_elems < req_elems) {
+            std::fill_n(h_rewind_lengths_storage.data() + n_elems, req_elems - n_elems, SizeType{0});
+        }
+    }
     check_cuda_error(cudaStreamSynchronize(stream_));
 
     const int active_size = state_->active_size;
@@ -2070,8 +2179,8 @@ bool LlamaBatch::Forward(GenerationState& g)
 
     // Helper for multi-token EAGLE: given the active decode batch size,
     // compute how many draft tokens per sequence we would like to generate
-    // in this engine step, respecting both the global engine token budget
-    // and the per-sequence speculative token cap.
+    // in this engine step, respecting both the per-sequence speculative
+    // token cap and the engine's per-step forward budget.
     auto compute_eagle_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
         if (!eagle_enabled || decode_batch_size <= 0) {
             return 0;
@@ -2092,15 +2201,23 @@ bool LlamaBatch::Forward(GenerationState& g)
             return 1;
         }
 
-        // Hard upper bound from engine budget: do not exceed the per-step
-        // engine token allowance when spreading draft tokens across the
-        // active decode batch.
-        const int max_by_engine = max_engine_tokens / decode_batch_size;
-        if (max_by_engine <= 0) {
-            return 1;
+        // Hard upper bound from the hardware forward budget: ensure that
+        // the planned per-sequence speculative tokens do not exceed what
+        // the engine can accommodate for this decode batch.
+        //
+        // max_forward_token_num_ is the per-step Q budget across the
+        // entire decode batch. Approximate a per-sequence share by
+        // dividing by the active decode batch size and clamp the
+        // speculative step size to that share.
+        int tokens_per_seq = max_engine_tokens;
+        if (max_forward_token_num_ > 0 && decode_batch_size > 0) {
+            const int per_seq_hw_cap = max_forward_token_num_ / decode_batch_size;
+            if (per_seq_hw_cap > 0) {
+                tokens_per_seq = std::min(tokens_per_seq, per_seq_hw_cap);
+            }
         }
 
-        const int tokens_per_seq = std::max(1, std::min(per_seq_cap, max_by_engine));
+        tokens_per_seq = std::max(1, std::min(per_seq_cap, tokens_per_seq));
         return tokens_per_seq;
     };
 
@@ -2425,57 +2542,117 @@ bool LlamaBatch::Forward(GenerationState& g)
                         eagle_end_ids_.data(),
                         batch_size);
                 }
-                core::Copy(host_end_ids.data(), batch_size, eagle_end_ids_.data());
+                {
+                    const ssize_t host_elems = static_cast<ssize_t>(host_end_ids.size());
+                    const ssize_t dev_elems  = eagle_end_ids_.size();
+                    const ssize_t req_elems  = static_cast<ssize_t>(batch_size);
+                    const ssize_t n_elems    = std::min(req_elems, std::min(host_elems, dev_elems));
+                    if (n_elems > 0) {
+                        if (isEagleDebugEnabled() && tp_rank_ == 0 && req_elems > dev_elems
+                            && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                            TM_LOG_WARNING(
+                                "[LlamaBatch][EAGLE][eagle_end_ids][clamp] req_elems=%zd dev_elems=%zd; clamping copy "
+                                "to n=%zd",
+                                req_elems,
+                                dev_elems,
+                                n_elems);
+                        }
+                        core::Copy(host_end_ids.data(), n_elems, eagle_end_ids_.data());
+                    }
+                    if (n_elems < req_elems && !host_end_ids.empty()) {
+                        // Mark any missing entries as "no EOS" to keep downstream kernels safe.
+                        std::fill_n(host_end_ids.data() + n_elems, req_elems - n_elems, -1);
+                    }
+                }
                 spec_ctx.d_end_ids = eagle_end_ids_.data();
             }
             // Posterior/typical gating knobs (per TRT).
+            // Only enable entropy-based masking when at least one request
+            // provides an explicit posterior threshold or alpha. This keeps
+            // the EAGLE3 draft path fast by default while preserving the
+            // ability to opt into gating when desired.
             {
-                std::vector<float> host_thr(max_batch_size_, 1.0f);
-                std::vector<float> host_alpha(batch_size, 1.0f);
-                std::vector<float> host_temp(batch_size, 1.0f);
+                bool enable_posterior = false;
                 for (int i = 0; i < batch_size; ++i) {
                     const auto* req = state_->requests[i].get();
                     if (!req) {
                         continue;
                     }
-                    host_temp[i] = req->gen_cfg.temperature;
-                    // If posterior params are absent, default to 1.0 (no masking).
-                    // if (!req->gen_cfg.posterior_thresholds.empty()) {
-                    //     host_thr[i] = req->gen_cfg.posterior_thresholds.front();
-                    // }
-                    // if (!req->gen_cfg.posterior_alphas.empty()) {
-                    //     host_alpha[i] = req->gen_cfg.posterior_alphas.front();
-                    // }
+                    if (!req->gen_cfg.posterior_thresholds.empty()
+                        || !req->gen_cfg.posterior_alphas.empty()) {
+                        enable_posterior = true;
+                        break;
+                    }
                 }
-                if (isEagleDebugEnabled() && tp_rank_ == 0) {
-                    TM_LOG_WARNING(
-                        "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_thr_step] step=%d batch=%d a=%p b=%p n=%d",
-                        g.step,
-                        batch_size,
-                        host_thr.data(),
-                        eagle_posterior_thresholds_.data(),
-                        batch_size);
-                    TM_LOG_WARNING(
-                        "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_alpha_step] step=%d batch=%d a=%p b=%p n=%d",
-                        g.step,
-                        batch_size,
-                        host_alpha.data(),
-                        eagle_posterior_alphas_.data(),
-                        batch_size);
-                    TM_LOG_WARNING(
-                        "[LlamaBatch][EAGLE][CopySITE:eagle_temperature_step] step=%d batch=%d a=%p b=%p n=%d",
-                        g.step,
-                        batch_size,
-                        host_temp.data(),
-                        eagle_temperatures_.data(),
-                        batch_size);
+
+                if (enable_posterior) {
+                    std::vector<float> host_thr(max_batch_size_, 1.0f);
+                    std::vector<float> host_alpha(batch_size, 1.0f);
+                    std::vector<float> host_temp(batch_size, 1.0f);
+                    for (int i = 0; i < batch_size; ++i) {
+                        const auto* req = state_->requests[i].get();
+                        if (!req) {
+                            continue;
+                        }
+                        host_temp[i] = req->gen_cfg.temperature;
+                        if (!req->gen_cfg.posterior_thresholds.empty()) {
+                            host_thr[i] = req->gen_cfg.posterior_thresholds.front();
+                        }
+                        if (!req->gen_cfg.posterior_alphas.empty()) {
+                            host_alpha[i] = req->gen_cfg.posterior_alphas.front();
+                        }
+                    }
+                    if (isEagleDebugEnabled() && tp_rank_ == 0
+                        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_thr_step] step=%d batch=%d a=%p b=%p n=%d",
+                            g.step,
+                            batch_size,
+                            host_thr.data(),
+                            eagle_posterior_thresholds_.data(),
+                            batch_size);
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_alpha_step] step=%d batch=%d a=%p b=%p n=%d",
+                            g.step,
+                            batch_size,
+                            host_alpha.data(),
+                            eagle_posterior_alphas_.data(),
+                            batch_size);
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][CopySITE:eagle_temperature_step] step=%d batch=%d a=%p b=%p n=%d",
+                            g.step,
+                            batch_size,
+                            host_temp.data(),
+                            eagle_temperatures_.data(),
+                            batch_size);
+                    }
+                    {
+                        const ssize_t req_elems = static_cast<ssize_t>(batch_size);
+                        const ssize_t n_thr     = std::min(
+                            req_elems,
+                            std::min(static_cast<ssize_t>(host_thr.size()), eagle_posterior_thresholds_.size()));
+                        const ssize_t n_alpha   = std::min(
+                            req_elems,
+                            std::min(static_cast<ssize_t>(host_alpha.size()), eagle_posterior_alphas_.size()));
+                        const ssize_t n_temp    = std::min(
+                            req_elems,
+                            std::min(static_cast<ssize_t>(host_temp.size()), eagle_temperatures_.size()));
+                        const ssize_t n_elems   = std::min(n_thr, std::min(n_alpha, n_temp));
+                        if (n_elems > 0) {
+                            core::Copy(host_thr.data(), n_elems, eagle_posterior_thresholds_.data());
+                            core::Copy(host_alpha.data(), n_elems, eagle_posterior_alphas_.data());
+                            core::Copy(host_temp.data(), n_elems, eagle_temperatures_.data());
+                        }
+                    }
+                    spec_ctx.d_posterior_thresholds = eagle_posterior_thresholds_.data();
+                    spec_ctx.d_posterior_alphas     = eagle_posterior_alphas_.data();
+                    spec_ctx.d_temperatures         = eagle_temperatures_.data();
                 }
-                core::Copy(host_thr.data(), batch_size, eagle_posterior_thresholds_.data());
-                core::Copy(host_alpha.data(), batch_size, eagle_posterior_alphas_.data());
-                core::Copy(host_temp.data(), batch_size, eagle_temperatures_.data());
-                spec_ctx.d_posterior_thresholds = eagle_posterior_thresholds_.data();
-                spec_ctx.d_posterior_alphas     = eagle_posterior_alphas_.data();
-                spec_ctx.d_temperatures         = eagle_temperatures_.data();
+                else {
+                    spec_ctx.d_posterior_thresholds = nullptr;
+                    spec_ctx.d_posterior_alphas     = nullptr;
+                    spec_ctx.d_temperatures         = nullptr;
+                }
             }
 
             model_->dynamicDecodeWithSpecMulti(g,
@@ -2886,7 +3063,15 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
             sequence_lengths_.data(),
             batch_size);
     }
-    core::Copy(h_seq_lengths.data(), batch_size, sequence_lengths_.data());
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(h_seq_lengths.size());
+        const ssize_t dev_elems  = sequence_lengths_.size();
+        const ssize_t req_elems  = static_cast<ssize_t>(batch_size);
+        const ssize_t n_elems    = std::min(req_elems, std::min(host_elems, dev_elems));
+        if (n_elems > 0) {
+            core::Copy(h_seq_lengths.data(), n_elems, sequence_lengths_.data());
+        }
+    }
     check_cuda_error(cudaStreamSynchronize(stream_));
 
     // If an EOS token was committed as part of the extra accepted tokens

@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import dataclasses
+import os
 import random
 from contextlib import asynccontextmanager, closing
 from copy import deepcopy
@@ -138,10 +139,13 @@ class GenOut:
     # for GPT-OSS harmony format
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
+    # Optional per-request metrics (e.g. EAGLE spec_info) propagated
+    # from the backend EngineOutput.
+    req_metrics: Any = None
 
 
 def _gen_out_to_response(out: GenOut, index) -> Response:
-    return Response(
+    resp = Response(
         text=out.response,
         generate_token_len=out.generate_token_len,
         input_token_len=out.input_token_len,
@@ -155,6 +159,12 @@ def _gen_out_to_response(out: GenOut, index) -> Response:
         tool_calls=out.tool_calls,
         index=index,
     )
+    # Preserve req_metrics when present so downstream consumers
+    # (e.g. benchmarks) can access EAGLE spec_info from offline
+    # pipelines just like they do in the serve path.
+    if getattr(out, "req_metrics", None) is not None:
+        setattr(resp, "req_metrics", out.req_metrics)
+    return resp
 
 
 def _append_response(dst: Response, src: Response):
@@ -177,6 +187,11 @@ def _append_response(dst: Response, src: Response):
         dst.reasoning_content = (dst.reasoning_content or "") + src.reasoning_content
     if src.tool_calls:
         dst.tool_calls = (dst.tool_calls or []) + src.tool_calls
+    # Propagate req_metrics when present so the final
+    # aggregated Response exposes per-request metrics
+    # (including EAGLE spec_info) to callers.
+    if getattr(src, "req_metrics", None) is not None:
+        setattr(dst, "req_metrics", src.req_metrics)
     return dst
 
 
@@ -449,16 +464,25 @@ class AsyncEngine(LogitsMixin):
         # Initialize harmony parser for GPT-OSS models
         self.harmony_parser = None
         if self.arch == "GptOssForCausalLM":
-            try:
-                from lmdeploy.serve.openai.harmony_utils import GptOssChatParser
+            disable_harmony = os.getenv("LMDEPLOY_DISABLE_HARMONY", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if disable_harmony:
+                logger.info("LMDEPLOY_DISABLE_HARMONY=1; skipping harmony parser init")
+            else:
+                try:
+                    from lmdeploy.serve.openai.harmony_utils import GptOssChatParser
 
-                self.harmony_parser = GptOssChatParser()
-                logger.info("GPT-OSS model detected, harmony parser initialized")
-            except ImportError as e:
-                logger.warning(
-                    f"Failed to import GptOssChatParser: {e}. "
-                    "Harmony format parsing will be disabled."
-                )
+                    self.harmony_parser = GptOssChatParser()
+                    logger.info("GPT-OSS model detected, harmony parser initialized")
+                except ImportError as e:
+                    logger.warning(
+                        f"Failed to import GptOssChatParser: {e}. "
+                        "Harmony format parsing will be disabled."
+                    )
 
     def close(self):
         self.internal_thread.close()
@@ -774,13 +798,30 @@ class AsyncEngine(LogitsMixin):
     ) -> Iterator[Iterator[Response]]:
 
         async def _sync_resp(g, que: Queue, idx: int, sem: asyncio.Semaphore):
-            async for out in g:
-                que.put(_gen_out_to_response(out, idx))
-            sem.release()
-            if not multiplex:
-                que.put(None)  # sentinel of inner generator
-            if pbar:
-                pbar.update(1)
+            try:
+                async for out in g:
+                    que.put(_gen_out_to_response(out, idx))
+            except Exception as e:
+                logger.exception(f"[sync_resp] exception caught: {type(e).__name__} {e}")
+                que.put(
+                    _gen_out_to_response(
+                        GenOut(
+                            response=f"internal error happened: {type(e).__name__}",
+                            history_token_len=0,
+                            input_token_len=0,
+                            generate_token_len=0,
+                            finish_reason="error",
+                            token_ids=[],
+                        ),
+                        idx,
+                    )
+                )
+            finally:
+                sem.release()
+                if not multiplex:
+                    que.put(None)  # sentinel of inner generator
+                if pbar:
+                    pbar.update(1)
 
         que = Queue()
 
@@ -893,6 +934,15 @@ class AsyncEngine(LogitsMixin):
                 res = None
                 for out in g:
                     res = _append_response(res, out)
+                if res is None:
+                    res = Response(
+                        text="internal error happened",
+                        generate_token_len=0,
+                        input_token_len=0,
+                        finish_reason="error",
+                        token_ids=[],
+                        index=len(outputs),
+                    )
                 outputs.append(res)
         finally:
             if pbar:
@@ -984,7 +1034,7 @@ class AsyncEngine(LogitsMixin):
         try:
             yield inst
         except (Exception, asyncio.CancelledError, GeneratorExit) as e:
-            logger.error(f"[model_inst] exception caught: {e}")
+            logger.exception(f"[model_inst] exception caught: {e}")
             if self.backend == "pytorch":
                 # manually end pytorch session
                 await inst.async_end(session_id)
@@ -999,7 +1049,7 @@ class AsyncEngine(LogitsMixin):
         try:
             yield generator
         except (Exception, asyncio.CancelledError, GeneratorExit) as e:  # noqa
-            logger.error(f"[safe_run] exception caught: {type(e).__name__} {e}")
+            logger.exception(f"[safe_run] exception caught: {type(e).__name__} {e}")
             # TODO: remove session_id from async cancel
             await inst.async_cancel(session_id)
             raise e
@@ -1243,10 +1293,17 @@ class AsyncEngine(LogitsMixin):
                             else outputs.logits
                         )
 
+                    # Preserve per-request metrics (including EAGLE
+                    # speculative decoding stats) on the GenOut so
+                    # offline pipelines can consume req_metrics in
+                    # the same way as the serve path.
+                    if getattr(outputs, "req_metrics", None) is not None:
+                        out.req_metrics = outputs.req_metrics
+
                     # Parse harmony format for GPT-OSS models
-                    if self.harmony_parser and parse_harmony and token_ids:
+                    if self.harmony_parser and parse_harmony and res:
                         try:
-                            parsed = self.harmony_parser.parse_streaming(token_ids)
+                            parsed = self.harmony_parser.parse_streaming(res)
                             # Update output with parsed harmony content
                             out.response = parsed.content or ""
                             out.reasoning_content = parsed.reasoning_content
@@ -1259,6 +1316,9 @@ class AsyncEngine(LogitsMixin):
                             logger.warning(
                                 f"Failed to parse harmony format: {e}. Using raw output."
                             )
+                            # Disable further parsing for this request to avoid
+                            # repeated parser failures and log spam.
+                            parse_harmony = False
 
                     yield out
                 # end of generator loop

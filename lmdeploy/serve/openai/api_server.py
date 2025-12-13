@@ -515,9 +515,13 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
 
             delta_token_ids = res.token_ids if res.token_ids is not None else []
             if gpt_oss_parser:
-                delta_message = gpt_oss_parser.parse_streaming(res.token_ids)
-                if res.finish_reason == 'stop' and len(delta_message.tool_calls) > 0:
-                    res.finish_reason = 'tool_calls'
+                try:
+                    delta_message = gpt_oss_parser.parse_streaming(res.token_ids)
+                    if res.finish_reason == 'stop' and len(delta_message.tool_calls) > 0:
+                        res.finish_reason = 'tool_calls'
+                except Exception as e:
+                    logger.warning(f'Failed to parse harmony format: {e}. Using raw output.')
+                    delta_message = DeltaMessage(role='assistant', content=res.response)
             else:
                 delta_message = DeltaMessage(role='assistant', content=res.response)
                 if has_parser:
@@ -596,9 +600,16 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         remote_token_ids.append(res.token_ids)
 
     if gpt_oss_parser:
-        message = gpt_oss_parser.parse_full(final_token_ids)
-        if final_res.finish_reason == 'stop' and len(message.tool_calls) > 0:
-            final_res.finish_reason = 'tool_calls'
+        try:
+            message = gpt_oss_parser.parse_full(final_token_ids)
+            if final_res.finish_reason == 'stop' and len(message.tool_calls) > 0:
+                final_res.finish_reason = 'tool_calls'
+        except Exception as e:
+            logger.warning(f'Failed to parse harmony format: {e}. Using raw output.')
+            message = ChatMessage(role='assistant',
+                                  content=text,
+                                  tool_calls=None,
+                                  reasoning_content=None)
     else:
         tool_calls = None
         reasoning_content = None

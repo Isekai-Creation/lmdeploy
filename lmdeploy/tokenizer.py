@@ -288,21 +288,46 @@ class HuggingFaceTokenizer:
         """
         tokenizer = self.model
         ids_offset, prev_tokens, prefix_offset, read_offset = state.as_tuple()
+
+        def _safe_convert_ids_to_tokens(input_ids: Sequence[int]) -> List[str]:
+            """Convert token ids to tokens defensively.
+
+            Some fast tokenizers raise OverflowError when given negative ids
+            (e.g. padding values from backends). Treat such ids as invalid
+            and skip them instead of crashing the pipeline.
+            """
+            try:
+                tokens = tokenizer.convert_ids_to_tokens(
+                    input_ids, skip_special_tokens=skip_special_tokens
+                )
+            except Exception:
+                cleaned_ids: List[int] = []
+                for token_id in input_ids:
+                    try:
+                        token_int = int(token_id)
+                    except Exception:
+                        continue
+                    if token_int >= 0:
+                        cleaned_ids.append(token_int)
+                try:
+                    tokens = tokenizer.convert_ids_to_tokens(
+                        cleaned_ids, skip_special_tokens=skip_special_tokens
+                    )
+                except Exception:
+                    tokens = []
+            # `convert_ids_to_tokens` may return None for out-of-range token_id.
+            tokens = tokens or []
+            if None in tokens:
+                tokens = [x for x in tokens if x is not None]
+            return tokens
+
         # This is the first iteration for this sequence
-        new_tokens = tokenizer.convert_ids_to_tokens(all_input_ids[ids_offset:],
-                                                     skip_special_tokens=skip_special_tokens)
-        # `convert_ids_to_tokens` returns None for out-of-range token_id
-        new_tokens = new_tokens or []
-        new_tokens = [x for x in new_tokens if x is not None] if None in new_tokens else new_tokens
+        new_tokens = _safe_convert_ids_to_tokens(all_input_ids[ids_offset:])
         if prev_tokens is None:
             # Please notice that in VLLM, indexes are detokenized one by one
             # while in LMDeploy, every turn, the detokenized indexes length
             # can be different.
-            prev_tokens = tokenizer.convert_ids_to_tokens(all_input_ids[:ids_offset],
-                                                          skip_special_tokens=skip_special_tokens)
-            # `convert_ids_to_tokens` returns None for out-of-range token_id
-            prev_tokens = prev_tokens or []
-            prev_tokens = [x for x in prev_tokens if x is not None] if None in prev_tokens else prev_tokens
+            prev_tokens = _safe_convert_ids_to_tokens(all_input_ids[:ids_offset])
             read_offset = len(prev_tokens)
             if skip_special_tokens and new_tokens and new_tokens[0] in tokenizer.all_special_ids:
                 read_offset = read_offset + 1  # skip special token

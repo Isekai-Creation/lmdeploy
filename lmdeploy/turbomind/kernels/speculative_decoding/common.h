@@ -169,6 +169,27 @@ void invokeExtractSuccessorsFromPaths(SizeType const* paths,
                                       cudaStream_t    stream);
 
 /**
+ * @brief Replicate a single-spec tree (paths_flat) across all batch slots.
+ *
+ * paths_flat is laid out as [num_paths, max_path_len] and represents the
+ * speculative tree discovered for a single sequence. This helper expands
+ * it into a per-slot draft_paths layout:
+ *
+ *   draft_paths[slot, path, level] = paths_flat[path, level]
+ *
+ * for all slot in [0, batch_size) and path in [0, max_decoding_tokens),
+ * filling unused entries with -1 when path >= num_paths.
+ */
+void invokeReplicatePathsFromFlat(SizeType const* paths_flat,
+                                  SizeType        num_paths,
+                                  SizeType        max_path_len,
+                                  SizeType*       draft_paths,
+                                  SizeType        batch_size,
+                                  SizeType        max_decoding_tokens,
+                                  cudaStream_t    stream);
+
+
+/**
  * @brief Parameters for KV cache rewind
  * 
  * Manages freeing KV cache blocks for rejected draft tokens.

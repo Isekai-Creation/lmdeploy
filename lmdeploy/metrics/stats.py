@@ -256,28 +256,43 @@ class SpeculativeDecodingStats:
     def update_from_output(self, outputs: EngineOutput):
         """Update from engine output."""
         if spec_info := getattr(outputs.req_metrics, 'spec_info', None):
+            num_drafts = int(spec_info.get("num_drafts", 0))
+            if num_drafts <= 0:
+                # Older builds exposed only per-request aggregates without a
+                # draft-count. Treat the entire request as a single draft to
+                # keep metrics bounded and non-crashing.
+                num_drafts = 1
+
+            num_draft_tokens = int(spec_info.get("num_draft_tokens", 0))
+            num_accepted_tokens = int(spec_info.get("num_accepted_tokens", 0))
+
             # Basic draft/accept counts.
-            self.num_drafts += 1
-            self.num_draft_tokens += spec_info['num_draft_tokens']
-            self.num_accepted_tokens += spec_info['num_accepted_tokens']
-            self.num_accepted_tokens_per_pos[:spec_info['num_accepted_tokens']] += 1
+            self.num_drafts += num_drafts
+            self.num_draft_tokens += num_draft_tokens
+            self.num_accepted_tokens += num_accepted_tokens
 
-            # Per-step EAGLE3 step-level metrics, when present.
-            tokens_per_seq = int(spec_info.get("tokens_per_seq", 0))
-            accepted_len_step = int(spec_info.get("accepted_len", 0))
+            # Step-level aggregates are reported by TurboMind as totals across
+            # drafts (per-request), so we aggregate using the draft count as a
+            # weight.
+            self.total_steps += num_drafts
+            self.total_tokens_per_seq += num_draft_tokens
+            self.total_accepted_len += num_accepted_tokens
+
+            max_tokens_per_seq = int(spec_info.get("max_tokens_per_seq", 0))
+            if max_tokens_per_seq <= 0 and num_drafts > 0:
+                max_tokens_per_seq = int(num_draft_tokens / num_drafts) if num_drafts else 0
+            self.max_tokens_per_seq = max(self.max_tokens_per_seq, max_tokens_per_seq)
+
             max_accepted_len_step = int(spec_info.get("max_accepted_len", 0))
-            committed_extras_step = int(spec_info.get("committed_extras", 0))
-
-            self.total_steps += 1
-            self.total_tokens_per_seq += tokens_per_seq
-            self.max_tokens_per_seq = max(self.max_tokens_per_seq, tokens_per_seq)
-
-            self.total_accepted_len += accepted_len_step
+            if max_accepted_len_step <= 0 and num_drafts > 0:
+                max_accepted_len_step = int(num_accepted_tokens / num_drafts) if num_drafts else 0
             self.max_accepted_len = max(self.max_accepted_len, max_accepted_len_step)
-            if max_accepted_len_step >= 2:
-                self.steps_with_accept_ge2 += 1
 
-            self.total_committed_extras += committed_extras_step
+            steps_accept_ge2 = int(spec_info.get("steps_accept_ge2", 0))
+            self.steps_with_accept_ge2 += steps_accept_ge2
+
+            total_committed_extras = int(spec_info.get("total_committed_extras", 0))
+            self.total_committed_extras += total_committed_extras
 
             # Optional tree-aware metrics.
             tree_info = spec_info.get("tree_decode") if isinstance(spec_info, dict) else None
@@ -330,7 +345,13 @@ class EagleMetricsSummary:
     num_draft_tokens: int
     num_accepted_tokens: int
     draft_acceptance_rate: float
+    # Conventionally includes the bonus token:
+    #   mean_acceptance_length = 1 + num_accepted_tokens / num_drafts.
+    # This can be large for long runs; use mean_accepted_tokens_per_draft
+    # for a more intuitive per-draft scalar.
     mean_acceptance_length: float
+    # Additional context: how many speculative tokens we attempted per draft.
+    num_spec_tokens: int | None = None
     # Extended summary fields derived from SpeculativeDecodingStats.
     mean_tokens_per_seq: float | None = None
     max_tokens_per_seq: int | None = None
@@ -341,6 +362,9 @@ class EagleMetricsSummary:
     tree_num_draft_tokens: int | None = None
     tree_num_target_tokens: int | None = None
     tree_num_accepted_tokens: int | None = None
+    # More intuitive scalar: average accepted tokens per draft (excluding the
+    # bonus token), i.e. num_accepted_tokens / num_drafts.
+    mean_accepted_tokens_per_draft: float | None = None
 
     @classmethod
     def from_stats(cls, stats: SpeculativeDecodingStats) -> "EagleMetricsSummary":
@@ -357,8 +381,10 @@ class EagleMetricsSummary:
         if num_drafts > 0:
             # Conventionally, mean acceptance length includes the bonus token.
             mean_acceptance_length = 1.0 + (num_accepted_tokens / num_drafts)
+            mean_accepted_tokens_per_draft = num_accepted_tokens / num_drafts
         else:
             mean_acceptance_length = float("nan")
+            mean_accepted_tokens_per_draft = float("nan")
 
         # Extended fields: averaged over speculative steps.
         if stats.total_steps > 0:
@@ -384,6 +410,7 @@ class EagleMetricsSummary:
             num_accepted_tokens=num_accepted_tokens,
             draft_acceptance_rate=draft_acceptance_rate,
             mean_acceptance_length=mean_acceptance_length,
+            num_spec_tokens=stats.num_spec_tokens,
             mean_tokens_per_seq=mean_tokens_per_seq,
             max_tokens_per_seq=max_tokens_per_seq,
             max_acceptance_length=max_acceptance_length,
@@ -392,6 +419,7 @@ class EagleMetricsSummary:
             tree_num_draft_tokens=tree_num_draft_tokens or None,
             tree_num_target_tokens=tree_num_target_tokens or None,
             tree_num_accepted_tokens=tree_num_accepted_tokens or None,
+            mean_accepted_tokens_per_draft=mean_accepted_tokens_per_draft,
         )
 
     def to_dict(self) -> dict:
@@ -403,6 +431,10 @@ class EagleMetricsSummary:
             "mean_acceptance_rate": float(self.draft_acceptance_rate),
             "mean_acceptance_length": float(self.mean_acceptance_length),
         }
+        if self.num_spec_tokens is not None:
+            out["num_spec_tokens"] = int(self.num_spec_tokens)
+        if self.mean_accepted_tokens_per_draft is not None:
+            out["mean_accepted_tokens_per_draft"] = float(self.mean_accepted_tokens_per_draft)
         # Extended fields are optional; include them when present.
         if self.mean_tokens_per_seq is not None:
             out["mean_tokens_per_seq"] = float(self.mean_tokens_per_seq)

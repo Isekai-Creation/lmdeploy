@@ -72,7 +72,19 @@ void Copy(const Buffer& a, Ref<Buffer> b_)
 
 void* Copy(const void* a, ssize_t n, void* b, const Stream& stream)
 {
+    if (turbomind::isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+        TM_LOG_WARNING("[EAGLE][CopyDBG] Copy(a=%p, b=%p, n=%zd)", a, b, n);
+    }
+
     auto err = cudaMemcpyAsync(b, a, n, cudaMemcpyDefault, stream.handle());
+    if (err != cudaSuccess && turbomind::isEagleDebugEnabled()
+        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+        TM_LOG_WARNING("[EAGLE][CopyDBG] cudaMemcpyAsync failed in Copy(a=%p, b=%p, n=%zd) with err=%d",
+                       a,
+                       b,
+                       n,
+                       static_cast<int>(err));
+    }
     check_cuda_error(err);
     return (char*)b + n;
 }

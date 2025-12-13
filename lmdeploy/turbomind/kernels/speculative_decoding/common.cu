@@ -814,6 +814,56 @@ void invokeExtractSuccessorsFromPaths(SizeType const* paths,
         num_successors, batch_size, max_decoding_tokens, successor_offsets, successor_counts);
 }
 
+namespace {
+
+__global__ void replicatePathsFromFlatKernel(SizeType const* paths_flat,
+                                             SizeType        num_paths,
+                                             SizeType        max_path_len,
+                                             SizeType*       draft_paths,
+                                             SizeType        batch_size,
+                                             SizeType        max_decoding_tokens)
+{
+    const SizeType path_idx = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
+    const SizeType slot     = static_cast<SizeType>(blockIdx.y);
+
+    if (slot >= batch_size || path_idx >= max_decoding_tokens) {
+        return;
+    }
+
+    const bool has_path = path_idx < num_paths;
+    const SizeType* src = has_path ? (paths_flat + path_idx * max_path_len) : nullptr;
+
+    SizeType* dst = draft_paths + (slot * max_decoding_tokens + path_idx) * max_path_len;
+    for (SizeType l = 0; l < max_path_len; ++l) {
+        dst[l] = has_path ? src[l] : static_cast<SizeType>(-1);
+    }
+}
+
+}  // namespace
+
+void invokeReplicatePathsFromFlat(SizeType const* paths_flat,
+                                  SizeType        num_paths,
+                                  SizeType        max_path_len,
+                                  SizeType*       draft_paths,
+                                  SizeType        batch_size,
+                                  SizeType        max_decoding_tokens,
+                                  cudaStream_t    stream)
+{
+    if (!paths_flat || !draft_paths || batch_size <= 0 || max_decoding_tokens <= 0 || max_path_len <= 0
+        || num_paths <= 0) {
+        return;
+    }
+
+    constexpr int BLOCK = 128;
+    const dim3    grid((static_cast<unsigned>(max_decoding_tokens) + BLOCK - 1) / BLOCK,
+                    static_cast<unsigned>(batch_size));
+    const dim3    block(BLOCK);
+
+    replicatePathsFromFlatKernel<<<grid, block, 0, stream>>>(
+        paths_flat, num_paths, max_path_len, draft_paths, batch_size, max_decoding_tokens);
+}
+
+
 /**
  * @brief Kernel: Rewind KV cache for rejected tokens
  *

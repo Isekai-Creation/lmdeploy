@@ -652,6 +652,7 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
                 float(num_accept) / float(eagle_steps) if eagle_steps > 0 else 0.0
             )
             spec_info = {
+                "num_drafts": int(eagle_steps),
                 "num_draft_tokens": int(num_draft),
                 "num_accepted_tokens": int(num_accept),
                 "avg_accepted_per_step": avg_accepted_per_step,
@@ -682,7 +683,7 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
                 committed_extras = max(0.0, accepted_len - 1.0)
 
             spec_info.update(
-                tokens_per_seq=int(tokens_per_seq),
+                tokens_per_seq=float(tokens_per_seq),
                 accepted_len=float(accepted_len),
                 max_accepted_len=int(max_accepted_len),
                 committed_extras=float(committed_extras),
@@ -708,6 +709,20 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
             if total_rewound or rewind_steps:
                 spec_info["num_rewound_tokens"] = int(total_rewound)
                 spec_info["rewind_steps"] = int(rewind_steps)
+
+            # Additional EAGLE step-level aggregates from the backend.
+            max_tokens_per_seq = _field("eagle_max_tokens_per_seq", 0)
+            max_accepted_len_backend = _field("eagle_max_accepted_len", 0)
+            steps_accept_ge2 = _field("eagle_steps_accept_ge2", 0)
+            total_committed_extras = _field("eagle_total_committed_extras", 0)
+            if max_tokens_per_seq:
+                spec_info["max_tokens_per_seq"] = int(max_tokens_per_seq)
+            if max_accepted_len_backend:
+                spec_info["max_accepted_len"] = int(max_accepted_len_backend)
+            if steps_accept_ge2:
+                spec_info["steps_accept_ge2"] = int(steps_accept_ge2)
+            if total_committed_extras:
+                spec_info["total_committed_extras"] = int(total_committed_extras)
             out.req_metrics.spec_info = spec_info
 
             # Optional debug/trace logging for EAGLE metrics.

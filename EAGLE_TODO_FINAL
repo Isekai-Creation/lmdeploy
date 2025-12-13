@@ -59,7 +59,7 @@ Handoff (A/C) after geometry:
 
 ### Engineer A – Kernels & math
 - [x] Implement `Eagle3AttentionWeight` construction and metadata (q heads, kv heads, head dims, scaling).
-- [x] Implement full CUDA path in `Eagle3AttentionLayer::Forward`: Q/K/V GEMMs, reshape, RoPE, SDPA (masking), V aggregation, O GEMM, output assign for BF16/FP16 (and optional FP32). **Current:** Q/K/V GEMMs + RoPE params + offset‑aware SDPA + Wo with q_len/kv_len/past_kv_len/packed_mask_stride/positions/runtime offsets plumbed, using native Eagle‑3 q/k/v/o geometry.
+- [x] Implement full CUDA path in `Eagle3AttentionLayer::Forward`: Q/K/V GEMMs, reshape, RoPE, SDPA (masking), V aggregation, O GEMM, output assign for BF16/FP16 (and optional FP32). **Current:** Q/K/V GEMMs + RoPE params + offset‑aware SDPA + Wo with q_len/kv_len/past_kv_len/packed_mask_stride/positions/runtime offsets plumbed, using native Eagle‑3 q/k/v/o geometry. For some large LM‑head/FC shapes on this sm120 BF16 GPU (e.g. `sm120_bf16_bf16_bf16_ttt_fff_{3,5}x34560x2880_1`) the CUTLASS registry has no fused kernel; TurboMind logs “No feasible kernel…” and falls back to naive BF16/cuBLAS, so throughput is currently below TRT‑LLM until tuned sm120 kernels are added.
 - [ ] Mirror TRT‑LLM scaling/clamping exactly for longer sequences: 1/sqrt(d_k), max‑subtraction, dtype handling (BF16/FP16), and any additional tree‑mask nuances observed in TRT tests.
 - [x] Compose true 2H QKV input (embedding_norm + fc_out mapped/padded to draft_hidden) in `Eagle3DraftLayer::Forward`; remove placeholder composition and head_num*size_per_head gating; match TRT 2H packing order.
 - [x] Ensure draft attention uses the real Eagle‑3 backend when geometry matches and only logs explicit fallback when geometry/dtypes are invalid; shallow paths are now limited to misconfigured runs, not the GPT‑OSS‑120B‑Eagle3 happy path.
@@ -531,6 +531,13 @@ GPT‑OSS‑120B, within agreed tolerances.
   - max_abs_diff within expected BF16 / MXFP ranges.
 
 **5.2 Speculative acceptance metrics vs TRT‑LLM**
+- [x] Wire `SpeculativeDecodingStats` / `EagleMetricsSummary` into the
+      offline TurboMind pipeline and `benchmark_speculative.py` so
+      speculative JSON outputs (e.g. `speculative_single_context8k.json`,
+      `speculative_batch4_context16k_3tokens.json`,
+      `speculative_single_context32k_3tokens.json`) include an
+      `eagle_speculation` block with aggregate draft/accept statistics.
+      Cross‑backend comparisons vs TRT‑LLM remain TODO.
 - [ ] Use `SpeculativeDecodingStats` / `EagleMetricsSummary` and
       TRT‑LLM’s test patterns to compare:
   - `mean_acceptance_length`,
@@ -544,11 +551,26 @@ GPT‑OSS‑120B, within agreed tolerances.
     an agreed threshold.
 
 **5.3 Throughput benchmarks**
-- [ ] Extend `inference/benchmark_speculative.py` / `run_spec_suite.sh`
-      with a GPT‑OSS‑120B‑Eagle3 profile:
-  - baseline (no spec),
-  - Eagle‑3 (TurboMind),
-  - optionally TRT‑LLM for reference.
+- [x] Extend `benchmark_speculative.py` / `run_spec_suite.sh` with a
+      GPT‑OSS‑120B‑Eagle3 offline profile on this sm120 BF16 machine:
+  - Verified stability + metrics sanity with prefix caching enabled
+    (`TM_FORCE_PREFIX_CACHING=1`, `TM_CACHE_MAX_ENTRY_COUNT=0.75`):
+    - 8K single: baseline + `num_spec_tokens ∈ {2,3,4,5}`
+      (`results/20251212_215840`).
+    - 32K single: baseline + `num_spec_tokens ∈ {2,3,4,5}`
+      (`results/20251212_220131`).
+    - 16K batch4: baseline + `num_spec_tokens ∈ {2,3,4,5}`
+      (`results/20251212_220420`).
+  - No CUDA errors, no Python tracebacks; BlockTrie “clamping cached prefix”
+    warnings are non‑fatal.
+  - `eagle_speculation.mean_acceptance_length` is now bounded and numerically
+    reasonable (≈2–5 depending on `num_spec_tokens`).
+- [~] Perf note (not a stability blocker): under the above settings, 32K single
+      and batch4 16K speculative configs are still slower than baseline; treat
+      as kernel/perf work (tracked in `EAGLE_TODO_OPTMIZATIONS.md`).
+- [ ] Extend the profile to cover TRT‑LLM as a reference backend and
+      run side‑by‑side benchmarks on shared hardware when official
+      GPT‑OSS‑120B‑Eagle3 weights and TRT‑LLM tooling are available.
 - [ ] Target:
   - TurboMind Eagle‑3 ≥ TurboMind baseline throughput,
   - TurboMind Eagle‑3 ≈ TRT‑LLM Eagle‑3 on the same hardware class in
