@@ -25,8 +25,25 @@
 #include "src/turbomind/layers/sampling_layers/StopCriteriaLayer.h"
 #include "src/turbomind/macro.h"
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/nvtx_utils.h"
 
 namespace turbomind {
+
+namespace {
+
+struct ScopedNvtxRange {
+    explicit ScopedNvtxRange(const char* name)
+    {
+        PUSH_RANGE(name);
+    }
+
+    ~ScopedNvtxRange()
+    {
+        POP_RANGE;
+    }
+};
+
+}  // namespace
 
 DynamicDecodeLayer::DynamicDecodeLayer(DataType              dtype,
                                        int                   max_batch_size,
@@ -295,6 +312,7 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
     // stop-words are not configured for this batch. When we take this path
     // we avoid building any host-side sequence-limit or finished buffers.
     if (gpu_tail_enabled) {
+        ScopedNvtxRange scope("EAGLE_TAIL_COMMIT");
         constexpr int kMaxEosPerSlot = 4;
         Buffer_<int> d_forced_tokens;
         Buffer_<int> d_forced_lengths;
@@ -308,7 +326,8 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
             d_forced_tokens_ptr  = forced_tokens;
             d_forced_lengths_ptr = forced_lengths;
         }
-        else {
+    else {
+        ScopedNvtxRange scope("EAGLE_TAIL_COMMIT");
             // Legacy path: copy host tail context to device. EOS metadata
             // is already on device (eos_ids_/eos_counts_) from Setup.
             d_forced_tokens  = Buffer_<int>(static_cast<size_t>(batch_size) * max_tail_len, kDEVICE);

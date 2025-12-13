@@ -11,6 +11,7 @@
 #include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include "src/turbomind/kernels/gpt_kernels.h"
 #include "src/turbomind/kernels/gemm/types.h"
+#include "src/turbomind/models/llama/llama_utils.h"
 
 namespace {
 
@@ -584,31 +585,34 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
                 weight_->eagle3_attn.num_q_heads,
                 weight_->eagle3_attn.num_kv_heads);
         }
-        Eagle3AttentionParam ep{};
-        ep.input              = qkv_input;
-        ep.output             = attn_out;
-        ep.attn_weights       = &weight_->attn;
-        ep.weights            = &weight_->eagle3_attn;
-        ep.layer_id           = 0;
-        ep.past_kv_len        = past_kv_len;
-        ep.packed_mask        = packed_mask ? &packed_mask : nullptr;
-        ep.packed_mask_stride = (packed_mask && packed_mask.ndim() >= 2) ? packed_mask.shape(1) : 0;
-        ep.position_ids       = position_ids ? &position_ids : nullptr;
-        ep.tree_offsets       = tree_offsets ? &tree_offsets : nullptr;
-        ep.runtime_offsets    = runtime_offsets ? &runtime_offsets : nullptr;
-        ep.kv_lens_runtime    = kv_lens_runtime ? &kv_lens_runtime : nullptr;
-        ep.successor_offsets  = successor_offsets ? &successor_offsets : nullptr;
-        ep.successor_counts   = successor_counts ? &successor_counts : nullptr;
-        ep.batch_size         = batch_size;
-        ep.q_len              = q_len > 0 ? q_len : 1;
-        ep.kv_len             = kv_len > 0 ? kv_len : ep.q_len;
-        ep.rope_base          = weight_->eagle3_attn.rope_base > 0.f ? weight_->eagle3_attn.rope_base : 10000.f;
-        ep.rope_scale         = weight_->eagle3_attn.rope_scale > 0.f ? weight_->eagle3_attn.rope_scale : 1.f;
-        ep.debug_qkv          = debug_enabled ? &debug_qkv_ : nullptr;
-        ep.debug_attn_out     = debug_enabled ? &debug_attn_out_ : nullptr;
-        eagle3_attn_layer_->Forward(ep);
-        attn_out = ep.output;
-        sync_check_cuda_error();
+        {
+            NvtxScope scope("EAGLE_DRAFT_ATTENTION_FMHA");
+            Eagle3AttentionParam ep{};
+            ep.input              = qkv_input;
+            ep.output             = attn_out;
+            ep.attn_weights       = &weight_->attn;
+            ep.weights            = &weight_->eagle3_attn;
+            ep.layer_id           = 0;
+            ep.past_kv_len        = past_kv_len;
+            ep.packed_mask        = packed_mask ? &packed_mask : nullptr;
+            ep.packed_mask_stride = (packed_mask && packed_mask.ndim() >= 2) ? packed_mask.shape(1) : 0;
+            ep.position_ids       = position_ids ? &position_ids : nullptr;
+            ep.tree_offsets       = tree_offsets ? &tree_offsets : nullptr;
+            ep.runtime_offsets    = runtime_offsets ? &runtime_offsets : nullptr;
+            ep.kv_lens_runtime    = kv_lens_runtime ? &kv_lens_runtime : nullptr;
+            ep.successor_offsets  = successor_offsets ? &successor_offsets : nullptr;
+            ep.successor_counts   = successor_counts ? &successor_counts : nullptr;
+            ep.batch_size         = batch_size;
+            ep.q_len              = q_len > 0 ? q_len : 1;
+            ep.kv_len             = kv_len > 0 ? kv_len : ep.q_len;
+            ep.rope_base          = weight_->eagle3_attn.rope_base > 0.f ? weight_->eagle3_attn.rope_base : 10000.f;
+            ep.rope_scale         = weight_->eagle3_attn.rope_scale > 0.f ? weight_->eagle3_attn.rope_scale : 1.f;
+            ep.debug_qkv          = debug_enabled ? &debug_qkv_ : nullptr;
+            ep.debug_attn_out     = debug_enabled ? &debug_attn_out_ : nullptr;
+            eagle3_attn_layer_->Forward(ep);
+            attn_out = ep.output;
+            sync_check_cuda_error();
+        }
     }
     else {
         if (!logged_invalid_geom) {
@@ -692,7 +696,9 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         ffn_input = attn_out;
     }
 
-    invokeRMSNorm(ffn_input, ffn_input, weight_->post_attn_norm, rmsnorm_eps_, stream);
+    {
+        NvtxScope scope("EAGLE_DRAFT_FFN");
+        invokeRMSNorm(ffn_input, ffn_input, weight_->post_attn_norm, rmsnorm_eps_, stream);
 
     // Ensure output buffer is allocated with the correct shape.
     if (!output_hidden || output_hidden.ndim() != 2 || output_hidden.shape(0) != batch_size
@@ -702,13 +708,14 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     }
 
     // Gated MLP using the prepared Eagle3 FFN weights.
-    LlamaFfnLayer::ForwardParam ffn_param{};
-    ffn_param.input    = ffn_input;
-    ffn_param.output   = output_hidden;
-    ffn_param.weights  = &weight_->ffn;
-    ffn_param.layer_id = 0;
-    ffn_layer_->forward(ffn_param);
-    sync_check_cuda_error();
+        LlamaFfnLayer::ForwardParam ffn_param{};
+        ffn_param.input    = ffn_input;
+        ffn_param.output   = output_hidden;
+        ffn_param.weights  = &weight_->ffn;
+        ffn_param.layer_id = 0;
+        ffn_layer_->forward(ffn_param);
+        sync_check_cuda_error();
+    }
     if (debug_enabled) {
         debug_ffn_out_ = output_hidden;
     }

@@ -16,16 +16,31 @@ namespace ft {
 
 // Tunable constants for Eagle3 FMHA. These are kept modest to
 // balance parallelism and resource usage while enabling multi-CTA
-// tiling over long KV spans.
+// tiling over long KV spans. The heavy FMHA kernels are optionally
+// compiled behind TM_ENABLE_EAGLE3_FMHA to avoid shared-memory
+// overuse on some toolchains while we iterate on other features
+// (e.g. FP4 KV cache).
+#ifndef TM_ENABLE_EAGLE3_FMHA
+#define TM_ENABLE_EAGLE3_FMHA 0
+#endif
+
 constexpr int kEagle3FmhaBlockSizeMax = 256;   // max threads per CTA in FMHA kernels
+constexpr int kEagle3FmhaBlockSize    = 128;   // default CTA size for tiled FMHA launch
 constexpr int kEagle3FmhaMaxHeadDim   = 128;   // maximum head_dim supported by FMHA path
 constexpr int kEagle3FmhaMaxTiles     = 8;     // max tiles per (token, head) for multi-CTA KV
 
 // Optional global tile statistics for debugging / perf analysis.
-// When TM_EAGLE3_FMHA_TILE_STATS is enabled, we count total tiles
-// processed and how many were skipped due to fully-masked KV spans.
-__device__ unsigned long long g_eagle3_fmha_tiles_total  = 0;
-__device__ unsigned long long g_eagle3_fmha_tiles_skipped = 0;
+// When TM_EAGLE3_FMHA_TILE_STATS is enabled, we count total tiles and
+// categorize them by span/mask emptiness.
+enum : int {
+    kEagle3FmhaTilesTotal = 0,
+    kEagle3FmhaTilesSpanEmpty = 1,
+    kEagle3FmhaTilesMaskEmpty = 2,
+    kEagle3FmhaTilesExecuted  = 3,
+    kEagle3FmhaTilesCount     = 4,
+};
+
+__device__ unsigned long long g_eagle3_fmha_tile_stats[kEagle3FmhaTilesCount] = {};
 
 namespace { // anonymous namespace for device helpers
 
@@ -372,11 +387,12 @@ __global__ void eagle3_fmha_kernel(const T* __restrict__ q_ptr,
     const int   pos_idx_q  = position_ids ? min(q_token_offset, token_num - 1) : q_token_offset;
     const int   q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start + q_pos);
     const float inv_sqrt   = rsqrtf(static_cast<float>(head_dim));
-    constexpr int kBlockLocal = kEagle3FmhaBlockSize;
 
-    __shared__ float s_max[kBlockLocal];
-    __shared__ float s_sum[kBlockLocal];
-    __shared__ float s_ctx[kMaxHeadDim][kBlockLocal];
+    const int kBlockLocal = blockDim.x;
+
+    __shared__ float s_max[kEagle3FmhaBlockSizeMax];
+    __shared__ float s_sum[kEagle3FmhaBlockSizeMax];
+    __shared__ float s_ctx[kMaxHeadDim][kEagle3FmhaBlockSizeMax];
 
     const int tid = threadIdx.x;
     if (tid >= kBlockLocal) {
@@ -614,6 +630,7 @@ __global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
     const int tile_len_actual = max(0, tile_end - tile_start);
     if (tile_len_actual <= 0) {
         if (tid == 0) {
+            atomicAdd(&g_eagle3_fmha_tile_stats[kEagle3FmhaTilesSpanEmpty], 1ull);
             partial_m[idx_tile] = -1e20f;
             partial_l[idx_tile] = 0.f;
             for (int d = 0; d < head_dim; ++d) {
@@ -629,13 +646,9 @@ __global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
     __shared__ float         s_ctx[kMaxHeadDim][kEagle3FmhaBlockSizeMax];
     __shared__ int           s_tile_has_any;
 
-    // Count this tile for tile statistics when TM_EAGLE3_FMHA_TILE_STATS
-    // is enabled. We cannot query the env var from device code, so the
-    // host side is responsible for deciding whether to read these
-    // counters; here we simply always increment them and leave it to
-    // the host to ignore them when the env is unset.
+    // Count this tile for tile statistics; host decides whether to read.
     if (tid == 0) {
-        atomicAdd(&g_eagle3_fmha_tiles_total, 1ull);
+        atomicAdd(&g_eagle3_fmha_tile_stats[kEagle3FmhaTilesTotal], 1ull);
     }
 
     // If a packed mask is present, cheaply detect tiles that have no
@@ -675,7 +688,7 @@ __global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
 
             s_tile_has_any = any;
             if (!any) {
-                atomicAdd(&g_eagle3_fmha_tiles_skipped, 1ull);
+                atomicAdd(&g_eagle3_fmha_tile_stats[kEagle3FmhaTilesMaskEmpty], 1ull);
                 partial_m[idx_tile] = -1e20f;
                 partial_l[idx_tile] = 0.f;
                 for (int d = 0; d < head_dim; ++d) {
@@ -746,6 +759,9 @@ __global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
     }
 
     if (m_tile > -1e19f) {
+        if (tid == 0) {
+            atomicAdd(&g_eagle3_fmha_tile_stats[kEagle3FmhaTilesExecuted], 1ull);
+        }
         for (int j = tid; j < tile_len_actual; j += kBlockLocal) {
             const int kv_index       = tile_start + j;
             const int k_token_offset = batch * kv_len + kv_index;
@@ -1226,6 +1242,7 @@ void launch_eagle3_fmha_kernel(const T*       q_ptr,
                                int            partial_tiles,
                                cudaStream_t   stream)
 {
+#if TM_ENABLE_EAGLE3_FMHA
     if (!q_ptr || !k_ptr || !v_ptr || !ctx_ptr || token_num <= 0 || q_len <= 0 || kv_len <= 0
         || !kv_start_per_token || !kv_len_per_token) {
         return;
@@ -1263,6 +1280,22 @@ void launch_eagle3_fmha_kernel(const T*       q_ptr,
 
     bool run_tiled = use_tiled;
 
+    auto get_block_size = []() {
+        static int cached = 0;
+        if (cached > 0) {
+            return cached;
+        }
+        int block = kEagle3FmhaBlockSizeMax;
+        if (const char* env = std::getenv("TM_EAGLE3_FMHA_BLOCK")) {
+            int v = std::atoi(env);
+            if (v >= 32 && v <= kEagle3FmhaBlockSizeMax && (v % 32) == 0) {
+                block = v;
+            }
+        }
+        cached = block;
+        return cached;
+    };
+
     if (run_tiled) {
         // Multi-CTA tiled path: split each (token, head) KV span into a fixed
         // number of tiles and reduce partial outputs across tiles. To avoid
@@ -1279,8 +1312,9 @@ void launch_eagle3_fmha_kernel(const T*       q_ptr,
             run_tiled = false;
         }
         else {
+            const int block_threads = get_block_size();
             dim3 grid1(total, num_tiles);
-        dim3 block1(kEagle3FmhaBlockSize);
+            dim3 block1(block_threads);
 
         eagle3_fmha_multi_cta_kernel1<T, kEagle3FmhaMaxHeadDim><<<grid1, block1, 0, stream>>>(q_ptr,
                                                                                               k_ptr,
@@ -1320,8 +1354,8 @@ void launch_eagle3_fmha_kernel(const T*       q_ptr,
 
     if (!run_tiled) {
         // Single-CTA fallback over the full KV span.
-        constexpr int kBlock = kEagle3FmhaBlockSize;
-        const int     grid   = (total + kBlock - 1) / kBlock;
+        const int kBlock = get_block_size();
+        const int grid   = (total + kBlock - 1) / kBlock;
 
         eagle3_fmha_kernel<T, kEagle3FmhaMaxHeadDim><<<grid, kBlock, 0, stream>>>(q_ptr,
                                                                                   k_ptr,
@@ -1342,6 +1376,59 @@ void launch_eagle3_fmha_kernel(const T*       q_ptr,
                                                                                   kv_len_per_token);
         sync_check_cuda_error();
     }
+    if (!run_tiled) {
+        // Single-CTA fallback over the full KV span.
+        const int kBlock = get_block_size();
+        const int grid   = (total + kBlock - 1) / kBlock;
+
+        eagle3_fmha_kernel<T, kEagle3FmhaMaxHeadDim><<<grid, kBlock, 0, stream>>>(q_ptr,
+                                                                                  k_ptr,
+                                                                                  v_ptr,
+                                                                                  ctx_ptr,
+                                                                                  token_num,
+                                                                                  batch_size,
+                                                                                  q_len,
+                                                                                  kv_len,
+                                                                                  num_q_heads,
+                                                                                  num_kv_heads,
+                                                                                  head_dim,
+                                                                                  past_kv_len,
+                                                                                  pos_ptr,
+                                                                                  packed,
+                                                                                  stride,
+                                                                                  kv_start_per_token,
+                                                                                  kv_len_per_token);
+        sync_check_cuda_error();
+    }
+#else
+    (void)q_ptr;
+    (void)k_ptr;
+    (void)v_ptr;
+    (void)ctx_ptr;
+    (void)token_num;
+    (void)batch_size;
+    (void)q_len;
+    (void)kv_len;
+    (void)num_q_heads;
+    (void)num_kv_heads;
+    (void)head_dim;
+    (void)past_kv_len;
+    (void)position_ids;
+    (void)packed_mask;
+    (void)packed_mask_stride;
+    (void)kv_start_per_token;
+    (void)kv_len_per_token;
+    (void)partial_o;
+    (void)partial_m;
+    (void)partial_l;
+    (void)partial_tiles;
+    (void)stream;
+    // When TM_ENABLE_EAGLE3_FMHA is disabled we treat the FMHA
+    // path as unavailable and rely on the higher-level Eagle3
+    // attention layer to fall back to its non-FMHA path.
+    TM_LOG_WARNING("[EAGLE3][FMHA] launch_eagle3_fmha_kernel is disabled at compile time "
+                   "(TM_ENABLE_EAGLE3_FMHA=0); falling back to non-FMHA Eagle3 attention.");
+#endif
 }
 
 // Type-specialized wrappers so that external translation units can call

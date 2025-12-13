@@ -2427,6 +2427,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                            head_dim,
                            batch_size,
                            param_.quant_policy,
+                           getSMVersion(),
                            stream_);
     }
 #if ENABLE_BF16
@@ -2450,6 +2451,7 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                            head_dim,
                            batch_size,
                            param_.quant_policy,
+                           getSMVersion(),
                            stream_);
     }
 #endif
@@ -2844,34 +2846,51 @@ void LlamaV2::dynamicDecodeMultiStep(Buffer             token_ids,
                                      int                max_context_len,
                                      const ForcedTailContext* forced_ctx)
 {
-    NvtxScope scope("dynamicDecodeMultiStep");
+    NvtxScope scope("BASE_DECODE_STEP");
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
     Tensor     output_ids_tensor;
-    const bool perf_mode  = turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
-    const int  batch_size = logits.shape(0);
-    TM_CHECK(batch_size > 0);
+    const bool perf_mode = turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
     if (perf_mode) {
-        const ssize_t total_tokens = token_ids.size();
-        TM_CHECK(total_tokens > 0);
-        TM_CHECK_EQ(total_tokens % batch_size, 0);
-        const ssize_t max_seq_len = total_tokens / batch_size;
+        // In PERF_MODE we require output_ids to have a well-defined
+        // [max_seq_len, stride_batch] layout that matches the physical
+        // TurboMind decode layout. The flat token_ids buffer is sized
+        // for at least max_context_len * engine_param_.max_batch_size
+        // (and often larger); we treat it as a 2D tensor with:
+        //   max_seq_len = max_context_len
+        //   stride_batch = engine_param_.max_batch_size
+        //
+        // This matches how DynamicDecodeLayer interprets output_ids in
+        // the hot path. If the backing buffer is smaller than this, or
+        // if a caller tries to use a different stride, we abort.
+        const int    stride_batch = engine_param_.max_batch_size;
+        const ssize_t required    = static_cast<ssize_t>(max_context_len) * stride_batch;
+        const ssize_t available   = token_ids.size();
+        if (available < required) {
+            TM_LOG_ERROR(
+                "[LlamaV2][dynamicDecodeMultiStep][PERF_MODE] token_ids size=%zd is smaller than "
+                "required max_seq_len * stride_batch = %zd * %d; aborting.",
+                available,
+                static_cast<ssize_t>(max_context_len),
+                stride_batch);
+            std::abort();
+        }
 
-        core::Layout layout({max_seq_len, batch_size});
+        core::Layout layout({max_context_len, stride_batch});
         output_ids_tensor = Tensor{token_ids, layout};
 
         static bool logged_layout = false;
         if (!logged_layout) {
-            TM_LOG_INFO("[PERF_MODE] output_ids ndim=%d max_seq_len=%zd stride_batch=%d",
+            TM_LOG_INFO("[PERF_MODE] output_ids ndim=%d max_seq_len=%d stride_batch=%d",
                         output_ids_tensor.ndim(),
-                        max_seq_len,
-                        batch_size);
+                        max_context_len,
+                        stride_batch);
             logged_layout = true;
         }
     }
     else {
-        // Non-PERF_MODE: retain legacy 1D semantics; DynamicDecodeLayer
-        // can still infer layout when needed.
+        // Non-PERF_MODE: retain legacy semantics; DynamicDecodeLayer
+        // will infer layout for 1D buffers when necessary.
         output_ids_tensor = Tensor{token_ids};
     }
 
@@ -3203,6 +3222,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     logEagleProgress(60, "EAGLE3 draft logits + tokens ready for tree build");
 
     // ========= Step 1: Build EAGLE tree from draft tokens =========
+    NvtxScope nvtx_tree("EAGLE_TREE_MASKS");
     const int num_draft_tokens = total_draft;
     const int inferred_tokens_per_seq =
         batch_size > 0 ? std::max(1, num_draft_tokens / batch_size) : 1;
@@ -3513,6 +3533,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         }
 
     // ========= Step 4: Device-side acceptance over tree paths =========
+    NvtxScope nvtx_accept("EAGLE_ACCEPT");
     std::vector<int> h_accepted_lens(batch_size, 0);
     std::vector<int> h_accepted_tokens(batch_size * max_path_len, -1);
     std::vector<int> host_best_path_ids(batch_size, 0);

@@ -33,10 +33,26 @@ void dispatchDecoding(const AttentionParams<T>& params)
 {
     const KvCacheMode kv_mode = GetKvCacheMode(params.quant_policy, params.arch);
 
+    enum class KvQuantKind
+    {
+        kNone,
+        kAffineInt,
+        kFp4Mx,
+    };
+
+    KvQuantKind quant_kind = KvQuantKind::kNone;
+
     const bool is_kv_int8 = kv_mode == KvCacheMode::kInt8;
     const bool is_kv_int4 = kv_mode == KvCacheMode::kInt4;
     const bool is_kv_fp4  = kv_mode == KvCacheMode::kFp4Mx;  // MXFP4 only; NVFP4 falls back to base KV for now.
     const int  query_group_sz = params.num_heads / params.num_kv_heads;
+
+    if (is_kv_fp4) {
+        quant_kind = KvQuantKind::kFp4Mx;
+    }
+    else if (is_kv_int4 || is_kv_int8) {
+        quant_kind = KvQuantKind::kAffineInt;
+    }
 
     using namespace attention;
 
@@ -79,10 +95,22 @@ void dispatchDecoding(const AttentionParams<T>& params)
 
     auto dispatch_kv = [&](auto arch, const auto dim) -> bool {
         FT_CHECK(!(is_kv_int4 && is_kv_int8));
-        FT_CHECK_WITH_INFO(!is_kv_fp4,
-                           "[decoding][FP4] FP4 KV cache decode path is not implemented yet; "
-                           "please disable FP4 KV or use a non-FP4 quant_policy.");
-        if (is_kv_int4) {
+        if (is_kv_fp4) {
+#if defined(ENABLE_FP4)
+            // Strict gating for FP4 MXFP4 decode: only enable on SM90/SM89 and
+            // when scale_block_ptrs have been wired through.
+            FT_CHECK_WITH_INFO(params.arch == 90 || params.arch == 89,
+                               "[decoding][FP4] MXFP4 FP4 KV cache decode is only supported on SM90/SM89; "
+                               "arch=%d is not supported.",
+                               params.arch);
+            return dispatch_h(arch, fp4_e2m1_t{}, dim);
+#else
+            FT_CHECK_WITH_INFO(false,
+                               "[decoding][FP4] FP4 KV cache requested in decode but ENABLE_FP4 is not defined; "
+                               "rebuild TurboMind with -DENABLE_FP4 and CUDA 12.8+.");
+#endif
+        }
+        else if (is_kv_int4) {
             return dispatch_h(arch, uint4_t{}, dim);
         }
         else if (is_kv_int8) {

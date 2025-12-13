@@ -14,9 +14,32 @@
 namespace turbomind {
 
 namespace ft {
-extern __device__ unsigned long long g_eagle3_fmha_tiles_total;
-extern __device__ unsigned long long g_eagle3_fmha_tiles_skipped;
+// Device-side FMHA tile statistics array declared in
+// eagle3_attention_kernels.cu. We treat it as an opaque array here
+// and index it using the same enum values as in the CUDA file.
+extern __device__ unsigned long long g_eagle3_fmha_tile_stats[];
 }  // namespace ft
+
+namespace {
+
+enum Eagle3FmhaTileStatIndex : int {
+    kEagle3FmhaTilesTotal      = 0,
+    kEagle3FmhaTilesSpanEmpty  = 1,
+    kEagle3FmhaTilesMaskEmpty  = 2,
+    kEagle3FmhaTilesExecuted   = 3,
+    kEagle3FmhaTilesCount      = 4,
+};
+
+inline bool is_env_enabled(const char* name)
+{
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) {
+        return false;
+    }
+    return !(v[0] == '0' && v[1] == '\0');
+}
+
+}  // namespace
 
 Eagle3AttentionLayer::Eagle3AttentionLayer(const cudaDeviceProp* prop, cudaStream_t stream):
     stream_{stream},
@@ -143,8 +166,7 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         if (cached >= 0) {
             return cached == 1;
         }
-        const char* env = std::getenv("TM_ENABLE_EAGLE3_FMHA");
-        cached          = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        cached = is_env_enabled("TM_ENABLE_EAGLE3_FMHA") ? 1 : 0;
         return cached == 1;
     };
 
@@ -153,13 +175,13 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         if (cached >= 0) {
             return cached == 1;
         }
-        const char* env = std::getenv("TM_EAGLE3_FMHA_AB");
-        cached          = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        cached = is_env_enabled("TM_EAGLE3_FMHA_AB") ? 1 : 0;
         return cached == 1;
     };
 
-    const bool enable_fmha    = is_fmha_enabled();
-    const bool enable_fmha_ab = is_fmha_ab_debug_enabled();
+    const bool enable_fmha       = is_fmha_enabled();
+    const bool enable_fmha_ab    = is_fmha_ab_debug_enabled();
+    const bool perf_mode_enabled = turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
 
     auto do_forward = [&](auto tag) {
         using T = decltype(tag);
@@ -434,7 +456,8 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             // For the tiled multi-CTA kernel we choose a small number of
             // KV tiles per (token, head) based on kv_len and a desired
             // kv_tile size, and reuse layer-owned scratch buffers for
-            // partial m/l/o across steps.
+            // partial m/l/o across steps. Additional knobs allow tuning
+            // block size and heuristic grouping parameters.
             int kv_tile = 128;
             if (const char* env = std::getenv("TM_EAGLE3_FMHA_KV_TILE")) {
                 int v = std::atoi(env);
@@ -461,18 +484,57 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                     max_tiles_cap = v;
                 }
             }
+
+            int fmha_block = 256;
+            if (const char* env = std::getenv("TM_EAGLE3_FMHA_BLOCK")) {
+                int v = std::atoi(env);
+                if (v >= 32 && v <= 256 && (v % 32) == 0) {
+                    fmha_block = v;
+                }
+            }
+
+            int heads_per_cta = 1;
+            if (const char* env = std::getenv("TM_EAGLE3_FMHA_HEADS_PER_CTA")) {
+                int v = std::atoi(env);
+                if (v > 0) {
+                    heads_per_cta = v;
+                }
+            }
+
+            int qtokens_per_cta = 0;
+            if (const char* env = std::getenv("TM_EAGLE3_FMHA_QTOKENS_PER_CTA")) {
+                int v = std::atoi(env);
+                if (v > 0) {
+                    qtokens_per_cta = v;
+                }
+            }
+
             const int max_tiles_est = kv_tile > 0 ? (kv_len + kv_tile - 1) / kv_tile : 1;
-            const int fmha_tiles    = std::max(1, std::min(max_tiles_est, max_tiles_cap));
-            const int total_fmha    = token_num * num_q_heads;
+            int       fmha_tiles    = std::max(1, std::min(max_tiles_est, max_tiles_cap));
+
+            if (heads_per_cta > 1) {
+                fmha_tiles = std::max(1, fmha_tiles / heads_per_cta);
+            }
+            if (qtokens_per_cta > 0 && q_len > 0 && batch_size > 0) {
+                const int q_tokens       = batch_size * q_len;
+                const int tiles_for_qtok = std::max(1, q_tokens / qtokens_per_cta);
+                fmha_tiles               = std::max(1, std::min(fmha_tiles, tiles_for_qtok));
+            }
+
+            const int total_fmha = token_num * num_q_heads;
             static bool logged_fmha_cfg = false;
-            if (!logged_fmha_cfg && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE")) {
+            if (!logged_fmha_cfg && perf_mode_enabled) {
                 TM_LOG_INFO(
-                    "[EAGLE3][FMHA_CFG] batch=%d kv_len=%d kv_tile=%d max_tiles_cap=%d fmha_tiles=%d",
+                    "[EAGLE3][FMHA_CFG] batch=%d kv_len=%d kv_tile=%d max_tiles_cap=%d fmha_tiles=%d "
+                    "block=%d heads_per_cta=%d qtokens_per_cta=%d",
                     batch_size,
                     kv_len,
                     kv_tile,
                     max_tiles_cap,
-                    fmha_tiles);
+                    fmha_tiles,
+                    fmha_block,
+                    heads_per_cta,
+                    qtokens_per_cta);
                 logged_fmha_cfg = true;
             }
             if (total_fmha > 0) {
@@ -490,6 +552,24 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                 if (!fmha_partial_o_ || fmha_partial_o_.byte_size() < partial_o_bytes) {
                     fmha_partial_o_ = core::Tensor{
                         {static_cast<int>(partial_count * static_cast<size_t>(head_dim))}, kFloat32, param.input.device()};
+                }
+            }
+
+            // Optional FMHA tile statistics: when TM_EAGLE3_FMHA_TILE_STATS is
+            // enabled, reset device-side counters once and emit a single
+            // summary line per run. This is explicitly opt-in so PERF_MODE
+            // remains free of D2H copies by default.
+            const bool fmha_tile_stats = is_env_enabled("TM_EAGLE3_FMHA_TILE_STATS");
+            if (fmha_tile_stats) {
+                static bool tile_stats_initialized = false;
+                if (!tile_stats_initialized) {
+                    tile_stats_initialized = true;
+                    void*  dev_ptr  = nullptr;
+                    size_t dev_size = 0;
+                    check_cuda_error(cudaGetSymbolAddress(&dev_ptr, ft::g_eagle3_fmha_tile_stats));
+                    dev_size = static_cast<size_t>(kEagle3FmhaTilesCount) * sizeof(unsigned long long);
+                    check_cuda_error(cudaMemsetAsync(dev_ptr, 0, dev_size, stream_));
+                    check_cuda_error(cudaStreamSynchronize(stream_));
                 }
             }
 
@@ -570,6 +650,23 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             }
 #endif
             sync_check_cuda_error();
+
+            if (fmha_tile_stats) {
+                void*  dev_ptr  = nullptr;
+                size_t dev_size = 0;
+                check_cuda_error(cudaGetSymbolAddress(&dev_ptr, ft::g_eagle3_fmha_tile_stats));
+                dev_size = static_cast<size_t>(kEagle3FmhaTilesCount) * sizeof(unsigned long long);
+                unsigned long long h_stats[kEagle3FmhaTilesCount] = {};
+                check_cuda_error(cudaMemcpyAsync(
+                    h_stats, dev_ptr, dev_size, cudaMemcpyDeviceToHost, stream_));
+                check_cuda_error(cudaStreamSynchronize(stream_));
+                TM_LOG_INFO(
+                    "[EAGLE3][FMHA_TILE_STATS] total=%llu span_empty=%llu mask_empty=%llu executed=%llu",
+                    static_cast<unsigned long long>(h_stats[kEagle3FmhaTilesTotal]),
+                    static_cast<unsigned long long>(h_stats[kEagle3FmhaTilesSpanEmpty]),
+                    static_cast<unsigned long long>(h_stats[kEagle3FmhaTilesMaskEmpty]),
+                    static_cast<unsigned long long>(h_stats[kEagle3FmhaTilesExecuted]));
+            }
 
             // Optional A/B correctness harness: when TM_EAGLE3_FMHA_AB is
             // enabled and we are in a reasonably small regime, run the

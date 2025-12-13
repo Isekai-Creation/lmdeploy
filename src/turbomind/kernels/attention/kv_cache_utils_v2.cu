@@ -6,6 +6,7 @@
 #include "src/turbomind/kernels/attention/kv_cache_utils_v2.h"
 #include "src/turbomind/kernels/attention/quantization.h"
 #include "src/turbomind/kernels/attention/rotary_embedding.h"
+#include "src/turbomind/kernels/attention/fp4_kv_utils.h"
 #include "src/turbomind/kernels/core/array_ops.h"
 #include "src/turbomind/kernels/core/thread_map.h"
 #include "src/turbomind/models/llama/llama_utils.h"
@@ -380,22 +381,15 @@ __global__ void __launch_bounds__(128) ProcessKV_v2(char**          blocks,
                 // per (token, head, layer). To avoid races, restrict to a
                 // single writer thread in the CTA.
                 if (scale_blocks_seq && warp_id == 0 && lane_id == 0) {
-                    const int block_len  = block_head.block_len();
-                    const int block_id   = local_ti / block_len;
-                    const int block_ti   = local_ti % block_len;
-                    char*     scale_base = scale_blocks_seq[block_id];
+                    const int block_len = block_head.block_len();
+                    const int head_num  = block_layout.config().head_num();
 
-                    const int head_num   = block_layout.config().head_num();
-                    const int bytes_per_token =
-                        2 * kScalesPerHead;  // K scales + V scales per token per head
-                    const int head_size  = block_len * bytes_per_token;
-                    const int layer_size = head_num * head_size;
+                    uint8_t* scale_ptr = get_fp4_mx_scale_base(
+                        scale_blocks_seq, layer_id, head_idx, head_num, block_len, HeadDim, local_ti);
 
-                    const size_t token_offset = static_cast<size_t>(layer_id) * layer_size
-                                                + static_cast<size_t>(head_idx) * head_size
-                                                + static_cast<size_t>(block_ti) * bytes_per_token;
-
-                    auto* scale_ptr = reinterpret_cast<uint8_t*>(scale_base + token_offset);
+                    if (!scale_ptr) {
+                        return;
+                    }
 
                     // Layout: [K_scales[0..kScalesPerHead), V_scales[0..kScalesPerHead)].
                     PRAGMA_UNROLL
@@ -746,6 +740,7 @@ void invokeFlattenKV_v2(T*                     k,
                         int                    head_dim,
                         int                    batch_size,
                         int                    quant_policy,
+                        int                    arch,
                         cudaStream_t           stream)
 {
     constexpr int kWarpCnt = 4;
@@ -791,19 +786,21 @@ void invokeFlattenKV_v2(T*                     k,
         FT_CHECK(0);
     };
 
+    const KvCacheMode kv_mode = GetKvCacheMode(quant_policy, arch);
+
     // FP4 KV cache flattening is not implemented yet. The SpecPV /
     // debug flatten paths must remain disabled when any FP4 KV mode is
     // active to avoid silently treating FP4 data as another quant mode.
-    if (quant_policy & QuantPolicy::kCacheKVFp4) {
+    if (kv_mode == KvCacheMode::kFp4Mx || kv_mode == KvCacheMode::kFp4Nv) {
         FT_CHECK_WITH_INFO(false,
                            "[flattenKV_v2][FP4] FP4 KV cache flatten path is not implemented yet; "
                            "SpecPV / debug flatten must be disabled when FP4 KV is enabled.");
     }
 
-    if (quant_policy & QuantPolicy::kCacheKVInt8) {
+    if (kv_mode == KvCacheMode::kInt8) {
         dispatch(uint8_t{});
     }
-    else if (quant_policy & QuantPolicy::kCacheKVInt4) {
+    else if (kv_mode == KvCacheMode::kInt4) {
         dispatch(uint4_t{});
     }
     else {
@@ -831,6 +828,7 @@ void invokeFlattenKV_v2(T*                     k,
                                      int                    head_dim,                                                  \
                                      int                    batch_size,                                                \
                                      int                    quant_policy,                                              \
+                                     int                    arch,                                                      \
                                      cudaStream_t           stream);
 
 INSTANTIATE_invokeFlattenKV_v2(half);

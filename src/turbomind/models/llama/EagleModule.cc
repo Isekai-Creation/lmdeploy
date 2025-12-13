@@ -1717,6 +1717,7 @@ void EagleModule::forward(const Tensor& input_ids,
                           "row_major");
     }
     {
+        NvtxScope       nvtx_scope_lm("EAGLE_DRAFT_LM_HEAD");
         EagleGemmTagGuard guard("EAGLE3_LM_HEAD");
         linear.Forward(*lm_input, lm_head_weight_, /*output=*/logits);
     }

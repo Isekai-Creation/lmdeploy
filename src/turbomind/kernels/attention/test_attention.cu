@@ -160,7 +160,8 @@ void TestBlocks(const thrust::universal_vector<T>& k_cache,        // [B, H, S, 
                            head_num,
                            head_dim,
                            batch_size,
-                           quant_policy);
+                           quant_policy,
+                           getSMVersion());
     }
 
     thrust::universal_vector<T> kv_cache_2(kv_cache.size());
@@ -572,7 +573,8 @@ int test_attention()
                        KvHeadNum,
                        kHeadDim,
                        kBatchSize,
-                       kQuantPolicy);
+                       kQuantPolicy,
+                       params.arch);
     cudaDeviceSynchronize();
 
     const size_t nbytes = blocks.size() / kContextLen * std::min(kContextLen, (size_t)params.window_size);

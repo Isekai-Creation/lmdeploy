@@ -84,6 +84,7 @@ void invokeFlattenKV_v2(T*                     k,
                         int                    head_dim,
                         int                    batch_size,
                         int                    quant_policy,
+                        int                    arch,
                         cudaStream_t           stream = {});
 
 /// TODO: remove `sum_k_len`
@@ -110,6 +111,7 @@ void invokeFlattenKV_v2_(const AttentionParams<T>& params, int sum_k_len)
                        params.size_per_head,
                        params.batch_size,
                        params.quant_policy,
+                       params.arch,
                        params.stream);
 }
 
