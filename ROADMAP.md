@@ -175,6 +175,74 @@ Kernel‑level design details and concrete tasks should be tracked in:
 
 ---
 
+## Phase 4.1 – EAGLE3‑aware FMHA and tree kernels (best‑effort design)
+
+Goal: go beyond generic TurboMind attention and build a **first‑class EAGLE3 FMHA pipeline**, leveraging patterns from TensorRT‑LLM, FlashInfer, SGLang, and DeepGEMM to make full‑KV EAGLE3 genuinely fast (2–3× vs baseline) before enabling SpecPV.
+
+17. GPU‑native EAGLE3 tree representation
+   - [ ] Replace scalar `runtime_offsets` / `tree_offsets` / `successor_*` adjacency scans with a **GPU tree builder**, inspired by SGLang’s `build_tree_efficient`:
+     - Produce a linked‑list representation per step: `retrive_index`, `retrive_next_token`, `retrive_next_sibling`.
+     - Optionally emit a **bit‑packed tree mask** (per token) suitable for feeding directly into FMHA kernels.
+   - [ ] Ensure the tree builder:
+     - Operates purely on device buffers (no per‑step host allocations),
+     - Is aware of `num_spec_tokens`, `depth`, and long‑context constraints (8K/16K/32K).
+
+18. Tree‑aware FMHA runner for EAGLE3 (FlashInfer / TRT‑LLM style)
+   - [ ] Introduce a dedicated **EAGLE3 FMHA runner** (separate from generic `AttentionUniversal`):
+     - Mirrors TensorRT‑LLM’s `TllmGenFmhaKernel` design:
+       - Pre‑registers a bank of FMHA kernels with meta (head dims, tile sizes, mask types, kernel type, scheduler, multi‑CTA KV mode).
+       - Selects the best kernel at runtime from a `RunnerParams`‑like struct that encodes **spec‑dec generation** mode (EAGLE3) and long‑context geometry.
+     - Integrates **custom mask preparation** à la TRT‑LLM’s `prepareCustomMask`:
+       - Maps our bit‑packed tree mask (from step 17) into the mask format expected by the FMHA kernels.
+   - [ ] Start with BF16/FP16 decode‑phase kernels for:
+     - `head_dim=64` (primary GPT‑OSS‑120B‑Eagle3 draft geometry),
+     - `num_heads_q=64`, `num_heads_kv=8`,
+     - `seq_len_q = num_spec_tokens`, `seq_len_kv` up to at least 32K.
+
+19. Multi‑CTA KV and reduction for long‑context spec‑dec
+   - [ ] Adopt FlashInfer’s multi‑CTA KV pattern for EAGLE3 spec‑dec:
+     - Split KV into tiles (`tileSizeKv ∈ {64,128}`) and compute QK across multiple CTAs per KV span.
+     - Use a separate **reduction kernel** (like FlashInfer’s `runFmhaReduction`) to combine partial results for each Q token.
+   - [ ] Design kernel configs so that:
+     - Each speculative token gets enough CTAs to saturate SMs at 16K/32K,
+     - The tile scheduler understands EAGLE3’s tree window (only visits tiles that contain valid KV tokens).
+
+20. QKV layout alignment with external FMHA kernels
+   - [ ] Align EAGLE3 Q/K/V layout and strides with FlashInfer/TRT‑LLM trtllm‑FMHA expectations:
+     - Use a standard `[batch, heads, seq, head_dim]` (or flattened equivalent) so we can:
+       - Either directly call FlashInfer’s trtllm FMHA from TurboMind, or
+       - Mirror its kernel meta and launch conventions in a TurboMind‑native implementation.
+   - [ ] Update `Eagle3AttentionLayer` to:
+     - Pack Q/K/V into this layout,
+     - Fill an FMHA runner params struct (not just `AttentionParams`) with spec‑dec‑specific fields (kernel type, mask type, Eagle tree mode).
+
+21. DeepGEMM integration for EAGLE3 FC and LM‑head
+   - [ ] Use `DeepGEMM/` as the primary backend for hot EAGLE3 GEMMs (FC + LM‑head), especially the problematic BF16 shapes seen on sm120:
+     - Route EAGLE3 FC and LM‑head matmuls through DeepGEMM’s autotuned dispatcher when shapes and dtypes are supported.
+     - Fall back to TurboMind’s `gemm2` only when DeepGEMM does not have a tuned kernel.
+   - [ ] Validate:
+     - No “no feasible kernel” logs remain for EAGLE3 shapes,
+     - Draft compute ceases to be the bottleneck once FMHA is optimized.
+
+22. A/B and targets before SpecPV
+   - [ ] Gate the full “best‑effort” EAGLE3 FMHA path behind a dedicated flag (e.g. `TM_ENABLE_EAGLE3_TRITON_FMHA`):
+     - When off: use existing streaming SDPA + gemm2 (baseline behaviour).
+     - When on: GPU tree build → custom mask → EAGLE3 FMHA runner (FlashInfer/TRT‑style) + DeepGEMM FC/LM‑head.
+   - [ ] Re‑run `run_spec_suite.sh` on GPT‑OSS‑120B‑Eagle3 with this path enabled:
+     - 8K/16K/32K single, 16K batch4; `num_spec_tokens ∈ {2,3,4,5}`.
+     - Targets before enabling SpecPV:
+       - 32K single, `num_spec_tokens=3` ≥ **2×** baseline throughput.
+       - 16K batch4, `num_spec_tokens=3` ≥ **1×** baseline.
+   - [ ] Only after these thresholds are met and numerics are stable do we proceed to SpecPV integration for EAGLE3.
+
+Design discussions and kernel‑level tasks for this phase should be kept in:
+
+- `EAGLE_TODO_OPTMIZATIONS.md` (EAGLE3‑specific),
+- `EAGLE_OPTIMIZATION_TABLES.md` (measured configs and speedups),
+- and cross‑referenced to external repos (`TensorRT-LLM/`, `flashinfer/`, `sglang/`, `DeepGEMM/`) where we mirror or reuse kernels.
+
+---
+
 ## Phase 5 – Evaluation, parity, and documentation
 
 Goal: evaluate GPT‑OSS‑120B‑MLA‑DSA + TurboMind + EAGLE3(+SpecPV) vs the baseline GPT‑OSS‑120B and vs TensorRT‑LLM.

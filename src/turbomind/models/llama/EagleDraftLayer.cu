@@ -12,6 +12,131 @@
 #include "src/turbomind/kernels/gpt_kernels.h"
 #include "src/turbomind/kernels/gemm/types.h"
 
+namespace {
+
+template<typename T>
+__global__ void copy_and_pad_rows_kernel(const T* __restrict__ src,
+                                         int                   src_ld,
+                                         T* __restrict__       dst,
+                                         int                   dst_ld,
+                                         int                   batch_size,
+                                         int                   src_cols,
+                                         int                   dst_cols,
+                                         int                   copy_cols)
+{
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+
+    if (row >= batch_size || col >= dst_cols) {
+        return;
+    }
+
+    const T* src_row = src + static_cast<size_t>(row) * src_ld;
+    T*       dst_row = dst + static_cast<size_t>(row) * dst_ld;
+
+    if (col < copy_cols && col < src_cols) {
+        dst_row[col] = src_row[col];
+    }
+    else {
+        dst_row[col] = T(0);
+    }
+}
+
+template<typename T>
+void launch_copy_and_pad_rows(const turbomind::Tensor& src,
+                              turbomind::Tensor&       dst,
+                              int                      copy_cols,
+                              cudaStream_t             stream)
+{
+    const int batch_size = static_cast<int>(src.shape(0));
+    const int src_cols   = static_cast<int>(src.shape(1));
+    const int dst_cols   = static_cast<int>(dst.shape(1));
+    const int src_ld     = static_cast<int>(src.stride(0));
+    const int dst_ld     = static_cast<int>(dst.stride(0));
+
+    dim3 block(128);
+    dim3 grid((dst_cols + block.x - 1) / block.x, batch_size);
+    copy_and_pad_rows_kernel<T><<<grid, block, 0, stream>>>(src.data<T>(),
+                                                            src_ld,
+                                                            dst.data<T>(),
+                                                            dst_ld,
+                                                            batch_size,
+                                                            src_cols,
+                                                            dst_cols,
+                                                            copy_cols);
+}
+
+template<typename T>
+__global__ void pack_two_halves_kernel(const T* __restrict__ first,
+                                       int                   first_ld,
+                                       const T* __restrict__ second,
+                                       int                   second_ld,
+                                       T* __restrict__       dst,
+                                       int                   dst_ld,
+                                       int                   batch_size,
+                                       int                   half_cols,
+                                       bool                  have_second)
+{
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+
+    if (row >= batch_size || col >= 2 * half_cols) {
+        return;
+    }
+
+    T*       dst_row = dst + static_cast<size_t>(row) * dst_ld;
+    const T* first_row =
+        first ? first + static_cast<size_t>(row) * first_ld : nullptr;
+    const T* second_row =
+        second ? second + static_cast<size_t>(row) * second_ld : nullptr;
+
+    if (col < half_cols) {
+        if (first_row && col < first_ld) {
+            dst_row[col] = first_row[col];
+        }
+        else {
+            dst_row[col] = T(0);
+        }
+    }
+    else {
+        const int second_col = col - half_cols;
+        if (have_second && second_row && second_col < second_ld) {
+            dst_row[col] = second_row[second_col];
+        }
+        else {
+            dst_row[col] = T(0);
+        }
+    }
+}
+
+template<typename T>
+void launch_pack_two_halves(const turbomind::Tensor& first,
+                            const turbomind::Tensor* second,
+                            turbomind::Tensor&       dst,
+                            int                      half_cols,
+                            bool                     have_second,
+                            cudaStream_t             stream)
+{
+    const int batch_size = static_cast<int>(dst.shape(0));
+    const int dst_ld     = static_cast<int>(dst.stride(0));
+    const int first_ld   = first ? static_cast<int>(first.stride(0)) : 0;
+    const int second_ld  = (second && *second) ? static_cast<int>((*second).stride(0)) : 0;
+
+    dim3 block(128);
+    dim3 grid((2 * half_cols + block.x - 1) / block.x, batch_size);
+    pack_two_halves_kernel<T><<<grid, block, 0, stream>>>(first ? first.data<T>() : nullptr,
+                                                          first_ld,
+                                                          (second && *second) ? second->data<T>() : nullptr,
+                                                          second_ld,
+                                                          dst.data<T>(),
+                                                          dst_ld,
+                                                          batch_size,
+                                                          half_cols,
+                                                          have_second);
+}
+
+}  // anonymous namespace
+
 namespace turbomind {
 
 Eagle3DraftLayer::Eagle3DraftLayer(const Eagle3DraftLayerWeight* weight,
@@ -147,17 +272,41 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         // Convert from base_hidden_dim_ to draft_dim before RMSNorm
         if (base_hidden_dim_ != draft_dim) {
             Tensor temp_embed_for_norm{{batch_size, draft_dim}, dtype, input_hidden.device()};
-            check_cuda_error(cudaMemsetAsync(temp_embed_for_norm.raw_data(), 0, temp_embed_for_norm.byte_size(), stream));
-            const size_t elem_bytes = byte_size(dtype, 1);
-            const size_t src_stride = static_cast<size_t>(embed_input_base_dim.stride(0)) * elem_bytes;
-            const size_t dst_stride = static_cast<size_t>(temp_embed_for_norm.stride(0)) * elem_bytes;
-            const int    copy_cols  = std::min(base_hidden_dim_, draft_dim);
-
-            for (int b = 0; b < batch_size; ++b) {
-                const char* src_row = static_cast<const char*>(embed_input_base_dim.raw_data()) + static_cast<size_t>(b) * src_stride;
-                char*       dst_row = static_cast<char*>(temp_embed_for_norm.raw_data()) + static_cast<size_t>(b) * dst_stride;
-                check_cuda_error(cudaMemcpyAsync(
-                    dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+            const int copy_cols = std::min(base_hidden_dim_, draft_dim);
+            switch (dtype) {
+            case kFloat16:
+                launch_copy_and_pad_rows<half_t>(embed_input_base_dim, temp_embed_for_norm, copy_cols, stream);
+                break;
+#if ENABLE_BF16
+            case kBfloat16:
+                launch_copy_and_pad_rows<bfloat16_t>(embed_input_base_dim, temp_embed_for_norm, copy_cols, stream);
+                break;
+#endif
+            case kFloat32:
+                launch_copy_and_pad_rows<float>(embed_input_base_dim, temp_embed_for_norm, copy_cols, stream);
+                break;
+            default:
+                TM_LOG_WARNING("[EAGLE3][Draft] unsupported dtype for embedding resize; falling back to memcpy path.");
+                {
+                    check_cuda_error(cudaMemsetAsync(
+                        temp_embed_for_norm.raw_data(), 0, temp_embed_for_norm.byte_size(), stream));
+                    const size_t elem_bytes = byte_size(dtype, 1);
+                    const size_t src_stride =
+                        static_cast<size_t>(embed_input_base_dim.stride(0)) * elem_bytes;
+                    const size_t dst_stride =
+                        static_cast<size_t>(temp_embed_for_norm.stride(0)) * elem_bytes;
+                    const size_t copy_bytes = static_cast<size_t>(copy_cols) * elem_bytes;
+                    for (int b = 0; b < batch_size; ++b) {
+                        const char* src_row =
+                            static_cast<const char*>(embed_input_base_dim.raw_data())
+                            + static_cast<size_t>(b) * src_stride;
+                        char* dst_row = static_cast<char*>(temp_embed_for_norm.raw_data())
+                            + static_cast<size_t>(b) * dst_stride;
+                        check_cuda_error(cudaMemcpyAsync(
+                            dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+                break;
             }
             invokeRMSNorm(embed_norm, temp_embed_for_norm, weight_->input_norm, rmsnorm_eps_, stream);
         } else {
@@ -206,15 +355,43 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
     if (hidden_dim != draft_dim) {
         // If input is wider than draft_dim, truncate; if narrower, pad zeros.
         draft_view = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
-        const size_t elem_bytes = byte_size(dtype, 1);
-        const size_t copy_bytes = static_cast<size_t>(std::min(hidden_dim, draft_dim)) * elem_bytes;
-        const size_t src_stride = static_cast<size_t>(input_hidden.stride(0)) * elem_bytes;
-        const size_t dst_stride = static_cast<size_t>(draft_view.stride(0)) * elem_bytes;
-        check_cuda_error(cudaMemsetAsync(draft_view.raw_data(), 0, draft_view.byte_size(), stream));
-        for (int b = 0; b < batch_size; ++b) {
-            char*       dst = static_cast<char*>(draft_view.raw_data()) + static_cast<size_t>(b) * dst_stride;
-            const char* src = static_cast<const char*>(input_hidden.raw_data()) + static_cast<size_t>(b) * src_stride;
-            check_cuda_error(cudaMemcpyAsync(dst, src, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+        const int copy_cols = std::min(hidden_dim, draft_dim);
+        switch (dtype) {
+        case kFloat16:
+            launch_copy_and_pad_rows<half_t>(input_hidden, draft_view, copy_cols, stream);
+            break;
+#if ENABLE_BF16
+        case kBfloat16:
+            launch_copy_and_pad_rows<bfloat16_t>(input_hidden, draft_view, copy_cols, stream);
+            break;
+#endif
+        case kFloat32:
+            launch_copy_and_pad_rows<float>(input_hidden, draft_view, copy_cols, stream);
+            break;
+        default:
+            TM_LOG_WARNING("[EAGLE3][Draft] unsupported dtype for draft_view resize; falling back to memcpy path.");
+            {
+                check_cuda_error(
+                    cudaMemsetAsync(draft_view.raw_data(), 0, draft_view.byte_size(), stream));
+                const size_t elem_bytes = byte_size(dtype, 1);
+                const size_t src_stride =
+                    static_cast<size_t>(input_hidden.stride(0)) * elem_bytes;
+                const size_t dst_stride =
+                    static_cast<size_t>(draft_view.stride(0)) * elem_bytes;
+                const size_t copy_bytes =
+                    static_cast<size_t>(copy_cols) * elem_bytes;
+                for (int b = 0; b < batch_size; ++b) {
+                    char* dst =
+                        static_cast<char*>(draft_view.raw_data())
+                        + static_cast<size_t>(b) * dst_stride;
+                    const char* src =
+                        static_cast<const char*>(input_hidden.raw_data())
+                        + static_cast<size_t>(b) * src_stride;
+                    check_cuda_error(cudaMemcpyAsync(
+                        dst, src, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+            break;
         }
     }
 
@@ -315,38 +492,59 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
         return;
     }
 
-    const size_t elem_bytes    = byte_size(dtype, 1);
-    const size_t src_row_bytes = static_cast<size_t>(hidden_norm.stride(0)) * elem_bytes;
-    const size_t dst_row_bytes = static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
-
-    char*       dst_base = static_cast<char*>(qkv_input.raw_data());
-    const char* src_base = static_cast<const char*>(hidden_norm.raw_data());
-    const size_t fc_row_bytes = have_fc ? static_cast<size_t>(fc_norm.stride(0)) * elem_bytes : src_row_bytes;
-    const char* fc_base       = have_fc ? static_cast<const char*>(fc_norm.raw_data()) : src_base;
-
-    // Strict TRT packing: first half embedding_norm, second half FC_norm.
-    const size_t slice_bytes = static_cast<size_t>(draft_dim) * elem_bytes;
-    for (int b = 0; b < batch_size; ++b) {
-        char*       dst_row = dst_base + static_cast<size_t>(b) * dst_row_bytes;
-        const char* src_row = src_base + static_cast<size_t>(b) * src_row_bytes;
-        check_cuda_error(
-            cudaMemcpyAsync(dst_row, src_row, slice_bytes, cudaMemcpyDeviceToDevice, stream));
-
-        char* second_dst = dst_row + slice_bytes;
-        if (have_fc) {
-            const char* second_src = fc_base + static_cast<size_t>(b) * fc_row_bytes;
-            check_cuda_error(cudaMemcpyAsync(
-                second_dst, second_src, slice_bytes, cudaMemcpyDeviceToDevice, stream));
+    // Strict TRT packing: first half embedding_norm (or hidden_norm), second half FC_norm.
+    static bool logged_missing_fc = false;
+    const turbomind::Tensor* second_half = nullptr;
+    if (have_fc) {
+        second_half = &fc_norm;
+    }
+    else {
+        if (!logged_missing_fc) {
+            TM_LOG_WARNING(
+                "[EAGLE3][Draft] FC capture missing; filling 2H QKV input second half with zeros.");
+            logged_missing_fc = true;
         }
-        else {
-            // No FC capture available; leave the second half zero but log once.
-            static bool logged_missing_fc = false;
-            if (!logged_missing_fc) {
-                TM_LOG_WARNING(
-                    "[EAGLE3][Draft] FC capture missing; filling 2H QKV input second half with zeros.");
-                logged_missing_fc = true;
+    }
+
+    switch (dtype) {
+    case kFloat16:
+        launch_pack_two_halves<half_t>(
+            embed_norm, second_half, qkv_input, draft_dim, have_fc, stream);
+        break;
+#if ENABLE_BF16
+    case kBfloat16:
+        launch_pack_two_halves<bfloat16_t>(
+            embed_norm, second_half, qkv_input, draft_dim, have_fc, stream);
+        break;
+#endif
+    case kFloat32:
+        launch_pack_two_halves<float>(
+            embed_norm, second_half, qkv_input, draft_dim, have_fc, stream);
+        break;
+    default:
+        TM_LOG_WARNING(
+            "[EAGLE3][Draft] unsupported dtype for QKV packing; falling back to memcpy path.");
+        {
+            const size_t elem_bytes = byte_size(dtype, 1);
+            const size_t src_row_bytes =
+                static_cast<size_t>(embed_norm.stride(0)) * elem_bytes;
+            const size_t dst_row_bytes =
+                static_cast<size_t>(qkv_input.stride(0)) * elem_bytes;
+            const char* src_base =
+                static_cast<const char*>(embed_norm.raw_data());
+            char* dst_base = static_cast<char*>(qkv_input.raw_data());
+            const size_t slice_bytes =
+                static_cast<size_t>(draft_dim) * elem_bytes;
+            for (int b = 0; b < batch_size; ++b) {
+                const char* src_row =
+                    src_base + static_cast<size_t>(b) * src_row_bytes;
+                char* dst_row =
+                    dst_base + static_cast<size_t>(b) * dst_row_bytes;
+                check_cuda_error(cudaMemcpyAsync(
+                    dst_row, src_row, slice_bytes, cudaMemcpyDeviceToDevice, stream));
             }
         }
+        break;
     }
 
     if (debug_enabled) {
@@ -438,17 +636,43 @@ void Eagle3DraftLayer::Forward(const Tensor& input_hidden,
 
     if (current_attn_out_dim != target_ffn_in_dim) {
         ffn_input = Tensor{{batch_size, draft_dim}, dtype, input_hidden.device()};
-        check_cuda_error(cudaMemsetAsync(ffn_input.raw_data(), 0, ffn_input.byte_size(), stream));
-        const size_t elem_bytes = byte_size(dtype, 1);
-        const size_t src_stride = static_cast<size_t>(attn_out.stride(0)) * elem_bytes;
-        const size_t dst_stride = static_cast<size_t>(ffn_input.stride(0)) * elem_bytes;
-        const int    copy_cols  = std::min(current_attn_out_dim, target_ffn_in_dim);
-
-        for (int b = 0; b < batch_size; ++b) {
-            const char* src_row = static_cast<const char*>(attn_out.raw_data()) + static_cast<size_t>(b) * src_stride;
-            char*       dst_row = static_cast<char*>(ffn_input.raw_data()) + static_cast<size_t>(b) * dst_stride;
-            check_cuda_error(cudaMemcpyAsync(
-                dst_row, src_row, static_cast<size_t>(copy_cols) * elem_bytes, cudaMemcpyDeviceToDevice, stream));
+        const int copy_cols = std::min(current_attn_out_dim, target_ffn_in_dim);
+        switch (dtype) {
+        case kFloat16:
+            launch_copy_and_pad_rows<half_t>(attn_out, ffn_input, copy_cols, stream);
+            break;
+#if ENABLE_BF16
+        case kBfloat16:
+            launch_copy_and_pad_rows<bfloat16_t>(attn_out, ffn_input, copy_cols, stream);
+            break;
+#endif
+        case kFloat32:
+            launch_copy_and_pad_rows<float>(attn_out, ffn_input, copy_cols, stream);
+            break;
+        default:
+            TM_LOG_WARNING("[EAGLE3][Draft] unsupported dtype for FFN input resize; falling back to memcpy path.");
+            {
+                check_cuda_error(
+                    cudaMemsetAsync(ffn_input.raw_data(), 0, ffn_input.byte_size(), stream));
+                const size_t elem_bytes = byte_size(dtype, 1);
+                const size_t src_stride =
+                    static_cast<size_t>(attn_out.stride(0)) * elem_bytes;
+                const size_t dst_stride =
+                    static_cast<size_t>(ffn_input.stride(0)) * elem_bytes;
+                const size_t copy_bytes =
+                    static_cast<size_t>(copy_cols) * elem_bytes;
+                for (int b = 0; b < batch_size; ++b) {
+                    const char* src_row =
+                        static_cast<const char*>(attn_out.raw_data())
+                        + static_cast<size_t>(b) * src_stride;
+                    char* dst_row =
+                        static_cast<char*>(ffn_input.raw_data())
+                        + static_cast<size_t>(b) * dst_stride;
+                    check_cuda_error(cudaMemcpyAsync(
+                        dst_row, src_row, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+            break;
         }
     }
     else {

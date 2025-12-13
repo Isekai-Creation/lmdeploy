@@ -188,6 +188,53 @@ void invokeReplicatePathsFromFlat(SizeType const* paths_flat,
                                   SizeType        max_decoding_tokens,
                                   cudaStream_t    stream);
 
+/**
+ * @brief Build a per-token linked-list style tree representation from
+ *        draft_paths for EAGLE3.
+ *
+ * For each slot and draft token, this helper populates:
+ *   - positions: approximate depth / position in the speculative tree,
+ *   - retrive_index: canonical index per token (slot-local),
+ *   - retrive_next_token: first child in the tree for this token (or -1),
+ *   - retrive_next_sibling: sibling linkage (or -1).
+ *
+ * The current implementation assumes a single-sequence tree cloned
+ * across batch slots and processes each slot independently on device.
+ */
+void invokeBuildLinkedTreeFromDraftPaths(SizeType const* draft_paths,
+                                         SizeType        batch_size,
+                                         SizeType        max_decoding_tokens,
+                                         SizeType        max_path_len,
+                                         SizeType        tokens_per_seq,
+                                         SizeType*       positions,
+                                         SizeType*       retrive_index,
+                                         SizeType*       retrive_next_token,
+                                         SizeType*       retrive_next_sibling,
+                                         cudaStream_t    stream);
+
+/**
+ * @brief Build per-slot forced tail tokens/lengths from accepted tokens.
+ *
+ * For each slot i:
+ *   - Let len = accepted_lens[i].
+ *   - Extras = max(min(len, max_tail_len) - 1, 0).
+ *   - forced_lengths[i] = Extras.
+ *   - forced_tokens[i, t] = accepted_tokens[i, 1 + t] for t in [0, Extras),
+ *     and -1 for remaining positions up to max_tail_len.
+ *
+ * This mirrors LlamaV2's host-side tail construction but runs entirely
+ * on device, enabling a GPU-only tail path when combined with
+ * DynamicDecodeLayer's TM_ENABLE_GPU_TAIL branch.
+ */
+void invokeBuildForcedTailsFromAccepted(TokenIdType const* accepted_tokens,
+                                        SizeType const*    accepted_lens,
+                                        SizeType           batch_size,
+                                        SizeType           max_path_len,
+                                        SizeType           max_tail_len,
+                                        TokenIdType*       forced_tokens,
+                                        SizeType*          forced_lengths,
+                                        cudaStream_t       stream);
+
 
 /**
  * @brief Parameters for KV cache rewind

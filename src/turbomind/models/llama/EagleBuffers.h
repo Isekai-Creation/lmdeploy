@@ -33,6 +33,15 @@ struct EagleBuffers {
         SizeType* draft_paths;               // [batch_size, max_decoding_tokens, max_path_len]
         SizeType* packed_masks;              // [batch_size, max_decoding_tokens, num_packed]
         int8_t* leaf_mask;                   // [batch_size, max_decoding_tokens]
+        // Optional linked-list style tree metadata (per slot):
+        //  positions: depth / position per draft token
+        //  retrive_index: canonical index per token (slot-local)
+        //  retrive_next_token: first child per token
+        //  retrive_next_sibling: sibling linkage per token
+        SizeType* tree_positions;            // [batch_size, max_decoding_tokens]
+        SizeType* retrive_index;             // [batch_size, max_decoding_tokens]
+        SizeType* retrive_next_token;        // [batch_size, max_decoding_tokens]
+        SizeType* retrive_next_sibling;      // [batch_size, max_decoding_tokens]
         
         // EagleNet metadata
         SizeType* eagle_net_ctx_lens;        // [batch_size]
@@ -66,6 +75,10 @@ struct EagleBuffers {
             draft_paths = nullptr;
             packed_masks = nullptr;
             leaf_mask = nullptr;
+            tree_positions = nullptr;
+            retrive_index = nullptr;
+            retrive_next_token = nullptr;
+            retrive_next_sibling = nullptr;
             eagle_net_ctx_lens = nullptr;
             eagle_net_gen_lens = nullptr;
             eagle_net_seq_lens = nullptr;

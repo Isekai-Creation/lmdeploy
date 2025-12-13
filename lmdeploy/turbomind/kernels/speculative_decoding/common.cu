@@ -863,6 +863,210 @@ void invokeReplicatePathsFromFlat(SizeType const* paths_flat,
         paths_flat, num_paths, max_path_len, draft_paths, batch_size, max_decoding_tokens);
 }
 
+// Build a simple linked-list style tree representation from draft_paths.
+// This kernel assumes that the speculative tree is identical across all
+// batch slots (as is the case for the current offline spec suite) and
+// processes each slot independently. For now we do not attempt to
+// reconstruct the full TensorRT-style adjacency; instead we derive:
+//   - positions[token] as an approximate depth (max level observed),
+//   - retrive_index[token] as a slot-local canonical index,
+//   - retrive_next_token / retrive_next_sibling as a basic child list.
+__global__ void buildLinkedTreeFromDraftPathsKernel(SizeType const* draft_paths,
+                                                    SizeType        batch_size,
+                                                    SizeType        max_decoding_tokens,
+                                                    SizeType        max_path_len,
+                                                    SizeType        tokens_per_seq,
+                                                    SizeType*       positions,
+                                                    SizeType*       retrive_index,
+                                                    SizeType*       retrive_next_token,
+                                                    SizeType*       retrive_next_sibling)
+{
+    const SizeType slot = static_cast<SizeType>(blockIdx.x);
+    if (slot >= batch_size) {
+        return;
+    }
+
+    if (tokens_per_seq <= 0 || max_decoding_tokens <= 0) {
+        return;
+    }
+
+    const SizeType offset = slot * max_decoding_tokens;
+
+    // Initialize per-token metadata for this slot.
+    for (SizeType t = 0; t < max_decoding_tokens; ++t) {
+        const SizeType idx = offset + t;
+        positions[idx]           = 0;
+        retrive_index[idx]       = idx;
+        retrive_next_token[idx]  = static_cast<SizeType>(-1);
+        retrive_next_sibling[idx] = static_cast<SizeType>(-1);
+    }
+
+    // Walk all paths and derive parent/child relationships from the
+    // [path, level] structure. We assume that entries are either valid
+    // token indices in [0, tokens_per_seq) or -1 as an end-of-path
+    // sentinel.
+    for (SizeType path = 0; path < tokens_per_seq; ++path) {
+        const SizeType* path_base =
+            draft_paths + (static_cast<size_t>(slot) * max_decoding_tokens + path) * max_path_len;
+
+        SizeType parent = -1;
+        for (SizeType l = 0; l < max_path_len; ++l) {
+            const SizeType node = path_base[l];
+            if (node < 0 || node >= tokens_per_seq) {
+                break;
+            }
+
+            const SizeType node_idx = offset + node;
+
+            if (parent >= 0 && parent < tokens_per_seq) {
+                const SizeType parent_idx = offset + parent;
+
+                // Update approximate depth: max over observed parent+1.
+                const SizeType parent_pos = positions[parent_idx];
+                const SizeType cand_pos   = parent_pos + 1;
+                if (cand_pos > positions[node_idx]) {
+                    positions[node_idx] = cand_pos;
+                }
+
+                // Maintain a simple singly-linked child list for parent.
+                SizeType first_child = retrive_next_token[parent_idx];
+                if (first_child < 0 || first_child >= max_decoding_tokens) {
+                    retrive_next_token[parent_idx] = node;
+                    retrive_next_sibling[node_idx] = static_cast<SizeType>(-1);
+                } else {
+                    // Prepend this node to the sibling list.
+                    retrive_next_token[parent_idx]  = node;
+                    retrive_next_sibling[node_idx] = first_child;
+                }
+            }
+            parent = node;
+        }
+    }
+}
+
+void invokeBuildLinkedTreeFromDraftPaths(SizeType const* draft_paths,
+                                         SizeType        batch_size,
+                                         SizeType        max_decoding_tokens,
+                                         SizeType        max_path_len,
+                                         SizeType        tokens_per_seq,
+                                         SizeType*       positions,
+                                         SizeType*       retrive_index,
+                                         SizeType*       retrive_next_token,
+                                         SizeType*       retrive_next_sibling,
+                                         cudaStream_t    stream)
+{
+    if (!draft_paths || !positions || !retrive_index || !retrive_next_token || !retrive_next_sibling
+        || batch_size <= 0 || max_decoding_tokens <= 0 || max_path_len <= 0 || tokens_per_seq <= 0) {
+        if (::turbomind::isEagleDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[EAGLE][tree] early-return: draft_paths=%p batch=%d max_tokens=%d "
+                         "max_path_len=%d tokens_per_seq=%d\n",
+                         static_cast<const void*>(draft_paths),
+                         static_cast<int>(batch_size),
+                         static_cast<int>(max_decoding_tokens),
+                         static_cast<int>(max_path_len),
+                         static_cast<int>(tokens_per_seq));
+        }
+        return;
+    }
+
+    dim3 grid(batch_size);
+    dim3 block(1);
+    buildLinkedTreeFromDraftPathsKernel<<<grid, block, 0, stream>>>(
+        draft_paths,
+        batch_size,
+        max_decoding_tokens,
+        max_path_len,
+        tokens_per_seq,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling);
+}
+
+// Build per-slot forced tail tokens/lengths from accepted tokens.
+// For each slot i:
+//   len = accepted_lens[i];
+//   extras = max(min(len, max_tail_len) - 1, 0);
+//   forced_lengths[i] = extras;
+//   forced_tokens[i, t] = accepted_tokens[i, 1 + t] for t < extras,
+//   and -1 for remaining positions.
+__global__ void buildForcedTailsFromAcceptedKernel(TokenIdType const* accepted_tokens,
+                                                   SizeType const*    accepted_lens,
+                                                   SizeType           batch_size,
+                                                   SizeType           max_path_len,
+                                                   SizeType           max_tail_len,
+                                                   TokenIdType*       forced_tokens,
+                                                   SizeType*          forced_lengths)
+{
+    const SizeType slot = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (slot >= batch_size) {
+        return;
+    }
+
+    const SizeType len_raw = accepted_lens ? accepted_lens[slot] : 0;
+    SizeType       len     = len_raw < 0 ? 0 : len_raw;
+
+    if (len <= 1 || max_tail_len <= 0) {
+        forced_lengths[slot] = 0;
+        // Still clear the tail buffer for this slot for determinism.
+        for (SizeType t = 0; t < max_tail_len; ++t) {
+            forced_tokens[static_cast<size_t>(slot) * max_tail_len + t] = static_cast<TokenIdType>(-1);
+        }
+        return;
+    }
+
+    if (len > max_path_len) {
+        len = max_path_len;
+    }
+
+    const SizeType extras = min(static_cast<SizeType>(max_tail_len), static_cast<SizeType>(len - 1));
+    forced_lengths[slot]  = extras;
+
+    const TokenIdType* src = accepted_tokens + static_cast<size_t>(slot) * max_path_len;
+    TokenIdType*       dst = forced_tokens + static_cast<size_t>(slot) * max_tail_len;
+
+    // Copy extras from accepted_tokens[1..] into tail buffer.
+    for (SizeType t = 0; t < max_tail_len; ++t) {
+        if (t < extras) {
+            const SizeType src_idx = 1 + t;
+            dst[t]                 = (src_idx < max_path_len) ? src[src_idx] : static_cast<TokenIdType>(-1);
+        }
+        else {
+            dst[t] = static_cast<TokenIdType>(-1);
+        }
+    }
+}
+
+void invokeBuildForcedTailsFromAccepted(TokenIdType const* accepted_tokens,
+                                        SizeType const*    accepted_lens,
+                                        SizeType           batch_size,
+                                        SizeType           max_path_len,
+                                        SizeType           max_tail_len,
+                                        TokenIdType*       forced_tokens,
+                                        SizeType*          forced_lengths,
+                                        cudaStream_t       stream)
+{
+    if (!accepted_tokens || !accepted_lens || !forced_tokens || !forced_lengths || batch_size <= 0
+        || max_path_len <= 0 || max_tail_len <= 0) {
+        if (::turbomind::isEagleDebugEnabled()) {
+            std::fprintf(stderr,
+                         "[EAGLE][tail] early-return: accepted_tokens=%p accepted_lens=%p "
+                         "batch=%d max_path_len=%d max_tail_len=%d\n",
+                         static_cast<const void*>(accepted_tokens),
+                         static_cast<const void*>(accepted_lens),
+                         static_cast<int>(batch_size),
+                         static_cast<int>(max_path_len),
+                         static_cast<int>(max_tail_len));
+        }
+        return;
+    }
+
+    constexpr int BLOCK = 128;
+    const int     grid  = (static_cast<int>(batch_size) + BLOCK - 1) / BLOCK;
+    buildForcedTailsFromAcceptedKernel<<<grid, BLOCK, 0, stream>>>(
+        accepted_tokens, accepted_lens, batch_size, max_path_len, max_tail_len, forced_tokens, forced_lengths);
+}
 
 /**
  * @brief Kernel: Rewind KV cache for rejected tokens

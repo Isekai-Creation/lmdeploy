@@ -259,6 +259,26 @@ struct LlamaLinear::Impl {
             desc_D.offsets = const_cast<int*>(offsets.data());
         }
 
+        if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_GEMM_SHAPE_LOG")) {
+            static int logged = 0;
+            // Log only a limited number of shapes to avoid console spam.
+            if (logged < 64) {
+                TM_LOG_INFO(
+                    "[EAGLE3][GEMM] op=MxKxN(%d,%d,%d) dtype=%d weight_dtype=%d input_dtype=%d orderA=%d "
+                    "orderB=%d orderD=%d",
+                    desc_A.rows,
+                    desc_A.cols,
+                    desc_D.cols,
+                    static_cast<int>(dense.data_type),
+                    static_cast<int>(dense.weight_type),
+                    static_cast<int>(dense.input_type),
+                    static_cast<int>(desc_A.order),
+                    static_cast<int>(desc_B.order),
+                    static_cast<int>(desc_D.order));
+                ++logged;
+            }
+        }
+
         auto ec = gemm_.Run(op,
                             1.f,
                             A.raw_data(),

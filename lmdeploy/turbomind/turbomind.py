@@ -1127,6 +1127,8 @@ class TurboMindInstance:
 
     def _get_generation_config(self, cfg: GenerationConfig):
         c = _tm.GenerationConfig()
+        perf_mode_env = os.getenv("LMDEPLOY_EAGLE_PERF_MODE", "").strip().lower()
+        perf_mode = perf_mode_env in ("1", "true", "yes", "on")
         c.max_new_tokens = cfg.max_new_tokens
         c.top_k = cfg.top_k
         c.top_p = cfg.top_p
@@ -1136,7 +1138,10 @@ class TurboMindInstance:
             c.eos_ids = cfg.stop_token_ids
         if cfg.bad_token_ids:
             c.bad_ids = _construct_stop_or_bad_words(cfg.bad_token_ids)
-        if not cfg.ignore_eos and cfg.stop_token_ids:
+        # In perf mode we want GPU tail to remain usable and avoid
+        # configuring stop-words for the tail path. Keep EOS ids so
+        # decode semantics are correct, but skip stop_ids entirely.
+        if not perf_mode and (not cfg.ignore_eos and cfg.stop_token_ids):
             c.stop_ids = _construct_stop_or_bad_words(cfg.stop_token_ids)
         c.repetition_penalty = cfg.repetition_penalty
         if cfg.min_new_tokens:

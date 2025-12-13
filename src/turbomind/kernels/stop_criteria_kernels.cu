@@ -147,10 +147,11 @@ struct TailParams {
     const int* eos_ids;
     const int* eos_counts;
 
-    int batch_size;
+    int batch_size;    // logical active slots
     int max_tail_len;
     int max_seq_len;
     int max_eos_per_slot;
+    int stride_batch;  // physical stride for output_ids rows
     int step;
 };
 
@@ -199,7 +200,8 @@ __global__ void apply_forced_tail_kernel(TailParams params)
             params.forced_tokens ? params.forced_tokens[i * params.max_tail_len + t] : -1;
 
         if (params.output_ids) {
-            params.output_ids[pos * params.batch_size + i] = value;
+            const int stride = params.stride_batch > 0 ? params.stride_batch : params.batch_size;
+            params.output_ids[pos * stride + i] = value;
         }
 
         ++seq_len;
@@ -249,6 +251,7 @@ void invokeApplyForcedTail(const int*   forced_tokens,
                            int          batch_size,
                            int          max_tail_len,
                            int          max_seq_len,
+                           int          stride_batch,
                            int          step,
                            cudaStream_t stream)
 {
@@ -272,6 +275,7 @@ void invokeApplyForcedTail(const int*   forced_tokens,
     params.max_tail_len          = max_tail_len;
     params.max_seq_len           = max_seq_len;
     params.max_eos_per_slot      = max_eos_per_slot;
+    params.stride_batch          = stride_batch;
     params.step                  = step;
 
     const int block = 256;

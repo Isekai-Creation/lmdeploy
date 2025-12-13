@@ -1224,22 +1224,6 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
             accepted_len = 1;
         }
 
-        if (accepted_len > 0 && accepted_token != h_token_ids[i]) {
-            // Keep raw acceptance for metrics, but log the divergence
-            // between the first accepted token and DynamicDecode's
-            // committed token. This can happen when sampling layers
-            // (e.g. penalties, guidance) adjust logits between the
-            // point where `target_tokens` were captured and the final
-            // decode decision.
-            TM_LOG_WARNING(
-                "[LlamaBatch][EAGLE] step=%d, seq=%d, accepted_token=%d mismatches "
-                "dynamicDecode token=%d; keeping raw acceptance for metrics",
-                g.step,
-                i,
-                accepted_token,
-                h_token_ids[i]);
-        }
-
         int planned_tokens_per_seq = eagle_tokens_per_seq;
         if (!eagle_planned_tokens_per_seq_.empty()
             && i < static_cast<int>(eagle_planned_tokens_per_seq_.size())) {
@@ -1291,14 +1275,13 @@ void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
         }
 
         TM_LOG_INFO(
-            "[LlamaBatch][EAGLE] step=%d, seq=%d, dynamic_token=%d, raw_accepted_len=%d, "
-            "effective_accepted_len=%d, accepted_token=%d, tokens_per_seq=%d, rewind_len=%d",
+            "[LlamaBatch][EAGLE] step=%d, seq=%d, base_token=%d, raw_accepted_len=%d, "
+            "effective_accepted_len=%d, tokens_per_seq=%d, rewind_len=%d",
             g.step,
             i,
-            h_token_ids[i],
+            accepted_token,
             raw_accepted_len,
             accepted_len,
-            accepted_token,
             planned_tokens_per_seq,
             rewind_len);
     }
@@ -2568,20 +2551,24 @@ bool LlamaBatch::Forward(GenerationState& g)
             }
             // Posterior/typical gating knobs (per TRT).
             // Only enable entropy-based masking when at least one request
-            // provides an explicit posterior threshold or alpha. This keeps
-            // the EAGLE3 draft path fast by default while preserving the
-            // ability to opt into gating when desired.
+            // provides an explicit posterior threshold or alpha, and when
+            // we are not in PERF_MODE. This keeps the EAGLE3 draft path
+            // fast by default while preserving the ability to opt into
+            // gating when desired outside perf runs.
             {
+                const bool perf_mode = turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
                 bool enable_posterior = false;
-                for (int i = 0; i < batch_size; ++i) {
-                    const auto* req = state_->requests[i].get();
-                    if (!req) {
-                        continue;
-                    }
-                    if (!req->gen_cfg.posterior_thresholds.empty()
-                        || !req->gen_cfg.posterior_alphas.empty()) {
-                        enable_posterior = true;
-                        break;
+                if (!perf_mode) {
+                    for (int i = 0; i < batch_size; ++i) {
+                        const auto* req = state_->requests[i].get();
+                        if (!req) {
+                            continue;
+                        }
+                        if (!req->gen_cfg.posterior_thresholds.empty()
+                            || !req->gen_cfg.posterior_alphas.empty()) {
+                            enable_posterior = true;
+                            break;
+                        }
                     }
                 }
 
@@ -2652,6 +2639,14 @@ bool LlamaBatch::Forward(GenerationState& g)
                     spec_ctx.d_posterior_thresholds = nullptr;
                     spec_ctx.d_posterior_alphas     = nullptr;
                     spec_ctx.d_temperatures         = nullptr;
+                }
+
+                if (perf_mode && tp_rank_ == 0) {
+                    static bool logged_entropy_perf = false;
+                    if (!logged_entropy_perf) {
+                        TM_LOG_WARNING("[LlamaBatch][EAGLE] entropy_gating=SKIPPED(LMDEPLOY_EAGLE_PERF_MODE)");
+                        logged_entropy_perf = true;
+                    }
                 }
             }
 

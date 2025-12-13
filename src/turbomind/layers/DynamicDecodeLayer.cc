@@ -51,6 +51,11 @@ DynamicDecodeLayer::DynamicDecodeLayer(DataType              dtype,
     // StopCriteriaLayer: [batch, 2, kMaxStopBadWordsLen].
     stop_words_     = {max_batch_size * 2 * kMaxStopBadWordsLen, kCPUpinned};
     stop_words_buf_ = {max_batch_size * 2 * kMaxStopBadWordsLen, kDEVICE};
+
+    // Persistent EOS metadata for GPU-tail path.
+    max_batch_size_ = max_batch_size;
+    eos_ids_        = {max_batch_size_ * 4, kDEVICE};
+    eos_counts_     = {max_batch_size_, kDEVICE};
 }
 
 DynamicDecodeLayer::~DynamicDecodeLayer() {}
@@ -71,6 +76,36 @@ void DynamicDecodeLayer::Setup(const std::vector<const Request*>& rs, const Tens
                         stop_words_.data(),
                         stop_words_buf_.data(),
                         stop_words_ten_);
+
+    // Precompute EOS ids/counts once per Setup and keep them on device
+    // so GPU-tail does not rebuild host EOS tables every step.
+    constexpr int kMaxEosPerSlot = 4;
+    std::vector<int> h_eos_ids(static_cast<size_t>(max_batch_size_) * kMaxEosPerSlot, 0);
+    std::vector<int> h_eos_counts(max_batch_size_, 0);
+
+    for (int i = 0; i < max_batch_size_; ++i) {
+        int count = 0;
+        if (i < static_cast<int>(rs.size()) && rs[i]) {
+            const auto& eos_vec = rs[i]->gen_cfg.eos_ids;
+            count               = static_cast<int>(std::min<size_t>(eos_vec.size(), kMaxEosPerSlot));
+            for (int k = 0; k < count; ++k) {
+                h_eos_ids[static_cast<size_t>(i) * kMaxEosPerSlot + k] = eos_vec[k];
+            }
+        }
+        h_eos_counts[i] = count;
+    }
+
+    check_cuda_error(cudaMemcpyAsync(eos_ids_.data(),
+                                     h_eos_ids.data(),
+                                     h_eos_ids.size() * sizeof(int),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+    check_cuda_error(cudaMemcpyAsync(eos_counts_.data(),
+                                     h_eos_counts.data(),
+                                     h_eos_counts.size() * sizeof(int),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
 }
 
 void DynamicDecodeLayer::Forward(TensorMap& args)
@@ -120,8 +155,8 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
         return;
     }
 
-    Tensor logits      = args.at("logits");
-    const int batch_size = logits.shape(0);
+    Tensor logits          = args.at("logits");
+    const int batch_size   = logits.shape(0);  // logical active slots for this step
 
     Tensor output_ids      = args.at("output_ids");
     Tensor sequence_length = args.at("sequence_length");
@@ -132,35 +167,63 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
     // this host-side buffer and rely on the device limit vector instead.
     std::vector<int> h_seq_limit;
 
-    int max_seq_len = 0;
+    int max_seq_len   = 0;
+    int stride_batch  = 0;
     if (output_ids.ndim() >= 2) {
-        // Normal case: output_ids is [max_seq_len, batch_size, ...]
-        max_seq_len = output_ids.shape(0);
+        // Normal case: output_ids is [max_seq_len, stride_batch, ...]
+        max_seq_len  = output_ids.shape(0);
+        stride_batch = (output_ids.ndim() >= 2) ? output_ids.shape(1) : batch_size;
     }
     else {
-        // Fallback: output_ids is a flat buffer. Infer [max_seq_len, batch_size]
-        // from the total size and batch_size, matching the indexing pattern
-        //   idx = pos * batch_size + i
+        // Flat layout: infer [max_seq_len, stride_batch] from total size.
+        // Prefer the engine's max_batch_size_ as the physical stride,
+        // falling back to the logical batch_size only when that matches.
         const int total_elems = static_cast<int>(output_ids.size());
-        if (batch_size <= 0 || total_elems <= 0 || (total_elems % batch_size) != 0) {
+        if (total_elems <= 0) {
             TM_LOG_WARNING(
                 "%s: output_ids tensor has ndim=%d and size=%d; cannot infer "
-                "[max_seq_len, batch_size] layout; skipping tail tokens",
+                "[max_seq_len, stride_batch] layout; skipping tail tokens",
                 __PRETTY_FUNCTION__,
                 output_ids.ndim(),
                 total_elems);
             TM_LOG_DEBUG("%s stop (invalid flat output_ids)", __PRETTY_FUNCTION__);
             return;
         }
-        max_seq_len = total_elems / batch_size;
+
+        if (max_batch_size_ > 0 && (total_elems % max_batch_size_) == 0) {
+            stride_batch = max_batch_size_;
+            max_seq_len  = total_elems / max_batch_size_;
+        }
+        else if (batch_size > 0 && (total_elems % batch_size) == 0) {
+            stride_batch = batch_size;
+            max_seq_len  = total_elems / batch_size;
+        }
+        else {
+            TM_LOG_WARNING(
+                "%s: output_ids tensor has ndim=%d and size=%d; cannot factor into "
+                "[max_seq_len, stride_batch] using batch_size=%d or max_batch_size_=%d; "
+                "skipping tail tokens",
+                __PRETTY_FUNCTION__,
+                output_ids.ndim(),
+                total_elems,
+                batch_size,
+                max_batch_size_);
+            TM_LOG_DEBUG("%s stop (invalid flat output_ids)", __PRETTY_FUNCTION__);
+            return;
+        }
+
         TM_LOG_WARNING(
-            "%s: output_ids tensor has ndim=%d; inferring max_seq_len=%d from "
-            "flat buffer of size=%d and batch_size=%d",
+            "%s: output_ids tensor has ndim=%d; inferring max_seq_len=%d, stride_batch=%d "
+            "from flat buffer of size=%d",
             __PRETTY_FUNCTION__,
             output_ids.ndim(),
             max_seq_len,
-            total_elems,
-            batch_size);
+            stride_batch,
+            total_elems);
+    }
+
+    if (stride_batch <= 0) {
+        stride_batch = batch_size;
     }
 
     const int step = *args.at("step").data<int>();
@@ -177,50 +240,64 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
 
     const bool gpu_tail_enabled = std::getenv("TM_ENABLE_GPU_TAIL") && !have_stop_words && max_tail_len > 0;
 
+    // Emit a single, reason-coded log per process so we know whether
+    // the GPU tail path is actually exercised in this run and why it
+    // might be disabled. This avoids guesswork when reading perf logs.
+    static bool logged_gpu_tail_reason = false;
+    if (!logged_gpu_tail_reason) {
+        const bool gpu_tail_env = std::getenv("TM_ENABLE_GPU_TAIL");
+        const char* reason      = nullptr;
+        if (gpu_tail_enabled) {
+            reason = "USED";
+        }
+        else if (!gpu_tail_env) {
+            reason = "ENV_DISABLED";
+        }
+        else if (have_stop_words) {
+            reason = "STOP_WORDS_PRESENT";
+        }
+        else if (max_tail_len <= 0) {
+            reason = "MAX_TAIL_LEN_ZERO";
+        }
+        else if (forced_ctx->device_pointers) {
+            reason = "DEVICE_POINTERS_WITHOUT_GPU_TAIL";
+        }
+        else {
+            reason = "UNKNOWN";
+        }
+        TM_LOG_WARNING(
+            "%s: GPU_TAIL reason=%s env=%d have_stop_words=%d max_tail_len=%d",
+            __PRETTY_FUNCTION__,
+            reason,
+            gpu_tail_env ? 1 : 0,
+            static_cast<int>(have_stop_words),
+            max_tail_len);
+        logged_gpu_tail_reason = true;
+    }
+
     // Optional GPU tail path: enabled via TM_ENABLE_GPU_TAIL and only when
     // stop-words are not configured for this batch. When we take this path
     // we avoid building any host-side sequence-limit or finished buffers.
     if (gpu_tail_enabled) {
         constexpr int kMaxEosPerSlot = 4;
+        Buffer_<int> d_forced_tokens;
+        Buffer_<int> d_forced_lengths;
+        Buffer_<int> d_committed(batch_size, kDEVICE);
 
-        std::vector<int> h_eos_ids(static_cast<size_t>(batch_size) * kMaxEosPerSlot, 0);
-        std::vector<int> h_eos_counts(batch_size, 0);
-        bool             eos_ok = true;
+        const int* d_forced_tokens_ptr  = nullptr;
+        const int* d_forced_lengths_ptr = nullptr;
 
-        for (int i = 0; i < batch_size; ++i) {
-            int count = 0;
-            if (i < static_cast<int>(requests_.size()) && requests_[i]) {
-                const auto& eos_vec = requests_[i]->gen_cfg.eos_ids;
-                if (static_cast<int>(eos_vec.size()) > kMaxEosPerSlot) {
-                    eos_ok = false;
-                    break;
-                }
-                count = static_cast<int>(eos_vec.size());
-                for (int k = 0; k < count; ++k) {
-                    h_eos_ids[static_cast<size_t>(i) * kMaxEosPerSlot + k] = eos_vec[k];
-                }
-            }
-            h_eos_counts[i] = count;
+        if (forced_ctx->device_pointers) {
+            // Callers have provided device-resident tail tokens/lengths.
+            d_forced_tokens_ptr  = forced_tokens;
+            d_forced_lengths_ptr = forced_lengths;
         }
+        else {
+            // Legacy path: copy host tail context to device. EOS metadata
+            // is already on device (eos_ids_/eos_counts_) from Setup.
+            d_forced_tokens  = Buffer_<int>(static_cast<size_t>(batch_size) * max_tail_len, kDEVICE);
+            d_forced_lengths = Buffer_<int>(batch_size, kDEVICE);
 
-        if (eos_ok) {
-            Buffer_<int> d_eos_ids(h_eos_ids.size(), kDEVICE);
-            Buffer_<int> d_eos_counts(batch_size, kDEVICE);
-            Buffer_<int> d_forced_tokens(static_cast<size_t>(batch_size) * max_tail_len, kDEVICE);
-            Buffer_<int> d_forced_lengths(batch_size, kDEVICE);
-            Buffer_<int> d_committed(batch_size, kDEVICE);
-
-            // Copy EOS metadata and forced tail context to device.
-            check_cuda_error(cudaMemcpyAsync(d_eos_ids.data(),
-                                             h_eos_ids.data(),
-                                             h_eos_ids.size() * sizeof(int),
-                                             cudaMemcpyHostToDevice,
-                                             stream_));
-            check_cuda_error(cudaMemcpyAsync(d_eos_counts.data(),
-                                             h_eos_counts.data(),
-                                             h_eos_counts.size() * sizeof(int),
-                                             cudaMemcpyHostToDevice,
-                                             stream_));
             check_cuda_error(cudaMemcpyAsync(d_forced_tokens.data(),
                                              forced_tokens,
                                              static_cast<size_t>(batch_size) * max_tail_len * sizeof(int),
@@ -229,39 +306,55 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
             check_cuda_error(cudaMemcpyAsync(
                 d_forced_lengths.data(), forced_lengths, batch_size * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-            Tensor* seq_lim     = args.try_("sequence_limit_length");
-            int*    d_seq_limit = seq_lim ? seq_lim->data<int>() : nullptr;
-
-            invokeApplyForcedTail(d_forced_tokens.data(),
-                                  d_forced_lengths.data(),
-                                  output_ids.data<int>(),
-                                  sequence_length.data<int>(),
-                                  finished.buffer().data<bool>(),
-                                  d_seq_limit,
-                                  d_eos_ids.data(),
-                                  d_eos_counts.data(),
-                                  kMaxEosPerSlot,
-                                  d_committed.data(),
-                                  batch_size,
-                                  max_tail_len,
-                                  max_seq_len,
-                                  step,
-                                  stream_);
-
-            if (committed) {
-                std::vector<int> committed_host(batch_size, 0);
-                check_cuda_error(cudaMemcpyAsync(committed_host.data(),
-                                                 d_committed.data(),
-                                                 batch_size * sizeof(int),
-                                                 cudaMemcpyDeviceToHost,
-                                                 stream_));
-                check_cuda_error(cudaStreamSynchronize(stream_));
-                std::copy(committed_host.begin(), committed_host.end(), committed);
-            }
-
-            TM_LOG_DEBUG("%s stop (GPU tail)", __PRETTY_FUNCTION__);
-            return;
+            d_forced_tokens_ptr  = d_forced_tokens.data();
+            d_forced_lengths_ptr = d_forced_lengths.data();
         }
+
+        Tensor* seq_lim     = args.try_("sequence_limit_length");
+        int*    d_seq_limit = seq_lim ? seq_lim->data<int>() : nullptr;
+
+        invokeApplyForcedTail(d_forced_tokens_ptr,
+                              d_forced_lengths_ptr,
+                              output_ids.data<int>(),
+                              sequence_length.data<int>(),
+                              finished.buffer().data<bool>(),
+                              d_seq_limit,
+                              eos_ids_.data(),
+                              eos_counts_.data(),
+                              kMaxEosPerSlot,
+                              d_committed.data(),
+                              batch_size,
+                              max_tail_len,
+                              max_seq_len,
+                              stride_batch,
+                              step,
+                              stream_);
+
+        if (committed) {
+            std::vector<int> committed_host(batch_size, 0);
+            check_cuda_error(cudaMemcpyAsync(committed_host.data(),
+                                             d_committed.data(),
+                                             batch_size * sizeof(int),
+                                             cudaMemcpyDeviceToHost,
+                                             stream_));
+            check_cuda_error(cudaStreamSynchronize(stream_));
+            std::copy(committed_host.begin(), committed_host.end(), committed);
+        }
+
+        TM_LOG_DEBUG("%s stop (GPU tail)", __PRETTY_FUNCTION__);
+        return;
+    }
+
+    // If GPU tail is disabled but the caller attempted to pass device
+    // pointers, we cannot safely run the host tail path. Treat this as a
+    // no-tail step to avoid misinterpreting device memory as host data.
+    if (forced_ctx->device_pointers) {
+        TM_LOG_WARNING(
+            "%s: device_pointers=true but TM_ENABLE_GPU_TAIL is not active or stop-words are configured; "
+            "skipping forced tails for this step.",
+            __PRETTY_FUNCTION__);
+        TM_LOG_DEBUG("%s stop (device pointers without GPU tail)", __PRETTY_FUNCTION__);
+        return;
     }
 
     // Build host-side sequence limits only when we are not taking the GPU
@@ -357,7 +450,7 @@ void DynamicDecodeLayer::ForwardMultiStep(TensorMap& args, const ForcedTailConte
             }
 
             const int value = forced_tokens[i * max_tail_len + t];
-            int*      dst   = d_output_ids + pos * batch_size + i;
+            int*      dst   = d_output_ids + pos * stride_batch + i;
             check_cuda_error(cudaMemcpyAsync(dst, &value, sizeof(int), cudaMemcpyHostToDevice, stream_));
 
             ++h_seq_len[i];

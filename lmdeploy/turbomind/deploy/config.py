@@ -88,6 +88,8 @@ class ModelConfig:
     kv_lora_rank: int = 0
     qk_rope_dim: int = 0
     v_head_dim: int = 0
+    mla_enabled: bool = False
+    mla_cache_impl: str = 'naive'
     # tuning
     tune_layer_num: int = 1
 

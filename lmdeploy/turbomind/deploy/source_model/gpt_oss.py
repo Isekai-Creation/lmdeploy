@@ -2,6 +2,7 @@
 
 import re
 
+from ..config import RopeParam
 from .base import INPUT_MODELS
 from .llama import LlamaModel, LlamaReader
 
@@ -49,9 +50,10 @@ class GptOssModel(LlamaModel):
 
     def model_info(self):
         cfg = self.model_config
-        types = cfg['layer_types']
-        sliding_window = cfg['sliding_window']
+        types = cfg.get('layer_types', [])
+        sliding_window = cfg.get('sliding_window', 0)
         info = super().model_info()
+        # Base GPT-OSS MoE / routing / activation wiring.
         info.update(attn_bias=int(cfg['attention_bias']),
                     mlp_bias=True,
                     expert_router_bias=True,
@@ -63,4 +65,28 @@ class GptOssModel(LlamaModel):
                     window_size=[sliding_window if x == 'sliding_attention' else 0 for x in types],
                     attn_sink=True,
                     activation_type='gpt-oss')
+
+        # If this GPT-OSS config has MLA fields (as produced by TransMLA),
+        # propagate them into the TurboMind model config so MLA geometry is
+        # available on the TM side. This mirrors the DeepSeek2 path.
+        kv_lora_rank = cfg.get('kv_lora_rank', 0) or 0
+        if kv_lora_rank > 0:
+            qk_rope_dim = cfg.get('qk_rope_head_dim', 0) or 0
+            qk_nope_dim = cfg.get('qk_nope_head_dim', 0) or 0
+            size_per_head = qk_rope_dim + qk_nope_dim or info['size_per_head']
+            # Update MLA-related fields and override size_per_head to match MLA.
+            info.update(
+                kv_lora_rank=kv_lora_rank,
+                q_lora_rank=cfg.get('q_lora_rank') or 0,
+                qk_rope_dim=qk_rope_dim,
+                v_head_dim=cfg.get('v_head_dim', info['size_per_head']),
+                size_per_head=size_per_head,
+                mla_enabled=True,
+                mla_cache_impl='naive',
+            )
+            # Ensure RoPE dim reflects the MLA rope sub-dimension.
+            rope_param: RopeParam = info['rope_param']
+            rope_param.dim = qk_rope_dim or rope_param.dim
+            info.update(rope_param=rope_param)
+
         return info

@@ -2953,6 +2953,13 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     eagle_step_accepted_tokens_.clear();
     eagle_step_max_extra_ = 0;
 
+    const bool eagle_align_debug = turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALIGN_DEBUG");
+    std::vector<int>             eagle_seq_len_before;
+
+    if (eagle_align_debug && tp_rank_ == 0) {
+        TM_LOG_WARNING("[LlamaV2][EAGLE][align] ENABLED step=%d batch=%d", g.step, logits.shape(0));
+    }
+
     const int batch_size = logits.shape(0);
     if (batch_size <= 0) {
         // Nothing to decode; keep baseline behaviour.
@@ -3274,6 +3281,22 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         d_num_successors.data(),
         stream_);
 
+    // Optional linked-list style tree metadata (positions and child/sibling
+    // lists) used by future EAGLE3 kernels. This is built entirely on GPU
+    // from the per-slot draft_paths layout and mirrors the SGLang-style
+    // retrive_index / retrive_next_token / retrive_next_sibling structure.
+    kernels::speculative_decoding::invokeBuildLinkedTreeFromDraftPaths(
+        reinterpret_cast<int32_t const*>(eagle_buffers_->inputs.draft_paths),
+        static_cast<int32_t>(batch_size),
+        static_cast<int32_t>(max_decoding_tokens_int),
+        static_cast<int32_t>(engine_param_.spec_max_draft_path_len),
+        static_cast<int32_t>(tokens_per_seq),
+        reinterpret_cast<int32_t*>(eagle_buffers_->inputs.tree_positions),
+        reinterpret_cast<int32_t*>(eagle_buffers_->inputs.retrive_index),
+        reinterpret_cast<int32_t*>(eagle_buffers_->inputs.retrive_next_token),
+        reinterpret_cast<int32_t*>(eagle_buffers_->inputs.retrive_next_sibling),
+        stream_);
+
     // Materialize draft-side offsets / successors for attention. Shapes:
     //  - tree_offsets: [batch+1], runtime_offsets: [batch+1]
     //  - successor_offsets: [batch+1], successor_counts: [<= batch * max_decoding_tokens]
@@ -3506,6 +3529,86 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
     check_cuda_error(cudaStreamSynchronize(stream_));
 
+    // Optional acceptance debug: when LMDEPLOY_EAGLE_ACCEPT_DEBUG is set,
+    // emit a compact per-slot snapshot for the first few steps so we can
+    // diagnose early mismatches between draft_ids, target_ids, and the
+    // accepted path/mask geometry without running full long-context
+    // benchmarks. This is intended for batch4/multi-token bring-up and is
+    // guarded by env so it does not perturb normal perf runs.
+    static int eagle_accept_debug_steps = 0;
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ACCEPT_DEBUG") && tp_rank_ == 0
+        && eagle_accept_debug_steps < 8) {
+        ++eagle_accept_debug_steps;
+
+        const int dump_batch = std::min(batch_size, 4);
+        TM_LOG_WARNING(
+            "[LlamaV2][EAGLE][accept_debug] step=%d batch=%d tokens_per_seq=%d paths_per_seq=%d "
+            "max_path_len=%d",
+            g.step,
+            batch_size,
+            inferred_tokens_per_seq,
+            paths_per_seq,
+            max_path_len);
+
+        if (eagle_buffers_ && eagle_buffers_->inputs.draft_tokens && eagle_buffers_->inputs.target_tokens) {
+            const int flat_tokens = batch_size * inferred_tokens_per_seq;
+            std::vector<int> h_draft(flat_tokens, -1);
+            std::vector<int> h_target(flat_tokens, -1);
+
+            check_cuda_error(cudaMemcpyAsync(h_draft.data(),
+                                             eagle_buffers_->inputs.draft_tokens,
+                                             static_cast<size_t>(flat_tokens) * sizeof(int),
+                                             cudaMemcpyDeviceToHost,
+                                             stream_));
+            check_cuda_error(cudaMemcpyAsync(h_target.data(),
+                                             eagle_buffers_->inputs.target_tokens,
+                                             static_cast<size_t>(flat_tokens) * sizeof(int),
+                                             cudaMemcpyDeviceToHost,
+                                             stream_));
+            check_cuda_error(cudaStreamSynchronize(stream_));
+
+            for (int b = 0; b < dump_batch; ++b) {
+                const int best_path  = host_best_path_ids[b];
+                const int acc_len    = h_accepted_lens[b];
+                const int token_off  = b * max_path_len;
+                const int path_off   = b * paths_per_seq * max_path_len + best_path * max_path_len;
+                std::ostringstream path_ss;
+                std::ostringstream draft_ss;
+                std::ostringstream target_ss;
+                for (int t = 0; t < acc_len && t < max_path_len; ++t) {
+                    const int node_idx = reinterpret_cast<const int32_t*>(eagle_buffers_->inputs.draft_paths)
+                                             [path_off + t];
+                    if (t) {
+                        path_ss << ',';
+                        draft_ss << ',';
+                        target_ss << ',';
+                    }
+                    path_ss << node_idx;
+                    if (node_idx > 0 && node_idx <= inferred_tokens_per_seq) {
+                        const int tok_idx = node_idx - 1;
+                        const int flat    = b * inferred_tokens_per_seq + tok_idx;
+                        draft_ss << h_draft[flat];
+                        target_ss << h_target[flat];
+                    }
+                    else {
+                        draft_ss << -1;
+                        target_ss << -1;
+                    }
+                }
+
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][accept_debug] slot=%d best_path=%d accepted_len=%d "
+                    "paths=[%s] draft=[%s] target=[%s]",
+                    b,
+                    best_path,
+                    acc_len,
+                    path_ss.str().c_str(),
+                    draft_ss.str().c_str(),
+                    target_ss.str().c_str());
+            }
+        }
+    }
+
     int total_accepted = 0;
     for (int b = 0; b < batch_size; ++b) {
         if (h_accepted_lens[b] < 0) {
@@ -3521,8 +3624,10 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         h_accepted_cumsum[b + 1] = h_accepted_cumsum[b] + h_accepted_lens[b];
     }
 
-    // Optional debug logging of accepted paths/tokens.
-    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+    // Optional debug logging of accepted paths/tokens. This can be enabled
+    // either via the general EAGLE debug flag or the dedicated acceptance
+    // debug env so that perf runs remain quiet by default.
+    if ((isEagleDebugEnabled() || turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ACCEPT_DEBUG")) && tp_rank_ == 0) {
         std::vector<int> h_draft(num_draft_tokens);
         std::vector<int> h_target(num_draft_tokens);
         std::copy_n(draft_tokens.data(), num_draft_tokens, h_draft.data());
@@ -3722,6 +3827,20 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     // ========= Build ForcedTailContext from accepted tokens (extras only) =========
     const int max_tail_len = engine_param_.spec_max_draft_path_len;
     if (max_tail_len <= 0 || eagle_step_accepted_lens_.empty()) {
+        if (eagle_align_debug && batch_size > 0 && sequence_length.device() == kDEVICE
+            && sequence_length.dtype() == kInt32) {
+            eagle_seq_len_before.assign(batch_size, 0);
+            const int* d_seq_len = sequence_length.data<int>();
+            if (d_seq_len) {
+                check_cuda_error(cudaMemcpyAsync(eagle_seq_len_before.data(),
+                                                 d_seq_len,
+                                                 static_cast<size_t>(batch_size) * sizeof(int),
+                                                 cudaMemcpyDeviceToHost,
+                                                 stream_));
+                check_cuda_error(cudaStreamSynchronize(stream_));
+            }
+        }
+
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -3739,12 +3858,10 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                                nullptr);
         return;
     }
-    std::vector<int> forced_lengths(batch_size, 0);
-    std::vector<int> forced_tokens(static_cast<size_t>(batch_size) * max_tail_len, -1);
-    std::vector<int> committed_lengths(batch_size, 0);
 
+    // Determine whether there is any usable tail to apply. This mirrors
+    // the original host-side logic but only inspects accepted lengths.
     int any_forced = 0;
-
     for (int i = 0; i < batch_size; ++i) {
         int len = (i < static_cast<int>(eagle_step_accepted_lens_.size()))
                       ? eagle_step_accepted_lens_[i]
@@ -3755,28 +3872,29 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         if (len > max_tail_len) {
             len = max_tail_len;
         }
-
         const int extra = len - 1;  // extras only; base token is committed by DynamicDecodeLayer
         if (extra <= 0) {
             continue;
         }
-
-        const int token_offset = i * max_tail_len;
-        if (token_offset + len > static_cast<int>(eagle_step_accepted_tokens_.size())) {
-            continue;
-        }
-
-        forced_lengths[i] = extra;
-        for (int t = 0; t < extra; ++t) {
-            forced_tokens[static_cast<size_t>(i) * max_tail_len + t] =
-                eagle_step_accepted_tokens_[token_offset + 1 + t];
-        }
-
         any_forced = std::max(any_forced, extra);
     }
 
     if (any_forced <= 0) {
         // No usable tails; fall back to single-token decode.
+        if (eagle_align_debug && batch_size > 0 && sequence_length.device() == kDEVICE
+            && sequence_length.dtype() == kInt32) {
+            eagle_seq_len_before.assign(batch_size, 0);
+            const int* d_seq_len = sequence_length.data<int>();
+            if (d_seq_len) {
+                check_cuda_error(cudaMemcpyAsync(eagle_seq_len_before.data(),
+                                                 d_seq_len,
+                                                 static_cast<size_t>(batch_size) * sizeof(int),
+                                                 cudaMemcpyDeviceToHost,
+                                                 stream_));
+                check_cuda_error(cudaStreamSynchronize(stream_));
+            }
+        }
+
         dynamicDecodeMultiStep(token_ids,
                                finished,
                                sequence_length,
@@ -3795,37 +3913,143 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         return;
     }
 
-    // Allocate a 2-D tail buffer for DynamicDecodeLayer::ForwardMultiStep.
-    // Layout: [max_tail_len, batch_size]
+    // Per-slot committed tail counts (host) for metrics and SpecPV hooks.
+    std::vector<int> committed_lengths(batch_size, 0);
 
-    ForcedTailContext forced{};
-    forced.max_tail_len      = max_tail_len;
-    forced.forced_tokens     = forced_tokens.data();
-    forced.forced_lengths    = forced_lengths.data();
-    forced.committed_lengths = committed_lengths.data();
+    // Prefer a fully GPU-native tail path when TM_ENABLE_GPU_TAIL is set.
+    const bool gpu_tail_env = std::getenv("TM_ENABLE_GPU_TAIL");
 
-    dynamicDecodeMultiStep(token_ids,
-                           finished,
-                           sequence_length,
-                           curand_state,
-                           logits,
-                           seq_limit_len,
-                           init_context_length,
-                           context_length,
-                           prompt_length,
-                           sampled_logprobs,
-                           sampled_indexes,
-                           sampled_nums,
-                           g.step,
-                           max_context_len,
-                           &forced);
+    if (gpu_tail_env) {
+        using kernels::speculative_decoding::SizeType;
+        using kernels::speculative_decoding::TokenIdType;
+
+        Buffer_<int> d_forced_tokens(static_cast<size_t>(batch_size) * max_tail_len, kDEVICE);
+        Buffer_<int> d_forced_lengths(batch_size, kDEVICE);
+
+        kernels::speculative_decoding::invokeBuildForcedTailsFromAccepted(
+            reinterpret_cast<TokenIdType const*>(eagle_buffers_->outputs.accepted_tokens),
+            reinterpret_cast<SizeType const*>(eagle_buffers_->outputs.accepted_lens),
+            static_cast<SizeType>(batch_size),
+            static_cast<SizeType>(max_path_len),
+            static_cast<SizeType>(max_tail_len),
+            reinterpret_cast<TokenIdType*>(d_forced_tokens.data()),
+            reinterpret_cast<SizeType*>(d_forced_lengths.data()),
+            stream_);
+
+        ForcedTailContext forced{};
+        forced.max_tail_len      = max_tail_len;
+        forced.forced_tokens     = d_forced_tokens.data();
+        forced.forced_lengths    = d_forced_lengths.data();
+        forced.committed_lengths = committed_lengths.data();
+        forced.device_pointers   = true;
+
+        if (eagle_align_debug && batch_size > 0 && sequence_length.device() == kDEVICE
+            && sequence_length.dtype() == kInt32) {
+            eagle_seq_len_before.assign(batch_size, 0);
+            const int* d_seq_len = sequence_length.data<int>();
+            if (d_seq_len) {
+                check_cuda_error(cudaMemcpyAsync(eagle_seq_len_before.data(),
+                                                 d_seq_len,
+                                                 static_cast<size_t>(batch_size) * sizeof(int),
+                                                 cudaMemcpyDeviceToHost,
+                                                 stream_));
+                check_cuda_error(cudaStreamSynchronize(stream_));
+            }
+        }
+
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               &forced);
+    }
+    else {
+        // Fallback: host-built tail, matching the original behaviour.
+        std::vector<int> forced_lengths(batch_size, 0);
+        std::vector<int> forced_tokens(static_cast<size_t>(batch_size) * max_tail_len, -1);
+
+        for (int i = 0; i < batch_size; ++i) {
+            int len = (i < static_cast<int>(eagle_step_accepted_lens_.size()))
+                          ? eagle_step_accepted_lens_[i]
+                          : 0;
+            if (len <= 1) {
+                continue;
+            }
+            if (len > max_tail_len) {
+                len = max_tail_len;
+            }
+
+            const int extra = len - 1;
+            if (extra <= 0) {
+                continue;
+            }
+
+            const int token_offset = i * max_tail_len;
+            if (token_offset + len > static_cast<int>(eagle_step_accepted_tokens_.size())) {
+                continue;
+            }
+
+            forced_lengths[i] = extra;
+            for (int t = 0; t < extra; ++t) {
+                forced_tokens[static_cast<size_t>(i) * max_tail_len + t] =
+                    eagle_step_accepted_tokens_[token_offset + 1 + t];
+            }
+        }
+
+        ForcedTailContext forced{};
+        forced.max_tail_len      = max_tail_len;
+        forced.forced_tokens     = forced_tokens.data();
+        forced.forced_lengths    = forced_lengths.data();
+        forced.committed_lengths = committed_lengths.data();
+
+        if (eagle_align_debug && batch_size > 0 && sequence_length.device() == kDEVICE
+            && sequence_length.dtype() == kInt32) {
+            eagle_seq_len_before.assign(batch_size, 0);
+            const int* d_seq_len = sequence_length.data<int>();
+            if (d_seq_len) {
+                check_cuda_error(cudaMemcpyAsync(eagle_seq_len_before.data(),
+                                                 d_seq_len,
+                                                 static_cast<size_t>(batch_size) * sizeof(int),
+                                                 cudaMemcpyDeviceToHost,
+                                                 stream_));
+                check_cuda_error(cudaStreamSynchronize(stream_));
+            }
+        }
+
+        dynamicDecodeMultiStep(token_ids,
+                               finished,
+                               sequence_length,
+                               curand_state,
+                               logits,
+                               seq_limit_len,
+                               init_context_length,
+                               context_length,
+                               prompt_length,
+                               sampled_logprobs,
+                               sampled_indexes,
+                               sampled_nums,
+                               g.step,
+                               max_context_len,
+                               &forced);
+    }
 
     // Reconcile acceptance with what was actually committed by the decode
     // layer. This ensures metrics, KV rewind, and g.step all see the same
     // effective extra lengths.
     int max_extra_committed = 0;
     for (int i = 0; i < batch_size; ++i) {
-        const int committed_extra = (i < static_cast<int>(committed_lengths.size())) ? committed_lengths[i] : 0;
+        const int committed_extra =
+            (i < static_cast<int>(committed_lengths.size())) ? committed_lengths[i] : 0;
         if (committed_extra <= 0) {
             // If nothing was committed, treat this slot as single-token.
             if (i < static_cast<int>(eagle_step_accepted_lens_.size())) {
@@ -3843,6 +4067,43 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     }
 
     eagle_step_max_extra_ = max_extra_committed;
+
+    // Under explicit alignment debug, enforce Contract A at the length
+    // level: whenever DynamicDecode commits extras for a slot, the
+    // accepted length we expose for metrics and KV must be exactly
+    // 1 + committed_extra (base + extras). Any deviation means the
+    // producer/consumer contract is broken.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALIGN_DEBUG") && max_tail_len > 0
+        && !eagle_step_accepted_lens_.empty()) {
+        for (int i = 0; i < batch_size; ++i) {
+            const int committed_extra =
+                (i < static_cast<int>(committed_lengths.size())) ? committed_lengths[i] : 0;
+            if (committed_extra <= 0) {
+                continue;
+            }
+            if (i >= static_cast<int>(eagle_step_accepted_lens_.size())) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][align] slot=%d committed_extra=%d but "
+                    "accepted_lens size=%zu (LMDEPLOY_EAGLE_ALIGN_DEBUG=1)",
+                    i,
+                    committed_extra,
+                    eagle_step_accepted_lens_.size());
+                std::abort();
+            }
+            const int expected_len = 1 + committed_extra;
+            const int actual_len   = eagle_step_accepted_lens_[i];
+            if (actual_len != expected_len) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][align] slot=%d committed_extra=%d "
+                    "expected_len=%d actual_len=%d (LMDEPLOY_EAGLE_ALIGN_DEBUG=1)",
+                    i,
+                    committed_extra,
+                    expected_len,
+                    actual_len);
+                std::abort();
+            }
+        }
+    }
 
     // Force the accepted root token for each slot to match the base token
     // actually committed by DynamicDecodeLayer, and instrument tail depth
@@ -3910,6 +4171,258 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                 max_accepted_len,
                 slots_ge2,
                 mismatch_slots);
+        }
+    }
+
+    // Optional acceptance vs commit alignment check. When enabled via
+    // LMDEPLOY_EAGLE_ALIGN_DEBUG, verify that the tokens actually written
+    // by DynamicDecodeLayer (base + tail) match the accepted tokens for
+    // this step for each slot, within the committed extra length. This
+    // is a debug-only invariant used to chase batch4 alignment issues and
+    // is gated by env + TP rank to avoid perturbing perf runs. The check
+    // uses the per-slot sequence length before decode so it remains valid
+    // even when g.step diverges from per-slot lengths after multi-token
+    // advancement.
+    if (eagle_align_debug && tp_rank_ == 0 && max_tail_len > 0 && !eagle_step_accepted_lens_.empty()
+        && !eagle_step_accepted_tokens_.empty() && batch_size > 0 && !eagle_seq_len_before.empty()) {
+        // Determine the physical stride for token_ids. For the common
+        // [time, max_batch_size] layout this is engine_param_.max_batch_size;
+        // fall back to batch_size only when the flat buffer is compatible.
+        const ssize_t token_elems     = token_ids.size();
+        const int     max_batch_size  = engine_param_.max_batch_size;
+        int           stride_batch    = batch_size;
+        if (max_batch_size > 0 && token_elems >= static_cast<ssize_t>(max_batch_size)) {
+            stride_batch = max_batch_size;
+        }
+        else if (batch_size > 0 && (token_elems % batch_size) == 0) {
+            stride_batch = batch_size;
+        }
+
+        const int max_extras_to_check = std::min(max_tail_len - 1, std::max(0, eagle_step_max_extra_));
+
+        // Fast path: if no committed extras exist for any slot, alignment
+        // is vacuously satisfied but also uninformative. Emit a note so
+        // callers know that ALIGN_DEBUG did not actually exercise any
+        // multi-token tails on this step.
+        if (max_extras_to_check <= 0) {
+            TM_LOG_WARNING(
+                "[LlamaV2][EAGLE][align] step=%d batch=%d stride_batch=%d max_extras_to_check=0 "
+                "(no committed extras to verify on this step)",
+                g.step,
+                batch_size,
+                stride_batch);
+        }
+        else if (stride_batch > 0 && token_elems > 0) {
+            // token_ids is laid out logically as [time, stride_batch]. Capture
+            // enough rows from time index 0 up to the largest row we might
+            // inspect based on seq_len_before and max_extras_to_check, while
+            // clamping to the available buffer size.
+            int max_seq_before = 0;
+            for (int i = 0; i < batch_size; ++i) {
+                const int len_before =
+                    (i < static_cast<int>(eagle_seq_len_before.size())) ? eagle_seq_len_before[i] : 0;
+                if (len_before > max_seq_before) {
+                    max_seq_before = len_before;
+                }
+            }
+
+            const int max_rows_from_buffer =
+                static_cast<int>(token_elems / static_cast<ssize_t>(stride_batch));
+            int total_rows = max_seq_before + max_extras_to_check + 1;
+            if (total_rows > max_rows_from_buffer) {
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][align] step=%d batch=%d requested_rows=%d clamped_rows=%d "
+                    "stride_batch=%d token_elems=%zd",
+                    g.step,
+                    batch_size,
+                    total_rows,
+                    max_rows_from_buffer,
+                    stride_batch,
+                    token_elems);
+                total_rows = max_rows_from_buffer;
+            }
+
+            if (total_rows > 0) {
+                std::vector<int> h_committed_full(static_cast<size_t>(total_rows) * stride_batch, -1);
+                int*             base_ptr = token_ids.data<int>();
+                check_cuda_error(cudaMemcpyAsync(h_committed_full.data(),
+                                                 base_ptr,
+                                                 static_cast<size_t>(total_rows) * stride_batch * sizeof(int),
+                                                 cudaMemcpyDeviceToHost,
+                                                 stream_));
+                check_cuda_error(cudaStreamSynchronize(stream_));
+
+                // Also capture the per-slot sequence lengths *after* decode
+                // so we can compute the actual number of tokens committed in
+                // this step for each slot.
+                std::vector<int> eagle_seq_len_after(batch_size, 0);
+                if (sequence_length.device() == kDEVICE && sequence_length.dtype() == kInt32) {
+                    const int* d_seq_after = sequence_length.data<int>();
+                    if (d_seq_after) {
+                        check_cuda_error(cudaMemcpyAsync(eagle_seq_len_after.data(),
+                                                         d_seq_after,
+                                                         static_cast<size_t>(batch_size) * sizeof(int),
+                                                         cudaMemcpyDeviceToHost,
+                                                         stream_));
+                        check_cuda_error(cudaStreamSynchronize(stream_));
+                    }
+                }
+
+                int slots_with_mismatch   = 0;
+                int max_committed_extras  = 0;
+                int any_committed_extras  = 0;
+
+                for (int i = 0; i < batch_size; ++i) {
+                    const int len = (i < static_cast<int>(eagle_step_accepted_lens_.size()))
+                                        ? eagle_step_accepted_lens_[i]
+                                        : 0;
+                    if (len <= 0) {
+                        continue;
+                    }
+
+                    const int token_offset = i * max_tail_len;
+                    if (token_offset >= static_cast<int>(eagle_step_accepted_tokens_.size())) {
+                        continue;
+                    }
+
+                    bool slot_mismatch = false;
+
+                    const int seq_before =
+                        (i < static_cast<int>(eagle_seq_len_before.size())) ? eagle_seq_len_before[i] : 0;
+                    const int seq_after =
+                        (i < static_cast<int>(eagle_seq_len_after.size())) ? eagle_seq_len_after[i] : seq_before;
+
+                    const int committed_len   = std::max(0, seq_after - seq_before);
+                    const int committed_extra = std::max(0, committed_len - 1);
+                    max_committed_extras      = std::max(max_committed_extras, committed_extra);
+                    if (committed_extra > 0) {
+                        any_committed_extras = 1;
+                    }
+
+                    // Base token alignment: accepted root vs decode base at
+                    // seq_before for this slot.
+                    const int accepted_base = eagle_step_accepted_tokens_[token_offset];
+                    const int committed_base =
+                        (seq_before >= 0 && seq_before < total_rows)
+                            ? h_committed_full[seq_before * stride_batch + i]
+                            : -1;
+                    if (accepted_base != committed_base) {
+                        slot_mismatch = true;
+                    }
+
+                    // Extra tokens alignment: accepted extras vs tail commits.
+                    const int extras = std::min(std::max(len - 1, 0), max_extras_to_check);
+                    for (int t = 0; t < extras; ++t) {
+                        const int accepted_extra = eagle_step_accepted_tokens_[token_offset + 1 + t];
+                        const int row_index      = seq_before + 1 + t;
+                        const int committed_extra_tok =
+                            (row_index >= 0 && row_index < total_rows)
+                                ? h_committed_full[row_index * stride_batch + i]
+                                : -1;
+                        if (accepted_extra != committed_extra_tok) {
+                            slot_mismatch = true;
+                            break;
+                        }
+                    }
+
+                    if (slot_mismatch) {
+                        ++slots_with_mismatch;
+
+                        // For the first mismatching slot, print a compact
+                        // snapshot with enough detail to diagnose whether the
+                        // contract is off by one or fundamentally wrong.
+                        const int max_terms = std::min(len, 8);
+
+                        std::ostringstream acc_ss;
+                        std::ostringstream mode_a_ss;
+                        std::ostringstream mode_b_ss;
+
+                        for (int k = 0; k < max_terms; ++k) {
+                            if (k) {
+                                acc_ss << ',';
+                                mode_a_ss << ',';
+                                mode_b_ss << ',';
+                            }
+                            const int acc_tok = eagle_step_accepted_tokens_[token_offset + k];
+                            acc_ss << acc_tok;
+
+                            const int row_a = seq_before + k;
+                            const int row_b = seq_before + 1 + k;
+                            const int tok_a = (row_a >= 0 && row_a < total_rows)
+                                                  ? h_committed_full[row_a * stride_batch + i]
+                                                  : -1;
+                            const int tok_b = (row_b >= 0 && row_b < total_rows)
+                                                  ? h_committed_full[row_b * stride_batch + i]
+                                                  : -1;
+                            mode_a_ss << tok_a;
+                            mode_b_ss << tok_b;
+                        }
+
+                        // Compute simple match scores for Mode A (aligned) and
+                        // Mode B (off-by-one) to help decide the intended
+                        // contract without further instrumentation.
+                        int mode_a_matches = 0;
+                        int mode_b_matches = 0;
+                        const int max_check = std::min(len, committed_len);
+                        for (int k = 0; k < max_check; ++k) {
+                            const int acc_tok = eagle_step_accepted_tokens_[token_offset + k];
+                            const int row_a   = seq_before + k;
+                            const int row_b   = seq_before + 1 + k;
+                            const int tok_a = (row_a >= 0 && row_a < total_rows)
+                                                  ? h_committed_full[row_a * stride_batch + i]
+                                                  : -1;
+                            const int tok_b = (row_b >= 0 && row_b < total_rows)
+                                                  ? h_committed_full[row_b * stride_batch + i]
+                                                  : -1;
+                            if (acc_tok == tok_a) {
+                                ++mode_a_matches;
+                            }
+                            if (acc_tok == tok_b) {
+                                ++mode_b_matches;
+                            }
+                        }
+
+                        TM_LOG_WARNING(
+                            "[LlamaV2][EAGLE][align] step=%d slot=%d len=%d seq_before=%d seq_after=%d "
+                            "committed_len=%d stride_batch=%d modeA_matches=%d modeB_matches=%d "
+                            "accepted_tokens=[%s] committed_A=[%s] committed_B=[%s]",
+                            g.step,
+                            i,
+                            len,
+                            seq_before,
+                            seq_after,
+                            committed_len,
+                            stride_batch,
+                            mode_a_matches,
+                            mode_b_matches,
+                            acc_ss.str().c_str(),
+                            mode_a_ss.str().c_str(),
+                            mode_b_ss.str().c_str());
+                    }
+                }
+
+                TM_LOG_WARNING(
+                    "[LlamaV2][EAGLE][align] step=%d batch=%d stride_batch=%d any_committed_extras=%d "
+                    "max_committed_extras=%d max_extras_to_check=%d",
+                    g.step,
+                    batch_size,
+                    stride_batch,
+                    any_committed_extras,
+                    max_committed_extras,
+                    max_extras_to_check);
+
+                if (slots_with_mismatch > 0) {
+                    TM_LOG_WARNING(
+                        "[LlamaV2][EAGLE][align] step=%d batch=%d slots_with_mismatch=%d "
+                        "(LMDEPLOY_EAGLE_ALIGN_DEBUG=1)",
+                        g.step,
+                        batch_size,
+                        slots_with_mismatch);
+                    // Fail fast under explicit align debug: any mismatch means
+                    // the acceptance/commit contract is broken for this step.
+                    std::abort();
+                }
+            }
         }
     }
 

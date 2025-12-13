@@ -570,83 +570,159 @@ PYBIND11_MODULE(_turbomind, m)
     // functionality is layered on top of this core.
     // ------------------------------------------------------------------
 
-    py::class_<RequestMetrics, std::shared_ptr<RequestMetrics>>(m, "RequestMetrics")
-        .def(py::init())
-        .def_readonly("enque_time", &RequestMetrics::enque_time)
-        .def_readonly("scheduled_time", &RequestMetrics::scheduled_time)
-        // EAGLE3: expose speculative decoding metrics when available.
-        .def_readonly("eagle_total_draft_tokens", &RequestMetrics::eagle_total_draft_tokens)
-        .def_readonly("eagle_total_accepted_tokens", &RequestMetrics::eagle_total_accepted_tokens)
-        .def_readonly("eagle_steps", &RequestMetrics::eagle_steps)
-        .def_readonly("eagle_total_rewound_tokens", &RequestMetrics::eagle_total_rewound_tokens)
-        .def_readonly("eagle_rewind_steps", &RequestMetrics::eagle_rewind_steps)
-        .def_readonly("eagle_max_tokens_per_seq", &RequestMetrics::eagle_max_tokens_per_seq)
-        .def_readonly("eagle_max_accepted_len", &RequestMetrics::eagle_max_accepted_len)
-        .def_readonly("eagle_steps_accept_ge2", &RequestMetrics::eagle_steps_accept_ge2)
-        .def_readonly("eagle_total_committed_extras", &RequestMetrics::eagle_total_committed_extras)
-        .def_readonly("eagle_tree_draft_tokens", &RequestMetrics::eagle_tree_draft_tokens)
-        .def_readonly("eagle_tree_target_tokens", &RequestMetrics::eagle_tree_target_tokens)
-        .def_readonly("eagle_tree_accepted_tokens", &RequestMetrics::eagle_tree_accepted_tokens);
+    // Lightweight build fingerprint so Python can assert it is using the
+    // intended TurboMind binary during perf/correctness sweeps.
+    m.def(
+        "build_id",
+        []() {
+            // NOTE: keep this string unique per significant binary change.
+            // It is not a semantic version; it is a quick fingerprint.
+            return std::string("eagle3-align-debug-v1");
+        },
+        "Return a short build identifier for the loaded TurboMind binary");
 
-    py::class_<ScheduleMetrics, std::shared_ptr<ScheduleMetrics>>(m, "ScheduleMetrics")
-        .def(py::init())
-        .def_readonly("total_seqs", &ScheduleMetrics::total_seqs)
-        .def_readonly("active_seqs", &ScheduleMetrics::active_seqs)
-        .def_readonly("waiting_seqs", &ScheduleMetrics::waiting_seqs)
-        .def_readonly("total_blocks", &ScheduleMetrics::total_blocks)
-        .def_readonly("active_blocks", &ScheduleMetrics::active_blocks)
-        .def_readonly("cached_blocks", &ScheduleMetrics::cached_blocks)
-        .def_readonly("free_blocks", &ScheduleMetrics::free_blocks);
+    // RequestMetrics can be registered by multiple modules in the same
+    // process in some environments. Guard the pybind11 registration so
+    // we never attempt to bind the same C++ type twice.
+    {
+        namespace detail = pybind11::detail;
+        py::handle existing = detail::get_type_handle(typeid(RequestMetrics), /*throw_if_missing=*/false);
+        if (existing) {
+            // Re-export the already-registered RequestMetrics type into
+            // this module so Python code can continue to access it via
+            // lmdeploy.lib._turbomind.RequestMetrics without triggering
+            // a second registration.
+            m.attr("RequestMetrics") = existing;
+        }
+        else {
+            py::class_<RequestMetrics, std::shared_ptr<RequestMetrics>>(m, "RequestMetrics")
+                .def(py::init())
+                .def_readonly("enque_time", &RequestMetrics::enque_time)
+                .def_readonly("scheduled_time", &RequestMetrics::scheduled_time)
+                // EAGLE3: expose speculative decoding metrics when available.
+                .def_readonly("eagle_total_draft_tokens", &RequestMetrics::eagle_total_draft_tokens)
+                .def_readonly("eagle_total_accepted_tokens", &RequestMetrics::eagle_total_accepted_tokens)
+                .def_readonly("eagle_steps", &RequestMetrics::eagle_steps)
+                .def_readonly("eagle_total_rewound_tokens", &RequestMetrics::eagle_total_rewound_tokens)
+                .def_readonly("eagle_rewind_steps", &RequestMetrics::eagle_rewind_steps)
+                .def_readonly("eagle_max_tokens_per_seq", &RequestMetrics::eagle_max_tokens_per_seq)
+                .def_readonly("eagle_max_accepted_len", &RequestMetrics::eagle_max_accepted_len)
+                .def_readonly("eagle_steps_accept_ge2", &RequestMetrics::eagle_steps_accept_ge2)
+                .def_readonly("eagle_total_committed_extras", &RequestMetrics::eagle_total_committed_extras)
+                .def_readonly("eagle_tree_draft_tokens", &RequestMetrics::eagle_tree_draft_tokens)
+                .def_readonly("eagle_tree_target_tokens", &RequestMetrics::eagle_tree_target_tokens)
+                .def_readonly("eagle_tree_accepted_tokens", &RequestMetrics::eagle_tree_accepted_tokens);
+        }
+    }
 
-    py::class_<SessionParam>(m, "SessionParam")
-        .def(py::init([](uint64_t id, int step, bool start, bool end) {
-                 if (!start && end) {
-                     throw std::logic_error("unsupported arguments: start=false, end=true");
-                 }
-                 SessionParam param{};
-                 param.id         = id;
-                 param.step       = step;
-                 param.start_flag = start;
-                 param.end_flag   = end;
-                 return param;
-             }),
-             "id"_a,
-             "step"_a,
-             "start"_a,
-             "end"_a)
-        .def_readwrite("id", &SessionParam::id)
-        .def_readwrite("step", &SessionParam::step)
-        .def_readwrite("start", &SessionParam::start_flag)
-        .def_readwrite("end", &SessionParam::end_flag);
+    {
+        namespace detail = pybind11::detail;
+        py::handle existing = detail::get_type_handle(typeid(ScheduleMetrics), /*throw_if_missing=*/false);
+        if (existing) {
+            m.attr("ScheduleMetrics") = existing;
+        }
+        else {
+            py::class_<ScheduleMetrics, std::shared_ptr<ScheduleMetrics>>(m, "ScheduleMetrics")
+                .def(py::init())
+                .def_readonly("total_seqs", &ScheduleMetrics::total_seqs)
+                .def_readonly("active_seqs", &ScheduleMetrics::active_seqs)
+                .def_readonly("waiting_seqs", &ScheduleMetrics::waiting_seqs)
+                .def_readonly("total_blocks", &ScheduleMetrics::total_blocks)
+                .def_readonly("active_blocks", &ScheduleMetrics::active_blocks)
+                .def_readonly("cached_blocks", &ScheduleMetrics::cached_blocks)
+                .def_readonly("free_blocks", &ScheduleMetrics::free_blocks);
+        }
+    }
 
-    py::class_<GenerationConfig>(m, "GenerationConfig")
-        .def(py::init())
-        .def_readwrite("max_new_tokens", &GenerationConfig::max_new_tokens)
-        .def_readwrite("min_new_tokens", &GenerationConfig::min_new_tokens)
-        .def_readwrite("eos_ids", &GenerationConfig::eos_ids)
-        .def_readwrite("stop_ids", &GenerationConfig::stop_ids)
-        .def_readwrite("bad_ids", &GenerationConfig::bad_ids)
-        .def_readwrite("top_p", &GenerationConfig::top_p)
-        .def_readwrite("top_k", &GenerationConfig::top_k)
-        .def_readwrite("min_p", &GenerationConfig::min_p)
-        .def_readwrite("temperature", &GenerationConfig::temperature)
-        .def_readwrite("repetition_penalty", &GenerationConfig::repetition_penalty)
-        .def_readwrite("random_seed", &GenerationConfig::random_seed)
-        .def_readwrite("output_logprobs", &GenerationConfig::output_logprobs)
-        .def_readwrite("output_last_hidden_state", &GenerationConfig::output_last_hidden_state)
-        .def_readwrite("output_logits", &GenerationConfig::output_logits)
-        .def("__repr__", [](const GenerationConfig& c) {
-            std::ostringstream oss;
-            oss << c;
-            return oss.str();
-        });
+    {
+        namespace detail = pybind11::detail;
 
-    py::class_<RequestState, std::unique_ptr<RequestState>>(m, "RequestState")
-        .def_readonly("status", &RequestState::status)
-        .def_readonly("seq_len", &RequestState::seq_len);
+        // SessionParam
+        {
+            py::handle existing = detail::get_type_handle(typeid(SessionParam), /*throw_if_missing=*/false);
+            if (existing) {
+                m.attr("SessionParam") = existing;
+            }
+            else {
+                py::class_<SessionParam>(m, "SessionParam")
+                    .def(py::init([](uint64_t id, int step, bool start, bool end) {
+                             if (!start && end) {
+                                 throw std::logic_error("unsupported arguments: start=false, end=true");
+                             }
+                             SessionParam param{};
+                             param.id         = id;
+                             param.step       = step;
+                             param.start_flag = start;
+                             param.end_flag   = end;
+                             return param;
+                         }),
+                         "id"_a,
+                         "step"_a,
+                         "start"_a,
+                         "end"_a)
+                    .def_readwrite("id", &SessionParam::id)
+                    .def_readwrite("step", &SessionParam::step)
+                    .def_readwrite("start", &SessionParam::start_flag)
+                    .def_readwrite("end", &SessionParam::end_flag);
+            }
+        }
 
-    py::class_<AtomicRequestState, std::shared_ptr<AtomicRequestState>>(m, "AtomicRequestState")
-        .def("consume", [](AtomicRequestState& s) { return s.exchange(nullptr); });
+        // GenerationConfig
+        {
+            py::handle existing = detail::get_type_handle(typeid(GenerationConfig), /*throw_if_missing=*/false);
+            if (existing) {
+                m.attr("GenerationConfig") = existing;
+            }
+            else {
+                py::class_<GenerationConfig>(m, "GenerationConfig")
+                    .def(py::init())
+                    .def_readwrite("max_new_tokens", &GenerationConfig::max_new_tokens)
+                    .def_readwrite("min_new_tokens", &GenerationConfig::min_new_tokens)
+                    .def_readwrite("eos_ids", &GenerationConfig::eos_ids)
+                    .def_readwrite("stop_ids", &GenerationConfig::stop_ids)
+                    .def_readwrite("bad_ids", &GenerationConfig::bad_ids)
+                    .def_readwrite("top_p", &GenerationConfig::top_p)
+                    .def_readwrite("top_k", &GenerationConfig::top_k)
+                    .def_readwrite("min_p", &GenerationConfig::min_p)
+                    .def_readwrite("temperature", &GenerationConfig::temperature)
+                    .def_readwrite("repetition_penalty", &GenerationConfig::repetition_penalty)
+                    .def_readwrite("random_seed", &GenerationConfig::random_seed)
+                    .def_readwrite("output_logprobs", &GenerationConfig::output_logprobs)
+                    .def_readwrite("output_last_hidden_state", &GenerationConfig::output_last_hidden_state)
+                    .def_readwrite("output_logits", &GenerationConfig::output_logits)
+                    .def("__repr__", [](const GenerationConfig& c) {
+                        std::ostringstream oss;
+                        oss << c;
+                        return oss.str();
+                    });
+            }
+        }
+
+        // RequestState
+        {
+            py::handle existing = detail::get_type_handle(typeid(RequestState), /*throw_if_missing=*/false);
+            if (existing) {
+                m.attr("RequestState") = existing;
+            }
+            else {
+                py::class_<RequestState, std::unique_ptr<RequestState>>(m, "RequestState")
+                    .def_readonly("status", &RequestState::status)
+                    .def_readonly("seq_len", &RequestState::seq_len);
+            }
+        }
+
+        // AtomicRequestState
+        {
+            py::handle existing = detail::get_type_handle(typeid(AtomicRequestState), /*throw_if_missing=*/false);
+            if (existing) {
+                m.attr("AtomicRequestState") = existing;
+            }
+            else {
+                py::class_<AtomicRequestState, std::shared_ptr<AtomicRequestState>>(m, "AtomicRequestState")
+                    .def("consume", [](AtomicRequestState& s) { return s.exchange(nullptr); });
+            }
+        }
+    }
 
     // DataType / MemoryType enums
     {

@@ -438,3 +438,48 @@ Suggested loss stack for Strategy B:
      - Base vs EAGLE3 vs EAGLE3+SpecPV vs EAGLE3+SpecPV+MLA/DSA.
 
 This doc should stay in sync with `EAGLE_TODO.md`, `EAGLE_TODO_COMPLETE`, and `SPECPV_TODO.md` as the implementation progresses. 
+
+---
+
+## 4. HF LlamaMLA past_key_values layout (inspect_mla_past_kv.py)
+
+To ground TurboMind’s MLA cache design, we added `LM/lmdeploy/inspect_mla_past_kv.py` and ran it against `models/gpt-oss-120b-mla-dsa`.
+
+Key findings:
+
+- Config:
+  - `architectures = ["LlamaMLAForCausalLM"]`
+  - `kv_lora_rank = 512`
+  - `qk_rope_head_dim = 64`, `qk_nope_head_dim = 64`, `qk_head_dim = 128`
+  - `v_head_dim = 64`
+  - `num_hidden_layers = 36`
+- `past_key_values`:
+  - For both the initial forward (prefill) and a second step with `past_key_values` fed back in:
+    - `past_key_values` is a list of length 36.
+    - Each entry is a 2-tuple, but both elements are `None`:
+      - `Layer XX: type=tuple, n_parts=2, part0=None, part1=None` for all layers.
+- Interpretation:
+  - This LlamaMLA variant uses the new `Cache` abstraction in `transformers.cache_utils`.
+  - The real K/V (or latent C) tensors are stored inside the `Cache` object; the tuple returned in `past_key_values` only carries placeholders.
+  - There is no explicit dense or latent KV tensor layout exposed through the HF API for us to mirror.
+
+Implications for TurboMind MLA:
+
+- We must define our own MLA KV/latent cache tensors:
+  - e.g. a `C_cache` of width `kv_lora_rank` plus derived dense K/V views as needed.
+  - KV rewind / prefix-copy helpers need to operate on this latent cache, not on HF-style `past_key_values`.
+- We should *not* try to treat HF `past_key_values` as a ground-truth tensor layout; instead, we take MLAAttention’s math (latent + up-projections + RoPE split) as the source of truth and design TurboMind’s cache and rewind semantics accordingly.
+
+## HF MLP / FFN structure vs checkpoint (Gate A)
+
+- `inspect_llama_mla_modules.py` on `models/gpt-oss-120b-mla-dsa` shows:
+  - Runtime MLP module type is `transformers.models.llama.modeling_llama.LlamaMLP` (dense FFN).
+  - For layer 0 and layer 18:
+    - `gate_proj.weight`, `up_proj.weight`, and `down_proj.weight` all exist with shape `(2880, 2880)`.
+- On-disk checkpoint inspection across all `model-*.safetensors` shards shows:
+  - No keys matching `model.layers.*.mlp.gate_proj.weight`, `model.layers.*.mlp.up_proj.weight`, or `model.layers.*.mlp.down_proj.weight`.
+  - Many keys of the form `model.layers.*.mlp.experts.*` and `model.layers.*.mlp.router.*` are present.
+- Conclusion (Gate A):
+  - The HF model we instantiate has a **dense LlamaMLP FFN** (gate/up/down), but the **safetensors checkpoint only contains MoE-style `mlp.experts.*` and `mlp.router.*` weights**.
+  - The dense MLP weights used at runtime are newly initialised in memory, not present as `mlp.gate_proj/up_proj/down_proj` tensors in the checkpoint files.
+  - TurboMind’s current FFN reader, which expects on-disk `mlp.gate_proj/up_proj/down_proj` tensors, therefore sees missing keys and fails during export.

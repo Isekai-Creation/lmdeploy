@@ -2,10 +2,14 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/kernels/attention/attention_params.h"
+#include "src/turbomind/core/tensor.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 #include <type_traits>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <cmath>
 
 namespace turbomind {
 
@@ -19,12 +23,23 @@ Eagle3AttentionLayer::Eagle3AttentionLayer(const cudaDeviceProp* prop, cudaStrea
 
 void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 {
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_FMHA_CONCURRENCY_DEBUG")) {
+        if (fmha_in_flight_) {
+            TM_LOG_WARNING("[EAGLE3][Attention] Concurrent Forward() detected on same layer instance");
+            std::abort();
+        }
+        fmha_in_flight_ = true;
+    }
+
     if (!param.input || !param.weights || !param.weights->is_initialized) {
         TM_LOG_WARNING(
             "[EAGLE3][Attention][fallback] invalid Eagle3AttentionParam; "
             "treating Eagle-3 attention as pass-through for this step.");
         if (param.input) {
             param.output = param.input;
+        }
+        if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_FMHA_CONCURRENCY_DEBUG")) {
+            fmha_in_flight_ = false;
         }
         return;
     }
@@ -55,6 +70,9 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             num_kv_heads,
             head_dim);
         param.output = param.input;
+        if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_FMHA_CONCURRENCY_DEBUG")) {
+            fmha_in_flight_ = false;
+        }
         return;
     }
 
@@ -75,6 +93,9 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             to_string(dtype),
             to_string(w.q_proj.dtype()));
         param.output = param.input;
+        if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_FMHA_CONCURRENCY_DEBUG")) {
+            fmha_in_flight_ = false;
+        }
         return;
     }
 
@@ -122,7 +143,18 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
         return cached == 1;
     };
 
-    const bool enable_fmha = is_fmha_enabled();
+    auto is_fmha_ab_debug_enabled = []() {
+        static int cached = -1;
+        if (cached >= 0) {
+            return cached == 1;
+        }
+        const char* env = std::getenv("TM_EAGLE3_FMHA_AB");
+        cached          = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        return cached == 1;
+    };
+
+    const bool enable_fmha    = is_fmha_enabled();
+    const bool enable_fmha_ab = is_fmha_ab_debug_enabled();
 
     auto do_forward = [&](auto tag) {
         using T = decltype(tag);
@@ -176,9 +208,8 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 
         // Optional FMHA wiring: when enabled via TM_ENABLE_EAGLE3_FMHA, pack
         // Q/K/V into a unified [token_num, q_heads + 2 * kv_heads, head_dim]
-        // layout and construct an AttentionParams<T> instance. For now, this
-        // is a wiring layer only; we still compute attention via the existing
-        // Eagle3 SDPA kernel so behaviour remains unchanged.
+        // layout, build per-token KV spans on GPU, and route attention
+        // through a tree-aware FMHA-style kernel that consumes those spans.
         if (enable_fmha) {
             const int local_q_heads      = num_q_heads;
             const int local_kv_heads     = num_kv_heads;
@@ -213,6 +244,90 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                                                  stream_));
             }
 
+            // Build per-token KV spans on device using the same runtime/tree/
+            // successor/kv_lens semantics as the current SDPA kernels. This
+            // gives FMHA a cheap way to know which KV window each token
+            // should attend to.
+            core::Tensor kv_start_t{{token_num}, kInt32, param.input.device()};
+            core::Tensor kv_len_t{{token_num}, kInt32, param.input.device()};
+
+            const int32_t* runtime_ptr =
+                (runtime_offsets && runtime_offsets->dtype() == kInt32) ? runtime_offsets->data<int32_t>() : nullptr;
+            const int32_t* tree_ptr =
+                (tree_offsets && tree_offsets->dtype() == kInt32) ? tree_offsets->data<int32_t>() : nullptr;
+            const int32_t* kv_runtime_ptr = (param.kv_lens_runtime && param.kv_lens_runtime->dtype() == kInt32)
+                                                ? param.kv_lens_runtime->data<int32_t>()
+                                                : nullptr;
+            const int32_t* succ_off_ptr = (param.successor_offsets && param.successor_offsets->dtype() == kInt32)
+                                              ? param.successor_offsets->data<int32_t>()
+                                              : nullptr;
+            const int32_t* succ_cnt_ptr = (param.successor_counts && param.successor_counts->dtype() == kInt32)
+                                              ? param.successor_counts->data<int32_t>()
+                                              : nullptr;
+
+            ft::launch_build_eagle3_kv_spans(token_num,
+                                             batch_size,
+                                             q_len,
+                                             kv_len,
+                                             runtime_ptr,
+                                             tree_ptr,
+                                             kv_runtime_ptr,
+                                             succ_off_ptr,
+                                             succ_cnt_ptr,
+                                             kv_start_t.data<int32_t>(),
+                                             kv_len_t.data<int32_t>(),
+                                             stream_);
+
+            // Optional KV-span integrity check for debugging: when
+            // LMDEPLOY_EAGLE_SPAN_DEBUG is enabled, verify on host that
+            // per-token spans lie within [0, kv_len] for this step and
+            // (when packed masks are in use) within the mask capacity
+            // implied by packed_mask_stride. Treat any violation as a
+            // hard failure under this debug gate so that spec runs never
+            // silently proceed with invalid spans.
+            if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_SPAN_DEBUG")) {
+                std::vector<int32_t> h_kv_start(token_num, 0);
+                std::vector<int32_t> h_kv_len(token_num, 0);
+
+                check_cuda_error(cudaMemcpyAsync(h_kv_start.data(),
+                                                 kv_start_t.data<int32_t>(),
+                                                 static_cast<size_t>(token_num) * sizeof(int32_t),
+                                                 cudaMemcpyDeviceToHost,
+                                                 stream_));
+                check_cuda_error(cudaMemcpyAsync(h_kv_len.data(),
+                                                 kv_len_t.data<int32_t>(),
+                                                 static_cast<size_t>(token_num) * sizeof(int32_t),
+                                                 cudaMemcpyDeviceToHost,
+                                                 stream_));
+                check_cuda_error(cudaStreamSynchronize(stream_));
+
+                const int packed_stride = param.packed_mask_stride;
+                const int packed_cap    = packed_stride > 0 ? packed_stride * 32 : kv_len;
+
+                for (int idx = 0; idx < token_num; ++idx) {
+                    const int start = h_kv_start[idx];
+                    const int len   = h_kv_len[idx];
+                    const int end   = start + len;
+                    if (start < 0 || len < 0 || end > kv_len || end > packed_cap) {
+                        TM_LOG_WARNING(
+                            "[EAGLE3][Attention][kv-span] invalid span at token=%d batch=%d "
+                            "(start=%d len=%d end=%d kv_len=%d packed_stride=%d packed_cap=%d)",
+                            idx,
+                            batch_size,
+                            start,
+                            len,
+                            end,
+                            kv_len,
+                            packed_stride,
+                            packed_cap);
+                        // Under span debug, fail fast so that any
+                        // invalid span is fixed before further perf
+                        // tuning or long benchmarks.
+                        std::abort();
+                    }
+                }
+            }
+
             AttentionParams<T> fmha{};
             fmha.out     = ctx.data<T>();
             fmha.q       = qkv.data<T>();
@@ -238,32 +353,250 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             fmha.spec_successor_counts   = param.successor_counts ? param.successor_counts->data<int32_t>() : nullptr;
             fmha.spec_tree_batch_size    = batch_size;
 
+            fmha.spec_kv_start_per_token = kv_start_t.data<int32_t>();
+            fmha.spec_kv_len_per_token   = kv_len_t.data<int32_t>();
+
             (void)fmha;
+
+            // Tree-aware FMHA-style SDPA that trusts the GPU span builder
+            // for runtime/tree/successor clamping. This is gated by
+            // TM_ENABLE_EAGLE3_FMHA so we can A/B it against the original
+            // SDPA path.
+            //
+            // For the tiled multi-CTA kernel we choose a small number of
+            // KV tiles per (token, head) based on kv_len and a desired
+            // kv_tile size, and reuse layer-owned scratch buffers for
+            // partial m/l/o across steps.
+            int kv_tile = 128;
+            if (const char* env = std::getenv("TM_EAGLE3_FMHA_KV_TILE")) {
+                int v = std::atoi(env);
+                if (v > 0) {
+                    kv_tile = v;
+                }
+            }
+            const int max_tiles_est = kv_tile > 0 ? (kv_len + kv_tile - 1) / kv_tile : 1;
+            const int fmha_tiles    = std::max(1, std::min(max_tiles_est, kEagle3FmhaMaxTiles));
+            const int total_fmha    = token_num * num_q_heads;
+            if (total_fmha > 0) {
+                const size_t partial_count   = static_cast<size_t>(total_fmha) * fmha_tiles;
+                const size_t partial_m_bytes = partial_count * sizeof(float);
+                const size_t partial_l_bytes = partial_count * sizeof(float);
+                const size_t partial_o_bytes = partial_count * static_cast<size_t>(head_dim) * sizeof(float);
+
+                if (!fmha_partial_m_.data() || fmha_partial_m_.nbytes() < partial_m_bytes) {
+                    fmha_partial_m_ = core::Tensor{{static_cast<int>(partial_count)}, kFloat32, param.input.device()};
+                }
+                if (!fmha_partial_l_.data() || fmha_partial_l_.nbytes() < partial_l_bytes) {
+                    fmha_partial_l_ = core::Tensor{{static_cast<int>(partial_count)}, kFloat32, param.input.device()};
+                }
+                if (!fmha_partial_o_.data() || fmha_partial_o_.nbytes() < partial_o_bytes) {
+                    fmha_partial_o_ = core::Tensor{
+                        {static_cast<int>(partial_count * static_cast<size_t>(head_dim))}, kFloat32, param.input.device()};
+                }
+            }
+
+            if constexpr (std::is_same_v<T, half_t>) {
+                ft::launch_eagle3_fmha_kernel_fp16(q.data<T>(),
+                                                   k.data<T>(),
+                                                   v.data<T>(),
+                                                   ctx.data<T>(),
+                                                   token_num,
+                                                   batch_size,
+                                                   q_len,
+                                                   kv_len,
+                                                   num_q_heads,
+                                                   num_kv_heads,
+                                                   head_dim,
+                                                   param.past_kv_len,
+                                                   param.position_ids,
+                                                   param.packed_mask,
+                                                   param.packed_mask_stride,
+                                                   kv_start_t.data<int32_t>(),
+                                                   kv_len_t.data<int32_t>(),
+                                                   fmha_partial_o_.data<float>(),
+                                                   fmha_partial_m_.data<float>(),
+                                                   fmha_partial_l_.data<float>(),
+                                                   fmha_tiles,
+                                                   stream_);
+            }
+#if ENABLE_BF16
+            else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                ft::launch_eagle3_fmha_kernel_bf16(q.data<T>(),
+                                                   k.data<T>(),
+                                                   v.data<T>(),
+                                                   ctx.data<T>(),
+                                                   token_num,
+                                                   batch_size,
+                                                   q_len,
+                                                   kv_len,
+                                                   num_q_heads,
+                                                   num_kv_heads,
+                                                   head_dim,
+                                                   param.past_kv_len,
+                                                   param.position_ids,
+                                                   param.packed_mask,
+                                                   param.packed_mask_stride,
+                                                   kv_start_t.data<int32_t>(),
+                                                   kv_len_t.data<int32_t>(),
+                                                   fmha_partial_o_.data<float>(),
+                                                   fmha_partial_m_.data<float>(),
+                                                   fmha_partial_l_.data<float>(),
+                                                   fmha_tiles,
+                                                   stream_);
+            }
+#endif
+#if ENABLE_FP32
+            else if constexpr (std::is_same_v<T, float>) {
+                ft::launch_eagle3_fmha_kernel_fp32(q.data<T>(),
+                                                   k.data<T>(),
+                                                   v.data<T>(),
+                                                   ctx.data<T>(),
+                                                   token_num,
+                                                   batch_size,
+                                                   q_len,
+                                                   kv_len,
+                                                   num_q_heads,
+                                                   num_kv_heads,
+                                                   head_dim,
+                                                   param.past_kv_len,
+                                                   param.position_ids,
+                                                   param.packed_mask,
+                                                   param.packed_mask_stride,
+                                                   kv_start_t.data<int32_t>(),
+                                                   kv_len_t.data<int32_t>(),
+                                                   fmha_partial_o_.data<float>(),
+                                                   fmha_partial_m_.data<float>(),
+                                                   fmha_partial_l_.data<float>(),
+                                                   fmha_tiles,
+                                                   stream_);
+            }
+#endif
+            sync_check_cuda_error();
+
+            // Optional A/B correctness harness: when TM_EAGLE3_FMHA_AB is
+            // enabled and we are in a reasonably small regime, run the
+            // original SDPA path in parallel and log the maximum absolute
+            // difference between SDPA and FMHA contexts. This is for
+            // debugging only and is not meant for production perf runs.
+            if (enable_fmha_ab && token_num <= 32 && kv_len <= 512) {
+                Tensor ctx_ref{{token_num, q_out_dim}, dtype, param.input.device()};
+                ft::launch_sdpa_kernel<T>(q.data<T>(),
+                                          k.data<T>(),
+                                          v.data<T>(),
+                                          ctx_ref.data<T>(),
+                                          token_num,
+                                          batch_size,
+                                          q_len,
+                                          kv_len,
+                                          num_q_heads,
+                                          num_kv_heads,
+                                          head_dim,
+                                          param.past_kv_len,
+                                          param.position_ids,
+                                          param.packed_mask,
+                                          param.packed_mask_stride,
+                                          runtime_offsets,
+                                          tree_offsets,
+                                          param.kv_lens_runtime,
+                                          param.successor_offsets,
+                                          param.successor_counts,
+                                          stream_);
+                sync_check_cuda_error();
+
+                const size_t elem_count = static_cast<size_t>(token_num) * q_out_dim;
+                std::vector<float> h_fmha(elem_count);
+                std::vector<float> h_ref(elem_count);
+
+                if constexpr (std::is_same_v<T, half_t>) {
+                    std::vector<half_t> tmp_fmha(elem_count);
+                    std::vector<half_t> tmp_ref(elem_count);
+                    check_cuda_error(cudaMemcpyAsync(
+                        tmp_fmha.data(), ctx.data<half_t>(), elem_count * sizeof(half_t), cudaMemcpyDeviceToHost, stream_));
+                    check_cuda_error(cudaMemcpyAsync(
+                        tmp_ref.data(), ctx_ref.data<half_t>(), elem_count * sizeof(half_t), cudaMemcpyDeviceToHost, stream_));
+                    check_cuda_error(cudaStreamSynchronize(stream_));
+                    for (size_t i = 0; i < elem_count; ++i) {
+                        h_fmha[i] = __half2float(tmp_fmha[i]);
+                        h_ref[i]  = __half2float(tmp_ref[i]);
+                    }
+                }
+#if ENABLE_BF16
+                else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                    std::vector<bfloat16_t> tmp_fmha(elem_count);
+                    std::vector<bfloat16_t> tmp_ref(elem_count);
+                    check_cuda_error(cudaMemcpyAsync(tmp_fmha.data(),
+                                                     ctx.data<bfloat16_t>(),
+                                                     elem_count * sizeof(bfloat16_t),
+                                                     cudaMemcpyDeviceToHost,
+                                                     stream_));
+                    check_cuda_error(cudaMemcpyAsync(tmp_ref.data(),
+                                                     ctx_ref.data<bfloat16_t>(),
+                                                     elem_count * sizeof(bfloat16_t),
+                                                     cudaMemcpyDeviceToHost,
+                                                     stream_));
+                    check_cuda_error(cudaStreamSynchronize(stream_));
+                    for (size_t i = 0; i < elem_count; ++i) {
+                        h_fmha[i] = __bfloat162float(tmp_fmha[i]);
+                        h_ref[i]  = __bfloat162float(tmp_ref[i]);
+                    }
+                }
+#endif
+#if ENABLE_FP32
+                else if constexpr (std::is_same_v<T, float>) {
+                    check_cuda_error(cudaMemcpyAsync(
+                        h_fmha.data(), ctx.data<float>(), elem_count * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+                    check_cuda_error(cudaMemcpyAsync(
+                        h_ref.data(), ctx_ref.data<float>(), elem_count * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+                    check_cuda_error(cudaStreamSynchronize(stream_));
+                }
+#endif
+                else {
+                    h_fmha.clear();
+                    h_ref.clear();
+                }
+
+                if (!h_fmha.empty() && h_fmha.size() == h_ref.size()) {
+                    float max_abs = 0.f;
+                    for (size_t i = 0; i < h_fmha.size(); ++i) {
+                        const float diff = std::fabs(h_fmha[i] - h_ref[i]);
+                        if (diff > max_abs) {
+                            max_abs = diff;
+                        }
+                    }
+                    TM_LOG_INFO(
+                        "[EAGLE3][Attention][fmha_ab] token_num=%d kv_len=%d max_abs_diff=%.6f",
+                        token_num,
+                        kv_len,
+                        max_abs);
+                }
+            }
         }
 
-        // SDPA (naive) over kv_len tokens.
-        ft::launch_sdpa_kernel<T>(q.data<T>(),
-                                  k.data<T>(),
-                                  v.data<T>(),
-                                  ctx.data<T>(),
-                                  token_num,
-                                  batch_size,
-                                  q_len,
-                                  kv_len,
-                                  num_q_heads,
-                                  num_kv_heads,
-                                  head_dim,
-                                  param.past_kv_len,
-                                  param.position_ids,
-                                  param.packed_mask,
-                                  param.packed_mask_stride,
-                                  runtime_offsets,
-                                  tree_offsets,
-                                  param.kv_lens_runtime,
-                                  param.successor_offsets,
-                                  param.successor_counts,
-                                  stream_);
-        sync_check_cuda_error();
+        // SDPA (naive) over kv_len tokens when FMHA path is disabled.
+        if (!enable_fmha) {
+            ft::launch_sdpa_kernel<T>(q.data<T>(),
+                                      k.data<T>(),
+                                      v.data<T>(),
+                                      ctx.data<T>(),
+                                      token_num,
+                                      batch_size,
+                                      q_len,
+                                      kv_len,
+                                      num_q_heads,
+                                      num_kv_heads,
+                                      head_dim,
+                                      param.past_kv_len,
+                                      param.position_ids,
+                                      param.packed_mask,
+                                      param.packed_mask_stride,
+                                      runtime_offsets,
+                                      tree_offsets,
+                                      param.kv_lens_runtime,
+                                      param.successor_offsets,
+                                      param.successor_counts,
+                                      stream_);
+            sync_check_cuda_error();
+        }
 
         // Optional debug capture of QKV/attn_out.
         if (param.debug_qkv) {
@@ -287,6 +620,10 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             *param.debug_attn_out = ctx;
         }
 
+        if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_FMHA_CONCURRENCY_DEBUG")) {
+            fmha_in_flight_ = false;
+        }
+
         // Final Wo projection. Prefer fused LLaMA-style Wo when present;
         // fall back to native o_proj otherwise.
         const Tensor* wo = param.attn_weights ? &param.attn_weights->output.weight : nullptr;
@@ -302,6 +639,9 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             TM_LOG_WARNING(
                 "[EAGLE3][Attention][fallback] missing Wo; returning context without projection.");
             param.output = ctx;
+            if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_FMHA_CONCURRENCY_DEBUG")) {
+                fmha_in_flight_ = false;
+            }
             return;
         }
 

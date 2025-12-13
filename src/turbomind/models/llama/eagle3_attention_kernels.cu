@@ -13,6 +13,13 @@
 namespace turbomind {
 namespace ft {
 
+// Tunable constants for Eagle3 FMHA. These are kept modest to
+// balance parallelism and resource usage while enabling multi-CTA
+// tiling over long KV spans.
+constexpr int kEagle3FmhaBlockSize = 64;   // threads per CTA in FMHA kernels
+constexpr int kEagle3FmhaMaxHeadDim = 128; // maximum head_dim supported by FMHA path
+constexpr int kEagle3FmhaMaxTiles   = 8;   // max tiles per (token, head) for multi-CTA KV
+
 namespace { // anonymous namespace for device helpers
 
 template<typename T>
@@ -195,12 +202,6 @@ __global__ void sdpa_streaming_kernel(const T* __restrict__ q_ptr,
     if (tree_offsets) {
         clamp_span(tree_offsets[batch], tree_offsets[batch + 1]);
     }
-    if (successor_offsets) {
-        const int succ_start = successor_offsets[batch];
-        const int succ_end   = successor_counts ? (succ_start + successor_counts[batch])
-                                                : successor_offsets[batch + 1];
-        clamp_span(succ_start, succ_end);
-    }
     if (kv_lens_runtime) {
         clamp_span(0, kv_lens_runtime[batch]);
     }
@@ -306,6 +307,561 @@ __global__ void sdpa_streaming_kernel(const T* __restrict__ q_ptr,
     }
 }
 
+// Tree-aware Eagle3 FMHA-style kernel that consumes precomputed per-token
+// KV windows [kv_start_per_token[t], kv_start_per_token[t] +
+// kv_len_per_token[t]) and the packed mask. Compared to the scalar
+// streaming SDPA kernel, this version parallelizes over the KV span
+// within a CTA and uses shared-memory reductions for the softmax stats
+// and context, avoiding per-thread serial walks over all KV tokens.
+template<typename T, int kMaxHeadDim>
+__global__ void eagle3_fmha_kernel(const T* __restrict__ q_ptr,
+                                   const T* __restrict__ k_ptr,
+                                   const T* __restrict__ v_ptr,
+                                   T* __restrict__       ctx_ptr,
+                                   int                   token_num,
+                                   int                   batch_size,
+                                   int                   q_len,
+                                   int                   kv_len,
+                                   int                   num_q_heads,
+                                   int                   num_kv_heads,
+                                   int                   head_dim,
+                                   int                   past_kv_len,
+                                   const int*            position_ids,
+                                   const int32_t*        packed_mask,
+                                   int                   packed_stride,
+                                   const int32_t*        kv_start_per_token,
+                                   const int32_t*        kv_len_per_token)
+{
+    const int linear    = blockIdx.x;
+    const int head      = linear % num_q_heads;
+    const int token_idx = linear / num_q_heads;
+    if (token_idx >= token_num) {
+        return;
+    }
+
+    const int batch     = q_len > 0 ? token_idx / q_len : 0;
+    const int q_pos     = q_len > 0 ? token_idx % q_len : token_idx;
+    const int q_token_offset = token_idx;
+
+    const int group_size = num_kv_heads > 0 ? (num_q_heads + num_kv_heads - 1) / num_kv_heads : 1;
+    const int kv_head    = head / group_size;
+    if (kv_head >= num_kv_heads) {
+        return;
+    }
+
+    const T* q = q_ptr + (token_idx * num_q_heads + head) * head_dim;
+
+    if (!kv_start_per_token || !kv_len_per_token || head_dim <= 0 || head_dim > kMaxHeadDim) {
+        return;
+    }
+
+    const int kv_start    = kv_start_per_token[token_idx];
+    const int kv_len_slot = kv_len_per_token[token_idx];
+
+    if (kv_len_slot <= 0 || kv_start < 0 || kv_start >= kv_len) {
+        return;
+    }
+
+    const int   pos_idx_q  = position_ids ? min(q_token_offset, token_num - 1) : q_token_offset;
+    const int   q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start + q_pos);
+    const float inv_sqrt   = rsqrtf(static_cast<float>(head_dim));
+    constexpr int kBlockLocal = kEagle3FmhaBlockSize;
+
+    __shared__ float s_max[kBlockLocal];
+    __shared__ float s_sum[kBlockLocal];
+    __shared__ float s_ctx[kMaxHeadDim][kBlockLocal];
+
+    const int tid = threadIdx.x;
+    if (tid >= kBlockLocal) {
+        return;
+    }
+
+    // Cache Q in registers.
+    float q_reg[kMaxHeadDim];
+    for (int d = 0; d < head_dim; ++d) {
+        q_reg[d] = to_float(q[d]);
+    }
+
+    // Phase 1: local max over assigned KV positions.
+    float local_max = -1e20f;
+    for (int j = tid; j < kv_len_slot; j += kBlockLocal) {
+        const int k_token_offset = batch * kv_len + (kv_start + j);
+        const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+
+        float dot = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += q_reg[d] * to_float(k[d]);
+        }
+
+        const int   pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
+        const int   kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
+        if (kv_position > q_position) {
+            continue;
+        }
+
+        if (packed_mask && packed_stride > 0) {
+            const int     j_off_mask = kv_start + j;
+            const int32_t mask_val   = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+            const bool    allowed    = (mask_val >> (j_off_mask & 31)) & 1;
+            if (!allowed) {
+                continue;
+            }
+        }
+
+        const float score = dot * inv_sqrt;
+        local_max         = fmaxf(local_max, score);
+    }
+
+    s_max[tid] = local_max;
+    __syncthreads();
+
+    // Reduce max across threads in the CTA.
+    for (int stride = kBlockLocal / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float m = s_max[0];
+
+    // Phase 2: accumulate weighted values and sum of weights.
+    float local_sum = 0.f;
+    float local_ctx[kMaxHeadDim];
+    for (int d = 0; d < head_dim; ++d) {
+        local_ctx[d] = 0.f;
+    }
+
+    if (m > -1e19f) {
+        for (int j = tid; j < kv_len_slot; j += kBlockLocal) {
+            const int k_token_offset = batch * kv_len + (kv_start + j);
+            const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+
+            float dot = 0.f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += q_reg[d] * to_float(k[d]);
+            }
+
+            const int   pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
+            const int   kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_start + j);
+            if (kv_position > q_position) {
+                continue;
+            }
+
+            if (packed_mask && packed_stride > 0) {
+                const int     j_off_mask = kv_start + j;
+                const int32_t mask_val   = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+                const bool    allowed    = (mask_val >> (j_off_mask & 31)) & 1;
+                if (!allowed) {
+                    continue;
+                }
+            }
+
+            const float score = dot * inv_sqrt - m;
+            const float e     = __expf(score);
+            if (e == 0.f) {
+                continue;
+            }
+
+            local_sum += e;
+
+            const int v_token_offset = batch * kv_len + (kv_start + j);
+            const T*  v              = v_ptr + (v_token_offset * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                local_ctx[d] += e * to_float(v[d]);
+            }
+        }
+    }
+
+    // Store per-thread ctx partials to shared memory (D-major).
+    for (int d = 0; d < head_dim; ++d) {
+        s_ctx[d][tid] = local_ctx[d];
+    }
+    s_sum[tid] = local_sum;
+    __syncthreads();
+
+    // Reduce sum of weights.
+    for (int stride = kBlockLocal / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid] += s_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float sum_w = s_sum[0];
+    const float inv_sum = sum_w > 0.f ? (1.f / sum_w) : 0.f;
+
+    // Reduce ctx across threads for each dimension and write out.
+    T* ctx = ctx_ptr + (token_idx * num_q_heads + head) * head_dim;
+    for (int d = tid; d < head_dim; d += kBlockLocal) {
+        float acc = 0.f;
+        for (int t = 0; t < kBlockLocal; ++t) {
+            acc += s_ctx[d][t];
+        }
+        ctx[d] = from_float<T>(acc * inv_sum);
+    }
+}
+
+// Multi-CTA, tile-based Eagle3 FMHA kernel (phase 1).
+// Each CTA processes a subset ("tile") of the KV span for a given
+// (token, head) pair and writes partial max/sum/context into global
+// scratch buffers. A second kernel reduces across tiles.
+template<typename T, int kMaxHeadDim>
+__global__ void eagle3_fmha_multi_cta_kernel1(const T* __restrict__ q_ptr,
+                                              const T* __restrict__ k_ptr,
+                                              const T* __restrict__ v_ptr,
+                                              int                   token_num,
+                                              int                   batch_size,
+                                              int                   q_len,
+                                              int                   kv_len,
+                                              int                   num_q_heads,
+                                              int                   num_kv_heads,
+                                              int                   head_dim,
+                                              int                   past_kv_len,
+                                              const int*            position_ids,
+                                              const int32_t*        packed_mask,
+                                              int                   packed_stride,
+                                              const int32_t*        kv_start_per_token,
+                                              const int32_t*        kv_len_per_token,
+                                              float* __restrict__   partial_o,   // [total * num_tiles, head_dim]
+                                              float* __restrict__   partial_m,   // [total * num_tiles]
+                                              float* __restrict__   partial_l,   // [total * num_tiles]
+                                              int                   num_tiles)
+{
+    const int linear = blockIdx.x;
+    const int tile   = blockIdx.y;
+
+    const int total = token_num * num_q_heads;
+    if (linear >= total || tile >= num_tiles) {
+        return;
+    }
+
+    constexpr int kBlockLocal = kEagle3FmhaBlockSize;
+    const int     tid         = threadIdx.x;
+    if (tid >= kBlockLocal) {
+        return;
+    }
+
+    const int head      = linear % num_q_heads;
+    const int token_idx = linear / num_q_heads;
+    const int batch     = q_len > 0 ? token_idx / q_len : 0;
+    const int q_pos     = q_len > 0 ? token_idx % q_len : token_idx;
+    const int q_token_offset = token_idx;
+
+    if (batch < 0 || batch >= batch_size) {
+        return;
+    }
+
+    const int group_size = num_kv_heads > 0 ? (num_q_heads + num_kv_heads - 1) / num_kv_heads : 1;
+    const int kv_head    = head / group_size;
+    if (kv_head >= num_kv_heads) {
+        return;
+    }
+
+    const T* q = q_ptr + (token_idx * num_q_heads + head) * head_dim;
+
+    const int idx_tile = linear * num_tiles + tile;
+    if (!kv_start_per_token || !kv_len_per_token || head_dim <= 0 || head_dim > kMaxHeadDim) {
+        // Invalid metadata for this token/head: neutral-fill this tile.
+        if (tid == 0) {
+            partial_m[idx_tile] = -1e20f;
+            partial_l[idx_tile] = 0.f;
+            for (int d = 0; d < head_dim; ++d) {
+                partial_o[static_cast<size_t>(idx_tile) * head_dim + d] = 0.f;
+            }
+        }
+        return;
+    }
+
+    const int kv_start_base = kv_start_per_token[token_idx];
+    const int kv_len_slot   = kv_len_per_token[token_idx];
+
+    if (kv_len_slot <= 0 || kv_start_base < 0 || kv_start_base >= kv_len) {
+        if (tid == 0) {
+            partial_m[idx_tile] = -1e20f;
+            partial_l[idx_tile] = 0.f;
+            for (int d = 0; d < head_dim; ++d) {
+                partial_o[static_cast<size_t>(idx_tile) * head_dim + d] = 0.f;
+            }
+        }
+        return;
+    }
+
+    const int   pos_idx_q  = position_ids ? min(q_token_offset, token_num - 1) : q_token_offset;
+    const int   q_position = position_ids ? position_ids[pos_idx_q] : (past_kv_len + kv_start_base + q_pos);
+    const float inv_sqrt   = rsqrtf(static_cast<float>(head_dim));
+
+    const int tile_len      = (kv_len_slot + num_tiles - 1) / num_tiles;
+    const int off_in_slot   = tile * tile_len;
+    if (off_in_slot >= kv_len_slot) {
+        if (tid == 0) {
+            partial_m[idx_tile] = -1e20f;
+            partial_l[idx_tile] = 0.f;
+            for (int d = 0; d < head_dim; ++d) {
+                partial_o[static_cast<size_t>(idx_tile) * head_dim + d] = 0.f;
+            }
+        }
+        return;
+    }
+
+    const int tile_start      = kv_start_base + off_in_slot;
+    const int tile_end        = min(kv_start_base + kv_len_slot, tile_start + tile_len);
+    const int tile_len_actual = max(0, tile_end - tile_start);
+    if (tile_len_actual <= 0) {
+        if (tid == 0) {
+            partial_m[idx_tile] = -1e20f;
+            partial_l[idx_tile] = 0.f;
+            for (int d = 0; d < head_dim; ++d) {
+                partial_o[static_cast<size_t>(idx_tile) * head_dim + d] = 0.f;
+            }
+        }
+        return;
+    }
+
+    // Shared buffers for this CTA.
+    __shared__ float s_max[kBlockLocal];
+    __shared__ float s_sum[kBlockLocal];
+    __shared__ float s_ctx[kMaxHeadDim][kBlockLocal];
+    __shared__ int   s_tile_has_any;
+
+    // If a packed mask is present, cheaply detect tiles that have no
+    // allowed KV positions at all and neutral-fill them so that phase-2
+    // can safely ignore them. This avoids doing dot products for tiles
+    // that are fully masked out.
+    if (packed_mask && packed_stride > 0) {
+        if (tid == 0) {
+            int any      = 0;
+            const int row = token_idx * packed_stride;
+
+            const int tile_first = tile_start;
+            const int tile_last  = tile_start + tile_len_actual; // exclusive
+
+            const int word_start = tile_first / 32;
+            const int word_end   = (tile_last + 31) / 32;
+
+            for (int w = word_start; w < word_end && !any; ++w) {
+                const int32_t mask_val = packed_mask[row + w];
+                if (mask_val == 0) {
+                    continue;
+                }
+
+                // Restrict to the bits that fall within [tile_first, tile_last).
+                const int bit_lo = (w == word_start) ? (tile_first & 31) : 0;
+                const int bit_hi =
+                    (w == word_end - 1) ? ((tile_last - 1) & 31) : 31;  // inclusive
+                const int  bit_count = bit_hi - bit_lo + 1;
+                const uint32_t mask  = (bit_count >= 32)
+                                           ? 0xFFFFFFFFu
+                                           : ((static_cast<uint32_t>(1u) << bit_count) - 1u) << bit_lo;
+
+                if ((static_cast<uint32_t>(mask_val) & mask) != 0u) {
+                    any = 1;
+                }
+            }
+
+            s_tile_has_any = any;
+            if (!any) {
+                partial_m[idx_tile] = -1e20f;
+                partial_l[idx_tile] = 0.f;
+                for (int d = 0; d < head_dim; ++d) {
+                    partial_o[static_cast<size_t>(idx_tile) * head_dim + d] = 0.f;
+                }
+            }
+        }
+        __syncthreads();
+        if (!s_tile_has_any) {
+            return;
+        }
+    }
+
+    // Cache Q in registers.
+    float q_reg[kMaxHeadDim];
+    for (int d = 0; d < head_dim; ++d) {
+        q_reg[d] = to_float(q[d]);
+    }
+
+    // Phase 1: local max over this tile.
+    float local_max = -1e20f;
+    for (int j = tid; j < tile_len_actual; j += kBlockLocal) {
+        const int kv_index       = tile_start + j;
+        const int k_token_offset = batch * kv_len + kv_index;
+        const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+
+        float dot = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += q_reg[d] * to_float(k[d]);
+        }
+
+        const int   pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
+        const int   kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_index);
+        if (kv_position > q_position) {
+            continue;
+        }
+
+        if (packed_mask && packed_stride > 0) {
+            const int     j_off_mask = kv_index;
+            const int32_t mask_val   = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+            const bool    allowed    = (mask_val >> (j_off_mask & 31)) & 1;
+            if (!allowed) {
+                continue;
+            }
+        }
+
+        const float score = dot * inv_sqrt;
+        local_max         = fmaxf(local_max, score);
+    }
+
+    s_max[tid] = local_max;
+    __syncthreads();
+
+    // Reduce max across threads in the CTA.
+    for (int stride = kBlockLocal / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float m_tile = s_max[0];
+
+    // Phase 2: accumulate weighted values and sum of weights for this tile.
+    float local_sum = 0.f;
+    float local_ctx[kMaxHeadDim];
+    for (int d = 0; d < head_dim; ++d) {
+        local_ctx[d] = 0.f;
+    }
+
+    if (m_tile > -1e19f) {
+        for (int j = tid; j < tile_len_actual; j += kBlockLocal) {
+            const int kv_index       = tile_start + j;
+            const int k_token_offset = batch * kv_len + kv_index;
+            const T*  k              = k_ptr + (k_token_offset * num_kv_heads + kv_head) * head_dim;
+
+            float dot = 0.f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += q_reg[d] * to_float(k[d]);
+            }
+
+            const int   pos_idx_k   = position_ids ? min(k_token_offset, token_num - 1) : k_token_offset;
+            const int   kv_position = position_ids ? position_ids[pos_idx_k] : (past_kv_len + kv_index);
+            if (kv_position > q_position) {
+                continue;
+            }
+
+            if (packed_mask && packed_stride > 0) {
+                const int     j_off_mask = kv_index;
+                const int32_t mask_val   = packed_mask[token_idx * packed_stride + j_off_mask / 32];
+                const bool    allowed    = (mask_val >> (j_off_mask & 31)) & 1;
+                if (!allowed) {
+                    continue;
+                }
+            }
+
+            const float score = dot * inv_sqrt - m_tile;
+            const float e     = __expf(score);
+            if (e == 0.f) {
+                continue;
+            }
+
+            local_sum += e;
+
+            const int v_token_offset = batch * kv_len + kv_index;
+            const T*  v              = v_ptr + (v_token_offset * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                local_ctx[d] += e * to_float(v[d]);
+            }
+        }
+    }
+
+    for (int d = 0; d < head_dim; ++d) {
+        s_ctx[d][tid] = local_ctx[d];
+    }
+    s_sum[tid] = local_sum;
+    __syncthreads();
+
+    // Reduce sum and context across threads.
+    for (int stride = kBlockLocal / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid] += s_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float tile_sum = s_sum[0];
+
+    if (tid == 0) {
+        partial_m[idx_tile] = m_tile;
+        partial_l[idx_tile] = tile_sum;
+    }
+
+    // Reduce ctx across threads for each dimension and store to partial_o.
+    for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.f;
+        for (int t = 0; t < kBlockLocal; ++t) {
+            acc += s_ctx[d][t];
+        }
+        if (tid == 0) {
+            partial_o[static_cast<size_t>(idx_tile) * head_dim + d] = acc;
+        }
+    }
+}
+
+// Multi-CTA, tile-based Eagle3 FMHA kernel (phase 2).
+// Reduces partial outputs across tiles and writes the final
+// normalized context vectors into ctx_ptr.
+template<typename T>
+__global__ void eagle3_fmha_multi_cta_kernel2(const float* __restrict__ partial_o,
+                                              const float* __restrict__ partial_m,
+                                              const float* __restrict__ partial_l,
+                                              T* __restrict__       ctx_ptr,
+                                              int                   total,
+                                              int                   num_tiles,
+                                              int                   head_dim)
+{
+    const int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear >= total) {
+        return;
+    }
+
+    const int base_idx = linear * num_tiles;
+
+    float m_global = -1e20f;
+    for (int t = 0; t < num_tiles; ++t) {
+        const float m_tile = partial_m[base_idx + t];
+        m_global           = fmaxf(m_global, m_tile);
+    }
+
+    if (m_global <= -1e19f) {
+        // No valid contributions; zero out the context.
+        T* ctx = ctx_ptr + static_cast<size_t>(linear) * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            ctx[d] = from_float<T>(0.f);
+        }
+        return;
+    }
+
+    float sum_global = 0.f;
+    for (int t = 0; t < num_tiles; ++t) {
+        const float m_tile = partial_m[base_idx + t];
+        const float l_tile = partial_l[base_idx + t];
+        if (l_tile <= 0.f) {
+            continue;
+        }
+        sum_global += __expf(m_tile - m_global) * l_tile;
+    }
+
+    const float inv_sum = sum_global > 0.f ? (1.f / sum_global) : 0.f;
+
+    T* ctx = ctx_ptr + static_cast<size_t>(linear) * head_dim;
+    for (int d = 0; d < head_dim; ++d) {
+        float o = 0.f;
+        for (int t = 0; t < num_tiles; ++t) {
+            const float m_tile = partial_m[base_idx + t];
+            const float scale  = __expf(m_tile - m_global);
+            const float val =
+                partial_o[(static_cast<size_t>(base_idx + t)) * head_dim + d];
+            o += scale * val;
+        }
+        ctx[d] = from_float<T>(o * inv_sum);
+    }
+}
+
 template<typename T>
 __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
                             const T* __restrict__ k_ptr,
@@ -359,12 +915,6 @@ __global__ void sdpa_kernel(const T* __restrict__ q_ptr,
     }
     if (tree_offsets) {
         clamp_span(tree_offsets[batch], tree_offsets[batch + 1]);
-    }
-    if (successor_offsets) {
-        const int succ_start = successor_offsets[batch];
-        const int succ_end   = successor_counts ? (succ_start + successor_counts[batch])
-                                                : successor_offsets[batch + 1];
-        clamp_span(succ_start, succ_end);
     }
     if (kv_lens_runtime) {
         clamp_span(0, kv_lens_runtime[batch]);
@@ -636,6 +1186,295 @@ void launch_sdpa_kernel(const T* q_ptr,
 }
 
 template<typename T>
+void launch_eagle3_fmha_kernel(const T*       q_ptr,
+                               const T*       k_ptr,
+                               const T*       v_ptr,
+                               T*             ctx_ptr,
+                               int            token_num,
+                               int            batch_size,
+                               int            q_len,
+                               int            kv_len,
+                               int            num_q_heads,
+                               int            num_kv_heads,
+                               int            head_dim,
+                               int            past_kv_len,
+                               const Tensor*  position_ids,
+                               const Tensor*  packed_mask,
+                               int            packed_mask_stride,
+                               const int32_t* kv_start_per_token,
+                               const int32_t* kv_len_per_token,
+                               float*         partial_o,
+                               float*         partial_m,
+                               float*         partial_l,
+                               int            partial_tiles,
+                               cudaStream_t   stream)
+{
+    if (!q_ptr || !k_ptr || !v_ptr || !ctx_ptr || token_num <= 0 || q_len <= 0 || kv_len <= 0
+        || !kv_start_per_token || !kv_len_per_token) {
+        return;
+    }
+
+    const int total = token_num * num_q_heads;
+
+    // Decide whether to use the tiled multi-CTA FMHA path. For Eagle3 we
+    // expect head_dim=64 with small q_len (num_spec_tokens) and large KV,
+    // so enable the tiled path by default in that regime and keep env
+    // overrides for debug/tuning:
+    //   TM_ENABLE_EAGLE3_FMHA_TILED  -> force tiled on
+    //   TM_DISABLE_EAGLE3_FMHA_TILED -> force tiled off
+    const char* tiled_env_on  = std::getenv("TM_ENABLE_EAGLE3_FMHA_TILED");
+    const char* tiled_env_off = std::getenv("TM_DISABLE_EAGLE3_FMHA_TILED");
+    const bool  force_tiled   = (tiled_env_on && tiled_env_on[0] != '\0');
+    const bool  force_scalar  = (tiled_env_off && tiled_env_off[0] != '\0');
+    const bool  default_tiled = (head_dim > 0 && head_dim <= kEagle3FmhaMaxHeadDim
+                                && head_dim == 64 && kv_len >= 512);
+    const bool  use_tiled     = !force_scalar && (force_tiled || default_tiled);
+
+    const int32_t* packed = nullptr;
+    int            stride = 0;
+    if (packed_mask) {
+        if (packed_mask->ndim() >= 2) {
+            stride = static_cast<int>(packed_mask->shape(1));
+        }
+        packed = packed_mask->data<int32_t>();
+    }
+    if (packed_mask_stride > 0) {
+        stride = packed_mask_stride;
+    }
+
+    const int* pos_ptr = position_ids ? position_ids->data<int>() : nullptr;
+
+    bool run_tiled = use_tiled;
+
+    if (run_tiled) {
+        // Multi-CTA tiled path: split each (token, head) KV span into a fixed
+        // number of tiles and reduce partial outputs across tiles. To avoid
+        // per-step cudaMalloc/cudaFree churn in the hot decode loop, the
+        // caller (Eagle3AttentionLayer) is responsible for providing
+        // adequately sized scratch buffers partial_o/m/l.
+        const int num_tiles = (partial_tiles > 0) ? min(partial_tiles, kEagle3FmhaMaxTiles) : kEagle3FmhaMaxTiles;
+
+        if (!partial_o || !partial_m || !partial_l) {
+            TM_LOG_ERROR("[EAGLE3][FMHA] tiled path selected but scratch buffers are null");
+            if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE")) {
+                std::abort();
+            }
+            run_tiled = false;
+        }
+        else {
+            dim3 grid1(total, num_tiles);
+        dim3 block1(kEagle3FmhaBlockSize);
+
+        eagle3_fmha_multi_cta_kernel1<T, kEagle3FmhaMaxHeadDim><<<grid1, block1, 0, stream>>>(q_ptr,
+                                                                                              k_ptr,
+                                                                                              v_ptr,
+                                                                                              token_num,
+                                                                                              batch_size,
+                                                                                              q_len,
+                                                                                              kv_len,
+                                                                                              num_q_heads,
+                                                                                              num_kv_heads,
+                                                                                              head_dim,
+                                                                                              past_kv_len,
+                                                                                              pos_ptr,
+                                                                                              packed,
+                                                                                              stride,
+                                                                                              kv_start_per_token,
+                                                                                              kv_len_per_token,
+                                                                                              partial_o,
+                                                                                              partial_m,
+                                                                                              partial_l,
+                                                                                              num_tiles);
+        sync_check_cuda_error();
+
+        const int kBlockReduce = 128;
+        const int grid2        = (total + kBlockReduce - 1) / kBlockReduce;
+
+            eagle3_fmha_multi_cta_kernel2<T><<<grid2, kBlockReduce, 0, stream>>>(partial_o,
+                                                                             partial_m,
+                                                                             partial_l,
+                                                                             ctx_ptr,
+                                                                             total,
+                                                                             num_tiles,
+                                                                             head_dim);
+        sync_check_cuda_error();
+        }
+    }
+
+    if (!run_tiled) {
+        // Single-CTA fallback over the full KV span.
+        constexpr int kBlock = kEagle3FmhaBlockSize;
+        const int     grid   = (total + kBlock - 1) / kBlock;
+
+        eagle3_fmha_kernel<T, kEagle3FmhaMaxHeadDim><<<grid, kBlock, 0, stream>>>(q_ptr,
+                                                                                  k_ptr,
+                                                                                  v_ptr,
+                                                                                  ctx_ptr,
+                                                                                  token_num,
+                                                                                  batch_size,
+                                                                                  q_len,
+                                                                                  kv_len,
+                                                                                  num_q_heads,
+                                                                                  num_kv_heads,
+                                                                                  head_dim,
+                                                                                  past_kv_len,
+                                                                                  pos_ptr,
+                                                                                  packed,
+                                                                                  stride,
+                                                                                  kv_start_per_token,
+                                                                                  kv_len_per_token);
+        sync_check_cuda_error();
+    }
+}
+
+// Type-specialized wrappers so that external translation units can call
+// the Eagle3 FMHA path without instantiating the template themselves.
+void launch_eagle3_fmha_kernel_fp16(const half_t*       q_ptr,
+                                    const half_t*       k_ptr,
+                                    const half_t*       v_ptr,
+                                    half_t*             ctx_ptr,
+                                    int                 token_num,
+                                    int                 batch_size,
+                                    int                 q_len,
+                                    int                 kv_len,
+                                    int                 num_q_heads,
+                                    int                 num_kv_heads,
+                                    int                 head_dim,
+                                    int                 past_kv_len,
+                                    const Tensor*       position_ids,
+                                    const Tensor*       packed_mask,
+                                    int                 packed_mask_stride,
+                                    const int32_t*      kv_start_per_token,
+                                    const int32_t*      kv_len_per_token,
+                                    float*              partial_o,
+                                    float*              partial_m,
+                                    float*              partial_l,
+                                    int                 partial_tiles,
+                                    cudaStream_t        stream)
+{
+    launch_eagle3_fmha_kernel<half_t>(q_ptr,
+                                      k_ptr,
+                                      v_ptr,
+                                      ctx_ptr,
+                                      token_num,
+                                      batch_size,
+                                      q_len,
+                                      kv_len,
+                                      num_q_heads,
+                                      num_kv_heads,
+                                      head_dim,
+                                      past_kv_len,
+                                      position_ids,
+                                      packed_mask,
+                                      packed_mask_stride,
+                                      kv_start_per_token,
+                                      kv_len_per_token,
+                                      partial_o,
+                                      partial_m,
+                                      partial_l,
+                                      partial_tiles,
+                                      stream);
+}
+
+#if ENABLE_BF16
+void launch_eagle3_fmha_kernel_bf16(const bfloat16_t*   q_ptr,
+                                    const bfloat16_t*   k_ptr,
+                                    const bfloat16_t*   v_ptr,
+                                    bfloat16_t*         ctx_ptr,
+                                    int                 token_num,
+                                    int                 batch_size,
+                                    int                 q_len,
+                                    int                 kv_len,
+                                    int                 num_q_heads,
+                                    int                 num_kv_heads,
+                                    int                 head_dim,
+                                    int                 past_kv_len,
+                                    const Tensor*       position_ids,
+                                    const Tensor*       packed_mask,
+                                    int                 packed_mask_stride,
+                                    const int32_t*      kv_start_per_token,
+                                    const int32_t*      kv_len_per_token,
+                                    float*              partial_o,
+                                    float*              partial_m,
+                                    float*              partial_l,
+                                    int                 partial_tiles,
+                                    cudaStream_t        stream)
+{
+    launch_eagle3_fmha_kernel<bfloat16_t>(q_ptr,
+                                          k_ptr,
+                                          v_ptr,
+                                          ctx_ptr,
+                                          token_num,
+                                          batch_size,
+                                          q_len,
+                                          kv_len,
+                                          num_q_heads,
+                                          num_kv_heads,
+                                          head_dim,
+                                          past_kv_len,
+                                          position_ids,
+                                          packed_mask,
+                                          packed_mask_stride,
+                                          kv_start_per_token,
+                                          kv_len_per_token,
+                                          partial_o,
+                                          partial_m,
+                                          partial_l,
+                                          partial_tiles,
+                                          stream);
+}
+#endif
+
+#if ENABLE_FP32
+void launch_eagle3_fmha_kernel_fp32(const float*        q_ptr,
+                                    const float*        k_ptr,
+                                    const float*        v_ptr,
+                                    float*              ctx_ptr,
+                                    int                 token_num,
+                                    int                 batch_size,
+                                    int                 q_len,
+                                    int                 kv_len,
+                                    int                 num_q_heads,
+                                    int                 num_kv_heads,
+                                    int                 head_dim,
+                                    int                 past_kv_len,
+                                    const Tensor*       position_ids,
+                                    const Tensor*       packed_mask,
+                                    int                 packed_mask_stride,
+                                    const int32_t*      kv_start_per_token,
+                                    const int32_t*      kv_len_per_token,
+                                    float*              partial_o,
+                                    float*              partial_m,
+                                    float*              partial_l,
+                                    int                 partial_tiles,
+                                    cudaStream_t        stream)
+{
+    launch_eagle3_fmha_kernel<float>(q_ptr,
+                                     k_ptr,
+                                     v_ptr,
+                                     ctx_ptr,
+                                     token_num,
+                                     batch_size,
+                                     q_len,
+                                     kv_len,
+                                     num_q_heads,
+                                     num_kv_heads,
+                                     head_dim,
+                                     past_kv_len,
+                                     position_ids,
+                                     packed_mask,
+                                     packed_mask_stride,
+                                     kv_start_per_token,
+                                     kv_len_per_token,
+                                     partial_o,
+                                     partial_m,
+                                     partial_l,
+                                     partial_tiles,
+                                     stream);
+}
+#endif
+
+template<typename T>
 void launch_expand_kv_to_q_kernel(const Tensor& kv, Tensor& q_expanded, int kv_heads, int head_dim, int group_size, cudaStream_t stream)
 {
     const int batch = kv.shape(0);
@@ -798,6 +1637,98 @@ void launch_eagle3_matmul_rowmajor_dispatch(const T* A,
     if (!launch_eagle3_matmul_gemm<T>(A, B, C, M, K, N, stream)) {
         launch_matmul_rowmajor_impl<T>(A, B, C, M, K, N, stream);
     }
+}
+
+namespace {
+
+__global__ void build_eagle3_kv_spans_kernel(int           token_num,
+                                             int           batch_size,
+                                             int           q_len,
+                                             int           kv_len,
+                                             const int32_t* runtime_offsets,
+                                             const int32_t* tree_offsets,
+                                             const int32_t* kv_lens_runtime,
+                                             const int32_t* successor_offsets,
+                                             const int32_t* successor_counts,
+                                             int32_t*       kv_start_per_token,
+                                             int32_t*       kv_len_per_token)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= token_num) {
+        return;
+    }
+
+    const int batch = q_len > 0 ? idx / q_len : 0;
+    if (batch < 0 || batch >= batch_size) {
+        return;
+    }
+
+    int kv_start = 0;
+    int kv_end   = kv_len;
+
+    auto clamp_span = [&](int start, int end) {
+        kv_start = max(kv_start, start);
+        kv_end   = min(kv_end, end);
+    };
+
+    if (runtime_offsets) {
+        clamp_span(runtime_offsets[batch], runtime_offsets[batch + 1]);
+    }
+    if (tree_offsets) {
+        clamp_span(tree_offsets[batch], tree_offsets[batch + 1]);
+    }
+    if (kv_lens_runtime) {
+        clamp_span(0, kv_lens_runtime[batch]);
+    }
+
+    kv_start = max(0, min(kv_start, kv_len));
+    kv_end   = max(0, min(kv_end, kv_len));
+    const int kv_len_slot = kv_end - kv_start;
+
+    if (kv_len_slot <= 0) {
+        kv_start_per_token[idx] = 0;
+        kv_len_per_token[idx]   = 0;
+        return;
+    }
+
+    kv_start_per_token[idx] = kv_start;
+    kv_len_per_token[idx]   = kv_len_slot;
+}
+
+}  // namespace
+
+void launch_build_eagle3_kv_spans(int           token_num,
+                                  int           batch_size,
+                                  int           q_len,
+                                  int           kv_len,
+                                  const int32_t* runtime_offsets,
+                                  const int32_t* tree_offsets,
+                                  const int32_t* kv_lens_runtime,
+                                  const int32_t* successor_offsets,
+                                  const int32_t* successor_counts,
+                                  int32_t*       kv_start_per_token,
+                                  int32_t*       kv_len_per_token,
+                                  cudaStream_t   stream)
+{
+    if (token_num <= 0 || batch_size <= 0 || q_len <= 0 || kv_len <= 0 || !kv_start_per_token || !kv_len_per_token) {
+        return;
+    }
+
+    const int block = 256;
+    const int grid  = (token_num + block - 1) / block;
+
+    build_eagle3_kv_spans_kernel<<<grid, block, 0, stream>>>(token_num,
+                                                             batch_size,
+                                                             q_len,
+                                                             kv_len,
+                                                             runtime_offsets,
+                                                             tree_offsets,
+                                                             kv_lens_runtime,
+                                                             successor_offsets,
+                                                             successor_counts,
+                                                             kv_start_per_token,
+                                                             kv_len_per_token);
+    sync_check_cuda_error();
 }
 
 

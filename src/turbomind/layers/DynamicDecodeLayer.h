@@ -35,6 +35,10 @@ struct ForcedTailContext {
     // will not report per-slot counts.
     int*       committed_lengths{nullptr};
     int        max_tail_len{0};
+    // When true, forced_tokens / forced_lengths are device pointers and
+    // may only be consumed by the GPU tail path. Host tail logic will
+    // treat this as "no tail" to avoid misinterpreting device memory.
+    bool       device_pointers{false};
 };
 
 class DynamicDecodeLayer {
@@ -67,6 +71,13 @@ private:
     Buffer_<int> stop_words_;
     Buffer_<int> stop_words_buf_;
     Tensor_<int> stop_words_ten_;
+
+    // Persistent EOS metadata for GPU-tail path. Layout:
+    //  eos_ids_:    [max_batch_size, kMaxEosPerSlot]
+    //  eos_counts_: [max_batch_size]
+    int           max_batch_size_{0};
+    Buffer_<int>  eos_ids_;
+    Buffer_<int>  eos_counts_;
 };
 
 }  // namespace turbomind

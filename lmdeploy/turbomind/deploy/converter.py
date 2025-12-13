@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
+
 import torch
 
 from lmdeploy.archs import get_model_arch, search_nested_config
@@ -129,8 +131,10 @@ def get_tm_model(model_path,
         out_dir(str): the output directory where to save to turbomind model.
             If it is None, the turbomind model won't be saved
     """
-    _, cfg = get_model_arch(model_path)
-    quant_config = search_nested_config(cfg.to_dict(), 'quantization_config')
+    arch, cfg = get_model_arch(model_path)
+    # Allow bring-up mode to bypass quantization config (e.g. MLA BF16 only)
+    disable_quant = os.getenv('TM_MLA_BRINGUP', '') == '1'
+    quant_config = None if disable_quant else search_nested_config(cfg.to_dict(), 'quantization_config')
     if quant_config:
         quant_method = quant_config.get('quant_method')
         _group_size = int(quant_config.get('group_size', 0))

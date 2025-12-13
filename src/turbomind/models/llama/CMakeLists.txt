@@ -10,7 +10,7 @@ add_library(Llama STATIC
         LlamaLinear.cu
         eagle3_attention_kernels.cu
         eagle3_attention_layer.cc
-        EagleDraftLayer.cc
+        EagleDraftLayer.cu
         BlockManager.cc
         BlockTrie.cc
         SequenceManager.cc

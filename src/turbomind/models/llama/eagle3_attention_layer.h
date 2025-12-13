@@ -177,8 +177,112 @@ void launch_sdpa_kernel(const T* q_ptr,
 
 
 template<typename T>
-
 void launch_expand_kv_to_q_kernel(const Tensor& kv, Tensor& q_expanded, int kv_heads, int head_dim, int group_size, cudaStream_t stream);
+
+// Tree-aware Eagle3 SDPA kernel that consumes precomputed per-token KV
+// windows [kv_start_per_token[t], kv_start_per_token[t] +
+// kv_len_per_token[t]) together with the packed mask. This is wired
+// behind TM_ENABLE_EAGLE3_FMHA in Eagle3AttentionLayer and is the first
+// concrete FMHA-style path for Eagle3.
+template<typename T>
+void launch_eagle3_fmha_kernel(const T*       q_ptr,
+                               const T*       k_ptr,
+                               const T*       v_ptr,
+                               T*             ctx_ptr,
+                               int            token_num,
+                               int            batch_size,
+                               int            q_len,
+                               int            kv_len,
+                               int            num_q_heads,
+                               int            num_kv_heads,
+                               int            head_dim,
+                               int            past_kv_len,
+                               const Tensor*  position_ids,
+                               const Tensor*  packed_mask,
+                               int            packed_mask_stride,
+                               const int32_t* kv_start_per_token,
+                               const int32_t* kv_len_per_token,
+                               float*         partial_o,
+                               float*         partial_m,
+                               float*         partial_l,
+                               int            partial_tiles,
+                               cudaStream_t   stream);
+
+// Non-templated convenience wrappers for the common dtypes so that
+// call sites (e.g. Eagle3AttentionLayer) do not need to instantiate
+// the FMHA template across translation units.
+void launch_eagle3_fmha_kernel_fp16(const half_t*       q_ptr,
+                                    const half_t*       k_ptr,
+                                    const half_t*       v_ptr,
+                                    half_t*             ctx_ptr,
+                                    int                 token_num,
+                                    int                 batch_size,
+                                    int                 q_len,
+                                    int                 kv_len,
+                                    int                 num_q_heads,
+                                    int                 num_kv_heads,
+                                    int                 head_dim,
+                                    int                 past_kv_len,
+                                    const Tensor*       position_ids,
+                                    const Tensor*       packed_mask,
+                                    int                 packed_mask_stride,
+                                    const int32_t*      kv_start_per_token,
+                                    const int32_t*      kv_len_per_token,
+                                    float*              partial_o,
+                                    float*              partial_m,
+                                    float*              partial_l,
+                                    int                 partial_tiles,
+                                    cudaStream_t        stream);
+
+#if ENABLE_BF16
+void launch_eagle3_fmha_kernel_bf16(const bfloat16_t*   q_ptr,
+                                    const bfloat16_t*   k_ptr,
+                                    const bfloat16_t*   v_ptr,
+                                    bfloat16_t*         ctx_ptr,
+                                    int                 token_num,
+                                    int                 batch_size,
+                                    int                 q_len,
+                                    int                 kv_len,
+                                    int                 num_q_heads,
+                                    int                 num_kv_heads,
+                                    int                 head_dim,
+                                    int                 past_kv_len,
+                                    const Tensor*       position_ids,
+                                    const Tensor*       packed_mask,
+                                    int                 packed_mask_stride,
+                                    const int32_t*      kv_start_per_token,
+                                    const int32_t*      kv_len_per_token,
+                                    float*              partial_o,
+                                    float*              partial_m,
+                                    float*              partial_l,
+                                    int                 partial_tiles,
+                                    cudaStream_t        stream);
+#endif
+
+#if ENABLE_FP32
+void launch_eagle3_fmha_kernel_fp32(const float*        q_ptr,
+                                    const float*        k_ptr,
+                                    const float*        v_ptr,
+                                    float*              ctx_ptr,
+                                    int                 token_num,
+                                    int                 batch_size,
+                                    int                 q_len,
+                                    int                 kv_len,
+                                    int                 num_q_heads,
+                                    int                 num_kv_heads,
+                                    int                 head_dim,
+                                    int                 past_kv_len,
+                                    const Tensor*       position_ids,
+                                    const Tensor*       packed_mask,
+                                    int                 packed_mask_stride,
+                                    const int32_t*      kv_start_per_token,
+                                    const int32_t*      kv_len_per_token,
+                                    float*              partial_o,
+                                    float*              partial_m,
+                                    float*              partial_l,
+                                    int                 partial_tiles,
+                                    cudaStream_t        stream);
+#endif
 
 template<typename T>
 void launch_eagle3_matmul_rowmajor_dispatch(const T* A,
@@ -188,6 +292,25 @@ void launch_eagle3_matmul_rowmajor_dispatch(const T* A,
                                             int      K,
                                             int      N,
                                             cudaStream_t stream);
+
+// Build per-token KV spans for Eagle3 attention on GPU. For each token
+// index t in [0, token_num), this computes a clamped KV window
+// [kv_start_per_token[t], kv_start_per_token[t] + kv_len_per_token[t])
+// using the same runtime/tree/successor/kv_lens logic as the current
+// SDPA kernels, but without applying packed masks. The result is
+// suitable for feeding into a tree-aware FMHA scheduler.
+void launch_build_eagle3_kv_spans(int           token_num,
+                                  int           batch_size,
+                                  int           q_len,
+                                  int           kv_len,
+                                  const int32_t* runtime_offsets,
+                                  const int32_t* tree_offsets,
+                                  const int32_t* kv_lens_runtime,
+                                  const int32_t* successor_offsets,
+                                  const int32_t* successor_counts,
+                                  int32_t*       kv_start_per_token,
+                                  int32_t*       kv_len_per_token,
+                                  cudaStream_t   stream);
 
 
 
@@ -262,6 +385,21 @@ public:
 private:
     cudaStream_t           stream_{};
     const cudaDeviceProp*  device_prop_{nullptr};
+
+    // FMHA scratch buffers for the tiled multi-CTA path. These are
+    // sized lazily based on (token_num * num_q_heads * num_tiles) and
+    // reused across steps to avoid per-step cudaMalloc/cudaFree in the
+    // hot decode loop. They are only used when TM_ENABLE_EAGLE3_FMHA
+    // is active and the tiled FMHA path is selected.
+    core::Tensor fmha_partial_m_;
+    core::Tensor fmha_partial_l_;
+    core::Tensor fmha_partial_o_;
+
+    // Debug-only guard for concurrent FMHA usage within a single layer
+    // instance. When LMDEPLOY_EAGLE_FMHA_CONCURRENCY_DEBUG is enabled,
+    // Forward() will abort if it detects re-entrancy while an FMHA call
+    // is in flight on this instance.
+    bool fmha_in_flight_{false};
 };
 
 }  // namespace turbomind

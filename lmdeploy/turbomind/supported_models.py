@@ -11,6 +11,8 @@ SUPPORTED_ARCHS = dict(
     BaichuanForCausalLM='baichuan2',
     # gpt-oss
     GptOssForCausalLM='gpt-oss',
+    # DeepSeek-style MLA GPT-OSS (TransMLA) using LlamaMLAForCausalLM
+    LlamaMLAForCausalLM='llama-mla',
     # internlm
     InternLMForCausalLM='llama',
     # internlm2

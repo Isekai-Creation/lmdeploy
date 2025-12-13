@@ -30,6 +30,11 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMalloc(&inputs.draft_paths, batch_size_ * max_decoding_tokens_ * max_path_len_ * sizeof(SizeType));
     cudaMalloc(&inputs.packed_masks, batch_size_ * max_decoding_tokens_ * num_packed_masks_ * sizeof(SizeType));
     cudaMalloc(&inputs.leaf_mask, batch_size_ * max_decoding_tokens_ * sizeof(int8_t));
+    // Linked-list style tree metadata (per slot, per draft token).
+    cudaMalloc(&inputs.tree_positions, batch_size_ * max_decoding_tokens_ * sizeof(SizeType));
+    cudaMalloc(&inputs.retrive_index, batch_size_ * max_decoding_tokens_ * sizeof(SizeType));
+    cudaMalloc(&inputs.retrive_next_token, batch_size_ * max_decoding_tokens_ * sizeof(SizeType));
+    cudaMalloc(&inputs.retrive_next_sibling, batch_size_ * max_decoding_tokens_ * sizeof(SizeType));
     
     cudaMalloc(&inputs.eagle_net_ctx_lens, batch_size_ * sizeof(SizeType));
     cudaMalloc(&inputs.eagle_net_gen_lens, batch_size_ * sizeof(SizeType));
@@ -95,6 +100,10 @@ void EagleBuffers::free() {
     cudaFree(inputs.draft_paths);
     cudaFree(inputs.packed_masks);
     cudaFree(inputs.leaf_mask);
+    cudaFree(inputs.tree_positions);
+    cudaFree(inputs.retrive_index);
+    cudaFree(inputs.retrive_next_token);
+    cudaFree(inputs.retrive_next_sibling);
     cudaFree(inputs.eagle_net_ctx_lens);
     cudaFree(inputs.eagle_net_gen_lens);
     cudaFree(inputs.eagle_net_seq_lens);
