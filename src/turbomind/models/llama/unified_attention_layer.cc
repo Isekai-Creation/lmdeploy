@@ -113,8 +113,54 @@ UnifiedAttentionLayer::UnifiedAttentionLayer(const ModelParam&     model,
 
 void UnifiedAttentionLayer::Initialize(TensorMap& args)
 {
-    h_q_len_ = args.at("h_q_len").buffer();
-    h_k_len_ = args.at("h_k_len").buffer();
+    // Decode/prefill batch geometry.
+    decode_num_ = *args.at("decode_num").data<int>();
+    prefil_num_ = *args.at("prefil_num").data<int>();
+    const int batch_size = decode_num_ + prefil_num_;
+
+    // Prefer explicit per-slot lengths when provided. Older call sites
+    // that predate h_q_len/h_k_len may omit them; in that case we build
+    // a conservative fallback based on the decoder_input token count so
+    // that attention still runs correctly for simple cases (e.g., single
+    // sequence prefill).
+    auto* q_tensor = args.try_("h_q_len");
+    auto* k_tensor = args.try_("h_k_len");
+    if (q_tensor && k_tensor) {
+        h_q_len_ = q_tensor->buffer();
+        h_k_len_ = k_tensor->buffer();
+    }
+    else {
+        if (batch_size > 0) {
+            h_q_len_ = Buffer_<int>{{batch_size}, kCPUpinned};
+            h_k_len_ = Buffer_<int>{{batch_size}, kCPUpinned};
+
+            int* q_ptr = h_q_len_.data();
+            int* k_ptr = h_k_len_.data();
+            std::fill_n(q_ptr, batch_size, 0);
+            std::fill_n(k_ptr, batch_size, 0);
+
+            const auto& decoder_input = args.at("decoder_input");
+            const int   token_num     = decoder_input.shape(0);
+
+            if (batch_size == 1) {
+                q_ptr[0] = token_num;
+                k_ptr[0] = token_num;
+            }
+            else if (token_num > 0) {
+                const int base = token_num / batch_size;
+                const int rem  = token_num % batch_size;
+                for (int i = 0; i < batch_size; ++i) {
+                    const int len = base + (i < rem ? 1 : 0);
+                    q_ptr[i]      = len;
+                    k_ptr[i]      = len;
+                }
+            }
+        }
+        else {
+            h_q_len_ = {};
+            h_k_len_ = {};
+        }
+    }
 
     const int bsz = h_q_len_.size();
 
@@ -131,9 +177,6 @@ void UnifiedAttentionLayer::Initialize(TensorMap& args)
     Copy(h_cu_x_len_.slice(0, 2 * bsz + 2), d_cu_x_len_.slice(0, 2 * bsz + 2));
 
     event_.Record(core::Context::stream());
-
-    decode_num_ = *args.at("decode_num").data<int>();
-    prefil_num_ = *args.at("prefil_num").data<int>();
 
     finished_  = args.at("finished").buffer();
     rope_base_ = args.at("rope_base").buffer();

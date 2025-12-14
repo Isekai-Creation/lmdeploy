@@ -299,7 +299,7 @@ private:
     int eagle_last_step_{-1};
 
     // First EOS id per request for EAGLE acceptance (device buffer).
-    Buffer_<int> eagle_end_ids_;
+    Buffer_<int>   eagle_end_ids_;
     Buffer_<float> eagle_posterior_thresholds_;  // [max_batch_size_]
     Buffer_<float> eagle_posterior_alphas_;      // [max_batch_size_]
     Buffer_<float> eagle_temperatures_;          // [max_batch_size_]
@@ -398,3 +398,4 @@ private:
 using Engine = LlamaBatch;
 
 }  // namespace turbomind
+

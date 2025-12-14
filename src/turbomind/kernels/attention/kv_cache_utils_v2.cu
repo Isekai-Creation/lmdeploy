@@ -558,10 +558,16 @@ void invokeProcessKV_v2(char**                 blocks,
 #endif
     }
     else if (kv_mode == KvCacheMode::kFp4Nv) {
-        // NVFP4 path is kept gated for now: until we mirror TensorRT‑LLM's
-        // FP8(E4M3) block-scale algorithm, fall back to unquantized KV
-        // so that quant_policy=16 on Blackwell behaves like base KV.
-        dispatch(T{});
+#if defined(ENABLE_FP4) && defined(ENABLE_FP8)
+        FT_CHECK_WITH_INFO(scale_blocks != nullptr,
+                           "[kv_cache_v2][FP8] NVFP4 FP4 KV cache requires a scale pool; "
+                           "scale_blocks must be non-null and initialized.");
+        dispatch(fp4_e2m1_t{});
+#else
+        FT_CHECK_WITH_INFO(false,
+                           "[kv_cache_v2][FP8] NVFP4 KV cache requested but ENABLE_FP4/ENABLE_FP8 is not defined; "
+                           "rebuild TurboMind with -DENABLE_FP4 -DENABLE_FP8 and CUDA 12.8+.");
+#endif
     }
     else {
         dispatch(T{});
@@ -604,6 +610,7 @@ template<int CTA_S, int HeadDim, int WarpCnt, class T, class Tkv, class BlockLay
 __global__ void __launch_bounds__(128) flattenKV_v2(T*              k,
                                                     T*              v,
                                                     const Tkv**     blocks,
+                                                    char**          scale_blocks,
                                                     const int*      cu_k_len,
                                                     const int*      cu_block_num,
                                                     RopeKernelParam rope_param,
@@ -663,28 +670,68 @@ __global__ void __launch_bounds__(128) flattenKV_v2(T*              k,
         local_ti     = cp_size.divmod(local_ti_rank, si);
         if (si < seq_len && local_ti_rank == cp_rank) {
             block_head.with((char**)blocks, local_ti, [&](auto k_cache, auto v_cache, T* k_param, T* v_param) {
-                PRAGMA_UNROLL
-                for (int c = 0; c < ITER_C; ++c) {
-                    int di = offset.x + c * Map::kDeltaC;
-                    Ldg(vec_K[s][c], &k_cache[di]);
-                    Ldg(vec_V[s][c], &v_cache[di]);
+                if constexpr (std::is_same_v<Tkv, fp4_e2m1_t>) {
+                    // MXFP4 path: Dequantize FP4(E2M1) payload using per-16-element exponent scales.
+                    static_assert(HeadDim % 16 == 0, "FP4 MXFP4 requires head_dim % 16 == 0");
+                    static_assert(kVecSize == 8, "FP4 MXFP4 assumes Vec covers 8 elements");
+
+                    constexpr int kScalesPerHead = HeadDim / 16;
+                    
+                    uint8_t* scale_ptr = get_fp4_mx_scale_base(
+                        scale_blocks + cu_block_num[batch_idx], // scale_blocks is now directly accessible here
+                        layer_id,
+                        head_idx,
+                        block_layout.config().head_num(),
+                        block_layout.config().block_len(),
+                        HeadDim,
+                        local_ti
+                    );
+
+                    ConvertKvCache<fp4_e2m1_t, T> dequantizer{};
+                    PRAGMA_UNROLL
+                    for (int c = 0; c < ITER_C; ++c) {
+                        const int di_base = offset.x + c * Map::kDeltaC;
+                        Ldg(vec_K[s][c], &k_cache[di_base]);
+                        Ldg(vec_V[s][c], &v_cache[di_base]);
+
+                        // Dequantize FP4 to T, then apply per-block scales
+                        auto dequant_K = dequantizer.convert(vec_K[s][c]);
+                        auto dequant_V = dequantizer.convert(vec_V[s][c]);
+
+                        PRAGMA_UNROLL
+                        for (int i = 0; i < kVecSize; ++i) {
+                            const int di = di_base + i;
+                            if (di < HeadDim) {
+                                const int scale_idx = di / 16; // K and V scales are interleaved for a given token
+                                const uint8_t exponent_u8_K = scale_ptr[scale_idx];
+                                const float scale_val_K = __expf((float)(exponent_u8_K - 127) * 0.693147182f);
+
+                                const uint8_t exponent_u8_V = scale_ptr[kScalesPerHead + scale_idx];
+                                const float scale_val_V = __expf((float)(exponent_u8_V - 127) * 0.693147182f);
+                                
+                                out_K[s][c][i] = dequant_K[i] * static_cast<T>(scale_val_K);
+                                out_V[s][c][i] = dequant_V[i] * static_cast<T>(scale_val_V);
+                            }
+                        }
+                    }
                 }
-                if constexpr (!std::is_same_v<T, Tkv>) {
-                    Ldg(param_K[s], k_param);
-                    Ldg(param_V[s], v_param);
+                else { // For Int4/Int8/Base KV
+                    ConvertKvCache<Tkv, T> conv_K{param_K[s][0], param_K[s][1]};
+                    ConvertKvCache<Tkv, T> conv_V{param_V[s][0], param_V[s][1]};
+                    PRAGMA_UNROLL
+                    for (int c = 0; c < ITER_C; ++c) {
+                        int di = offset.x + c * Map::kDeltaC;
+                        Ldg(vec_K[s][c], &k_cache[di]);
+                        Ldg(vec_V[s][c], &v_cache[di]);
+                        out_K[s][c] = conv_K(vec_K[s][c]);
+                        out_V[s][c] = conv_V(vec_V[s][c]);
+                    }
+                    if constexpr (!std::is_same_v<T, Tkv>) {
+                        Ldg(param_K[s], k_param);
+                        Ldg(param_V[s], v_param);
+                    }
                 }
             });
-        }
-    }
-
-    PRAGMA_UNROLL
-    for (int s = 0; s < ITER_S; ++s) {
-        ConvertKvCache<Tkv, T> conv_K{param_K[s][0], param_K[s][1]};
-        ConvertKvCache<Tkv, T> conv_V{param_V[s][0], param_V[s][1]};
-        PRAGMA_UNROLL
-        for (int c = 0; c < ITER_C; ++c) {
-            out_K[s][c] = conv_K(vec_K[s][c]);
-            out_V[s][c] = conv_V(vec_V[s][c]);
         }
     }
 
@@ -724,6 +771,7 @@ template<class T>
 void invokeFlattenKV_v2(T*                     k,
                         T*                     v,
                         char**                 blocks,
+                        char**                 scale_blocks,
                         const int*             cu_k_len,
                         const int*             cu_block_num,
                         const RopeKernelParam& rope_param,
@@ -760,6 +808,7 @@ void invokeFlattenKV_v2(T*                     k,
         flattenKV_v2<CTA_S, kHeadDim, kWarpCnt><<<grid, block, 0, stream>>>(k,
                                                                             v,
                                                                             (const Tkv**)blocks,
+                                                                            scale_blocks,
                                                                             cu_k_len,
                                                                             cu_block_num,
                                                                             rope_param,
@@ -788,15 +837,27 @@ void invokeFlattenKV_v2(T*                     k,
 
     const KvCacheMode kv_mode = GetKvCacheMode(quant_policy, arch);
 
-    // FP4 KV cache flattening is not implemented yet. The SpecPV /
-    // debug flatten paths must remain disabled when any FP4 KV mode is
-    // active to avoid silently treating FP4 data as another quant mode.
-    if (kv_mode == KvCacheMode::kFp4Mx || kv_mode == KvCacheMode::kFp4Nv) {
-        FT_CHECK_WITH_INFO(false,
-                           "[flattenKV_v2][FP4] FP4 KV cache flatten path is not implemented yet; "
-                           "SpecPV / debug flatten must be disabled when FP4 KV is enabled.");
+#if defined(ENABLE_FP4)
+    if (kv_mode == KvCacheMode::kFp4Mx) {
+        FT_CHECK_WITH_INFO(scale_blocks != nullptr,
+                           "[kv_cache_v2][FP4] MXFP4 FP4 KV cache requires a scale pool; "
+                           "scale_blocks must be non-null and initialized.");
+        dispatch(fp4_e2m1_t{});
     }
-
+    else if (kv_mode == KvCacheMode::kFp4Nv) {
+        // NVFP4 path is kept gated for now. Fall back to unquantized KV.
+        dispatch(T{});
+    }
+    else if (kv_mode == KvCacheMode::kInt8) {
+        dispatch(uint8_t{});
+    }
+    else if (kv_mode == KvCacheMode::kInt4) {
+        dispatch(uint4_t{});
+    }
+    else {
+        dispatch(T{});
+    }
+#else
     if (kv_mode == KvCacheMode::kInt8) {
         dispatch(uint8_t{});
     }
@@ -806,12 +867,14 @@ void invokeFlattenKV_v2(T*                     k,
     else {
         dispatch(T{});
     }
+#endif
 }
 
 #define INSTANTIATE_invokeFlattenKV_v2(type)                                                                           \
     template void invokeFlattenKV_v2(type*                  k,                                                         \
                                      type*                  v,                                                         \
                                      char**                 blocks,                                                    \
+                                     char**                 scale_blocks,                                              \
                                      const int*             cu_k_len,                                                  \
                                      const int*             cu_block_num,                                              \
                                      const RopeKernelParam& rope_param,                                                \

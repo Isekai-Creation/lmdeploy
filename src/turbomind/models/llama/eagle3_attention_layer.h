@@ -14,8 +14,6 @@ namespace turbomind {
 
 namespace ft {
 
-
-
 template<typename T>
 
 __global__ void apply_rope_kernel(T*       q_ptr,

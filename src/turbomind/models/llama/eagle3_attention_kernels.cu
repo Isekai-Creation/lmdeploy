@@ -3,7 +3,6 @@
 #include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cub/cub.cuh>
 #include <cstdlib>
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/eagle_debug.h"
@@ -30,17 +29,23 @@ constexpr int kEagle3FmhaMaxHeadDim   = 128;   // maximum head_dim supported by 
 constexpr int kEagle3FmhaMaxTiles     = 8;     // max tiles per (token, head) for multi-CTA KV
 
 // Optional global tile statistics for debugging / perf analysis.
-// When TM_EAGLE3_FMHA_TILE_STATS is enabled, we count total tiles and
-// categorize them by span/mask emptiness.
+// Tile index layout for span/mask/execute buckets.
 enum : int {
-    kEagle3FmhaTilesTotal = 0,
+    kEagle3FmhaTilesTotal     = 0,
     kEagle3FmhaTilesSpanEmpty = 1,
     kEagle3FmhaTilesMaskEmpty = 2,
     kEagle3FmhaTilesExecuted  = 3,
     kEagle3FmhaTilesCount     = 4,
 };
 
+// Device-side storage for the counters.
 __device__ unsigned long long g_eagle3_fmha_tile_stats[kEagle3FmhaTilesCount] = {};
+
+cudaError_t GetEagle3FmhaTileStats(void** dev_ptr)
+{
+    return cudaGetSymbolAddress(dev_ptr, g_eagle3_fmha_tile_stats);
+}
+
 
 namespace { // anonymous namespace for device helpers
 

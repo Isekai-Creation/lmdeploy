@@ -648,7 +648,7 @@ void LlamaTritonModel::createEngine(int device_id, int rank)
 
     h_comm->Sync();
 
-    engine.Start();
+    // engine.Start();
 }
 
 ScheduleMetrics LlamaTritonModel::getScheduleMetrics(int device_id, int rank)

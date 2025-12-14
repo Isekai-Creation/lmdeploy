@@ -132,6 +132,11 @@ struct TreeLogitsToTargetsParams {
 
     TokenIdType* target_tokens;     // [max_batch_size, max_decoding_tokens]
 
+    // Optional draft-vocab remap: when non-null, logits are over a
+    // reduced draft vocab and each argmax id must be mapped to the
+    // full target vocab using draft_id_to_target[id].
+    const TokenIdType* draft_id_to_target{nullptr}; // [vocab_size] or null
+
     cudaStream_t stream;
 };
 

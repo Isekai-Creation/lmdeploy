@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
+#include <climits>
 #include <cub/cub.cuh>
 
 #include "src/turbomind/utils/eagle_debug.h"
@@ -633,6 +634,107 @@ void launch_set_skip_decode(const int* generation_lengths,
     }
 }
 
+namespace {
+
+// Compute compact list of active slots for an EAGLE step. A slot is
+// considered active when:
+//   - finished[slot] == false
+//   - sequence_lengths[slot] < seq_limit_len[slot] (when seq_limit_len provided)
+__global__ void computeActiveSlotsKernel(const bool* finished,
+                                         const int*  sequence_lengths,
+                                         const int*  seq_limit_len,
+                                         int         batch_size,
+                                         int         max_batch_size,
+                                         int*        active_slots,
+                                         int*        active_inverse,
+                                         int*        active_count)
+{
+    const int slot = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (slot < 0 || slot >= batch_size) {
+        return;
+    }
+
+    const bool is_finished = finished ? finished[slot] : false;
+    const int  seq_len     = sequence_lengths ? sequence_lengths[slot] : 0;
+    const int  limit       = seq_limit_len ? seq_limit_len[slot] : INT_MAX;
+
+    const bool below_limit = (seq_len < limit);
+    const bool is_active   = (!is_finished) && below_limit;
+
+    if (!is_active) {
+        if (active_inverse && slot < max_batch_size) {
+            active_inverse[slot] = -1;
+        }
+        return;
+    }
+
+    const int idx = atomicAdd(active_count, 1);
+    if (idx >= max_batch_size) {
+        // Out-of-range; mark as inactive for safety.
+        if (active_inverse && slot < max_batch_size) {
+            active_inverse[slot] = -1;
+        }
+        return;
+    }
+
+    if (active_slots) {
+        active_slots[idx] = slot;
+    }
+    if (active_inverse && slot < max_batch_size) {
+        active_inverse[slot] = idx;
+    }
+}
+
+}  // namespace
+
+void launchComputeActiveSlots(const ActiveSlotsParams& params)
+{
+    if (!params.active_slots || !params.active_count || params.batch_size <= 0 || params.max_batch_size <= 0) {
+        return;
+    }
+
+    // Reset active_count to 0 and active_inverse to -1 when provided.
+    cudaError_t err = cudaMemsetAsync(params.active_count, 0, sizeof(int), params.stream);
+    if (::turbomind::isEagleDebugEnabled() && err != cudaSuccess) {
+        std::fprintf(stderr,
+                     "[EAGLE][ActiveSlots] cudaMemsetAsync(active_count) failed: err=%d (%s)\n",
+                     static_cast<int>(err),
+                     cudaGetErrorString(err));
+    }
+    if (params.active_inverse) {
+        err = cudaMemsetAsync(
+            params.active_inverse, 0xFF, static_cast<size_t>(params.max_batch_size) * sizeof(int), params.stream);
+        if (::turbomind::isEagleDebugEnabled() && err != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[EAGLE][ActiveSlots] cudaMemsetAsync(active_inverse) failed: err=%d (%s)\n",
+                         static_cast<int>(err),
+                         cudaGetErrorString(err));
+        }
+    }
+
+    const int threads = 128;
+    const int blocks  = (params.batch_size + threads - 1) / threads;
+    computeActiveSlotsKernel<<<blocks, threads, 0, params.stream>>>(params.finished,
+                                                                     params.sequence_lengths,
+                                                                     params.seq_limit_len,
+                                                                     params.batch_size,
+                                                                     params.max_batch_size,
+                                                                     params.active_slots,
+                                                                     params.active_inverse,
+                                                                     params.active_count);
+
+    if (::turbomind::isEagleDebugEnabled()) {
+        auto err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[EAGLE][ActiveSlots] kernel error: err=%d (%s) batch_size=%d max_batch_size=%d\n",
+                         static_cast<int>(err),
+                         cudaGetErrorString(err),
+                         params.batch_size,
+                         params.max_batch_size);
+        }
+    }
+}
 
 namespace {
 

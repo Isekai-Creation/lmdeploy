@@ -1,9 +1,9 @@
 #include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/logger.h"
-#include "src/turbomind/kernels/attention/attention_params.h"
 #include "src/turbomind/core/tensor.h"
 #include "src/turbomind/utils/eagle_debug.h"
+#include "src/turbomind/kernels/attention/attention_params.h"
 
 #include <type_traits>
 #include <cstdlib>
@@ -14,11 +14,10 @@
 namespace turbomind {
 
 namespace ft {
-// Device-side FMHA tile statistics array declared in
-// eagle3_attention_kernels.cu. We treat it as an opaque array here
-// and index it using the same enum values as in the CUDA file.
-extern __device__ unsigned long long g_eagle3_fmha_tile_stats[];
+// Helper function to get the address of the device-side tile statistics.
+cudaError_t GetEagle3FmhaTileStats(void** dev_ptr);
 }  // namespace ft
+
 
 namespace {
 
@@ -418,6 +417,12 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                 }
             }
 
+            // Populate a unified AttentionParams view for this Eagle3 FMHA
+            // launch so that we stay aligned with the rest of the TurboMind
+            // attention stack. Today this is only used for debug /
+            // introspection – the actual kernels below take raw pointers –
+            // but it keeps all of the tree / span / mask wiring in one
+            // struct that can be surfaced to generic helpers later.
             AttentionParams<T> fmha{};
             fmha.out     = ctx.data<T>();
             fmha.q       = qkv.data<T>();
@@ -439,9 +444,10 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
 
             fmha.spec_runtime_offsets    = runtime_offsets ? runtime_offsets->data<int32_t>() : nullptr;
             fmha.spec_tree_offsets       = tree_offsets ? tree_offsets->data<int32_t>() : nullptr;
-            fmha.spec_successor_offsets  = param.successor_offsets ? param.successor_offsets->data<int32_t>() : nullptr;
-            fmha.spec_successor_counts   = param.successor_counts ? param.successor_counts->data<int32_t>() : nullptr;
-            fmha.spec_tree_batch_size    = batch_size;
+            fmha.spec_successor_offsets  =
+                param.successor_offsets ? param.successor_offsets->data<int32_t>() : nullptr;
+            fmha.spec_successor_counts = param.successor_counts ? param.successor_counts->data<int32_t>() : nullptr;
+            fmha.spec_tree_batch_size  = batch_size;
 
             fmha.spec_kv_start_per_token = kv_start_t.data<int32_t>();
             fmha.spec_kv_len_per_token   = kv_len_t.data<int32_t>();
@@ -566,8 +572,8 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
                     tile_stats_initialized = true;
                     void*  dev_ptr  = nullptr;
                     size_t dev_size = 0;
-                    check_cuda_error(cudaGetSymbolAddress(&dev_ptr, ft::g_eagle3_fmha_tile_stats));
-                    dev_size = static_cast<size_t>(kEagle3FmhaTilesCount) * sizeof(unsigned long long);
+                    check_cuda_error(ft::GetEagle3FmhaTileStats(&dev_ptr));
+                    dev_size = static_cast<size_t>(4) * sizeof(unsigned long long);
                     check_cuda_error(cudaMemsetAsync(dev_ptr, 0, dev_size, stream_));
                     check_cuda_error(cudaStreamSynchronize(stream_));
                 }
@@ -654,7 +660,7 @@ void Eagle3AttentionLayer::Forward(Eagle3AttentionParam& param)
             if (fmha_tile_stats) {
                 void*  dev_ptr  = nullptr;
                 size_t dev_size = 0;
-                check_cuda_error(cudaGetSymbolAddress(&dev_ptr, ft::g_eagle3_fmha_tile_stats));
+                check_cuda_error(ft::GetEagle3FmhaTileStats(&dev_ptr));
                 dev_size = static_cast<size_t>(kEagle3FmhaTilesCount) * sizeof(unsigned long long);
                 unsigned long long h_stats[kEagle3FmhaTilesCount] = {};
                 check_cuda_error(cudaMemcpyAsync(

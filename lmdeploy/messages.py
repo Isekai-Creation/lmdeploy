@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from __future__ import annotations
 import enum
 import time
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
 from lmdeploy.speculative_config import SpeculativeConfig
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationRequest
+from lmdeploy.pytorch.config import TurboMindSchedulerConfig, TurboMindKVConfig
 
 from .tokenizer import Tokenizer
 from .utils import get_logger
@@ -277,136 +279,325 @@ class TurbomindEngineConfig:
         assert self.dtype in ["auto", "float16", "bfloat16"]
         assert self.tp >= 1, "tp must be a positive integer"
         assert self.cache_max_entry_count > 0, "invalid cache_max_entry_count"
-        # TurboMind backend supports fp16/bf16 (0), int4 (4), int8 (8),
-        # and NVFP4 KV cache (16). Keep this in sync with QuantPolicy.
         assert self.quant_policy in (0, 4, 8, 16), "invalid quant_policy"
         assert self.rope_scaling_factor >= 0, "invalid rope_scaling_factor"
         assert self.max_prefill_token_num >= 0, "invalid max_prefill_token_num"
         assert self.num_tokens_per_iter >= 0, "invalid num_tokens_per_iter"
 
 
+class TurboMindEngineConfig(TurbomindEngineConfig):
+    """Backwards-compatible alias for newer API name."""
+    pass
+
+
+
+
+
 @dataclass
+
+class DriftEngineConfig:
+
+    # Model / parallelism
+
+    model_path: str
+
+    tp: int = 1
+
+    pp: int = 1
+
+    session_len: int = 8192
+
+    max_batch_size: int = 256
+
+    dtype: Literal["fp16", "bf16", "fp8"] = "fp16"
+
+
+
+    # Scheduler
+
+    scheduler: TurboMindSchedulerConfig = field(default_factory=TurboMindSchedulerConfig)
+
+    kv: TurboMindKVConfig = field(default_factory=TurboMindKVConfig)
+
+
+
+    # Drift-specific tuning
+
+    prefer_high_throughput: bool = True
+
+    # When True, bias scheduler toward larger batches and chunked prefill.
+
+    target_latency_ms_p50: int = 50
+
+    target_latency_ms_p95: int = 200
+
+    # Expose trade-off knobs:
+
+    decode_microbatch_size: int | None = None
+
+    prefill_microbatch_size: int | None = None
+
+
+
+    # Instrumentation / safety
+
+    max_queued_requests: int = 4096
+
+    abort_on_oom: bool = True
+
+    log_level: Literal["info", "debug", "warning"] = "info"
+
+
+
+
+
+@dataclass
+
 class PytorchEngineConfig:
+
     """PyTorch Engine Config.
 
+
+
     Args:
+
         dtype (str): data type for model weights and activations. It can be
+
             one of the following values, ['auto', 'float16', 'bfloat16']
+
             The `auto` option will use FP16 precision for FP32 and FP16
+
             models, and BF16 precision for BF16 models.
+
         tp (int): Tensor Parallelism. default 1.
+
         dp (int): Data Parallelism. default 1.
+
         dp_rank (int): rank of dp.
+
         ep (int): Expert Parallelism. default 1.
+
         session_len (int): Max session length. Default None.
+
         max_batch_size (int): Max batch size. If it is not specified,
+
             the engine will automatically set it according to the device
+
         attn_tp_size (int): tp size for attention, only works for dp>1
+
         mlp_tp_size (int): tp size for mlp, only works for dp>1
+
         moe_tp_size (int): tp size for moe, only works for dp>1
+
         cache_max_entry_count (float): the percentage of gpu memory occupied
+
             by the k/v cache. For lmdeploy versions greater than `v0.2.1`,
+
             it defaults to 0.8, signifying the percentage of FREE GPU memory
+
             to be reserved for the k/v cache
+
         prefill_interval (int): Interval to perform prefill,
+
             Default 16.
+
         block_size (int): paging cache block size, default 64.
+
         num_cpu_blocks (int): Num cpu blocks. If num is 0, cache
+
             would be allocate according to current environment.
+
         num_gpu_blocks (int): Num gpu blocks. If num is 0, cache
+
             would be allocate according to current environment.
+
         adapters (dict): The path configs to lora adapters.
+
         max_prefill_token_num (int): tokens per iteration.
+
         thread_safe (bool): thread safe engine instance.
+
         enable_prefix_caching (bool): Enable token match and sharing caches.
+
         device_type (str): The inference device type, options ['cuda']
+
         eager_mode (bool): Enable "eager" mode or not
+
         custom_module_map (Dict): nn module map customized by users. Once
+
             provided, the original nn modules of the model will be
+
             substituted by the mapping ones
+
         download_dir (str): Directory to download and load the weights,
+
             default to the default cache directory of huggingface.
+
         revision (str): The specific model version to use.
+
             It can be a branch name, a tag name, or a commit id.
+
             If unspecified, will use the default version.
+
         quant_policy (int): default to 0. When k/v is quantized into 4 or 8
+
             bit, set it to 4 or 8, respectively
+
         distributed_executor_backend (str): backend of distributed backend,
+
             options: ['uni', 'mp', 'ray']
+
         empty_init (bool): Whether to load the model weights, you should set
+
             it to True if you want to update weights after create the pipeline
+
         enable_microbatch (bool): enable microbatch for specified model
+
         enable_eplb (bool): enable eplb for specified model
+
         enable_metrics (bool): enable metrics system
+
         role (EngineRole): role of engin, options: ['Hybrid', 'Prefill',
+
             'Decode']. Default to `EngineRole.Hybrid`.
+
         migration_backend: migration backend. options: ['DLSlime'].
+
             Default to `MigrationBackend.DLSlime`.
+
         enable_mp_engine (bool): run engine in multi-process mode.
+
         mp_engine_backend (str): backend of mp engine, options:
+
             ['mp', 'ray']. Default to `mp`.
+
         model_format (str): weight quantization policy, options: ['fp8'].
+
         hf_overrides (Dict[str, Any]): Huggingface overrides for the model.
+
             It can be used to override the default config of the model,
+
         disable_vision_encoder (bool): Whether to disable loading vision
+
             encoder. Default to False.
+
         logprobs_mode (str): The mode of logprob, options: ['raw_logits', 'raw_logprobs']
+
         dllm_block_length (int): Block size of block diffusion model.
+
         dllm_unmasking_strategy (str): Dllm unmasking strategy, options:
+
             ['low_confidence_dynamic', 'low_confidence_static', 'sequential'].
+
         dllm_denoising_steps (int): Dllm denoising steps.
+
         dllm_confidence_threshold (float): dllm unmasking threshold for
+
             dynamic unmasking.
+
     """
 
+
+
     dtype: str = "auto"
+
     tp: int = 1
+
     dp: int = 1
+
     dp_rank: int = 0
+
     ep: int = 1
+
     session_len: int = None
+
     max_batch_size: int = None
+
     attn_tp_size: int = None
+
     mlp_tp_size: int = None
+
     moe_tp_size: int = None
+
     cache_max_entry_count: float = 0.8
+
     prefill_interval: int = 16
+
     block_size: int = 64
+
     num_cpu_blocks: int = 0
+
     num_gpu_blocks: int = 0
+
     adapters: Dict[str, str] = None
+
     max_prefill_token_num: int = 4096
+
     thread_safe: bool = False
+
     enable_prefix_caching: bool = False
+
     device_type: str = "cuda"
+
     eager_mode: bool = False
+
     custom_module_map: Dict[str, str] = None
+
     download_dir: str = None
+
     revision: str = None
+
     quant_policy: Literal[0, 4, 8] = 0
+
     distributed_executor_backend: str = None
+
     empty_init: bool = False
+
     enable_microbatch: bool = False
+
     enable_eplb: bool = False
+
     enable_mp_engine: bool = False
+
     mp_engine_backend: str = "mp"
+
     model_format: str = None
+
     enable_metrics: bool = True
+
     hf_overrides: Optional[Dict[str, Any]] = None
+
     disable_vision_encoder: bool = False
+
     logprobs_mode: str = None
+
     # router replay
+
     enable_return_routed_experts: bool = False
+
     enable_transfer_obj_ref: bool = False
 
+
+
     # dllm
+
     dllm_block_length: int = None
+
     dllm_unmasking_strategy: str = "low_confidence_dynamic"
+
     dllm_denoising_steps: int = None
+
     dllm_confidence_threshold: float = 0.85
 
+
+
     role: EngineRole = EngineRole.Hybrid
+
     migration_backend: MigrationBackend = MigrationBackend.DLSlime
+
+    scheduler: TurboMindSchedulerConfig = field(default_factory=TurboMindSchedulerConfig)
+
+    kv: TurboMindKVConfig = field(default_factory=TurboMindKVConfig)
 
     def __post_init__(self):
         """Check input validation."""

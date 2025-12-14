@@ -1,11 +1,12 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.11)
 
 
 add_library(Llama STATIC
         LlamaV2.cc
         LlamaBatch.cc
+        ../common/model_layout.cc
         specpv_kv_cache.cc
         LlamaLinear.cu
         eagle3_attention_kernels.cu

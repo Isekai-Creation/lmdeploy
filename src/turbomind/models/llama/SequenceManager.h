@@ -5,58 +5,12 @@
 #include <functional>
 
 #include "src/turbomind/core/allocator.h"
+#include "src/turbomind/core/sequence.h" // Add include for new Sequence.h
 
 #include "src/turbomind/models/llama/BlockManager.h"
 #include "src/turbomind/models/llama/BlockTrie.h"
 
 namespace turbomind {
-
-struct Sequence {
-
-    enum Status
-    {
-        kCached = 0,
-        kLocked,
-        kActive
-    };
-
-    uint64_t id;
-    Status   status = kCached;
-
-    BlockIds  blocks;
-    UniqueIds block_unique_ids;
-
-    int input_length = 0;  // the number of tokens to be processed in each forward iter
-
-    mutable std::vector<int> prompt;
-
-    mutable std::vector<int> tokens;  // update by user or when the sequence is finished
-
-    mutable int cache_len = 0;
-
-    // additional data kept round-to-round
-    mutable std::vector<std::byte> random_state;  // update by user
-
-    mutable float rope_theta = 0.f;
-
-    // embedding data
-    mutable std::vector<std::vector<std::byte>> input_embeddings;
-    mutable std::vector<std::pair<int, int>>    input_embedding_ranges;
-
-    explicit Sequence(uint64_t _id): id(_id) {}
-
-    friend std::ostream& operator<<(std::ostream& os, const Sequence& seq);
-};
-
-using Sequences = std::vector<const Sequence*>;
-
-inline std::ostream& operator<<(std::ostream& os, const Sequence& seq)
-{
-    os << "id=" << seq.id << ", status=" << seq.status << ", token_count=" << seq.tokens.size()
-       << ", block_count=" << seq.blocks.size() << ", cache_len=" << seq.cache_len
-       << ", random_state_size=" << seq.random_state.size() << ", input_length=" << seq.input_length;
-    return os;
-}
 
 class SequenceManager {
 public:

@@ -261,6 +261,32 @@ struct KVCacheRewindParams {
 
 void invokeKVCacheRewind(KVCacheRewindParams const& params);
 
+struct ActiveSlotsParams {
+    const bool* finished{nullptr};        // [max_batch_size]
+    const int*  sequence_lengths{nullptr}; // [max_batch_size]
+    const int*  seq_limit_len{nullptr};    // [max_batch_size]
+    int         batch_size{0};            // logical decode batch for this step
+    int         max_batch_size{0};        // engine_param_.max_batch_size
+    int*        active_slots{nullptr};    // [max_batch_size] compact list of active slots
+    int*        active_inverse{nullptr};  // [max_batch_size] slot -> compact index or -1
+    int*        active_count{nullptr};    // [1] scalar count of active slots
+    cudaStream_t stream{};                // CUDA stream
+};
+
+// Compute the compact set of active slots for an EAGLE step.
+//
+// A slot is considered active when:
+//   - finished[slot] == false
+//   - sequence_lengths[slot] < seq_limit_len[slot] (when seq_limit_len provided)
+//
+// The kernel writes:
+//   active_slots[0..active_count-1]  = slot indices
+//   active_inverse[slot]             = compact index in [0, active_count) or -1
+//   *active_count                    = number of active slots
+//
+// active_inverse is optional and may be null when not needed.
+void launchComputeActiveSlots(const ActiveSlotsParams& params);
+
 struct EntropyMaskParams {
     float const* logits{nullptr};             // [rows, cols]
     float*       logits_out{nullptr};         // optional out (if null, in-place)

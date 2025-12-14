@@ -62,7 +62,9 @@ def run_once(
         "--measurement-runs",
         "1",
     ]
-    subprocess.run(cmd, check=True, cwd=str(Path(__file__).resolve().parents[2]), env=env)
+    # Run from the repository root (parents[3]) so benchmark_speculative.py
+    # is resolved correctly when this script lives under LM/lmdeploy/tools.
+    subprocess.run(cmd, check=True, cwd=str(Path(__file__).resolve().parents[3]), env=env)
 
     # Pick the relevant JSON for this scenario.
     if scenario == "single":
@@ -143,4 +145,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -31,6 +31,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions(-DENABLE_BF16=1)
 endif()
 
+# Enable FP4 KV cache support.
+add_definitions(-DENABLE_FP4=1)
+
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
 
 option(BUILD_MULTI_GPU "Build multi-gpu support" ON)
@@ -221,30 +224,9 @@ endif()
 
 
 if(ARCH STREQUAL "x86_64")
-  if (NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "")
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS "13.0")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 70-real 75-real)  # V100, 2080
-    endif()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 80-real) # A100
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11.1")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 86-real) # 3090
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11.8")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real) # 4090
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "12.0")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 90a-real) # H100
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "12.8")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real) # 5090
-    endif ()
-    if (MSVC)
-      list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES 80-real 90a-real)
-    endif ()
-  endif ()
+  # Build for Ada/Hopper and Blackwell GPUs. This enables BF16/FP4 paths
+  # on 8.9/9.0a while also generating native kernels for sm_120.
+  set(CMAKE_CUDA_ARCHITECTURES "89-real;90a-real;120-real")
 elseif(ARCH STREQUAL "aarch64")
   if (NOT CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 72-real 87-real)  # Jetson

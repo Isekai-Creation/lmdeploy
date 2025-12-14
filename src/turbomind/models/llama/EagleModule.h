@@ -247,6 +247,7 @@ private:
     // Cached model dims / dtype
     int      hidden_units_{0};        // legacy default (draft hidden unless overridden)
     int      vocab_size_{0};
+    int      draft_vocab_size_{0};
     DataType weight_dtype_{kFloat16};
     float rope_base_{10000.0f};
     float rope_scale_{1.0f};

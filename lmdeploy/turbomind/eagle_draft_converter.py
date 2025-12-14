@@ -83,6 +83,13 @@ def _write_tensor(t: torch.Tensor, path: str, dtype: torch.dtype) -> None:
     arr.tofile(path)
 
 
+def _write_int32_vector(v: torch.Tensor, path: str) -> None:
+    """Write a 1D int32 tensor as raw binary."""
+    v = v.to(torch.int32).contiguous().view(-1).cpu().numpy()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    v.tofile(path)
+
+
 def _find_safetensor_shards(path: str) -> Iterable[str]:
     """Return all *.safetensors shards under ``path`` (sorted)."""
     return sorted(glob.glob(os.path.join(path, "*.safetensors")))
@@ -402,6 +409,7 @@ def _convert_eagle3_midlayer(
     vocab_size: int,
     inter_size: int,
     base_model_dir: Optional[str],
+    draft_vocab_size: Optional[int],
     logger=None,
 ) -> None:
     """Handle NVIDIA GPT-OSS Eagle3 midlayer checkpoint (model.safetensors).
@@ -443,7 +451,65 @@ def _convert_eagle3_midlayer(
             f"LM head output dimension mismatch: "
             f"Expected {hidden_size}, got {lm_head.shape[0]}"
         )
-    _write_tensor(lm_head, os.path.join(out_dir, "output.weight"), w_dtype)
+
+    # Decide draft vocab for the draft LM-head. When an explicit
+    # draft_vocab_size is provided and smaller than the full vocab, we
+    # slice the LM head to [hidden, draft_vocab] to cut FLOPs on the
+    # draft path. Otherwise we keep the full vocab.
+    if draft_vocab_size is not None and draft_vocab_size > 0:
+        draft_vocab = min(int(draft_vocab_size), vocab_size)
+    else:
+        draft_vocab = vocab_size
+
+    lm_head_draft = lm_head[:, :draft_vocab].contiguous()
+    _write_tensor(lm_head_draft, os.path.join(out_dir, "output.weight"), w_dtype)
+
+    # Optional draft-id -> full-vocab-id remap. For Eagle-3, HF
+    # checkpoints typically expose a "d2t" tensor whose entries are
+    # offsets between draft vocab ids and target vocab ids. When
+    # present we integrate it into a direct mapping; otherwise we fall
+    # back to identity so downstream code can always treat draft ids as
+    # full-vocab ids.
+    map_path = os.path.join(out_dir, "draft_id_to_target_id.weight")
+    d2t_key: Optional[str] = None
+    for k in keys:
+        if "d2t" in k:
+            d2t_key = k
+            break
+
+    mapping: Optional[torch.Tensor] = None
+    if d2t_key is not None:
+        try:
+            d2t = _load_tensor_from_shards(shards, d2t_key, optional=True)
+        except Exception:
+            d2t = None
+        if d2t is not None:
+            d2t = d2t.to(torch.int64).view(-1)
+            if d2t.numel() >= draft_vocab:
+                d2t = d2t[:draft_vocab]
+                base = torch.arange(draft_vocab, dtype=torch.int64)
+                mapping = base + d2t
+                if vocab_size > 0:
+                    mapping.clamp_(0, vocab_size - 1)
+            elif log:
+                log.warning(
+                    "Eagle3 d2t tensor length %d < draft_vocab_size %d; "
+                    "ignoring d2t and using identity mapping.",
+                    d2t.numel(),
+                    draft_vocab,
+                )
+
+    if mapping is None:
+        if log and draft_vocab < vocab_size:
+            log.warning(
+                "No Eagle3 d2t mapping found; using identity "
+                "draft_id_to_target_id for draft_vocab_size=%d (<= vocab_size=%d).",
+                draft_vocab,
+                vocab_size,
+            )
+        mapping = torch.arange(draft_vocab, dtype=torch.int32)
+
+    _write_int32_vector(mapping, map_path)
 
     # Token embeddings: populate from base model if available, else zeros.
     tok_emb_path = os.path.join(out_dir, "tok_embeddings.weight")
@@ -766,6 +832,16 @@ def prepare_eagle_draft_from_hf(
     cfg = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
     hidden_size = int(getattr(cfg, "hidden_size"))
     vocab_size = int(getattr(cfg, "vocab_size"))
+
+    # Optional draft vocab size for Eagle-3: when present, this is the
+    # size of the reduced LM head / draft vocab used by the draft
+    # model. TurboMind keeps model_config.vocab_size equal to the full
+    # target vocab and records draft_vocab_size separately.
+    draft_vocab_size_cfg = int(getattr(cfg, "draft_vocab_size", 0) or 0)
+    if draft_vocab_size_cfg > 0 and draft_vocab_size_cfg <= vocab_size:
+        draft_vocab_size: Optional[int] = draft_vocab_size_cfg
+    else:
+        draft_vocab_size = None
     num_heads = int(getattr(cfg, "num_attention_heads"))
     head_dim: Optional[int] = getattr(cfg, "head_dim", None)
     if head_dim is None and num_heads > 0:
@@ -834,6 +910,12 @@ def prepare_eagle_draft_from_hf(
         model_cfg["eagle_capture_layers"] = [1, 17, 32]
         model_cfg["eagle_num_capture_layers"] = len(model_cfg["eagle_capture_layers"])
 
+    # Record draft_vocab_size when present so EagleModule can allocate
+    # a reduced LM head and draft-id mapping. When absent we fall back
+    # to full-vocab draft LM head.
+    if draft_vocab_size is not None:
+        model_cfg["draft_vocab_size"] = int(draft_vocab_size)
+
     tm_cfg = {"model_config": model_cfg}
     with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(tm_cfg, f)
@@ -848,6 +930,7 @@ def prepare_eagle_draft_from_hf(
             vocab_size,
             inter_size,
             base_model_dir,
+            draft_vocab_size,
             logger=log,
         )
     elif layout == "llama_like":

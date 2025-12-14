@@ -12,6 +12,7 @@
 
 #include "src/turbomind/kernels/attention/impl.h"
 #include "src/turbomind/kernels/attention/quantization.h"
+#include "src/turbomind/kernels/attention/fp4_kv_utils.h"
 
 namespace turbomind::attention {
 
@@ -31,6 +32,7 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
     using Tkv = Tkv_;
 
     static constexpr int kQuantKV = !std::is_same_v<T, Tkv>;
+    static constexpr bool kFp4Mx  = std::is_same_v<Tkv, fp4_e2m1_t>;
 
     static constexpr int CTA_H = CTA_H_;
     static constexpr int CTA_Q = CTA_Q_;
@@ -144,12 +146,13 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
 
     using SmemLayoutKVp = SmemLayoutV2<CTA_S, 2, CTA_S, 2, Identity>;
 
-    using SmemM = float[K_M][kWarpCntH][kWarpCntS];
-    using SmemL = float[K_M][kWarpCntH][kWarpCntS];
-    using SmemO = Array<float, 4>[V_M][V_N][2][kWarpCntH][kWarpCntS][T_D];  // (Qm, Dn, d2, Hw, Sw, d8), (d4)
-                                                                            //   1  64   4  WH  WS   8     1
+    using BlockIterator_ = BlockIterator<block::Head<T, Tkv, block::Layout<block::Config<T, Tkv, HeadDim>>>, CTA_S>;
 
     using PointerKV = get_pointer_type<Tkv>;
+
+    using SmemM = Array<float, 1>[K_M][kWarpCntS];
+    using SmemL = Array<float, 1>[K_M][kWarpCntS];
+    using SmemO = Array<float, VEC>[V_M][V_N][V_N][kWarpCntH][kWarpCntS][T_D];
 
     union SharedStorage {
         __align__(16) T Q[SmemLayoutQ::kSize];
@@ -257,8 +260,9 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
         FragK     frag_K;
         DataK     data_K;
         ParamK    param_K;
+        const BlockIterator_& cache_iter_;
 
-        __device__ StateQK(SharedStorage& storage, FragQ frag_Q_)
+        __device__ StateQK(SharedStorage& storage, FragQ frag_Q_, const BlockIterator_& cache_iter) : cache_iter_(cache_iter)
         {
             smem_K       = storage.KV.data();
             smem_K_param = storage.KVp;
@@ -281,7 +285,7 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
             const int offset_s = lane_id / T_D * S_S_thr + warp_id * WARP_S;
             const int offset_c = lane_id % T_D * S_D_thr;
 
-            if (kQuantKV && n == 0) {
+            if (kQuantKV && !kFp4Mx && n == 0) {
                 PRAGMA_UNROLL
                 for (int n = 0; n < K_N; ++n) {
                     const int si = n * S_S + offset_s;
@@ -302,8 +306,13 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
         {
             PRAGMA_UNROLL
             for (int k = 0; k < K_K; ++k) {
-                ConvertKvCache<Tkv, Tqk> convert(param_K[n][0], param_K[n][1]);
-                frag_K[n][k] = convert(data_K[n][k]);
+                if constexpr (kFp4Mx) {
+                    frag_K[n][k] = ConvertKvCache<Tkv, Tqk>::convert(data_K[n][k]);
+                }
+                else {
+                    ConvertKvCache<Tkv, Tqk> convert(param_K[n][0], param_K[n][1]);
+                    frag_K[n][k] = convert(data_K[n][k]);
+                }
             }
         }
     };
@@ -365,8 +374,9 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
         FragV     frag_V;
         DataV     data_V;
         ParamV    param_V;
+        const BlockIterator_& cache_iter_;
 
-        __device__ StatePV(SharedStorage& storage, bool offset = false)
+        __device__ StatePV(SharedStorage& storage, bool offset, const BlockIterator_& cache_iter) : cache_iter_(cache_iter)
         {
             smem_V       = storage.KV.data() + (offset ? SmemLayoutK::kSize : 0);
             smem_V_param = storage.KVp + (offset ? SmemLayoutKVp::kSize : 0);
@@ -380,11 +390,11 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
             const int offset_s = lane_id / T_D * S_S_thr + warp_id * WARP_S;
             const int offset_c = lane_id % T_D * S_D_thr;
 
-            if (kQuantKV && k == 0) {
+            if (kQuantKV && !kFp4Mx && k == 0) {
                 PRAGMA_UNROLL
-                for (int k = 0; k < V_K; ++k) {
-                    const int si = k * S_S + offset_s;
-                    Lds(param_V[k], &smem_V_param[pipe_iter * SmemLayoutKVp::kSize + SmemLayoutKVp::apply(si, 0)]);
+                for (int kk = 0; kk < V_K; ++kk) {
+                    const int si = kk * S_S + offset_s;
+                    Lds(param_V[kk], &smem_V_param[pipe_iter * SmemLayoutKVp::kSize + SmemLayoutKVp::apply(si, 0)]);
                 }
             }
 
@@ -401,8 +411,13 @@ struct Impl<MMA_SIMT, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S,
         {
             PRAGMA_UNROLL
             for (int n = 0; n < V_N; ++n) {
-                ConvertKvCache<Tkv, Tpv> convert(param_V[k][0], param_V[k][1]);
-                frag_V[k][n] = convert(data_V[k][n]);
+                if constexpr (kFp4Mx) {
+                    frag_V[k][n] = ConvertKvCache<Tkv, Tpv>::convert(data_V[k][n]);
+                }
+                else {
+                    ConvertKvCache<Tkv, Tpv> convert(param_V[k][0], param_V[k][1]);
+                    frag_V[k][n] = convert(data_V[k][n]);
+                }
             }
         }
     };

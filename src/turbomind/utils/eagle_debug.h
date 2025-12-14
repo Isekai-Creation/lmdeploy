@@ -13,8 +13,8 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <map>
-#include <mutex>
 #include <string>
 #include <vector>
 #ifndef _WIN32
@@ -131,11 +131,32 @@ inline std::map<EagleGemmShapeKey, std::uint64_t>& eagleGemmShapeCounts()
     return counts;
 }
 
-inline std::mutex& eagleGemmShapeMutex()
+struct EagleSpinLock {
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+};
+
+inline EagleSpinLock& eagleGemmShapeLock()
 {
-    static std::mutex m;
-    return m;
+    static EagleSpinLock lock;
+    return lock;
 }
+
+class EagleSpinGuard {
+public:
+    explicit EagleSpinGuard(EagleSpinLock& lock): lock_(lock)
+    {
+        while (lock_.flag.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+
+    ~EagleSpinGuard()
+    {
+        lock_.flag.clear(std::memory_order_release);
+    }
+
+private:
+    EagleSpinLock& lock_;
+};
 
 inline void EagleGemmShapeSummaryAtExit()
 {
@@ -150,7 +171,7 @@ inline void EagleGemmShapeSummaryAtExit()
 
     std::vector<std::pair<EagleGemmShapeKey, std::uint64_t>> entries;
     {
-        std::lock_guard<std::mutex> lock(eagleGemmShapeMutex());
+        EagleSpinGuard guard(eagleGemmShapeLock());
         entries.assign(counts.begin(), counts.end());
     }
 
@@ -250,7 +271,7 @@ inline void logEagleGemmShape(const char* tag,
 
     auto& counts = eagleGemmShapeCounts();
     {
-        std::lock_guard<std::mutex> lock(eagleGemmShapeMutex());
+        EagleSpinGuard guard(eagleGemmShapeLock());
         counts[key] += 1;
     }
 }

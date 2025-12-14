@@ -116,11 +116,27 @@ It is written to support work on GPT‑OSS‑120B and EAGLE3, with the explicit 
       - Partial KV cache (SpecPV) for EAGLE3 target‑tree decode and partial verification.
     - `src/turbomind/kernels/attention/fp4_kv_utils.h`:
       - Utilities for NVFP4 KV quantization (kernel‑side).
+    - `src/turbomind/models/common/model_layout.{h,cc}`:
+      - `ModelLayout` and `make_gpt_oss_120b_layout()` define a canonical KV geometry (layers, KV heads, head dim, page size, max seq len) for GPT‑OSS‑120B.
+    - `src/turbomind/core/kv_cache_manager.{h,cc}`:
+      - Engine‑level `KVCacheManager` that owns a contiguous KV buffer, exposes paged allocation via `KVLayout`, and supports:
+        - `estimate_usage(ModelLayout, prompt_len, max_new_tokens)` → `KVUsageEstimate`.
+        - `can_reserve` / `reserve` / `release` by `seq_id` with optional shared pages from prefix cache.
+        - `page_for`, `get_page_data_ptr`, `get_sequence_page_ids` for attention kernels.
+      - Uses per‑page reference counts so shared prefixes can safely reuse KV pages.
+    - `src/turbomind/core/prefix_cache.{h,cc}`:
+      - `PrefixCache` maps `PrefixKey` (tokens, namespace) → KV page indices with LRU eviction and basic metrics (hits, misses, evictions, bytes evicted).
+      - Integrates with `KVCacheManager` to release pages on erase/evict.
+    - `src/turbomind/engine/capacity_scheduler.{h,cc}`:
+      - `CapacityScheduler` wraps `KVCacheManager` + `PrefixCache` to implement KV‑aware admission:
+        - `try_start_request(seq_id, KVUsageEstimate, pre_existing_page_ids)` with bounded eviction retries.
+        - `finish_request(seq_id)` to release KV and clear any cached prefix for that sequence.
   - KV cache characteristics:
     - Page/block‑structured KV with support for:
       - Long context (hierarchical layout).
       - Partial KV reuse for speculative decoding (SpecPV).
       - NVFP4 compression for KV to reduce memory bandwidth and footprint.
+      - Non‑speculative page‑level reuse for shared prefixes via `PrefixCache` + `KVCacheManager`.
 
 - **Speculative decoding kernels (EAGLE / EAGLE3 / DeepSeek MTP)**
   - `src/turbomind/kernels/speculative_decoding` (wired via `eagle_kernels` in `src/turbomind/kernels/CMakeLists.txt`):
@@ -130,6 +146,40 @@ It is written to support work on GPT‑OSS‑120B and EAGLE3, with the explicit 
     - Draft tree acceptance logic (verify longest valid prefix).
     - Packed / leaf masks for efficient tree traversal on GPU.
     - Partial KV rewind/commit (SpecPV) when draft tokens are rejected.
+
+- **Engine‑level scheduler & DriftEngine (non‑speculative GPT‑OSS‑120B)**
+  - `src/turbomind/engine/scheduler_config.h`:
+    - `SchedulerConfig` encodes per‑step limits and policy:
+      - `max_num_batched_tokens`, `max_num_seqs`.
+      - `enable_chunked_prefill`, `max_num_partial_prefills`, `long_prefill_token_threshold`.
+      - `prefer_decode_over_prefill`, latency targets (`target_latency_ms_p50/p95`), `enable_prefix_caching`.
+  - `src/turbomind/engine/EngineScheduler.{h,cc}`:
+    - Maintains per‑sequence state:
+      - `SequenceState` (prompt_len, prefilled_len, generated_len, max_new_tokens, `SequencePhase`).
+      - Maps `seq_id → SequenceState` plus active request and queue membership.
+    - Admits new requests via `on_new_requests(...)`:
+      - Validates `SessionParam` transitions.
+      - Optionally consults `PrefixCache` and `CapacityScheduler` before creating a `SequenceState`.
+      - Keeps explicit prefill and decode queues with debug checks for unique membership.
+    - Schedules work via `schedule_step(prefill_batch, decode_batch)`:
+      - Enforces per‑step token and sequence budgets.
+      - Computes `PrefillChunk{req, start_pos, len}` for long prompts (chunked prefill).
+      - Treats decode as 1‑token steps (non‑speculative) via `tokens_for_decode_step`.
+      - Uses `update_sequence_state` to manage phase transitions and release KV on `kFinished`.
+    - Adapts decode vs prefill share via `update_metrics(const DriftMetrics&)` and `decode_token_ratio_` / `prefill_token_ratio_`.
+  - `src/turbomind/engine/drift_engine_config.h`:
+    - `DriftEngineConfig` composes `SchedulerConfig`, `KVLayout`, `ModelLayout` and adds:
+      - `prefer_high_throughput`, latency targets, `max_queued_requests`, `abort_on_oom`.
+  - `src/turbomind/engine/drift_engine.{h,cc}`:
+    - `DriftEngine` is a non‑speculative TurboMind backend that orchestrates:
+      - `Gateway` (request routing), `EngineScheduler`, `KVCacheManager`, `PrefixCache`, `CapacityScheduler`, and `LlamaBatch`.
+    - `worker_loop(rank)`:
+      - Uses `gateway_->pop(...)` to pull new/kill requests,
+        feeds them to `scheduler_.on_new_requests(...)`,
+        calls `scheduler_.schedule_step(...)` to build `prefill_batch` / `decode_batch`,
+        executes them via `LlamaBatch::execute_batches(...)`,
+        and notifies the gateway with any produced signals.
+    - Shutdown is driven via an `abort_` flag; threading policy (per‑rank worker threads/processes) is owned by the higher‑level server.
 
 ### 1.2 Execution Model
 
@@ -444,5 +494,51 @@ The engines above share several themes that are critical for GPT‑OSS‑120B pe
   - TurboMind:
     - Implements EAGLE/EAGLE3 kernels and SpecPV partial KV in C++.
     - Engine‑level interfaces (generation config, KV rewind/commit, scheduler integration) are present but can be tightened and better documented.
+
+### 6.1 SGLang‑Style Config Parity for TurboMind / DriftEngine
+
+From a configuration and behavior point of view, the key SGLang knobs we care about are:
+
+- **Scheduler / batching knobs**
+  - `max-running-requests`, `max-queued-requests`, `max-total-tokens`.
+  - `chunked-prefill-size`, `max-prefill-tokens`.
+  - `schedule-policy` and priority controls.
+- **KV / prefix cache knobs**
+  - `page-size`, hybrid KV ratios, radix eviction policy, enable/disable prefix cache.
+- **Backend knobs**
+  - Attention backends (prefill vs decode), sampling backend.
+- **Speculative knobs**
+  - Algorithm choice and draft/acceptance parameters (EAGLE/EAGLE3/NGRAM, etc.).
+  - MoE‑specific controls (expert parallelism, communication backends).
+
+TurboMind/DriftEngine already has direct counterparts to most of these:
+
+- Python **TurboMindSchedulerConfig** and **TurboMindKVConfig** (see `lmdeploy/pytorch/config.py`) and **DriftEngineConfig** (see `lmdeploy/messages.py`) expose:
+  - Per‑step token/sequence budgets, chunked prefill flags, decode‑vs‑prefill preference and latency targets.
+  - KV layout controls (page size, capacity) and prefix cache enable/eviction policy.
+- C++ **SchedulerConfig**, **EngineScheduler**, **KVLayout/KVCacheManager**, **PrefixCache**, **CapacityScheduler**, and **DriftEngineConfig** give those knobs concrete semantics in the engine loop.
+
+To match SGLang “in spirit” for non‑speculative GPT‑OSS‑120B, the remaining work is:
+
+- **Complete config→behavior wiring**
+  - Ensure every Python knob in `TurboMindSchedulerConfig`, `TurboMindKVConfig`, and `DriftEngineConfig` is threaded into:
+    - `SchedulerConfig` / `EngineScheduler` (token budgets, chunked prefill, optional scheduling policy).
+    - `KVLayout` / `KVCacheManager` (page size, capacity, KV dtype where applicable).
+    - `PrefixCache` and `CapacityScheduler` (enable/disable, eviction behavior).
+  - Add an explicit `schedule_policy` enum to `SchedulerConfig` and implement at least:
+    - `fcfs` and a simple “short‑prompt‑first” policy for non‑spec DriftEngine.
+- **Observability**
+  - Export from C++ the metrics needed to tune and compare configs:
+    - Per‑step decode/prefill tokens and queue lengths (scheduler perspective).
+    - KV usage and eviction statistics (CapacityScheduler + KVCacheManager).
+    - Prefix cache hits, misses, evictions, and bytes evicted.
+  - Expose these metrics to Python so `pipeline` / `serve` and benchmark scripts can integrate them (similar to SGLang’s metrics flags).
+- **Benchmarks and gates**
+  - Build a minimal benchmark harness that can run:
+    - Legacy TurboMind, DriftEngine, and peer engines (vLLM, sglang, TensorRT‑LLM, EasyDeL) on the same workloads.
+  - Use throughput/latency/KV metrics to select default DriftEngine settings and define CI gates, instead of relying on guessed defaults.
+- **Speculative & MoE as a separate layer**
+  - Keep DriftEngine’s core scheduler non‑speculative in this document.
+  - Add a separate `SpeculativeConfig` (see `EAGLE_TODOS.md` / `SPECPV_TODO.md`) that mirrors SGLang’s `--speculative-*` knobs and maps onto TurboMind’s EAGLE/EAGLE3/SpecPV integration once the base non‑spec DriftEngine is stable.
 
 This ENGINE.md captures how LMDeploy/TurboMind is structured today and how peer engines in this repo approach KV management, scheduling, and speculative decoding. It is intended as a living reference while we optimize GPT‑OSS‑120B and EAGLE3 paths to surpass vLLM, sglang, TensorRT‑LLM, and EasyDeL on real workloads.

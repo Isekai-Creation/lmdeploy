@@ -10,6 +10,18 @@
 
 namespace turbomind {
 
+// Runtime decode-time quantization kind. This is orthogonal to
+// quant_policy's bitmask and deduced from KvCacheMode at dispatch:
+//   - kNone:    unquantized KV
+//   - kAffineInt: int4/int8 affine (scale, zero) KV cache
+//   - kFp4Mx:  FP4(E2M1) MXFP4-style KV cache with exponent scales
+enum class KvQuantKind : int
+{
+    kNone = 0,
+    kAffineInt,
+    kFp4Mx,
+};
+
 // 64-bit offsets may be needed
 struct LinearIteratorParams {
     const void* kv_cache;
@@ -83,6 +95,11 @@ struct AttentionParams {
     int  max_position_embeddings;
 
     int quant_policy;
+
+    // Decode-time KV quantization kind derived from KvCacheMode.
+    // This is set on the host side in dispatchDecoding and can be
+    // used by device code for assertions and quant-specific paths.
+    KvQuantKind kv_quant_kind{KvQuantKind::kNone};
 
     int    max_split_k;
     int*   split_cnt;

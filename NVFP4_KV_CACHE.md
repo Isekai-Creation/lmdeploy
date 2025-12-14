@@ -222,6 +222,55 @@ Key traits we will mirror:
   - NVFP4 KV cache requires FP8 context FMHA (Q path) and certain SMs (SM100/120/121).
   - MLA currently **does not** support NVFP4 KV (explicitly disabled in TRT‑LLM).
 
+### 2.3 NVIDIA Model‑Optimizer NVFP4 (weights side, used as KV reference)
+
+While TensorRT‑LLM implements the runtime kernels, **Model‑Optimizer** exposes the NVFP4 format and scaling semantics very explicitly in Python. We mirror those semantics for KV cache:
+
+- Core implementation: `modelopt/torch/quantization/qtensor/nvfp4_tensor.py`
+  - FP4 payload:
+    - Values are quantized to E2M1 using an `e2m1_values` LUT.
+    - FP4 codes are packed: `(q_weight[...,1::2] << 4) | q_weight[...,0::2]`.
+  - Two‑level scaling:
+    - Per‑tensor scale `weights_scaling_factor_2`:
+      - `≈ reduce_amax(input) / (6.0 * 448.0)`.
+    - Per‑block scale `weights_scaling_factor`:
+      - `per_block_amax = reduce_block_amax(input, block_sizes={-1: block_size})`
+      - `per_block_scale = per_block_amax / (6.0 * weights_scaling_factor_2)`
+      - Stored as `torch.float8_e4m3fn` (viewed as `uint8`).
+    - Effective scale at dequant time:
+      - `per_block_scale * weights_scaling_factor_2` (both K and V use this pattern).
+- ONNX export: `modelopt/onnx/export/nvfp4_exporter.py`
+  - `_cast_fp4(array)`:
+    - Uses `NVFP4QTensor._cast_fp4` and packs 2×FP4 per byte.
+  - `_cast_fp8(array)`:
+    - Clamps to ±448 and casts to `float8_e4m3fn` → `uint8`.
+  - `compute_scales`:
+    - Computes `_sw_f32_per_tensor` and `_sw_f32_per_block` for each weight tensor.
+  - `compress_weights` + `_replace_fp4qdq_with_2dq`:
+    - Replaces `TRT_FP4QDQ` with:
+      1. `sw_f32 = DequantizeLinear(sw_f8_per_block, sw_f32_per_tensor)`
+      2. `w32  = DequantizeLinear(w_f4, sw_f32, block_size=16)`
+    - This exact “two‑DQ” structure is what we replicate in TurboMind’s NVFP4 KV decode: FP8(E4M3) block scales + FP32 global scales + FP4 payload.
+
+For KV cache we treat each `(layer, kv_head)` like a “weight tensor”:
+
+- FP4 payload layout:
+  - Exactly identical to Model‑Optimizer: 2 FP4 codes per byte, E2M1 grid.
+- FP8(E4M3) per‑16 block scales:
+  - Stored in the **scale pool** as `uint8` bytes, but interpreted as FP8(E4M3).
+- Optional global K/V scales:
+  - FP32 arrays per `(layer, kv_head)` following the same `amax / (6 * 448)` logic.
+
+TurboMind’s NVFP4 KV semantics are therefore:
+
+- Encode:  
+  `x_fp4 = QuantizeFP4_E2M1(x / (scale_fp8 * scale_global))`  
+  `scale_fp8 = FP32 → FP8(E4M3)` per 16 dims, `scale_global` is FP32 per (layer, kv_head).
+- Decode:  
+  `x ≈ DequantFP4_E2M1(payload) * (DequantFP8_E4M3(scale_fp8) * scale_global)`.
+
+This ensures KV cache uses **the same NVFP4 scaling semantics** as weights and ONNX export, just with KV‑specific layout and paging.
+
 ---
 
 ## 3. Design Goals for NVFP4 in TurboMind / LMDeploy
@@ -276,13 +325,13 @@ enum class KvCacheMode {
 Mode selection from `ModelParam.quant_policy`:
 
 - Start from the bitmask:
-  - `has_int8  = (quant_policy & QuantPolicy::kCacheKVInt8)   != 0;`
-  - `has_int4  = (quant_policy & QuantPolicy::kCacheKVInt4)   != 0;`
-  - `has_nvfp4 = (quant_policy & QuantPolicy::kCacheKVNVFP4)  != 0;`
+  - `has_int8 = (quant_policy & QuantPolicy::kCacheKVInt8) != 0;`
+  - `has_int4 = (quant_policy & QuantPolicy::kCacheKVInt4) != 0;`
+  - `has_fp4  = (quant_policy & QuantPolicy::kCacheKVFp4)  != 0;`
 - Then:
-  - If `has_nvfp4`:
+  - If `has_fp4`:
     - On Blackwell (SM10x/SM12x): `kNvFp4`.
-    - Optionally on SM90/Hopper: `kMxFp4` (emulated NVFP4‑like format using exponent scales).
+    - On Hopper (SM89/90): `kMxFp4` (MXFP4 exponent‑style format).
   - Else if `has_int8`: `kInt8`.
   - Else if `has_int4`: `kInt4`.
   - Else: `kNone`.
@@ -355,15 +404,18 @@ This keeps:
 - Backwards compatibility for 4‑bit int KV (`quant_policy=4`).
 - A clean, explicit code path for NVFP4 (`quant_policy=16`).
 
-### 4.2 NVFP4‑specific engine options
+### 4.2 FP4‑specific engine options (MXFP4 first, NVFP4 gated)
 
 We will **not** add a separate top‑level flag initially; instead:
 
-- Use `quant_policy = 16` to indicate NVFP4 KV cache.
+- Use `quant_policy = 16` (bit `kCacheKVFp4`) to indicate the FP4 KV cache family.
+- Let `GetKvCacheMode(quant_policy, sm_version)` choose:
+  - MXFP4 (`kFp4Mx`) on Hopper SMs (89/90) when `ENABLE_FP4` is defined.
+  - NVFP4 (`kFp4Nv`) on Blackwell SMs (100/101/120/121) when `ENABLE_FP4` is defined.
 - Gate on:
-  - CUDA device capability (SM ≥ 100 for Blackwell),
+  - CUDA device capability (SM ≥ 100 for **NVFP4**, SM89/90 for **MXFP4**),
   - Build flag `ENABLE_FP4` (mirroring TRT‑LLM),
-  - Model dtype and KV shape constraints.
+  - Model dtype and KV shape constraints (e.g., head_dim % 16 == 0).
 
 If needed later, we can add:
 
@@ -378,7 +430,7 @@ If needed later, we can add:
 #### 5.1.1 New QuantPolicy value
 
 - In `llama_utils.h`:
-  - Add `kCacheKVNVFP4 = 0x10;`.
+  - Add `kCacheKVFp4 = 0x10;`.
 
 #### 5.1.2 FP4 type alias
 
@@ -442,9 +494,10 @@ Hence we keep:
 
 In `LlamaBatch::InitializeBufferAndKVCache()`:
 
-- Detect NVFP4:
-  - `bool is_nvfp4 = (quant_policy & QuantPolicy::kCacheKVNVFP4) != 0;`
-- For FP4 modes (`KvCacheMode::kMxFp4` or `kNvFp4`):
+- Detect FP4 modes via `KvCacheMode`:
+  - `KvCacheMode::kFp4Mx` on Hopper (MXFP4),
+  - `KvCacheMode::kFp4Nv` on Blackwell (NVFP4, currently gated to base KV).
+- For FP4 modes (`KvCacheMode::kFp4Mx` or `kFp4Nv`):
   - **Data pool layout (packed FP4 in uint8 containers)**:
     - Per token, per head, per K/V:
       - Logical FP4 values per head: `head_dim`.
@@ -504,15 +557,12 @@ Instead of touching `BlockManager` internals, we keep the dual‑pool logic in `
 
 In `invokeProcessKV_v2` and `invokeFlattenKV_v2` (`kv_cache_utils_v2.cu` / `.h`):
 
-- Detect NVFP4:
-  - `is_nvfp4 = (quant_policy & QuantPolicy::kCacheKVNVFP4) != 0;`
+- Detect KV mode via `KvCacheMode` instead of raw `quant_policy` bits.
 - Dispatch `Tkv`:
-  - If `quant_policy & QuantPolicy::kCacheKVInt8` → `Tkv = uint8_t` (int8 KV).
-  - Else if `quant_policy & QuantPolicy::kCacheKVInt4` → `Tkv = uint4_t` (int4 KV).
-  - Else if `is_nvfp4` and `ENABLE_FP4`:
-    - `Tkv = fp4_e2m1_t` (NVFP4 values).
-  - Else:
-    - `Tkv = T` (no quantization).
+  - `KvCacheMode::kInt8`  → `Tkv = uint8_t` (int8 KV).
+  - `KvCacheMode::kInt4`  → `Tkv = uint4_t` (int4 KV).
+  - `KvCacheMode::kFp4Mx` → `Tkv = fp4_e2m1_t` (MXFP4 FP4 values).
+  - `KvCacheMode::kFp4Nv` → currently treated as base KV (`Tkv = T`) until true NVFP4 is implemented.
 
 #### 5.3.2 NVFP4 quantization (write path)
 For FP4 KV cache we distinguish two algorithms, both using FP4(E2M1) payload but **different scale formats**:
@@ -591,6 +641,160 @@ Decode work items for implementation:
 - Add a new `KvCacheMode` branch in `dispatchDecoding` for FP4 modes.
 - Plumb FP4 payload + scale pool pointers into the decode kernels similarly to how TRT‑LLM’s FMHA/XQA code does.
 - Ensure the new decode path keeps per‑head/per‑block scaling semantics identical between prefill and decode.
+
+#### 5.3.5 Concrete NVFP4 helpers and kernels (TurboMind entry points)
+
+To make the above semantics implementation‑ready, we standardize the NVFP4‑specific helpers and kernel entry points:
+
+- FP8(E4M3) decode helper (device):
+
+```cpp
+// Near other FP4/FP8 helpers (e.g. core/data_type.h or a small fp8_utils.h)
+__device__ inline float decode_fp8_e4m3(uint8_t v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Example using NV FP8 intrinsics if available
+    __nv_fp8_e4m3fn x;
+    x.__x = v;
+    // Convert to FP32; exact intrinsic depends on CUDA version
+    return __half2float(__nv_cvt_fp8_to_fp16(x, __NV_SATFINITE, 0));
+#else
+    // Fallback: small E4M3 decode using bit manipulation
+    return fp8_e4m3_decode_fallback(v);
+#endif
+}
+```
+
+- NVFP4 branch in the KV write dispatcher:
+
+```cpp
+// kv_cache_utils_v2.cu
+template <typename T>
+void invokeProcessKV_v2(/* existing params */,
+                        KvCacheMode kv_cache_mode,
+                        uint8_t* kv_blocks,
+                        uint8_t* scale_blocks,
+                        const float* global_k_scales,
+                        const float* global_v_scales) {
+    switch (kv_cache_mode) {
+    case KvCacheMode::kFp4Mx:
+        TM_CHECK(scale_blocks != nullptr);
+        ProcessKV_v2<T, fp4_e2m1_t, KvCacheMode::kFp4Mx>(
+            /* args */, kv_blocks, scale_blocks, nullptr, nullptr);
+        break;
+    case KvCacheMode::kFp4Nv:
+        TM_CHECK(scale_blocks != nullptr);
+        ProcessKV_v2<T, fp4_e2m1_t, KvCacheMode::kFp4Nv>(
+            /* args */, kv_blocks, scale_blocks,
+            global_k_scales, global_v_scales);
+        break;
+    // existing kNone/kInt4/kInt8 cases...
+    }
+}
+```
+
+- NVFP4 encode inside `ProcessKV_v2`:
+
+```cpp
+// kv_cache_utils_v2.cu
+template <typename T, typename Tkv, KvCacheMode Mode>
+__global__ void ProcessKV_v2(/* geometry, pointers, etc. */,
+                             uint8_t* kv_blocks,
+                             uint8_t* scale_blocks,
+                             const float* global_k_scales,
+                             const float* global_v_scales) {
+    // ... common setup ...
+
+    if constexpr (Mode == KvCacheMode::kFp4Nv) {
+        // For each (layer, kv_head, token) handled by this kernel/block:
+        float gk = global_k_scales ? global_k_scales[gk_index] : 1.0f;
+        float gv = global_v_scales ? global_v_scales[gv_index] : 1.0f;
+
+        for (int block_idx = 0; block_idx < blocks_per_head; ++block_idx) {
+            float k_vals[16];
+            float v_vals[16];
+            load_kv_block_16(/* args */, k_vals, v_vals);
+
+            float max_k = max_abs_16(k_vals);
+            float max_v = max_abs_16(v_vals);
+
+            float s_k = max_k > 0.f ? max_k / (6.0f * gk) : 0.f;
+            float s_v = max_v > 0.f ? max_v / (6.0f * gv) : 0.f;
+
+            uint8_t k_scale_fp8 = encode_fp8_e4m3(s_k);
+            uint8_t v_scale_fp8 = encode_fp8_e4m3(s_v);
+            store_nvfp4_block_scales(scale_blocks, layer, kv_head, token,
+                                     block_idx, k_scale_fp8, v_scale_fp8);
+
+            quantize_block_fp4_store(k_vals, s_k * gk, kv_blocks, /* K offset */);
+            quantize_block_fp4_store(v_vals, s_v * gv, kv_blocks, /* V offset */);
+        }
+    }
+
+    // ... other Mode branches ...
+}
+```
+
+- NVFP4 decode in the attention decode path:
+
+```cpp
+// decoding.cu
+template <typename T>
+void dispatchDecoding(const AttentionParams<T>& params,
+                      KvCacheMode kv_cache_mode,
+                      const uint8_t* kv_blocks,
+                      const uint8_t* scale_blocks,
+                      const float* global_k_scales,
+                      const float* global_v_scales) {
+    switch (kv_cache_mode) {
+    case KvCacheMode::kFp4Nv:
+        DecodingKernel<T, fp4_e2m1_t, KvCacheMode::kFp4Nv>
+            <<<grid, block>>>(params, kv_blocks, scale_blocks,
+                              global_k_scales, global_v_scales);
+        break;
+    // existing cases...
+    }
+}
+
+template <typename T, typename Tkv, KvCacheMode Mode>
+struct StatePV {
+    __device__ inline void Transform(/* ... */) {
+        if constexpr (Mode == KvCacheMode::kFp4Nv) {
+            const uint8_t* scale_base =
+                get_fp4_nv_scale_base(scale_blocks_seq, layer_idx, kv_head_idx,
+                                      token_idx, scales_per_head);
+
+            for (int block_idx = 0; block_idx < blocks_per_head; ++block_idx) {
+                uint8_t k_scale_byte = scale_base[block_idx];
+                uint8_t v_scale_byte = scale_base[block_idx + scales_per_head];
+
+                float gk = global_k_scales ? global_k_scales[gk_index] : 1.0f;
+                float gv = global_v_scales ? global_v_scales[gv_index] : 1.0f;
+
+                float s_k = decode_fp8_e4m3(k_scale_byte) * gk;
+                float s_v = decode_fp8_e4m3(v_scale_byte) * gv;
+
+                T k_vals[16], v_vals[16];
+                load_fp4_block_and_convert(kv_blocks_seq, block_idx, k_vals, v_vals);
+
+                for (int i = 0; i < 16; ++i) {
+                    k_vals[i] = static_cast<T>(static_cast<float>(k_vals[i]) * s_k);
+                    v_vals[i] = static_cast<T>(static_cast<float>(v_vals[i]) * s_v);
+                }
+
+                consume_pv_block(k_vals, v_vals, block_idx);
+            }
+        }
+
+        // ... existing kNone/kInt4/kInt8/kFp4Mx handling ...
+    }
+};
+```
+
+These skeletons are **illustrative** only; the actual implementation must:
+
+- Reuse existing FP4 packing/unpacking helpers for layout correctness.
+- Use the same address computation helpers as MXFP4 (`get_fp4_mx_scale_base`) for NVFP4 (`get_fp4_nv_scale_base`).
+- Maintain strict gating for NVFP4 (`ENABLE_FP4`, SM version checks) and keep `kFp4Nv` disabled until all TODOs in `NVFP4_KV_TODOS.md` §5.3–5.7 and §7 are satisfied.
 
 ---
 
@@ -722,9 +926,12 @@ We defer all MLA‑specific details until Phase 1 is complete and validated.
 
 - Existing LMDeploy/TurboMind KV cache supports:
   - Unquantized, int4, and int8 KV cache in a single `BlockManager` pool.
-- FP4 KV cache (MXFP4_KV + NVFP4_KV) requires:
-  - A new quant policy (`16` → `kCacheKVNVFP4`),
+- FP4 KV cache family (MXFP4_KV + NVFP4_KV) requires:
+  - A new FP4 bit in `QuantPolicy` (`16` → `kCacheKVFp4`),
   - Dual block managers (data + scales) for KV cache,
-  - New FP4 quantization/dequantization kernels in `kv_cache_utils_v2`,
-  - A decode path that reads FP4 KV + scales directly in the hot attention loop.
-- Phase 1 will deliver FP4 KV cache for **non‑MLA** models only (with both MXFP4 fallback and NVFP4 where available), preserving existing int4/int8 behaviour and paving the way for MLA in a follow‑up phase.
+  - FP4 quantization/dequantization kernels in `kv_cache_utils_v2`,
+  - A decode path that reads FP4 KV + scales directly in the hot attention loop (no flatten‑before‑decode).
+- Phase 1 implementation is staged:
+  - First, **MXFP4_KV on Hopper (SM89/90)**: FP4(E2M1) payload + per‑16 exponent scales, end‑to‑end for non‑MLA models (prefill + decode), with SpecPV/flatten kept as debug/compat paths only.
+  - Then, **NVFP4_KV on Blackwell (SM10x/SM12x)**: true NVFP4 semantics (FP8(E4M3) block scales + optional global K/V scales) under strict arch gating.
+- NVFP4 is kept **gated** until the FP8(E4M3) scale path is fully implemented and tested (see `NVFP4_KV_TODOS.md` for live status and milestones).

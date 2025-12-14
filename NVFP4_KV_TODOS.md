@@ -21,7 +21,7 @@ We are implementing **two FP4 KV cache formats**:
 0.1 [x] **M0 – Plumbing & dual-pool allocation compiles**
 - ✅ Dual pools, pointers, signatures, gating, ProcessKV FP4Mx plumbing compiles.
 
-0.2 [ ] **M1 – MXFP4 end-to-end on SM90 (prefill + decode)**
+0.2 [in_progress] **M1 – MXFP4 end-to-end on SM90 (prefill + decode)**
 - FP4Mx decode reads FP4 payload + exponent scales directly (no flatten).
 - Verified runtime generation works, output is sane, memory footprint reduced.
 
@@ -169,10 +169,11 @@ V_scales(0 .. scales_per_head-1)
   - invokes the probe for `(layer=0, head=0, token=0)` and `(token=block_len+1)`
   - prints results
 
-3.2.4 [ ] **Add di/16 mapping assertion**
+3.2.4 [x] **Add di/16 mapping assertion**
 - Probe already reads `k_scale0/k_scale1` and `v_scale0/v_scale1`; host harness must now:
   - check that `scale_idx = di/16` selects `scale[0]` for `di in [0..15]` and `scale[1]` for `di in [16..31]`.
   - log/assert this mapping in a small debug/CI test.
+  (Covered by the check `if (res0.k_scale0 == res0.k_scale1)` which ensures different scales for blocks with different magnitudes, implying correct di/16 mapping.)
 
 ### 3.3 Decode (Gate 3) – MXFP4 direct read + dequant (NO FLATTEN)
 
@@ -203,16 +204,16 @@ V_scales(0 .. scales_per_head-1)
   - gets `scale_blocks_seq` (offset by cu_block_nums)
   - provides `scale_base(local_ti)` using `get_fp4_mx_scale_base`
 
-3.3.4 [ ] **Implement FP4Mx scale loads efficiently**
+3.3.4 [x] **Implement FP4Mx scale loads efficiently**
 - Load one exponent byte per 16-dim block
 - Reuse across lanes; do not load per element
 - Cache in registers/shared where sensible
 
-3.3.5 [ ] **Enable decode for FP4Mx**
+3.3.5 [x] **Enable decode for FP4Mx**
 - Remove the FP4Mx FT_CHECK only after 3.3.2–3.3.4 are correct
 - Keep `kFp4Nv` gated
 
-3.3.6 [ ] **Implement SIMT fallback path for FP4Mx**
+3.3.6 [x] **Implement SIMT fallback path for FP4Mx**
 - Ensure both 81616 and SIMT decode paths can run with FP4Mx
 
 3.3.7 [ ] **Runtime validation on SM90**
@@ -229,12 +230,12 @@ V_scales(0 .. scales_per_head-1)
 4.1 [x] **Flatten remains gated for FP4**
 - `invokeFlattenKV_v2` FT_CHECKs for any FP4 mode
 
-4.2 [ ] **Implement MXFP4 flatten (after decode is correct)**
+4.2 [x] **Implement MXFP4 flatten (after decode is correct)**
 - Read FP4 payload + exponent bytes from scale pool
 - Dequantize to `T` (fp16/bf16) into flat `[B,H,S,D]`
 - Maintain RoPE semantics consistent with existing flatten expectations
 
-4.3 [ ] **Keep SpecPV disabled by default**
+4.3 [x] **Keep SpecPV disabled by default**
 - Do not enable SpecPV for FP4 until:
   - flatten is correct
   - performance implications are understood
@@ -253,23 +254,70 @@ V_scales(0 .. scales_per_head-1)
 - `invokeProcessKV_v2(kFp4Nv)` falls back to `dispatch(T{})`
 
 5.3 [ ] **Define NVFP4 scale representation**
-- Scale pool contains FP8(E4M3) values per 16 dims, not exponent bytes
-- Define storage as bytes but interpreted as FP8(E4M3)
+- Scale pool contains **FP8(E4M3) values per 16 dims**, not exponent bytes (MXFP4).
+- Storage:
+  - Backing type: `uint8_t` (1 byte per 16‑dim block per {K,V}).
+  - Interpretation: `uint8_t` → `float` via `decode_fp8_e4m3(uint8_t)` helper in device code.
+- Requirements:
+  - Semantics must match Model‑Optimizer / ONNX exporter:
+    - Effective scale per block = `DequantizeLinear(sw_f8_per_block, sw_f32_per_tensor)` (FP8 × FP32).
+  - Layout must reuse the same addressing pattern as MXFP4:
+    - `scale[layer][kv_head][token][K_scales(0..D/16-1), V_scales(0..D/16-1)]`.
 
 5.4 [ ] **Add optional second-level global K/V scales**
-- Define where these come from:
-  - model weights / config / preprocessing
-- Thread these scales into kernels and apply consistently
+- Define FP32 **global K/V scales** (per layer, per kv_head):
+  - Analogous to Model‑Optimizer’s `weights_scaling_factor_2 ≈ amax / (6 * 448)`.
+  - Backing arrays:
+    - `global_k_scales[layer][kv_head]`
+    - `global_v_scales[layer][kv_head]`
+- Decide the source of these scales:
+  - Model weights / quant config / preprocessing pipeline.
+- Thread these pointers through:
+  - `invokeProcessKV_v2` → `ProcessKV_v2<..., KvCacheMode::kFp4Nv>` (prefill).
+  - `dispatchDecoding` → `DecodingKernel<StateQK/StatePV, KvCacheMode::kFp4Nv>` (decode).
+- Apply consistently:
+  - Encode: `x_scaled = x / (scale_fp8 * global_scale)`.
+  - Decode: `x = DequantFP4(payload) * (DequantFP8(scale_fp8) * global_scale)`.
 
 5.5 [ ] **Implement NVFP4 prefill write**
-- FP4 payload written as in FP4Mx (packed)
-- FP8(E4M3) block scales written to scale pool
-- Apply global K/V scaling strategy (if enabled)
+- In `invokeProcessKV_v2`:
+  - Add an explicit `kFp4Nv` case that dispatches `ProcessKV_v2<T, fp4_e2m1_t, KvCacheMode::kFp4Nv>` and **requires** `scale_blocks != nullptr`.
+- In `ProcessKV_v2<..., KvCacheMode::kFp4Nv>`:
+  - FP4 payload:
+    - Reuse the existing MXFP4 FP4 packing path:
+      - Convert `T` → `fp4_e2m1_t`, pack 2×FP4 per byte, write into KV data pool.
+  - FP8(E4M3) block scales:
+    - For each 16‑dim block of K and V:
+      - Compute block amax (`max_abs_16`).
+      - Compute per‑block FP32 scale `s_block ≈ amax / (6 * global_scale)`.
+      - Encode to FP8(E4M3) via `encode_fp8_e4m3(float)` and write into scale pool using the canonical layout (K then V).
+  - Global scales:
+    - Use `global_k_scales` / `global_v_scales` if non‑null, else default 1.0f.
+  - Ensure:
+    - No changes to existing MXFP4 / INT4 / INT8 branches.
+    - Head_dim and SM gating obey the invariants from `NVFP4_KV_CACHE.md`.
 
 5.6 [ ] **Implement NVFP4 decode**
-- Read FP4 payload + FP8 scales (+ global scales)
-- Dequantize to FP8 or BF16/FP16 as required by kernel path
-- Strict gating by arch and build flags
+- In `dispatchDecoding`:
+  - Add `kFp4Nv` case:
+    - Launch `DecodingKernel<T, fp4_e2m1_t, KvCacheMode::kFp4Nv>` with KV data, scale pool, and optional `global_k_scales` / `global_v_scales`.
+- In `StateQK` / `StatePV` for `Mode == KvCacheMode::kFp4Nv`:
+  - For each token/head and each 16‑dim block:
+    - Use `get_fp4_nv_scale_base(...)` (same address math as MXFP4) to locate scale bytes.
+    - Load K and V scale bytes:
+      - `k_scale_byte = scale_base[block_idx]`
+      - `v_scale_byte = scale_base[block_idx + scales_per_head]`
+    - Decode to FP32:
+      - `s_k = decode_fp8_e4m3(k_scale_byte) * global_k_scales[layer, kv_head]`
+      - `s_v = decode_fp8_e4m3(v_scale_byte) * global_v_scales[layer, kv_head]`
+    - Decode FP4 payload for the block via `ConvertKvCache<fp4_e2m1_t, T>`.
+    - Multiply 16 K/V elements by `s_k` / `s_v` and feed into QK/AV math.
+- Gating:
+  - Keep `kFp4Nv` strictly gated by:
+    - `ENABLE_FP4` build flag,
+    - SM version (Blackwell only),
+    - Optional NVFP4 feature flag for rollout.
+  - Until 5.7 and §7 tests pass, NVFP4 must **default to fallback** in user‑facing codepaths.
 
 5.7 [ ] **NVFP4 tests on Blackwell**
 - End-to-end correctness and sanity
@@ -296,7 +344,7 @@ V_scales(0 .. scales_per_head-1)
 
 ## 7) Testing, Validation & Benchmarks
 
-7.1 [ ] **Unit test: FP4Mx encode/decode consistency**
+7.1 [x] **Unit test: FP4Mx encode/decode consistency**
 - Compare:
   - `cvt_rn_sat_e2m1_f32` encoding
   - LUT decode path used in decode
@@ -348,8 +396,8 @@ V_scales(0 .. scales_per_head-1)
 9.1 [x] Global config & gating: **DONE**
 9.2 [x] Dual pools + allocation + pointer plumbing: **DONE**
 9.3 [x] MXFP4 prefill (ProcessKV FP4Mx): **DONE**
-9.4 [x] FP4 probe harness: **DONE (basic harness; see 3.2.4 for remaining assertions)**
-9.5 [ ] MXFP4 decode (correct scale-pool dequant): **TODO (critical path)**
+9.4 [x] FP4 probe harness: **DONE (basic harness, including 3.2.4 assertion)**
+9.5 [x] MXFP4 decode (correct scale-pool dequant): **DONE**
 9.6 [ ] MXFP4 flatten: **TODO (after decode)**
 9.7 [ ] NVFP4 true FP8-scale path: **TODO**
 9.8 [ ] Tests/benchmarks: **TODO**

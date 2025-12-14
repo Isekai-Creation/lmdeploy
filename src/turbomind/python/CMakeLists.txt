@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.11)
 project(_turbomind LANGUAGES CXX CUDA)
 
 execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-m" "pybind11" "--cmakedir"

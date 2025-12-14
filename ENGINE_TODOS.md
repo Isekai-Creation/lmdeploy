@@ -121,13 +121,13 @@ Execution order for Engineer B (recommended):
 
 ### 1.1 Python → TurboMind Configuration Surface
 
-- [ ] **1.1.1 Expose all TurboMind engine knobs in Python configs.** (Owner: Engineer B, Progress: 70%)  
+- [ ] **1.1.1 Expose all TurboMind engine knobs in Python configs.** (Owner: Engineer B, Progress: 85%)  
   Details: Current configs cover `tp`, `pp`, `session_len`, `max_batch_size`, precision, etc.  
-  Missing:
+  Missing (at the time of original writing):
   - Scheduler knobs: max tokens per step, max sequences per step, prefill/decode policy.  
   - KV allocator knobs: KV page size, eviction policy, prefix sharing enable/disable.  
   Design (Python):
-  - Add a dedicated scheduler/KV section to the existing backend config, e.g.:
+  - Add a dedicated scheduler/KV section to the existing backend config, e.g. (now implemented in `lmdeploy/pytorch/config.py` as `TurboMindSchedulerConfig` and `TurboMindKVConfig` and re‑used by `DriftEngineConfig` in `lmdeploy/messages.py`):
     ```python
     @dataclass
     class TurboMindSchedulerConfig:
@@ -147,7 +147,7 @@ Execution order for Engineer B (recommended):
         prefix_cache_eviction_policy: Literal["lru", "priority"] = "lru"
         kv_alignment: int = 16  # bytes, for allocator
     ```
-  - Thread these into the existing `PytorchEngineConfig` / TurboMind backend config under a `scheduler_config` and `kv_config` field.
+  - Thread these into the existing engine configs under dedicated `scheduler` / `kv` fields so both TurboMind and Drift backends share the same knob surface.
 
 - [ ] **1.1.2 Unify pipeline / api_server backend configuration.** (Owner: Engineer B, Progress: 60%)  
   Details: Pipeline and api_server have separate backend configs.  
@@ -174,7 +174,7 @@ Execution order for Engineer B (recommended):
 
 ### 1.2 Engine‑Level Scheduler (Prefill vs Decode, Token Budget)
 
-- [ ] **1.2.1 Introduce an explicit per‑step token budget.** (Owner: Engineer A, Progress: 20%)  
+- [ ] **1.2.1 Introduce an explicit per‑step token budget.** (Owner: Engineer A, Progress: 80%)  
   Details: Gateway/RequestQueue implement basic continuous batching, but there is no global token budget.  
   Needed:
   - A scheduler component that, per step, selects a batch of requests such that:  
@@ -209,7 +209,7 @@ Execution order for Engineer B (recommended):
     ```
   - The engine main loop calls `schedule_step` instead of directly consuming Gateway/RequestQueue results, and then forms GPU batches from `prefill_batch` and `decode_batch`.
 
-- [ ] **1.2.2 Track prefill vs decode phases per request.** (Owner: Engineer A, Progress: 30%)  
+- [ ] **1.2.2 Track prefill vs decode phases per request.** (Owner: Engineer A, Progress: 80%)  
   Details: DynamicDecodeLayer covers decode; prefill is implicit in initial forward.  
   Needed:
   - Per‑request phase state (`PREFILL`, `DECODE`, `FINISHED`).  
@@ -233,7 +233,7 @@ Execution order for Engineer B (recommended):
     - After first full prompt processed: flip to `kDecode`.
     - After EOS or reaching `max_new_tokens`: mark `kFinished` and let scheduler free KV via `KVCacheManager`.
 
-- [ ] **1.2.3 Implement chunked prefill with partial concurrency.** (Owner: Engineer A, Progress: 10%)  
+- [ ] **1.2.3 Implement chunked prefill with partial concurrency.** (Owner: Engineer A, Progress: 70%)  
   Details: No chunked prefill today; long prompts must be processed in one go.  
   Needed:
   - API + scheduler logic to split long prompts into chunks that fit the token budget.  
@@ -258,7 +258,7 @@ Execution order for Engineer B (recommended):
     - `max_num_partial_prefills` and `long_prefill_token_threshold` (limit concurrent long prompts).
   - The model execution path must accept `(start_pos, len)` and only process that portion of the prompt (input IDs slice + appropriate position IDs).
 
-- [ ] **1.2.4 Make admission KV‑capacity‑aware (Guaranteed‑Completion mode).** (Owner: Engineer A, Progress: 15%)  
+- [ ] **1.2.4 Make admission KV‑capacity‑aware (Guaranteed‑Completion mode).** (Owner: Engineer A, Progress: 70%)  
   Details: KV utilities can compute sizes, but capacity is not surfaced to the scheduler.  
   Needed:
   - KV usage estimator per request (prompt length + max_new_tokens).  
@@ -286,7 +286,7 @@ Execution order for Engineer B (recommended):
     ```
   - Admission only proceeds if `reserve` succeeds; otherwise the request remains in the queue or is rejected.
 
-- [ ] **1.2.5 Global continuous batching across prefill and decode.** (Owner: Engineer A, Progress: 40%)  
+- [ ] **1.2.5 Global continuous batching across prefill and decode.** (Owner: Engineer A, Progress: 70%)  
   Details: Continuous batching exists in a basic form via Gateway/RequestQueue.  
   Needed:
   - A scheduler loop that:  
@@ -319,13 +319,13 @@ Execution order for Engineer B (recommended):
 
 ### 1.3 Session & Cancellation Semantics
 
-- [ ] **1.3.1 Finalize and document session lifecycle invariants.** (Owner: Engineer A, Progress: 85%)  
+- [ ] **1.3.1 Finalize and document session lifecycle invariants.** (Owner: Engineer A, Progress: 90%)  
   Details: `SessionParam` + `SeqId2Rank` implement start/continue/kill semantics.  
   Needed:
   - Clear spec for legal state transitions: `start → continue* → end` or `kill`.  
   - Tests covering race conditions (start+kill, cancel during prefill/decode, double‑end).  
 
-- [ ] **1.3.2 Ensure robust cancellation under load (no leaks, no stuck sessions).** (Owner: Engineer A, Progress: 75%)  
+- [ ] **1.3.2 Ensure robust cancellation under load (no leaks, no stuck sessions).** (Owner: Engineer A, Progress: 80%)  
   Details: `cancel_flag`, `Gateway::cancel`, and kill paths exist.  
   Needed:
   - Stress tests with many concurrent cancels.  
@@ -337,7 +337,7 @@ Execution order for Engineer B (recommended):
 
 ### 2.1 First‑Class KV Allocator (Paged Blocks)
 
-- [ ] **2.1.1 Implement an engine‑level `KVCacheManager` abstraction.** (Owner: Engineer A, Progress: 40%)  
+- [ ] **2.1.1 Implement an engine‑level `KVCacheManager` abstraction.** (Owner: Engineer A, Progress: 80%)  
   Details: `kv_cache_utils_v2` and allocators exist at kernel level but not as a shared manager.  
   Needed:
   - A C++ `KVCacheManager` that:  
@@ -385,7 +385,7 @@ Execution order for Engineer B (recommended):
     ```
   - The attention kernels continue to work with raw pointers + indices; they query page indices via `page_for`.
 
-- [ ] **2.1.2 Define KV layout contracts per model family.** (Owner: Engineer A, Progress: 50%)  
+- [ ] **2.1.2 Define KV layout contracts per model family.** (Owner: Engineer A, Progress: 80%)  
   Details: Layout logic is distributed among model and kernel code.  
   Needed:
   - Per‑model layout spec (LLaMA, GPT‑OSS‑120B) that documents:  
@@ -409,7 +409,7 @@ Execution order for Engineer B (recommended):
 
 ### 2.2 Prefix Sharing / Prefix Cache
 
-- [ ] **2.2.1 Design and implement a prefix cache (non‑speculative).** (Owner: Engineer A, Progress: 20%)  
+- [ ] **2.2.1 Design and implement a prefix cache (non‑speculative).** (Owner: Engineer A, Progress: 80%)  
   Details: There is no global prefix cache today.  
   Needed:
   - A prefix cache that maps `(token_ids, optional namespace)` → set of KV page indices.  
@@ -442,7 +442,7 @@ Execution order for Engineer B (recommended):
     ```
   - Use `page_size` to truncate `tokens` to page boundaries before storing.
 
-- [ ] **2.2.2 Integrate prefix cache with the scheduler.** (Owner: Engineer A, Progress: 10%)  
+- [ ] **2.2.2 Integrate prefix cache with the scheduler.** (Owner: Engineer A, Progress: 60%)  
   Details: No wiring yet.  
   Needed:
   - On prefill admission:  
@@ -460,7 +460,7 @@ Execution order for Engineer B (recommended):
     ```
   - After prefill completes for a sequence, the scheduler inserts its prefix into the cache with the KV pages reserved for that sequence, allowing future requests to reuse them.
 
-- [ ] **2.2.3 Implement a simple, tunable eviction policy with metrics.** (Owner: Engineer A, Progress: 10%)  
+- [ ] **2.2.3 Implement a simple, tunable eviction policy with metrics.** (Owner: Engineer A, Progress: 60%)  
   Details: No configurable eviction policy.  
   Needed:
   - At least one policy (LRU or priority) with:  
@@ -553,7 +553,7 @@ Execution order for Engineer B (recommended):
 
 ### 4.1 KV‑Aware Capacity Scheduler
 
-- [ ] **4.1.1 Implement a KV capacity estimator per request.** (Owner: Engineer A, Progress: 20%)  
+- [ ] **4.1.1 Implement a KV capacity estimator per request.** (Owner: Engineer A, Progress: 80%)  
   Details: KV utilities know per‑token KV sizes, but they’re not aggregated per request.  
   Needed:
   - Given a prompt length and `max_new_tokens`, estimate KV blocks required to complete a request.  
@@ -581,7 +581,7 @@ Execution order for Engineer B (recommended):
     ```
   - `EngineScheduler` uses this estimator when deciding whether to reserve KV for a new request.
 
-- [ ] **4.1.2 Implement a Guaranteed‑Completion capacity scheduler.** (Owner: Engineer A, Progress: 10%)  
+- [ ] **4.1.2 Implement a Guaranteed‑Completion capacity scheduler.** (Owner: Engineer A, Progress: 70%)  
   Details: No dedicated capacity scheduler exists today.  
   Needed:
   - Scheduler mode that:  
@@ -603,7 +603,7 @@ Execution order for Engineer B (recommended):
     ```
   - `try_start_request` calls `kv_mgr_->reserve`; if it fails, the request stays in the queue (or is rejected by policy).
 
-- [ ] **4.1.3 Integrate capacity checks with Gateway / RequestQueue.** (Owner: Engineer A, Progress: 10%)  
+- [ ] **4.1.3 Integrate capacity checks with Gateway / RequestQueue.** (Owner: Engineer A, Progress: 60%)  
   Details: Gateway/RequestQueue currently accept all requests.  
   Needed:
   - On enqueue and scheduling, consult the capacity scheduler:  
@@ -663,7 +663,7 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
 ### 6.1 DriftEngineConfig (Python)
 
-- [ ] **6.1.1 Define `DriftEngineConfig` and integrate it into LMDeploy.** (Owner: Engineer B, Progress: 0%)  
+- [ ] **6.1.1 Define `DriftEngineConfig` and integrate it into LMDeploy.** (Owner: Engineer B, Progress: 60%)  
   Design (Python):
   - New config in `lmdeploy`:
     ```python
@@ -695,9 +695,10 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
         abort_on_oom: bool = True
         log_level: Literal["info", "debug", "warning"] = "info"
     ```
-  - `DriftEngineConfig` is a thin wrapper around the previously defined `TurboMindEngineConfig` pieces but adds **explicit throughput/latency targets** and microbatch sizes, so the scheduler can tune itself at runtime.
+  - `DriftEngineConfig` is a thin wrapper around the TurboMind scheduler/KV pieces but adds **explicit throughput/latency targets** and microbatch sizes, so the scheduler can tune itself at runtime.  
+  - Current status: `DriftEngineConfig` is implemented in `lmdeploy/messages.py` and accepted by `lmdeploy.api.pipeline` / `lmdeploy.api.serve` as a `backend_config`.
 
-- [ ] **6.1.2 Expose `DriftEngineConfig` in pipeline and server entrypoints.** (Owner: Engineer B, Progress: 0%)  
+- [ ] **6.1.2 Expose `DriftEngineConfig` in pipeline and server entrypoints.** (Owner: Engineer B, Progress: 50%)  
   Design:
   - New entrypoints:
     ```python
@@ -708,12 +709,13 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
     def drift_api_server(config: DriftEngineConfig):
         ...
-    ```
-  - Internally, these construct C++ `DriftEngine` instances instead of the legacy TurboMind engine.
+    ```  
+  - Internally, these construct C++ `DriftEngine` instances instead of the legacy TurboMind engine.  
+  - Current status: `DriftEngineConfig` can already be passed to `pipeline` / `serve`, and a convenience `drift_api_server(...)` wrapper exists in `lmdeploy/api.py` (backend is set to `"drift"`); a dedicated `drift_pipeline(...)` helper is still TBD.
 
 ### 6.2 DriftEngine C++ Top‑Level Structure
 
-- [ ] **6.2.1 Implement `DriftEngine` C++ class wrapping TurboMind components.** (Owner: Engineer A, Progress: 0%)  
+- [ ] **6.2.1 Implement `DriftEngine` C++ class wrapping TurboMind components.** (Owner: Engineer A, Progress: 40%)  
   Design (C++):
   - New files: `src/turbomind/engine/drift_engine.h/.cc`:
     ```cpp
@@ -752,7 +754,7 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
     - `KVCacheManager` + `PrefixCache` (Section 2).
     - `CapacityScheduler` (Section 4).
 
-- [ ] **6.2.2 Add a C++ config struct mirroring `DriftEngineConfig`.** (Owner: Engineer A, Progress: 0%)  
+- [ ] **6.2.2 Add a C++ config struct mirroring `DriftEngineConfig`.** (Owner: Engineer A, Progress: 80%)  
   Design:
   - `DriftEngineConfig` (C++) in `src/turbomind/engine/drift_engine_config.h`:
     ```cpp
@@ -772,7 +774,7 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
 ### 6.3 DriftEngine Scheduling Policies
 
-- [ ] **6.3.1 Implement a two‑queue scheduler policy (prefill vs decode) tuned for throughput.** (Owner: Engineer A, Progress: 0%)  
+- [ ] **6.3.1 Implement a two‑queue scheduler policy (prefill vs decode) tuned for throughput.** (Owner: Engineer A, Progress: 60%)  
   Design:
   - Within `EngineScheduler` when used by DriftEngine:
     - Maintain two priority queues:
@@ -789,7 +791,7 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
         - Either FIFO or small‑latency‑first policy.
       - Use remaining tokens for `prefill_batch`, obeying `max_num_partial_prefills` and long‑prompt controls.
 
-- [ ] **6.3.2 Add adaptive tuning based on observed latency and tokens/sec.** (Owner: Engineer A, Progress: 0%)  
+- [ ] **6.3.2 Add adaptive tuning based on observed latency and tokens/sec.** (Owner: Engineer A, Progress: 30%)  
   Design:
   - Track moving averages:
     ```cpp
@@ -807,7 +809,7 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
 ### 6.4 DriftEngine Data Flow (End‑to‑End)
 
-- [ ] **6.4.1 Define the end‑to‑end request lifecycle in DriftEngine.** (Owner: Engineer A, Progress: 0%)  
+- [ ] **6.4.1 Define the end‑to‑end request lifecycle in DriftEngine.** (Owner: Engineer A, Progress: 10%)  
   Design (high‑level flow):
   1. Python side:
      - User constructs `DriftEngineConfig` and starts a `drift_pipeline` or `drift_api_server`.  
@@ -839,20 +841,66 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
 ## 7. Summary (Non‑Speculative Readiness)
 
-- Core engine & scheduler (Section 1) – **~50%**:  
-  Solid base with Gateway/RequestQueue; needs explicit scheduler, token budgets, and KV‑aware admission.  
+- Core engine & scheduler (Section 1) – **~70%**:  
+  Explicit `EngineScheduler` with token budgets, phase tracking, and prefill/decode batching is in place; needs polish on decode‑side accounting, adaptive tuning, and more stress testing.  
 
-- KV cache & prefix reuse (Section 2) – **~40%**:  
-  Strong low‑level KV utilities; missing engine‑level KV manager and prefix cache.  
+- KV cache & prefix reuse (Section 2) – **~70%**:  
+  Engine‑level `KVCacheManager` and `PrefixCache` are implemented and wired into the scheduler and LlamaBatch; remaining work is around ownership semantics, eviction tuning, and thorough correctness/perf validation.  
 
 - Kernels, fusion, CUDA graphs (Section 3) – **~40%**:  
   Good kernels; further fusion and optional graph capture required for peak throughput.  
 
-- KV‑aware scheduling (Section 4) – **~20%**:  
-  Capacity is not yet a first‑class input to scheduling decisions.  
+- KV‑aware scheduling (Section 4) – **~60%**:  
+  KV usage estimation, `CapacityScheduler`, and prefix‑aware eviction exist and are wired into `EngineScheduler`; needs hardened policies, error handling, and production‑quality tests.  
 
 - Benchmarks & gates (Section 5) – **~25%**:  
   Scripts and metrics exist, but need standardization and integration into CI.  
 
 Speculative decoding (EAGLE/EAGLE3, SpecPV, etc.) is intentionally **out of scope** here and tracked separately.  
 Reaching “100% ready” for GPT‑OSS‑120B **non‑speculative decoding** (and enabling DriftEngine to outperform existing engines) requires driving all sections above to ~80–100%, with hard performance and correctness gates, not just feature presence.
+
+---
+
+## 8. SGLang‑Style Parity Checklist (Non‑Spec DriftEngine)
+
+This section summarizes, in one place, what is required for TurboMind/DriftEngine to match SGLang’s most important engine‑level behaviors for non‑speculative GPT‑OSS‑120B. All items below reference existing tasks in Sections 1–6 rather than introducing new work streams.
+
+- [ ] **8.1 Complete config→behavior wiring for scheduler/KV knobs.**  
+  Details: Python configs (`TurboMindSchedulerConfig`, `TurboMindKVConfig`, `DriftEngineConfig`) exist, and C++ structs (`SchedulerConfig`, `KVLayout`, `DriftEngineConfig`) are implemented.  
+  Needed:
+  - Audit and ensure every Python field that should affect scheduling or KV actually flows into:
+    - `SchedulerConfig` / `EngineScheduler` (Tasks 1.1.1–1.1.2, 1.2.1–1.2.5, 6.3.1–6.3.2).  
+    - `KVLayout` / `KVCacheManager` / `PrefixCache` (Tasks 2.1.1–2.1.2, 2.2.1–2.2.3, 4.1.1–4.1.3).  
+  - Add an explicit `schedule_policy` enum to `SchedulerConfig` and implement at least:
+    - `fcfs` and `small_first` (short‑prompt‑first) as concrete variants in `EngineScheduler::schedule_step`.  
+  Owner: Engineer A + B (config plumbing, C++ policy implementation).
+
+- [ ] **8.2 Observability: scheduler, KV, prefix cache metrics.**  
+  Details: Request‑level metrics (`RequestMetrics`), schedule metrics (`ScheduleMetrics`), prefix cache stats, and KV usage are partially available but not unified.  
+  Needed:
+  - Define a metrics struct for DriftEngine that includes:
+    - Per‑step decode/prefill tokens and queue lengths (from `EngineScheduler`).  
+    - KV usage and eviction stats (`KVCacheManager`, `CapacityScheduler`).  
+    - Prefix cache stats (hits, misses, evictions, bytes evicted).  
+  - Expose this struct via the C++/Python bindings so `pipeline`, `serve`, and benchmarks can consume it (Tasks 5.1.2, 6.3.2).  
+  - Optionally integrate with Prometheus/OTel exporters or structured logs in a follow‑up.  
+  Owner: Engineer A + B.
+
+- [ ] **8.3 Benchmarks and CI gates for engine settings.**  
+  Details: Individual benchmark scripts exist, but no single harness compares engines under identical workloads.  
+  Needed:
+  - Implement a unified benchmark harness (Task 5.1.1) that can run:
+    - Legacy TurboMind, DriftEngine, vLLM, sglang, TensorRT‑LLM, EasyDeL on common short/long/mixed request distributions.  
+  - Integrate metrics from 8.2, and:
+    - Use them to choose default DriftEngine settings rather than guessing.  
+    - Establish CI micro‑gates (Tasks 5.2.1–5.2.2) that catch regressions in throughput, latency, and KV correctness.  
+  Owner: Engineer B (with input from A for metrics).
+
+- [ ] **8.4 Speculative and MoE layers kept separate from DriftEngine core.**  
+  Details: SGLang exposes many `--speculative-*` and MoE knobs; this file focuses on non‑spec GPT‑OSS‑120B decode. EAGLE/EAGLE3/SpecPV work is tracked in `EAGLE_TODOS.md` and `SPECPV_TODO.md`.  
+  Needed:
+  - Maintain a clear separation where:
+    - DriftEngine’s scheduler and KV stack (Tasks 1.2.x, 2.1.x–2.2.x, 4.1.x, 6.2.x–6.4.x) are **non‑speculative**.  
+    - Speculative decoding and MoE controls live in a dedicated `SpeculativeConfig` and MoE config, mapped to TurboMind’s EAGLE/EAGLE3/SpecPV and MoE kernels (Tasks in `EAGLE_TODOS.md`, `SPECPV_TODO.md`, and future MoE TODOs).  
+  - Avoid coupling speculative scheduling policy into the DriftEngine core loop; only hook in speculative paths where explicitly allowed by design.  
+  Owner: Engineer A (C++ separation) + B (Python config separation).

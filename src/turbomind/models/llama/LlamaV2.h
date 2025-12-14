@@ -67,6 +67,8 @@ public:
             int                          max_batch_size,
             std::shared_ptr<LlamaWeight> weights);
 
+    ~LlamaV2();
+
     size_t vocab_size() const noexcept
     {
         return vocab_size_;
@@ -234,7 +236,8 @@ private:
                                   int           tokens_per_seq,
                                   EagleBuffers& buffers,
                                   Tensor&       draft_logits,
-                                  cudaStream_t  stream);
+                                  const std::vector<int>& active_slots,
+                                  cudaStream_t            stream);
 
     // Seed the SpecPV partial-KV cache from a fully-verified prefix up to
     // `verified_seq_len` tokens. This flattens the live full-KV prefix
@@ -276,6 +279,31 @@ private:
     int eagleMaxEngineTokensPerStep() const noexcept
     {
         return eagle_max_engine_tokens_per_step_;
+    }
+
+    // Conservative upper bound on total draft tokens across all active
+    // slots for a single decode step. This is derived from engine
+    // configuration (spec_max_decoding_tokens and max_batch_size) and
+    // used to clamp per-sequence tokens_per_seq once active slot count
+    // is known.
+    int maxTotalDraftTokensPerStep() const noexcept
+    {
+        const int max_decoding_tokens = engine_param_.spec_max_decoding_tokens;
+        const int max_batch           = engine_param_.max_batch_size;
+        if (max_decoding_tokens <= 0 || max_batch <= 0) {
+            // Fallback to hardware forward-token budget when decoding
+            // tokens or batch size are unset; this keeps behaviour
+            // consistent with existing max_forward_token_num gating.
+            return engine_param_.max_forward_token_num;
+        }
+        long long total = static_cast<long long>(max_decoding_tokens) * static_cast<long long>(max_batch);
+        if (total <= 0) {
+            return engine_param_.max_forward_token_num;
+        }
+        if (total > static_cast<long long>(std::numeric_limits<int>::max())) {
+            return std::numeric_limits<int>::max();
+        }
+        return static_cast<int>(total);
     }
 
 private:
@@ -361,7 +389,28 @@ private:
     std::vector<int> eagle_step_accepted_lens_;
     std::vector<int> eagle_step_accepted_tokens_;
     int              eagle_step_tokens_per_seq_{0};
+    int              eagle_step_active_count_{0};
     int              eagle_step_max_extra_{0};
+
+    // Optional CUDA graph state for the Eagle3 draft path. When enabled
+    // via LMDEPLOY_EAGLE_CUDA_GRAPH_DRAFT, we capture a single canonical
+    // ForwardDraft call for a fixed (total_nodes, hidden_dims) shape and
+    // reuse it across steps that match that geometry. Handles are stored
+    // as opaque pointers to avoid exposing CUDA graph types in the header.
+    bool   eagle_draft_graph_enabled_{false};
+    bool   eagle_draft_graph_captured_{false};
+    int    eagle_draft_graph_total_nodes_{0};
+    int    eagle_draft_graph_attn_hidden_dim_{0};
+    int    eagle_draft_graph_draft_hidden_dim_{0};
+    void*  eagle_draft_graph_handle_{nullptr};
+    void*  eagle_draft_graph_exec_handle_{nullptr};
+    Tensor eagle_draft_graph_input_hidden_;
+    Tensor eagle_draft_graph_captured_hidden_;
+    Tensor eagle_draft_graph_position_ids_;
+    Tensor eagle_draft_graph_draft_hidden_;
+    Buffer eagle_draft_graph_logits_buffer_;
+    Tensor eagle_draft_graph_logits_;
+    Tensor eagle_draft_graph_logits_f32_;
 };
 
 }  // namespace turbomind

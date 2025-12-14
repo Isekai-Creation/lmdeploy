@@ -348,3 +348,49 @@ Eagle‑3 flow. The main remaining gaps are:
 
 These items are tracked in `EAGLE_TODO_FINAL` (Phases 2–5).
 
+---
+
+## 4. Perf gates and tuning tooling
+
+TurboMind wires Eagle‑3 perf validation and tuning through a small set
+of CLI tools and environment flags:
+
+- `benchmark_speculative.py`
+  - Drives baseline and Eagle‑3 speculative runs for:
+    - 32K single (`--scenario single`)
+    - 16K batch4 large‑context (`--scenario large-context`)
+  - Respects `LMDEPLOY_EAGLE_PERF_MODE=1` and
+    `LMDEPLOY_EAGLE_MICRO_STEPS` so micro runs can exercise long‑context
+    behaviour without full 16K/32K sweeps.
+- `tools/check_perf_gates.py`
+  - Consumes JSON outputs from `benchmark_speculative.py` and enforces
+    the micro perf gates:
+    - 32K single micro: spec‑3 ≥ 2.0× baseline and
+      `mean_acceptance_length ≥ 3.0`.
+    - 16K batch4 micro: spec‑3 ≥ 1.0× baseline and
+      `mean_acceptance_length ≥ 2.2`.
+- `run_spec_suite.sh`
+  - Entry point for the full speculative suite. When `SCENARIOS` contains
+    `large-context`, it automatically:
+    - Runs the 32K single + 16K batch4 micro gates in PERF_MODE
+      (3 consecutive passes by default).
+    - Uses `LMDEPLOY_EAGLE_MICRO_STEPS_SINGLE` / `_BATCH4` to control
+      micro step counts (defaults 512 / 128).
+    - Refuses to run full large‑context scenarios if any micro gate fails.
+- `tools/sweep_fmha_sm120.py`
+  - Sweeps `TM_EAGLE3_FMHA_{KV_TILE,MAX_TILES,BLOCK,HEADS_PER_CTA}` over
+    32K single + 16K batch4 micro runs and writes
+    `build/fmha_sweep_sm120.json` with throughput, acceptance, and tile
+    stats, which is used to choose near‑optimal FMHA defaults.
+- `tools/tune_eagle3_gemm_sm120.py`
+  - Reads `build/eagle3_gemm_shapes_sm120.json` (emitted when
+    `LMDEPLOY_EAGLE_GEMM_SHAPE_LOG=1` and `LMDEPLOY_EAGLE_PERF_MODE=1`
+    are enabled), aggregates GEMM shapes by tag
+    (`EAGLE3_FFN_*`, `EAGLE3_FC`, `EAGLE3_LM_HEAD(_SMALLVOC)`) and
+    prepares inputs for the gemm2 tuner/export pipeline.
+
+In PERF_MODE, GEMM dispatch treats any `EAGLE3_*` tag as tuned‑only:
+cache misses for Eagle‑3 draft FFN/FC/LM‑head shapes abort instead of
+falling back to generic kernels or cuBLAS, ensuring that 32K single and
+16K batch4 perf runs track the tuned configuration derived from the FMHA
+sweep and GEMM tuning pipeline.

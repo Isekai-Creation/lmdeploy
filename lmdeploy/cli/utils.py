@@ -131,7 +131,7 @@ class ArgumentHelper:
         return parser.add_argument('--dtype',
                                    type=str,
                                    default=default,
-                                   choices=['auto', 'float16', 'bfloat16'],
+                                   choices=['auto', 'fp16', 'bf16', 'fp8'],
                                    help='data type for model weights and activations. '
                                    'The "auto" option will use FP16 precision '
                                    'for FP32 and FP16 models, and BF16 precision '

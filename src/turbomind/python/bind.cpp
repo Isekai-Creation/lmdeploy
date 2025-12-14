@@ -577,7 +577,7 @@ PYBIND11_MODULE(_turbomind, m)
         []() {
             // NOTE: keep this string unique per significant binary change.
             // It is not a semantic version; it is a quick fingerprint.
-            return std::string("eagle3-align-debug-v1");
+            return std::string("eagle3-sm120-v2");
         },
         "Return a short build identifier for the loaded TurboMind binary");
 

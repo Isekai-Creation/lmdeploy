@@ -27,7 +27,8 @@ struct Impl<MMA_81616, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S
     using T   = T_;
     using Tkv = Tkv_;
 
-    static constexpr int kQuantKV = !std::is_same_v<T, Tkv>;
+    static constexpr int  kQuantKV = !std::is_same_v<T, Tkv>;
+    static constexpr bool kFp4Mx   = kQuantKV && std::is_same_v<Tkv, fp4_e2m1_t>;
 
     static constexpr int CTA_H = CTA_H_;
     static constexpr int CTA_Q = CTA_Q_;
@@ -247,7 +248,8 @@ struct Impl<MMA_81616, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S
         DataK     data_K;
         FragK     frag_K;
 
-        __device__ StateQK(SharedStorage& storage, FragQ frag_Q_)
+        template<class CacheIter>
+        __device__ StateQK(SharedStorage& storage, FragQ frag_Q_, const CacheIter&)
         {
             smem_K       = storage.KV.data();
             smem_K_param = storage.KVp;
@@ -266,7 +268,7 @@ struct Impl<MMA_81616, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S
             const int warp_id = threadIdx.x / WARP_SIZE;
             const int lane_id = threadIdx.x % WARP_SIZE;
 
-            if (kQuantKV && k == 0) {
+            if (kQuantKV && !kFp4Mx && k == 0) {
                 static_assert(K_M == 1);
                 const int m = 0;
                 PRAGMA_UNROLL
@@ -298,7 +300,29 @@ struct Impl<MMA_81616, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S
                     frag_K[k][m] = data_K[k][m];
                 }
             }
-            else {  // this also covers non-quantized case, but it's too convolved to read
+            else if constexpr (kFp4Mx) {
+                // FP4 MXFP4 path: decode FP4(E2M1) payload into T without
+                // applying affine (scale, zero) parameters. Per-block
+                // exponent scaling from the FP4 scale pool is applied at a
+                // higher level once scale bytes are available in decode.
+                static_assert(K_M == 1);
+                if (k % X == 0) {
+                    using Converter = ConvertKvCache<Tkv, T>;
+                    PRAGMA_UNROLL
+                    for (int s = 0; s < 2; ++s) {
+                        PRAGMA_UNROLL
+                        for (int d = 0; d < 2; ++d) {
+                            auto dx_d2 =
+                                Converter::convert((Array<Tkv, X * 2>&)data_K[k / X][0][d * 4 * X + s * 2 * X]);
+                            PRAGMA_UNROLL
+                            for (int x = 0; x < X; ++x) {
+                                (Array<short, 2>&)frag_K[k + x][0][d * 4 + s * 2] = (Array<short, 2>&)dx_d2[x * 2];
+                            }
+                        }
+                    }
+                }
+            }
+            else {  // affine int4/int8 KV cache
                 static_assert(K_M == 1);
                 if (k % X == 0) {
                     using Converter = ConvertKvCache<Tkv, T>;
@@ -373,7 +397,8 @@ struct Impl<MMA_81616, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S
         FragP     frag_P;
         FragV     frag_V;
 
-        __device__ StatePV(SharedStorage& storage, bool offset = false)
+        template<class CacheIter>
+        __device__ StatePV(SharedStorage& storage, bool offset, const CacheIter&)
         {
             smem_V       = storage.KV.data() + (offset ? SmemLayoutK::kSize : 0);
             smem_V_param = storage.KVp + (offset ? SmemLayoutKVp::kSize : 0);
@@ -383,7 +408,7 @@ struct Impl<MMA_81616, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S
         {
             const int warp_id = threadIdx.x / WARP_SIZE;
             const int lane_id = threadIdx.x % WARP_SIZE;
-            if (kQuantKV && m == 0) {
+            if (kQuantKV && !kFp4Mx && m == 0) {
                 static_assert(V_K == 1);
                 const int k = 0;
                 PRAGMA_UNROLL
@@ -423,7 +448,28 @@ struct Impl<MMA_81616, T_, Tkv_, CTA_H_, CTA_Q_, CTA_S_, WARP_H_, WARP_Q, WARP_S
                     frag_V[m][k] = data_V[m][k];
                 }
             }
-            else {
+            else if constexpr (kFp4Mx) {
+                // FP4 MXFP4 path: decode FP4(E2M1) payload into T without
+                // applying affine (scale, zero). Per-block exponent
+                // scaling is handled separately once FP4 scale bytes are
+                // visible in decode.
+                static_assert(V_K == 1);
+                if (m % X == 0) {
+                    PRAGMA_UNROLL
+                    for (int s = 0; s < 2; ++s) {
+                        PRAGMA_UNROLL
+                        for (int d = 0; d < 2; ++d) {
+                            auto dx_d2 = ConvertKvCache<Tkv, T>::convert(
+                                (Array<Tkv, 2 * X>&)data_V[m / X][0][s * 4 * X + d * 2 * X]);
+                            PRAGMA_UNROLL
+                            for (int x = 0; x < X; ++x) {
+                                (Array<T, 2>&)frag_V[m + x][0][s * 4 + d * 2] = (Array<T, 2>&)dx_d2[x * 2];
+                            }
+                        }
+                    }
+                }
+            }
+            else {  // affine int4/int8 KV cache
                 static_assert(V_K == 1);
                 if (m % X == 0) {
                     PRAGMA_UNROLL

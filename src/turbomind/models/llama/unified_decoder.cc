@@ -118,7 +118,7 @@ void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
                                   int           kv_len,
                                   int           past_kv_len,
                                   Tensor&       output_hidden,
-                                  int           batch_size,
+                                  int           num_tokens,
                                   cudaStream_t  stream)
 {
     TM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -130,24 +130,24 @@ void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
         return;
     }
 
-    if (!input_hidden || input_hidden.ndim() != 2 || input_hidden.shape(0) != batch_size
+    if (!input_hidden || input_hidden.ndim() != 2 || input_hidden.shape(0) != num_tokens
         || input_hidden.shape(1) != static_cast<int>(hidden_units_)) {
         TM_LOG_WARNING(
             "[UnifiedDecoder][EAGLE3][fallback] input_hidden shape mismatch in ForwardDraft "
             "(got=[%d,%d], expected=[%d,%zu]); passing through.",
             input_hidden ? input_hidden.shape(0) : -1,
             input_hidden ? input_hidden.shape(1) : -1,
-            batch_size,
+            num_tokens,
             hidden_units_);
         output_hidden = input_hidden;
         return;
     }
 
-    if (!output_hidden || output_hidden.ndim() != 2 || output_hidden.shape(0) != batch_size
+    if (!output_hidden || output_hidden.ndim() != 2 || output_hidden.shape(0) != num_tokens
         || output_hidden.shape(1) != static_cast<int>(hidden_units_)
         || output_hidden.dtype() != input_hidden.dtype()
         || output_hidden.device().type != input_hidden.device().type) {
-        output_hidden = Tensor{{batch_size, static_cast<int>(hidden_units_)}, input_hidden.dtype(), kDEVICE};
+        output_hidden = Tensor{{num_tokens, static_cast<int>(hidden_units_)}, input_hidden.dtype(), kDEVICE};
     }
 
     Tensor mask_tensor = packed_mask;

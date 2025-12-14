@@ -12,7 +12,8 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from lmdeploy.cli.utils import ArgumentHelper, DefaultsAndTypesHelpFormatter
-from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, TurbomindEngineConfig
+from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, TurboMindEngineConfig
+from lmdeploy.pytorch.config import TurboMindKVConfig
 from lmdeploy.profiler import Profiler, Session
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer
 from lmdeploy.utils import get_logger
@@ -134,9 +135,9 @@ def sample_random_requests(
 
 class Engine:
 
-    def __init__(self, model_path: str, engine_config: Union[PytorchEngineConfig, TurbomindEngineConfig]):
+    def __init__(self, model_path: str, engine_config: Union[PytorchEngineConfig, TurboMindEngineConfig]):
         self.tokenizer = Tokenizer(model_path)
-        if isinstance(engine_config, TurbomindEngineConfig):
+        if isinstance(engine_config, TurboMindEngineConfig):
             from lmdeploy.turbomind import TurboMind
             tm_model = TurboMind.from_pretrained(model_path, engine_config=engine_config)
             self.backend = 'turbomind'
@@ -341,20 +342,21 @@ def main():
     args = parse_args()
     random.seed(args.seed)
     if args.backend == 'turbomind':
-        engine_config = TurbomindEngineConfig(
+        kv_config = TurboMindKVConfig(
+            kv_page_size=args.cache_block_seq_len,
+            prefix_cache_enabled=args.enable_prefix_caching,
+            # kv_capacity_bytes is auto if None
+        )
+        engine_config = TurboMindEngineConfig(
             max_batch_size=args.concurrency // args.dp,
             tp=args.tp,
-            dp=args.dp,
-            cp=args.cp,
-            cache_max_entry_count=args.cache_max_entry_count,
-            cache_block_seq_len=args.cache_block_seq_len,
             model_format=args.model_format,
             quant_policy=args.quant_policy,
             num_tokens_per_iter=args.num_tokens_per_iter,
             max_prefill_iters=args.max_prefill_iters,
-            enable_prefix_caching=args.enable_prefix_caching,
             dtype=args.dtype,
-            communicator=args.communicator,
+            # communicator=args.communicator, # communicator is not in TurboMindEngineConfig
+            kv=kv_config,
         )
     elif args.backend == 'pytorch':
         engine_config = PytorchEngineConfig(

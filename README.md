@@ -197,6 +197,11 @@ LMDeploy has developed two inference engines - [TurboMind](./docs/en/inference/t
 
 They differ in the types of supported models and the inference data type. Please refer to [this table](./docs/en/supported_models/supported_models.md) for each engine's capability and choose the proper one that best fits your actual needs.
 
+Internally, the TurboMind backend is being refactored into a new **DriftEngine** orchestration that adds an explicit engine‑level scheduler, KV cache manager, prefix cache, and KV‑aware capacity control on top of the existing kernels. For a detailed design and an execution plan of this work, see:
+
+- `LM/lmdeploy/ENGINE.md` – architecture and cross‑engine comparison (TurboMind, DriftEngine, vLLM, sglang, TensorRT‑LLM, EasyDeL).
+- `LM/lmdeploy/ENGINE_TODOS.md` – numbered TODOs and progress for the TurboMind/DriftEngine engine, scheduler, KV manager, prefix cache, capacity scheduler, and benchmarks.
+
 # Quick Start [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Dh-YlSwg78ZO3AlleO441NF_QP2shs95#scrollTo=YALmXnwCG1pQ)
 
 ## Installation

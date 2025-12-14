@@ -4,7 +4,7 @@ from typing import Dict, List, Literal, Optional, Union
 
 from transformers import AutoConfig
 
-from .messages import PytorchEngineConfig, TurbomindEngineConfig
+from .messages import PytorchEngineConfig, TurboMindEngineConfig
 from .utils import get_logger
 
 logger = get_logger('lmdeploy')
@@ -57,17 +57,17 @@ def autoget_backend(model_path: str) -> Literal['turbomind', 'pytorch']:
 
 def autoget_backend_config(
     model_path: str,
-    backend_config: Optional[Union[PytorchEngineConfig, TurbomindEngineConfig]] = None
-) -> Union[PytorchEngineConfig, TurbomindEngineConfig]:
+    backend_config: Optional[Union[PytorchEngineConfig, TurboMindEngineConfig]] = None
+) -> Union[PytorchEngineConfig, TurboMindEngineConfig]:
     """Get backend config automatically.
 
     Args:
         model_path (str): The input model path.
-        backend_config (TurbomindEngineConfig | PytorchEngineConfig): The
+        backend_config (PytorchEngineConfig | TurboMindEngineConfig): The
             input backend config. Default to None.
 
     Returns:
-        (PytorchEngineConfig | TurbomindEngineConfig): The auto-determined
+        (PytorchEngineConfig | TurboMindEngineConfig): The auto-determined
             backend engine config.
     """
     from dataclasses import asdict
@@ -76,7 +76,7 @@ def autoget_backend_config(
     if backend == 'pytorch':
         config = PytorchEngineConfig()
     else:
-        config = TurbomindEngineConfig()
+        config = TurboMindEngineConfig()
     if backend_config is not None:
         if type(backend_config) == type(config):
             return backend_config
@@ -86,10 +86,10 @@ def autoget_backend_config(
                 if v and hasattr(config, k):
                     setattr(config, k, v)
             # map attributes with different names
-            if type(backend_config) is TurbomindEngineConfig:
-                config.block_size = backend_config.cache_block_seq_len
+            if type(backend_config) is TurboMindEngineConfig:
+                config.block_size = backend_config.kv.kv_page_size
             else:
-                config.cache_block_seq_len = backend_config.block_size
+                config.kv.kv_page_size = backend_config.block_size
     return config
 
 

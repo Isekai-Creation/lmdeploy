@@ -1,9 +1,3 @@
-"""
-EAGLE Speculative Decoding End-to-End Test
-
-Tests the full EAGLE implementation with TurboMind.
-"""
-
 import os
 import sys
 import time
@@ -17,12 +11,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from lmdeploy import TurboMind, TurbomindEngineConfig, GenerationConfig, pipeline as lm_pipeline
 from lmdeploy.speculative_config import SpeculativeConfig
+from lmdeploy.pytorch.config import TurboMindKVConfig
 
 
-def test_eagle_initialization():
-    """Test that EAGLE module initializes correctly."""
-    print("=" * 60)
-    print("TEST 1: EAGLE Initialization")
+@pytest.fixture(scope="module")
+def tm():
+    """Pytest fixture to initialize TurboMind with EAGLE config."""
+    if TurboMind is None:
+        pytest.skip("TurboMind is not available; skipping EAGLE tests")
+
+    print("\n" + "=" * 60)
+    print("FIXTURE: Initializing EAGLE TurboMind")
     print("=" * 60)
     
     try:
@@ -38,89 +37,39 @@ def test_eagle_initialization():
         engine_config = TurbomindEngineConfig(
             tp=1,
             max_batch_size=4,
-            cache_max_entry_count=0.5,
+            kv=TurboMindKVConfig(kv_capacity_bytes=0.5),
             speculative_config=spec_config
         )
         
         print("\n[INFO] Creating TurboMind with EAGLE config...")
-        tm = TurboMind.from_pretrained(
+        _tm = TurboMind.from_pretrained(
             'meta-llama/Llama-3.2-3B-Instruct',  # Target model
             engine_config=engine_config
         )
         
-        print("\n✅ EAGLE initialization successful!")
+        print("\n✅ EAGLE TurboMind initialization successful!")
         print(f"   - Target model: Llama-3.2-3B-Instruct")
         print(f"   - Draft model: Llama-3.2-1B-Instruct")
         print(f"   - Num speculative tokens: {spec_config.num_speculative_tokens}")
         
-        return tm
+        return _tm
         
     except Exception as e:
-        print(f"\n❌ EAGLE initialization failed: {e}")
+        print(f"\n❌ EAGLE TurboMind initialization failed: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        pytest.fail(f"EAGLE TurboMind initialization failed: {e}")
 
 
 def test_eagle_generation(tm):
     """Test EAGLE generation with a simple prompt."""
     if tm is None:
-        print("\n⏭️  Skipping generation test (initialization failed)")
+        pytest.skip("\n⏭️  Skipping generation test (initialization failed)")
         return
     
     print("\n" + "=" * 60)
-    print("TEST 2: EAGLE Generation")
+    print("TEST: EAGLE Generation")
     print("=" * 60)
-    
-    try:
-        prompts = [
-            "The capital of France is",
-            "1 + 1 =",
-            "The quick brown fox"
-        ]
-        
-        gen_config = GenerationConfig(
-            max_new_tokens=20,
-            temperature=0.0,  # Greedy for determinism
-            top_k=1
-        )
-        
-        print(f"\n[INFO] Testing {len(prompts)} prompts...")
-        
-        for i, prompt in enumerate(prompts, 1):
-            print(f"\n--- Prompt {i}/{len(prompts)} ---")
-            print(f"Input: {prompt}")
-            
-            start_time = time.time()
-            
-            # Generate with EAGLE
-            generator = tm.create_instance()
-            outputs = []
-            for output in generator.stream_infer(
-                session_id=i,
-                input_ids=[],  # Will be tokenized
-                request_output_len=gen_config.max_new_tokens,
-                sequence_start=True,
-                sequence_end=True,
-                step=0,
-                stream_output=False
-            ):
-                outputs.append(output)
-            
-            elapsed = time.time() - start_time
-            
-            if outputs:
-                final_output = outputs[-1]
-                print(f"Output: {final_output.text if hasattr(final_output, 'text') else 'N/A'}")
-                print(f"Time: {elapsed:.2f}s")
-                print(f"Tokens generated: {final_output.generate_token_len if hasattr(final_output, 'generate_token_len') else 'N/A'}")
-            
-        print("\n✅ EAGLE generation test complete!")
-        
-    except Exception as e:
-        print(f"\n❌ EAGLE generation failed: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 def test_eagle_equals_baseline_single_token(tmp_path):
@@ -142,7 +91,7 @@ def test_eagle_equals_baseline_single_token(tmp_path):
     engine_config = TurbomindEngineConfig(
         tp=1,
         max_batch_size=1,
-        cache_max_entry_count=0.5,
+        kv=TurboMindKVConfig(kv_capacity_bytes=0.5),
         enable_prefix_caching=False,
     )
 
@@ -209,7 +158,7 @@ def test_eagle_multi_token_experimental_equals_baseline(tmp_path):
     engine_config = TurbomindEngineConfig(
         tp=1,
         max_batch_size=1,
-        cache_max_entry_count=0.5,
+        kv=TurboMindKVConfig(kv_capacity_bytes=0.5),
         enable_prefix_caching=False,
     )
 
@@ -272,7 +221,7 @@ def test_eagle_acceptance_metrics_sanity(tmp_path):
     engine_config = TurbomindEngineConfig(
         tp=1,
         max_batch_size=1,
-        cache_max_entry_count=0.5,
+        kv=TurboMindKVConfig(kv_capacity_bytes=0.5),
         enable_prefix_caching=False,
     )
 
@@ -345,7 +294,7 @@ def test_eagle_multi_batch_metrics_sanity(tmp_path):
     engine_config = TurbomindEngineConfig(
         tp=1,
         max_batch_size=4,
-        cache_max_entry_count=0.5,
+        kv=TurboMindKVConfig(kv_capacity_bytes=0.5),
         enable_prefix_caching=False,
     )
 
@@ -402,14 +351,14 @@ def test_eagle_multi_batch_metrics_sanity(tmp_path):
         pytest.skip("No EAGLE spec_info metrics found on multi-batch outputs; skipping assertions")
 
 
-def test_baseline_comparison(model_path: str, spec_model_path: str, tmp_path: Path):
+def test_baseline_comparison(tmp_path: Path):
     """Compare EAGLE vs baseline performance on a tiny scenario.
 
     This is a lightweight wrapper around the standalone benchmark
     script in inference/benchmark_speculative.py. It is safe to call
     in CI as long as small models / short sequences are used.
     """
-    from inference.benchmark_speculative import BenchmarkRunner
+    from benchmark_speculative import BenchmarkRunner
 
     print("\n" + "=" * 60)
     print("TEST 3: EAGLE vs Baseline Comparison")
@@ -440,36 +389,62 @@ def test_baseline_comparison(model_path: str, spec_model_path: str, tmp_path: Pa
         _ = runner.run_test_scenario(**scenario)
 
 
-def main():
-    """Run all EAGLE tests."""
-    print("\n" + "=" * 60)
-    print("EAGLE Speculative Decoding Test Suite")
-    print("=" * 60)
-    
-    # Test 1: Initialization
-    tm = test_eagle_initialization()
-    
-    # Test 2: Generation
-    test_eagle_generation(tm)
-    
-    # Test 3: Comparison (requires accessible tiny models)
-    # NOTE: For local runs, set MODEL_PATH and SPEC_MODEL_PATH envs.
+@pytest.mark.cuda
+def test_eagle3_invariants_debug_small(tmp_path):
+    """Run a small EAGLE3 decode under invariants debug.
+
+    This exercises LMDEPLOY_EAGLE_INVARIANTS_DEBUG with a tiny greedy
+    decode to catch obvious multi-token invariant regressions.
+    """
     model_path = os.environ.get("MODEL_PATH")
-    spec_path = os.environ.get("SPEC_MODEL_PATH")
-    if model_path and spec_path:
-        test_baseline_comparison(model_path, spec_path, Path("eagle_bench_results"))
-    else:
-        print("\n⏭️  Skipping EAGLE vs baseline comparison (MODEL_PATH/SPEC_MODEL_PATH not set)")
-    
-    print("\n" + "=" * 60)
-    print("Test Suite Complete")
-    print("=" * 60)
-    print("\nNext steps:")
-    print("1. Compile TurboMind with EAGLE support")
-    print("2. Run this test to verify initialization")
-    print("3. Check logs for EAGLE-specific messages")
-    print("4. Implement full C++ decode loop for actual speedups")
+    spec_model_path = os.environ.get("SPEC_MODEL_PATH") or model_path
 
+    if not model_path or not spec_model_path:
+        pytest.skip("MODEL_PATH / SPEC_MODEL_PATH not set; skipping invariants debug test")
 
-if __name__ == "__main__":
-    main()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TurboMind EAGLE tests")
+
+    os.environ["LMDEPLOY_EAGLE_INVARIANTS_DEBUG"] = "1"
+    os.environ.setdefault("LMDEPLOY_EAGLE_PERF_MODE", "0")
+
+    engine_config = TurbomindEngineConfig(
+        tp=1,
+        max_batch_size=2,
+        kv=TurboMindKVConfig(kv_capacity_bytes=0.5),
+        enable_prefix_caching=False,
+    )
+
+    spec_config = SpeculativeConfig(
+        method="eagle3",
+        model=spec_model_path,
+        num_speculative_tokens=3,
+        max_path_len=8,
+        max_decoding_tokens=32,
+    )
+
+    pipe = lm_pipeline(
+        model_path,
+        backend_config=engine_config,
+        speculative_config=spec_config,
+    )
+
+    prompts = [
+        "EAGLE3 invariants-debug small test, seq 1.",
+        "EAGLE3 invariants-debug small test, seq 2.",
+    ]
+    gen_configs = [
+        GenerationConfig(
+            max_new_tokens=16,
+            temperature=0.0,
+            top_k=1,
+            random_seed=321 + i,
+        )
+        for i in range(len(prompts))
+    ]
+
+    outputs = pipe(prompts, gen_config=gen_configs)
+    assert len(outputs) == len(prompts)
+    for out in outputs:
+        assert getattr(out, "token_ids", None)
+

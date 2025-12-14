@@ -214,8 +214,8 @@ __global__ void treeLogitsToTargetIdsKernel(TreeLogitsToTargetsParams params)
 
     const float* row = params.logits + static_cast<size_t>(idx) * params.vocab_size;
 
-    float   best_val = -FLT_MAX;
-    SizeType best_id = 0;
+    float    best_val = -FLT_MAX;
+    SizeType best_id  = 0;
 
     for (SizeType j = 0; j < params.vocab_size; ++j) {
         const float v = row[j];
@@ -236,8 +236,16 @@ __global__ void treeLogitsToTargetIdsKernel(TreeLogitsToTargetsParams params)
         return;
     }
 
+    // Map draft-vocab id to full-vocab id when a mapping table is
+    // provided; otherwise treat best_id as a full-vocab id.
+    TokenIdType out_id = static_cast<TokenIdType>(best_id);
+    if (params.draft_id_to_target) {
+        const TokenIdType mapped = params.draft_id_to_target[best_id];
+        out_id                   = mapped;
+    }
+
     const SizeType offset = slot * params.max_decoding_tokens + token_idx;
-    params.target_tokens[offset] = static_cast<TokenIdType>(best_id);
+    params.target_tokens[offset] = out_id;
 }
 
 __global__ void gatherTreePackedMaskKernel(const SizeType* packed_masks,

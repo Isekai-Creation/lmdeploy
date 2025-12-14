@@ -211,9 +211,10 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     // UnifiedDecoder. Draft-specific tensors explicitly use
     // draft_hidden_units_ below, and attention uses base_hidden_units_ when
     // Eagle3 geometry is present.
-    hidden_units_ = hidden_units;
-    hidden_units  = hidden_units_;
-    vocab_size_   = vocab_size;
+    hidden_units_      = hidden_units;
+    hidden_units       = hidden_units_;
+    vocab_size_        = vocab_size;
+    draft_vocab_size_  = model_config["draft_vocab_size"] ? model_config["draft_vocab_size"].as<int>() : vocab_size_;
 
     // Warn when base hidden does not match head geometry.
     if (base_hidden_units_ != head_num * head_dim) {
@@ -342,14 +343,49 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     // draft-hidden space.
     weights_.attn_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
 
-    // Draft FFN stays in draft_hidden space.
-    weights_.mlp_gate_up = Tensor{Layout({intermediate_size * 2, draft_hidden_units_}), dtype, kDEVICE};
-    weights_.mlp_down    = Tensor{Layout({intermediate_size, draft_hidden_units_}), dtype, kDEVICE};
+    // Draft FFN stays in draft_hidden space. For Eagle3 we optionally
+    // allow a "thin" FFN that reduces the intermediate width for the
+    // draft-only path. This is controlled by `eagle_ffn_thin_factor`
+    // in config.yaml; when N>1, we clamp intermediate_size to
+    // max(draft_hidden_units_ / N, 1) for the draft layer.
+    int ffn_inter_size = intermediate_size;
+    if (eagle3) {
+        const auto thin_node = model_config["eagle_ffn_thin_factor"];
+        if (thin_node && thin_node.IsScalar()) {
+            try {
+                const int factor = thin_node.as<int>();
+                if (factor > 1) {
+                    const int thin = std::max(draft_hidden_units_ / factor, 1);
+                    if (thin < ffn_inter_size) {
+                        TM_LOG_INFO(
+                            "[EAGLE][EagleModule::load] Eagle3 thin FFN enabled: intermediate_size %d -> %d (factor=%d)",
+                            ffn_inter_size,
+                            thin,
+                            factor);
+                        ffn_inter_size = thin;
+                    }
+                }
+            }
+            catch (const std::exception&) {
+                // Ignore malformed thin factor and keep default size.
+            }
+        }
+    }
+    weights_.mlp_gate_up = Tensor{Layout({ffn_inter_size * 2, draft_hidden_units_}), dtype, kDEVICE};
+    weights_.mlp_down    = Tensor{Layout({ffn_inter_size, draft_hidden_units_}), dtype, kDEVICE};
 
     // Output norm and LM head operate in the same hidden space as the base
     // model hidden states (hidden_units_ / draft_hidden_units_).
     weights_.output_norm = Tensor{Layout({draft_hidden_units_}), dtype, kDEVICE};
-    weights_.lm_head     = Tensor{Layout({draft_hidden_units_, vocab_size}), dtype, kDEVICE};
+    // LM head may operate over a reduced draft vocab to cut FLOPs on the
+    // draft path. When draft_vocab_size_ is not set explicitly, fall back
+    // to the full vocab.
+    const int draft_vocab = draft_vocab_size_ > 0 ? draft_vocab_size_ : vocab_size_;
+    weights_.lm_head      = Tensor{Layout({draft_hidden_units_, draft_vocab}), dtype, kDEVICE};
+    // Optional draft-id -> full-vocab-id remap. When a mapping file is
+    // not present we fall back to an identity map so that downstream
+    // code can always rely on full-vocab ids.
+    weights_.draft_id_to_target_id = Tensor{Layout({draft_vocab}), kInt32, kDEVICE};
 
     // Optional native Eagle3 attention projections (non‑LLaMA geometry).
     // Only allocate these when we have full Eagle3 geometry; otherwise
@@ -522,6 +558,42 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     // Output norm and LM head are required for EagleModule to be usable.
     bool output_norm_ok = load_with_variants(weights_.output_norm, "norm.weight");
     bool lm_head_ok     = load_with_variants(weights_.lm_head, "output.weight");
+    // Optional draft-id → target-id remap. When the mapping file is
+    // missing we initialise an identity mapping on device so that
+    // downstream code can always treat draft ids as full-vocab ids.
+    {
+        const std::string map_path = base + "draft_id_to_target_id.weight";
+        bool              map_ok   = false;
+        if (weights_.draft_id_to_target_id && !map_path.empty()) {
+            std::ifstream map_file(map_path, std::ios::binary | std::ios::ate);
+            if (map_file) {
+                const auto elems = static_cast<std::streamsize>(weights_.draft_id_to_target_id.size());
+                const auto bytes = elems * static_cast<std::streamsize>(sizeof(int32_t));
+                if (map_file.tellg() == bytes) {
+                    map_file.seekg(0, std::ios::beg);
+                    std::vector<int32_t> host_map(static_cast<size_t>(elems));
+                    if (map_file.read(reinterpret_cast<char*>(host_map.data()), bytes)) {
+                        check_cuda_error(cudaMemcpy(weights_.draft_id_to_target_id.data<int32_t>(),
+                                                    host_map.data(),
+                                                    bytes,
+                                                    cudaMemcpyHostToDevice));
+                        map_ok = true;
+                    }
+                }
+            }
+        }
+        if (!map_ok && weights_.draft_id_to_target_id) {
+            const ssize_t elems = weights_.draft_id_to_target_id.size();
+            std::vector<int32_t> host_map(static_cast<size_t>(elems));
+            for (ssize_t i = 0; i < elems; ++i) {
+                host_map[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+            }
+            check_cuda_error(cudaMemcpy(weights_.draft_id_to_target_id.data<int32_t>(),
+                                        host_map.data(),
+                                        static_cast<size_t>(elems) * sizeof(int32_t),
+                                        cudaMemcpyHostToDevice));
+        }
+    }
     success &= output_norm_ok && lm_head_ok;
 
     // Prepare LM head wrapper for LlamaLinear. The input dim for the
@@ -531,16 +603,29 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
     // hidden width.
     if (weights_.lm_head) {
         int lm_in  = this->hidden_units_;
-        int lm_out = this->vocab_size_;
+        int lm_out = (draft_vocab_size_ > 0) ? draft_vocab_size_ : this->vocab_size_;
         if (weights_.lm_head.ndim() == 2) {
-            lm_in  = weights_.lm_head.shape(0);
-            lm_out = weights_.lm_head.shape(1);
+            lm_in = weights_.lm_head.shape(0);
+            // When the on-disk LM head has a larger vocab than the
+            // configured draft_vocab_size_, slice the weight tensor to
+            // keep only the first draft_vocab_size_ columns. This allows
+            // us to reduce LM-head FLOPs without requiring a separate
+            // truncated weight file.
+            const int raw_out = weights_.lm_head.shape(1);
+            lm_out            = std::min(lm_out, raw_out);
         }
         lm_head_input_dim_ = lm_in;
         vocab_size_        = lm_out;
 
-        lm_head_weight_.emplace(lm_in, lm_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
-        lm_head_weight_.weight      = weights_.lm_head.borrow();
+        lm_head_weight_.emplace(
+            lm_in, lm_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
+        // Borrow a view over the first lm_out columns so the dense
+        // kernel never touches the tail of the full-vocab head.
+        Tensor lm_head_view = weights_.lm_head;
+        if (weights_.lm_head.ndim() == 2 && weights_.lm_head.shape(1) != lm_out) {
+            lm_head_view = weights_.lm_head.slice({0, 0}, {lm_in, lm_out});
+        }
+        lm_head_weight_.weight      = lm_head_view.borrow();
         lm_head_weight_.bias        = {};
         lm_head_weight_.data_type   = weight_dtype_;
         lm_head_weight_.weight_type = weight_dtype_;
@@ -670,7 +755,8 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
         // Minimal FFN wrapper: treat mlp_gate_up as a fused gating
         // projection and mlp_down as the output projection. We rely on
         // the same LlamaLinear backend used elsewhere in EagleModule.
-        const int inter_size = intermediate_size;
+        // Use the actual FFN intermediate size backing mlp_gate_up/down.
+        const int inter_size = weights_.mlp_down.shape(0);
         const int tp_size    = 1;
         const int tp_rank    = 0;
         const int group_size = 1;
@@ -1224,17 +1310,22 @@ void EagleModule::forward(const Tensor& input_ids,
     // Ensure LM head wrapper is ready (defensive in case load() was skipped)
     if (!lm_head_prepared_ && weights_.lm_head) {
         int lm_in  = this->hidden_units_;
-        int lm_out = this->vocab_size_;
+        int lm_out = (draft_vocab_size_ > 0) ? draft_vocab_size_ : this->vocab_size_;
         if (weights_.lm_head.ndim() == 2) {
-            lm_in  = weights_.lm_head.shape(0);
-            lm_out = weights_.lm_head.shape(1);
+            lm_in = weights_.lm_head.shape(0);
+            const int raw_out = weights_.lm_head.shape(1);
+            lm_out            = std::min(lm_out, raw_out);
         }
         lm_head_input_dim_ = lm_in;
         vocab_size_        = lm_out;
 
         lm_head_weight_.emplace(
             lm_in, lm_out, this->weight_dtype_, /*bias=*/false, this->weight_dtype_, /*group_size=*/1);
-        lm_head_weight_.weight      = weights_.lm_head.borrow();
+        Tensor lm_head_view = weights_.lm_head;
+        if (weights_.lm_head.ndim() == 2 && weights_.lm_head.shape(1) != lm_out) {
+            lm_head_view = weights_.lm_head.slice({0, 0}, {lm_in, lm_out});
+        }
+        lm_head_weight_.weight      = lm_head_view.borrow();
         lm_head_weight_.bias        = {};
         lm_head_weight_.data_type   = weight_dtype_;
         lm_head_weight_.weight_type = weight_dtype_;

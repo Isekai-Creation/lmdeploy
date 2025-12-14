@@ -44,7 +44,7 @@ public:
                       int           kv_len,
                       int           past_kv_len,
                       Tensor&       output_hidden,
-                      int           batch_size,
+                      int           num_tokens,
                       cudaStream_t  stream);
 
     // Debug tensor accessors for eagle3 draft layer (populated when
