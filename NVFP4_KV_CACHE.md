@@ -29,11 +29,12 @@ The goal is to:
 
 **Config surface**
 
-- `TurbomindEngineConfig.quant_policy: int` with current valid values `{0, 4, 8}`:
+- `TurbomindEngineConfig.quant_policy: int` with current valid values `{0, 4, 8, 16}` for TurboMind:
   - `0`: no KV quantization (KV cache stored in model dtype: FP16/BF16).
-  - `4`: 4‑bit KV quantization.
-  - `8`: 8‑bit KV quantization.
-- CLI exposes `--quant-policy` with choices `[0, 4, 8]`.
+  - `4`: 4‑bit integer KV quantization.
+  - `8`: 8‑bit integer KV quantization.
+  - `16`: FP4 KV cache (FP4 E2M1 payload); maps to MXFP4 on Hopper (SM89/90) and is reserved for NVFP4 on Blackwell (SM10x/SM12x).
+- CLI exposes `--quant-policy` with choices `[0, 4, 8, 16]` for the TurboMind engine; PyTorch engine may still restrict this to `{0, 4, 8}`.
 
 **Propagation path**
 
@@ -56,7 +57,7 @@ The goal is to:
 
 **Quant policy enum**
 
-- `llama_utils.h`:
+- `llama_utils.h` (current):
   - ```cpp
     enum QuantPolicy {
         kNone        = 0x00,
@@ -64,12 +65,13 @@ The goal is to:
         kReserve2    = 0x02,
         kCacheKVInt8 = 0x08,
         kCacheKVInt4 = 0x04,
+        // FP4 KV cache (FP4 E2M1 payload + per-16-element scales; MXFP4/NVFP4 family)
+        kCacheKVFp4  = 0x10,
     };
     ```
-- In practice, LMDeploy sets `quant_policy = 4` or `8`. C++ side uses:
-  - `if (quant_policy & QuantPolicy::kCacheKVInt8) { ... }`
-  - `else if (quant_policy & QuantPolicy::kCacheKVInt4) { ... }`
-  - For 4 and 8, these checks behave as expected.
+- C++ side interprets `quant_policy` as a **bitmask**:
+  - Int modes: `quant_policy & kCacheKVInt8` / `kCacheKVInt4`.
+  - FP4 modes: `quant_policy & kCacheKVFp4`, further refined to MXFP4 vs NVFP4 by `KvCacheMode` and SM version (see §3.3).
 
 ### 1.3 C++ side: KV block layout and cache managers
 
@@ -104,18 +106,19 @@ The goal is to:
 **KV cache initialization**
 
 - `LlamaBatch::InitializeBufferAndKVCache()` (`LlamaBatch.cc`):
-  - Determines KV element bits:
-    - `dbits = byte_size(data_type_, 8)` (16 for fp16/bf16).
-    - `quant_policy = model_->param_.quant_policy;`
-    - `elem_bits = quant_policy ? quant_policy : dbits;`  *(current code as of today)*
-  - Constructs `SequenceManager::BlockConfig`:
-    - `head_dim`, `kv_head_num`, `block_seq_len`, and:
-      - `t_bits = (elem_bits == dbits ? 0 : dbits)`,
-      - `q_bits = elem_bits`.
-  - Uses helper `get_cache_block_size` to compute `block_size` and builds a `BlockManager` with capacity derived from:
-    - `cache_max_block_count` and available GPU memory.
+  - Computes `dbits = byte_size(data_type_, 8)` (16 for fp16/bf16).
+  - Derives `KvCacheMode` from `model_->param_.quant_policy` and SM version via `GetKvCacheMode`:
+    - `kNone`, `kInt4`, `kInt8`, `kFp4Mx`, `kFp4Nv`.
+  - Sets `q_bits` / `t_bits` based on the mode (see §3.3):
+    - `kNone`: `q_bits = dbits`, `t_bits = 0`.
+    - `kInt8`: `q_bits = 8`, `t_bits = dbits`.
+    - `kInt4`: `q_bits = 4`, `t_bits = dbits`.
+    - `kFp4Mx` / `kFp4Nv`: `q_bits = 4`, `t_bits = 0` (no inline `(scale, zero)`).
+  - Constructs `SequenceManager::BlockConfig` with:
+    - `head_dim`, `kv_head_num`, `block_seq_len`, and the chosen `q_bits`/`t_bits`.
+  - Uses `get_cache_block_size` to compute the **data pool** `block_size`, and a separate `scale_block_size` for FP4 modes (one byte per 16 values for both K and V), which is passed into `SequenceManager` to allocate the FP4 scale pool alongside the data pool.
 
-> **Important:** this `elem_bits = quant_policy ? quant_policy : dbits` pattern only works because `quant_policy` is currently in `{0, 4, 8}` and is treated as the *bit‑width* when non‑zero. Once we add FP4 modes where `quant_policy` becomes a **bitmask** (e.g. `0x10` for NVFP4), this logic must be replaced by an explicit **KV cache mode** derived from the bitmask (see §3.3). We must not reuse `elem_bits = quant_policy` for any new FP4 modes.
+> **Historical note:** older code used `elem_bits = quant_policy ? quant_policy : dbits` and inferred `q_bits` directly from `quant_policy`. That was only sound when `quant_policy ∈ {0,4,8}` and meant “bit‑width”. In the current design this pattern has been removed in favour of `KvCacheMode` and explicit `q_bits`/`t_bits` selection.
 
 ### 1.4 C++ side: KV cache write / read paths
 
@@ -129,19 +132,28 @@ The goal is to:
 - `invokeProcessKV_v2` (`kv_cache_utils_v2.cu`):
   - Dispatches `ProcessKV_v2` with:
     - `T` = model dtype (`half` or `nv_bfloat16`),
-    - `Tkv` chosen based on `quant_policy`:
-      - `uint8_t` if `QuantPolicy::kCacheKVInt8`,
-      - `uint4_t` if `QuantPolicy::kCacheKVInt4`,
-      - `T` otherwise (no quant).
+    - `Tkv` chosen from `KvCacheMode`:
+      - `uint8_t` if `KvCacheMode::kInt8`,
+      - `uint4_t` if `KvCacheMode::kInt4`,
+      - `fp4_e2m1_t` if `KvCacheMode::kFp4Mx` (MXFP4 on Hopper),
+      - `T` otherwise (no quant, or `kFp4Nv` currently treated as base KV).
   - `ProcessKV_v2`:
     - Loads K/V tiles into `vec_K`, `vec_V`.
     - Optionally adds bias and applies RoPE.
     - For quantized KV (`T != Tkv`):
-      - Uses `warp_stats` to compute per‑tile min/max.
-      - Calculates `(scale, zero)` per tile.
-      - Uses `ConvertKvCache<T, Tkv>` and `StoreQuantParam<Tkv>` to:
-        - Write quantized data (`k_cache`, `v_cache`) into KV blocks.
-        - Write per‑token quant params (`k_param`, `v_param`) into param region of the block.
+      - For int4/int8:
+        - Uses `warp_stats` to compute per‑tile min/max.
+        - Calculates `(scale, zero)` per tile.
+        - Uses `ConvertKvCache<T, Tkv>` and `StoreQuantParam<Tkv>` to:
+          - Write quantized data (`k_cache`, `v_cache`) into KV blocks.
+          - Write per‑token quant params (`k_param`, `v_param`) into the param region of the block.
+      - For MXFP4 (`Tkv = fp4_e2m1_t`):
+        - Computes per‑16‑dim exponent bytes and writes them into the FP4 **scale pool** following the canonical layout
+          `scale[layer][kv_head][token][K_scales(0..D/16-1), V_scales(0..D/16-1)]`.
+        - Converts to FP4(E2M1) via `ConvertKvCache<fp4_e2m1_t, T>`’s inverse path and stores packed FP4 payload in the data pool via `block::Head<T, fp4_e2m1_t, BlockLayout>`.
+        - Does **not** use the inline `(scale, zero)` param region.
+      - For NVFP4 (`KvCacheMode::kFp4Nv`):
+        - Remains **gated** and falls back to base KV until true FP8(E4M3) block scale support is implemented.
 
 **KV read: flatten + decode**
 
@@ -219,13 +231,14 @@ Key traits we will mirror:
 - Target **non‑MLA** models first:
   - Standard MHA/GQA (e.g. GPT‑OSS‑120B).
   - No MLA‑specific KV layout changes in Phase 1.
-- Add a **third** KV quantization mode:
+- Add a **third FP4 KV cache family** on top of existing int4/int8:
   - Existing:
     - `0`: no KV quant.
     - `4`: int4 KV cache (uint4_t + scale/zero).
     - `8`: int8 KV cache (uint8_t + scale/zero).
-  - New:
-    - `NVFP4`: FP4 E2M1 KV cache + FP8 E4M3 block scales.
+  - New FP4 bit (`QuantPolicy::kCacheKVFp4` / `quant_policy=16` on TurboMind):
+    - On Hopper (SM89/90): **MXFP4_KV** — FP4 E2M1 payload + per‑16‑dim exponent bytes stored in a separate **scale pool**.
+    - On Blackwell (SM10x/SM12x): **NVFP4_KV** — FP4 E2M1 payload + per‑16‑dim FP8(E4M3) scales (to be implemented).
 - Keep existing int4/int8 behaviour intact and configurable.
 
 ### 3.2 Constraints and invariants
@@ -318,24 +331,24 @@ We have two realistic options for exposing NVFP4:
 
 Given the risk and lack of strong reason to deprecate int4 KV, this option is **not acceptable** for a clean integration.
 
-#### Option B (chosen): Extend `quant_policy` domain to `{0, 4, 8, 16}` and add a new bit for NVFP4
+#### Option B (chosen): Extend `quant_policy` domain to `{0, 4, 8, 16}` and add a new FP4 bit
 
 - Extend `QuantPolicy` enum (`llama_utils.h`) with:
-  - `kCacheKVNVFP4 = 0x10;`
+  - `kCacheKVFp4 = 0x10;`
 - Interpret `ModelParam.quant_policy` as a **bitmask**:
   - Lower bits (0x04, 0x08) indicate integer quant bits (int4/int8).
-  - New bit 0x10 indicates NVFP4 floating‑point KV:
-    - KV values stored as FP4 E2M1,
-    - KV scales stored as separate FP8 E4M3 block scales.
+  - New bit 0x10 indicates **FP4 KV cache family**:
+    - KV values stored as FP4 E2M1 in the data pool,
+    - KV scales stored in a separate scale pool (exponent bytes for MXFP4; FP8(E4M3) for NVFP4).
 - Mapping from Python `quant_policy` to C++ `QuantPolicy`:
-  - `0` → `kNone`.
-  - `4` → `kCacheKVInt4`.
-  - `8` → `kCacheKVInt8`.
-  - `16` → `kCacheKVNVFP4`.
-- Python side changes:
-  - Relax assertions in `TurbomindEngineConfig.__post_init__` and `PytorchEngineConfig.__post_init__` to allow `16`.
-  - Update CLI helpers (`CLI.utils.ArgumentHelper.quant_policy`) to accept `16` and document it as “NVFP4 KV cache”.
-  - For TurboMind engine, treat `quant_policy=16` as “NVFP4” and not as “16‑bit quant”.
+  - `0`  → `kNone`.
+  - `4`  → `kCacheKVInt4`.
+  - `8`  → `kCacheKVInt8`.
+  - `16` → `kCacheKVFp4`.
+- Python side changes (TurboMind):
+  - Relax assertions in `TurbomindEngineConfig.__post_init__` to allow `16`.
+  - Update CLI helpers (`CLI.utils.ArgumentHelper.quant_policy`) to accept `16` and document it as “FP4 KV cache (MXFP4 on Hopper, NVFP4 reserved on Blackwell)”.
+  - For TurboMind engine, treat `quant_policy=16` as “FP4 KV cache” and let `GetKvCacheMode` map to MXFP4 vs NVFP4 based on SM and `ENABLE_FP4`.
 
 This keeps:
 
@@ -369,10 +382,9 @@ If needed later, we can add:
 
 #### 5.1.2 FP4 type alias
 
-- Introduce FP4 E2M1 type (if not already present):
-  - Use NVIDIA’s `__nv_fp4_e2m1` or an alias:
-    - `using fp4_e2m1_t = __nv_fp4_e2m1;`
-- Guard NVFP4 code paths under `#if ENABLE_FP4` and compile only when CUDA headers expose FP4.
+- FP4 E2M1 storage type already exists in TurboMind:
+  - `struct fp4_e2m1_t {};` with `bitsof_t<fp4_e2m1_t> = 4` and `SubBytePtr<fp4_e2m1_t>` for packed storage.
+- Guard FP4‑specific kernels and dispatch under `#if ENABLE_FP4` where CUDA headers expose FP4 conversion intrinsics.
 
 #### 5.1.3 Capability detection
 
@@ -629,10 +641,10 @@ In `LM/lmdeploy/lmdeploy/turbomind/deploy/config.py`:
 
 This section is the implementation checklist. We keep Phase 1 strictly about *non‑MLA* (standard MHA/GQA).
 
-### 7.1 Config & plumbing
+### 7.1 Config & plumbing (Phase 1: MXFP4 first, NVFP4 gated)
 
-- [x] Extend `QuantPolicy` enum with FP4 KV bit (`kCacheKVFp4 = 0x10`) and derive `KvCacheMode` (NONE/INT4/INT8/MXFP4/NVFP4) based on `quant_policy` and SM version.
-- [x] Allow `quant_policy == 16` in `TurbomindEngineConfig` (TurboMind backend) and wire it through the LMDeploy config / CLI.
+- [x] Extend `QuantPolicy` enum with FP4 KV bit (`kCacheKVFp4 = 0x10`) and derive `KvCacheMode` (NONE/INT4/INT8/FP4_MX/FP4_NV) based on `quant_policy` and SM version.
+- [x] Allow `quant_policy == 16` in `TurbomindEngineConfig` (TurboMind backend) and wire it through the LMDeploy config / CLI as “FP4 KV cache (MXFP4 on Hopper; NVFP4 reserved on Blackwell)”.
 - [ ] Extend PyTorch engine config to accept `quant_policy == 16` (optional; TurboMind‑only for now).
 - [ ] In TurboMind Python, validate device type and CUDA capability for NVFP4 (optional but recommended).
 
@@ -651,21 +663,21 @@ This section is the implementation checklist. We keep Phase 1 strictly about *no
 
 ### 7.3 FP4 quantization kernels (MXFP4_KV + NVFP4_KV)
 
-- [ ] Introduce `fp4_e2m1_t` alias and guard with `ENABLE_FP4`.
-- [ ] Extend `invokeProcessKV_v2`:
-  - [ ] Branch on FP4 modes and call `ProcessKV_v2` with `Tkv = fp4_e2m1_t`.
-  - [ ] Ensure `block::Layout` uses `q_bits = 4` and `t_bits = 0` for FP4 modes.
+- [x] Introduce `fp4_e2m1_t` storage type and conversion helpers guarded with `ENABLE_FP4` (see `core/data_type.h` and `quantization.h`).
+- [x] Extend `invokeProcessKV_v2`:
+  - [x] Branch on FP4 modes via `KvCacheMode` and call `ProcessKV_v2` with `Tkv = fp4_e2m1_t` for MXFP4.
+  - [x] Ensure `block::Layout` uses `q_bits = 4` and `t_bits = 0` for FP4 modes (no inline `(scale, zero)`).
 
-- [ ] Implement MXFP4_KV quantization inside `ProcessKV_v2`:
-  - [ ] Per‑block (16 values) exponent computation and storage in the scale pool.
-  - [ ] Conversion from `T` to `fp4_e2m1_t` via CUDA intrinsics and packed storage in the data pool.
+- [x] Implement MXFP4_KV quantization inside `ProcessKV_v2`:
+  - [x] Per‑block (16 values) exponent computation and storage in the scale pool (uint8 exponent bytes with bias 127).
+  - [x] Conversion from `T` to `fp4_e2m1_t` and packed storage in the data pool.
 
 - [ ] Implement NVFP4_KV quantization inside `ProcessKV_v2`:
   - [ ] Per‑block (16 values) FP8(E4M3) scale computation (and optional K/V tensor‑level scales) matching TRT‑LLM’s NVFP4 behaviour.
-  - [ ] Conversion from `T` to `fp4_e2m1_t` via CUDA intrinsics and packed storage in the data pool.
+  - [ ] Conversion from `T` to `fp4_e2m1_t` and packed storage in the data pool.
 
 - [ ] Extend `invokeFlattenKV_v2`:
-  - [ ] For FP4 modes, decode FP4 values + block scales (MXFP4 or NVFP4) and output `T` (fp16/bf16).
+  - [ ] For FP4 modes, decode FP4 values + block scales (MXFP4 or NVFP4) and output `T` (fp16/bf16) as a **debug/compat** path (not used in the main decode loop).
 
 ### 7.4 Decode & flatten integration
 
