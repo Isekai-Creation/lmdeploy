@@ -101,7 +101,49 @@ bool BlockManager::Malloc()
 size_t BlockManager::GetBlockCount(size_t block_size, double ratio, GetFreeMemSize get_free_size)
 {
     size_t free = get_free_size();
-    return static_cast<size_t>(free * ratio) / block_size;
+
+    // Treat `ratio` as an upper bound on the fraction of free device
+    // memory that can be reserved for KV blocks. On very large models
+    // (e.g. 120B with long contexts) an aggressive ratio such as 0.75
+    // can lead to allocator failures on the first chunk allocation even
+    // though the theoretical "free * ratio" budget exists. To make the
+    // BlockManager more robust, apply an internal safety cap while
+    // keeping the user-visible knob unchanged.
+    double effective_ratio = ratio;
+
+    // Optional environment override to tighten the KV budget without
+    // changing engine configs. When set to a value in (0,1], this caps
+    // the internal ratio used for block sizing.
+    if (const char* env = std::getenv("TM_KV_EFFECTIVE_RATIO")) {
+        char*  end = nullptr;
+        double v   = std::strtod(env, &end);
+        if (end != env && v > 0.0 && v <= 1.0) {
+            if (v < effective_ratio) {
+                effective_ratio = v;
+                TM_LOG_WARNING(
+                    "[BlockManager] TM_KV_EFFECTIVE_RATIO=%s clamping cache_max_entry_count from %.3f to %.3f",
+                    env,
+                    ratio,
+                    effective_ratio);
+            }
+        }
+    }
+    else {
+        // Default safety cap when no explicit override is provided.
+        // This leaves headroom for model weights, activations, and
+        // additional runtime buffers even when cache_max_entry_count
+        // is configured to aggressive values like 0.75.
+        constexpr double kMaxSafeRatio = 0.70;
+        if (effective_ratio > kMaxSafeRatio) {
+            TM_LOG_WARNING(
+                "[BlockManager] Clamping cache_max_entry_count from %.3f to %.3f to avoid KV overallocation.",
+                ratio,
+                kMaxSafeRatio);
+            effective_ratio = kMaxSafeRatio;
+        }
+    }
+
+    return static_cast<size_t>(free * effective_ratio) / block_size;
 }
 
 void BlockManager::Move(std::vector<int>& src, const std::vector<int>& delta, std::vector<int>& dst)
