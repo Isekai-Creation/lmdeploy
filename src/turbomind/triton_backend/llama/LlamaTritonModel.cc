@@ -356,7 +356,23 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
     max_forward_token_num += engine_param_.max_batch_size;
 
     engine_param_.max_context_token_num = engine_reader["max_context_token_num"].as<int>(0);
-    engine_param_.session_len           = model_reader["session_len"].as<int>(0);
+
+    // Prefer an explicit engine-level session length when provided by the
+    // backend config (e.g. TurbomindEngineConfig.session_len in Python
+    // benchmarks). Falling back to the model's intrinsic `session_len`
+    // keeps backward compatibility, but avoids over-allocating KV/cache
+    // for very long contexts when the engine only ever uses shorter
+    // sequences (such as 8K/32K speculative benchmarks).
+    {
+        const int engine_session_len = engine_reader["session_len"].as<int>(0);
+        const int model_session_len  = model_reader["session_len"].as<int>(0);
+        if (engine_session_len > 0) {
+            engine_param_.session_len = engine_session_len;
+        }
+        else {
+            engine_param_.session_len = model_session_len;
+        }
+    }
 
     engine_param_.cache_max_block_count = engine_reader["cache_max_entry_count"].as<float>(0);
     engine_param_.cache_chunk_size      = engine_reader["cache_chunk_size"].as<int>(0);
@@ -648,7 +664,7 @@ void LlamaTritonModel::createEngine(int device_id, int rank)
 
     h_comm->Sync();
 
-    // engine.Start();
+    engine.Start();
 }
 
 ScheduleMetrics LlamaTritonModel::getScheduleMetrics(int device_id, int rank)

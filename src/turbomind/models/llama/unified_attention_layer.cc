@@ -286,15 +286,75 @@ Tensor UnifiedAttentionLayer::core_attention(Tensor& qkv, const ForwardParam& p,
     const auto device = qkv.device();
     const auto dtype  = qkv.dtype();
 
-    const int batch_size = decode_num_ + prefil_num_;
+    // Decode + prefill batch geometry. `h_q_len_` / `h_k_len_` are built
+    // for `bsz = h_q_len_.size()` slots; in well-formed calls this should
+    // equal `decode_num_ + prefil_num_`. To keep the attention layer
+    // robust against mismatches (which can otherwise lead to out-of-bounds
+    // reads and absurd k_count values), clamp the effective batch size and
+    // derive `k_count` directly from `h_k_len_` instead of relying on
+    // `h_cu_k_len_` (which may have been corrupted by earlier bugs).
+    const int bsz         = h_q_len_.size();
+    int       batch_size  = decode_num_ + prefil_num_;
+    batch_size            = std::max(0, std::min(batch_size, bsz));
+    int decode_slots      = std::max(0, std::min(decode_num_, batch_size));
+
     const int q_count    = qkv.shape(0);
-    const int k_count    = h_cu_k_len_[batch_size] - h_cu_k_len_[decode_num_];
+    int       k_count    = 0;
+    if (batch_size > decode_slots && h_k_len_.size() >= batch_size) {
+        const int* hk = h_k_len_.data();
+        for (int i = decode_slots; i < batch_size; ++i) {
+            k_count += std::max(0, hk[i]);
+        }
+    }
+
+    // Guard against corrupted or overflowed k_count. In a healthy engine
+    // k_count should be non-negative and bounded by the configured
+    // max_context_token_num for this engine. When it falls outside this
+    // range we clamp it conservatively so that the temporary K/V staging
+    // buffer (`tmp_kv`) never attempts to allocate an absurd length.
+    const int max_ctx_tokens = std::max(1, engine_param_.max_context_token_num);
+    if (k_count < 0 || k_count > max_ctx_tokens) {
+        TM_LOG_WARNING(
+            "[UnifiedAttention] Clamping k_count from %d to [%d, %d] "
+            "(decode_num=%d, prefil_num=%d, bsz=%d)",
+            k_count,
+            0,
+            max_ctx_tokens,
+            decode_num_,
+            prefil_num_,
+            bsz);
+        k_count = std::max(0, std::min(k_count, max_ctx_tokens));
+    }
+
     const int layer_id   = p.layer_id;
 
     const int local_q_kv_head_num = local_head_num_ + 2 * local_kv_head_num_;
 
     Tensor attn{{q_count, (int)local_head_num_ * (int)size_per_head_}, dtype, device};
-    Tensor tmp_kv{{(int)local_kv_head_num_, 2, k_count + MAX_CTA_S, (int)size_per_head_}, dtype, device};
+    // Compute a safe extent for the temporary K/V staging buffer,
+    // guarding against integer overflow on the `k_count + MAX_CTA_S`
+    // expression. The extra MAX_CTA_S tokens are used as a small safety
+    // margin in the underlying kernels.
+    int64_t kv_extent64 = static_cast<int64_t>(k_count) + MAX_CTA_S;
+    if (kv_extent64 <= 0) {
+        kv_extent64 = MAX_CTA_S;
+    }
+    const int64_t max_kv_extent =
+        static_cast<int64_t>(max_ctx_tokens) + MAX_CTA_S;
+    if (kv_extent64 > max_kv_extent) {
+        TM_LOG_WARNING(
+            "[UnifiedAttention] Clamping tmp_kv extent from %ld to %ld "
+            "(k_count=%d, MAX_CTA_S=%d, max_ctx_tokens=%d)",
+            (long)kv_extent64,
+            (long)max_kv_extent,
+            k_count,
+            MAX_CTA_S,
+            max_ctx_tokens);
+        kv_extent64 = max_kv_extent;
+    }
+    const int kv_extent = static_cast<int>(kv_extent64);
+
+    Tensor tmp_kv{{(int)local_kv_head_num_, 2, kv_extent, (int)size_per_head_}, dtype, device};
 
     auto CreateParams = [&](int offset, int batch_size, int max_kv_splits, cudaStream_t stream) {
         AttentionParams<T> params{};

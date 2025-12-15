@@ -48,9 +48,9 @@ BlockManager::BlockManager(
         chunk_size_ = chunk_size;
     }
 
-    TM_LOG_INFO("[BlockManager] block_size = %.3f MB", (float)block_size_ / (1 << 20));
-    TM_LOG_INFO("[BlockManager] max_block_count = %d", max_block_count_);
-    TM_LOG_INFO("[BlockManager] chunk_size = %d", chunk_size_);
+    TM_LOG_WARNING("[BlockManager] block_size = %.3f MB", (float)block_size_ / (1 << 20));
+    TM_LOG_WARNING("[BlockManager] max_block_count = %d (free_mem ratio applied)", max_block_count_);
+    TM_LOG_WARNING("[BlockManager] chunk_size = %d", chunk_size_);
 
     blocks_.reserve(max_block_count_);
 
@@ -59,7 +59,9 @@ BlockManager::BlockManager(
     free_ids_.reserve(max_block_count_);
 
     // pre-allocate first chunk
-    Malloc();
+    if (!Malloc()) {
+        TM_LOG_ERROR("[BlockManager] Failed to allocate first chunk! size=%lu, chunk_size=%d", block_size_ * chunk_size_, chunk_size_);
+    }
     dbg(free_ids_);
 }
 
@@ -78,7 +80,10 @@ bool BlockManager::Malloc()
         return false;
     }
 
-    auto ptr = (std::byte*)allocator_->allocate(block_size_ * chunk_size);
+    size_t alloc_size = block_size_ * chunk_size;
+    TM_LOG_WARNING("[BlockManager][Malloc] alloc_size = %lu * %d = %lu bytes (%.2f GB)", block_size_, chunk_size, alloc_size, alloc_size/1e9);
+
+    auto ptr = (std::byte*)allocator_->allocate(alloc_size);
     if (!ptr) {
         return false;
     }

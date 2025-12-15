@@ -481,15 +481,10 @@ LlamaV2::~LlamaV2()
 
 bool LlamaV2::isSpecPVEnabled() const noexcept
 {
-    // FP4 KV cache is not yet supported by SpecPV partial-KV integration.
-    // When FP4 KV is active we hard-disable SpecPV to avoid flattening
-    // from an unsupported FP4 KV layout.
-    if (param_.quant_policy & QuantPolicy::kCacheKVFp4) {
-        return false;
-    }
-
-    return engine_param_.enable_specpv && specpv_supported_ && isTargetTreeDecodeEnabled()
-           && static_cast<bool>(specpv_kv_cache_);
+    // Temporarily disable SpecPV partial-KV integration entirely. Full-KV
+    // EAGLE3 remains enabled; SpecPV will be reintroduced once its length
+    // and memory invariants are fully hardened.
+    return false;
 }
 
 bool LlamaV2::shouldUseSpecPV(int seq_len) const noexcept
@@ -2627,6 +2622,14 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
                                       Tensor&          out_k,
                                       Tensor&          out_v)
 {
+    // SpecPV partial-KV flattening is an optional feature. When SpecPV is
+    // disabled for this engine (either via config or because an earlier
+    // guard tripped), this helper must be a no-op to avoid allocating any
+    // large [B,H,S,D] scratch buffers.
+    if (!isSpecPVEnabled() || !specpv_kv_cache_) {
+        return false;
+    }
+
     if (!sequence_manager_ || !sequences || batch_size <= 0 || verified_seq_len <= 0) {
         return false;
     }
@@ -2690,6 +2693,24 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
         return false;
     }
 
+    // Sanity check: flattening more prefix tokens than are actually
+    // present in the SequenceManager is always a logic error and a fast
+    // path to absurd tensor sizes. When this happens we disable SpecPV
+    // and fall back to the full-KV path for this engine instead of
+    // attempting to materialize an invalid [B,H,S,D] layout.
+    if (verified_seq_len > total_tokens) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer requested verified_seq_len=%d "
+            "but total_tokens=%d; disabling SpecPV for this engine.",
+            verified_seq_len,
+            total_tokens);
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
+        return false;
+    }
+
     // Build block pointer table for the active sequences, storing device
     // pointers as 64-bit integers so we can reinterpret them as `char**`
     // when launching the flatten kernel.
@@ -2750,9 +2771,45 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
 
     // Flatten per-layer KV for this prefix into a temporary fp16/bf16
     // buffer and then convert to float32 for SpecPV.
-    const int head_num    = static_cast<int>(local_kv_head_num_);
-    const int head_dim    = static_cast<int>(size_per_head_);
-    const int max_seq_len = verified_seq_len;
+    const int head_num = static_cast<int>(local_kv_head_num_);
+    const int head_dim = static_cast<int>(size_per_head_);
+
+    // Derive the actual prefix length we will materialize from the
+    // per-slot prefix lengths rather than trusting verified_seq_len
+    // directly. This keeps the [B,H,S,D] scratch layout bounded by the
+    // real KV prefix that exists in SequenceManager even if the
+    // sequence_length buffer or SpecPV bookkeeping is corrupted.
+    int max_seq_len = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        if (h_prefix_len[i] > max_seq_len) {
+            max_seq_len = h_prefix_len[i];
+        }
+    }
+
+    const int max_session_len =
+        engine_param_.session_len > 0 ? engine_param_.session_len : attn_param_.max_position_embeddings;
+    if (max_seq_len <= 0 || max_seq_len > max_session_len) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] flattenPrefixKVForLayer derived invalid max_seq_len=%d "
+            "(verified_seq_len=%d, session_len=%d); disabling SpecPV and falling back to full-KV.",
+            max_seq_len,
+            verified_seq_len,
+            max_session_len);
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
+        return false;
+    }
+
+    TM_LOG_DEBUG(
+        "[LlamaV2][SpecPV] flattenPrefixKVForLayer allocating flat_k/flat_v "
+        "(layer=%d, batch=%d, heads=%d, len=%d, dim=%d)",
+        layer_idx,
+        batch_size,
+        head_num,
+        max_seq_len,
+        head_dim);
 
     Tensor flat_k_half{{batch_size, head_num, max_seq_len, head_dim}, dtype_, kDEVICE};
     Tensor flat_v_half{{batch_size, head_num, max_seq_len, head_dim}, dtype_, kDEVICE};
@@ -2841,6 +2898,15 @@ bool LlamaV2::flattenPrefixKVForLayer(int              layer_idx,
     sync_check_cuda_error();
 
     // Convert flattened KV to float32 for SpecPV summarization.
+    TM_LOG_DEBUG(
+        "[LlamaV2][SpecPV] flattenPrefixKVForLayer allocating out_k/out_v "
+        "(layer=%d, batch=%d, heads=%d, len=%d, dim=%d)",
+        layer_idx,
+        batch_size,
+        head_num,
+        max_seq_len,
+        head_dim);
+
     out_k = Tensor{{batch_size, head_num, max_seq_len, head_dim}, kFloat32, kDEVICE};
     out_v = Tensor{{batch_size, head_num, max_seq_len, head_dim}, kFloat32, kDEVICE};
     if (!out_k || !out_v) {
@@ -2973,6 +3039,26 @@ void LlamaV2::updateSpecPVAfterAcceptance(const Buffer&        sequence_length,
         if (h_seq_len[i] > max_len) {
             max_len = h_seq_len[i];
         }
+    }
+
+    // Defensive guard: sequence lengths must stay within the configured
+    // session length. When they exceed this bound it usually indicates a
+    // logic error or corrupted length buffer. In that case we disable
+    // SpecPV for this engine and fall back to the full-KV path rather
+    // than attempting to flatten an absurd prefix length and exhausting
+    // device memory.
+    const int max_session_len = engine_param_.session_len > 0 ? engine_param_.session_len : attn_param_.max_position_embeddings;
+    if (max_len > max_session_len) {
+        TM_LOG_WARNING(
+            "[LlamaV2][SpecPV][fallback] sequence_length contains invalid length %d "
+            "(session_len=%d); disabling SpecPV and continuing with full-KV.",
+            max_len,
+            max_session_len);
+        specpv_supported_             = false;
+        specpv_retrieval_initialized_ = false;
+        specpv_partial_steps_         = 0;
+        specpv_kv_cache_.reset();
+        return;
     }
 
     if (max_len <= 0 || !shouldUseSpecPV(max_len)) {

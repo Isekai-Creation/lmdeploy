@@ -3525,6 +3525,8 @@ void LlamaBatch::InitializeBufferAndKVCache()
         }
     }
 
+    TM_LOG_WARNING("[LlamaBatch] Creating SequenceManager. block_size(from layout)=?, scale_block_size=%lu", scale_block_size);
+
     sequence_manager_.reset(new SequenceManager{model_->layer_num_,
                                                 block_config,
                                                 cache_block_budget,

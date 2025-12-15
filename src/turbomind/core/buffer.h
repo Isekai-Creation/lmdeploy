@@ -45,6 +45,11 @@ public:
     Buffer(ssize_t size, DataType dtype, Allocator& alloc):
         base_{}, size_{size}, device_{alloc->device()}, dtype_{dtype}
     {
+        // Defensive check: element count should never be negative. When
+        // this happens it usually indicates an upstream overflow in shape
+        // or layout calculation. Fail fast here instead of propagating a
+        // huge wrapped size into the allocator.
+        TM_CHECK_GE(size, 0) << "Buffer constructed with negative element count";
         auto bytes = turbomind::byte_size(dtype, size);
         data_      = {alloc->allocate(bytes), [=](auto p) { alloc->deallocate(p, bytes); }};
     }

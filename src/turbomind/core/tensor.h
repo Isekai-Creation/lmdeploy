@@ -19,7 +19,40 @@ public:
 
     Tensor(Layout layout, DataType dtype, Allocator& alloc): layout_{std::move(layout)}
     {
-        buffer_ = Buffer(layout_.cosize(), dtype, alloc);
+        auto cosz = layout_.cosize();
+        if (cosz < 0) {
+            TM_LOG_ERROR("[Tensor] Negative cosize detected for layout %s (cosize=%zd); "
+                         "this indicates an upstream shape/stride overflow and is treated "
+                         "as a fatal invariant violation.",
+                         to_string(layout_).c_str(),
+                         cosz);
+            std::abort();
+        }
+
+        // Detect absurdly large tensors to avoid multi‑TB allocation
+        // attempts when upstream length bookkeeping is corrupted.
+        // Legitimate large weights (e.g. ~1e9 elements) should remain
+        // below this threshold. When this guard triggers we treat it as
+        // a fatal invariant violation instead of silently returning an
+        // empty buffer so that the offending callsite can be debugged.
+        constexpr ssize_t kLargeTensorThreshold = static_cast<ssize_t>(2000000000);  // 2e9 elements
+        if (cosz > kLargeTensorThreshold) {
+            TM_LOG_ERROR("[Tensor] Large tensor allocation too large: layout=%s cosize=%zd dtype=%d "
+                         "(threshold=%zd); aborting to avoid invalid multi-TB allocation.",
+                         to_string(layout_).c_str(),
+                         cosz,
+                         static_cast<int>(dtype),
+                         kLargeTensorThreshold);
+            std::abort();
+        }
+
+        // For reasonably-sized tensors, allocate backing storage normally.
+        if (cosz > 0) {
+            buffer_ = Buffer(cosz, dtype, alloc);
+        }
+        else {
+            buffer_ = Buffer{};
+        }
     }
 
     Tensor(Buffer buffer, Layout layout): layout_{std::move(layout)}, buffer_{buffer.slice(0, layout_.cosize())} {}
