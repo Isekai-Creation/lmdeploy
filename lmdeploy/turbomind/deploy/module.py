@@ -309,7 +309,8 @@ class MLA(Module):
         q, k = r.mla_norm(i)
         if q is not None:
             self.model.save_split(q, self._layernorm.format(i, 'q'))
-        self.model.save_split(k, self._layernorm.format(i, 'kv'))
+        if k is not None:
+            self.model.save_split(k, self._layernorm.format(i, 'kv'))
 
 
 class Misc(Module):

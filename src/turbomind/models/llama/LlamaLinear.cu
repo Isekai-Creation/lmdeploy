@@ -15,10 +15,129 @@
 #include "src/turbomind/models/llama/LlamaLinear.h"
 
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 
 using namespace gemm;
+
+namespace {
+
+// Simple row-major GEMM fallback: C[M,N] = A[M,K] @ B[K,N]
+template<typename T>
+__device__ inline float to_float_fallback(T x)
+{
+    return static_cast<float>(x);
+}
+
+template<>
+__device__ inline float to_float_fallback<half_t>(half_t x)
+{
+    return __half2float(x);
+}
+
+#if ENABLE_BF16
+template<>
+__device__ inline float to_float_fallback<bfloat16_t>(bfloat16_t x)
+{
+    return __bfloat162float(x);
+}
+#endif
+
+template<typename T>
+__device__ inline T from_float_fallback(float x)
+{
+    return static_cast<T>(x);
+}
+
+template<>
+__device__ inline half_t from_float_fallback<half_t>(float x)
+{
+    return __float2half(x);
+}
+
+#if ENABLE_BF16
+template<>
+__device__ inline bfloat16_t from_float_fallback<bfloat16_t>(float x)
+{
+    return __float2bfloat16(x);
+}
+#endif
+
+template<typename T>
+__global__ void NaiveRowMajorGemmKernel(const T* __restrict__ A,
+                                        const T* __restrict__ B,
+                                        T* __restrict__       C,
+                                        int                   M,
+                                        int                   K,
+                                        int                   N,
+                                        int                   lda,
+                                        int                   ldb,
+                                        int                   ldc)
+{
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) {
+        return;
+    }
+
+    float acc = 0.f;
+    for (int k = 0; k < K; ++k) {
+        const float a = to_float_fallback<T>(A[row * lda + k]);
+        const float b = to_float_fallback<T>(B[k * ldb + col]);
+        acc += a * b;
+    }
+    C[row * ldc + col] = from_float_fallback<T>(acc);
+}
+
+template<typename T>
+void launch_naive_rowmajor_gemm(const Tensor& A, const Tensor& B, Tensor& C, cudaStream_t stream)
+{
+    const int M   = static_cast<int>(A.shape(0));
+    const int K   = static_cast<int>(A.shape(1));
+    const int N   = static_cast<int>(B.shape(1));
+    const int lda = static_cast<int>(A.stride(0));
+    const int ldb = static_cast<int>(B.stride(0));
+    const int ldc = static_cast<int>(C.stride(0));
+
+    if (M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
+
+    // Sanity-check that the inner dimensions line up before launching
+    // the fallback kernel. When they do not (e.g. due to a higher‑level
+    // geometry mismatch), we skip the GEMM and leave C cleared to
+    // avoid illegal memory accesses.
+    if (B.shape(0) != K) {
+        TM_LOG_ERROR(
+            "[LlamaLinear][fallback] Skipping naive GEMM due to incompatible shapes: "
+            "A=(%d,%d) B=(%d,%d) C=(%d,%d)",
+            M,
+            K,
+            static_cast<int>(B.shape(0)),
+            static_cast<int>(B.shape(1)),
+            static_cast<int>(C.shape(0)),
+            static_cast<int>(C.shape(1)));
+        check_cuda_error(cudaMemsetAsync(C.raw_data(), 0, C.byte_size(), stream));
+        return;
+    }
+
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+
+    NaiveRowMajorGemmKernel<T><<<grid, block, 0, stream>>>(
+        static_cast<const T*>(A.raw_data()),
+        static_cast<const T*>(B.raw_data()),
+        static_cast<T*>(C.raw_data()),
+        M,
+        K,
+        N,
+        lda,
+        ldb,
+        ldc);
+}
+
+}  // anonymous namespace
 
 struct LlamaLinear::Impl {
 
@@ -141,6 +260,19 @@ struct LlamaLinear::Impl {
             desc_D.offsets = const_cast<int*>(offsets.data());
         }
 
+        if (isEnvVarEnabled("LMDEPLOY_EAGLE_GEMM_SHAPE_LOG")) {
+            static int logged = 0;
+            if (logged < 64) {
+                logEagleGemmShape("LLAMA_LINEAR",
+                                  desc_A.rows,
+                                  desc_A.cols,
+                                  desc_D.cols,
+                                  static_cast<int>(dense.data_type),
+                                  desc_A.order == kRowMajor ? "row_major" : "col_major");
+                ++logged;
+            }
+        }
+
         auto ec = gemm_.Run(op,
                             1.f,
                             A.raw_data(),
@@ -161,6 +293,41 @@ struct LlamaLinear::Impl {
 
         if (ec) {
             TM_LOG_ERROR("%s: %d", __PRETTY_FUNCTION__, ec);
+            // Fallback: for non-quantized BF16/FP16 dense GEMMs that our
+            // fused kernels do not cover (e.g. new SM architectures),
+            // fall back to a simple row-major GEMM so that higher-level
+            // code (including Eagle3) can continue to run.
+            const bool no_quant = dense.input_quant.type == QuantType::kNone
+                && dense.weight_quant.type == QuantType::kNone;
+            if (no_quant && (dense.data_type == kBfloat16 || dense.data_type == kFloat16)
+                && dense.data_type == dense.weight_type && dense.data_type == dense.input_type
+                && desc_A.order == kRowMajor && desc_B.order == kRowMajor && desc_D.order == kRowMajor) {
+                const bool perf_mode = isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
+                const char* current_tag = eagleCurrentGemmTag();
+                if (perf_mode && current_tag && std::strncmp(current_tag, "EAGLE3_", 7) == 0) {
+                    TM_LOG_ERROR(
+                        "[LlamaLinear][fallback] GEMM fallback in PERF_MODE for Eagle3 tag=%s "
+                        "M=%d K=%d N=%d; aborting.",
+                        current_tag,
+                        desc_A.rows,
+                        desc_A.cols,
+                        desc_D.cols);
+                    std::abort();
+                }
+                TM_LOG_ERROR(
+                    "[LlamaLinear][fallback] GEMM failed for dtype=%d; falling back to naive row-major matmul.",
+                    static_cast<int>(dense.data_type));
+
+                if (dense.data_type == kFloat16) {
+                    launch_naive_rowmajor_gemm<half_t>(A, B, D, stream_);
+                }
+#if ENABLE_BF16
+                else if (dense.data_type == kBfloat16) {
+                    launch_naive_rowmajor_gemm<bfloat16_t>(A, B, D, stream_);
+                }
+#endif
+                sync_check_cuda_error();
+            }
         }
     }
 

@@ -26,8 +26,13 @@ endif ()
 find_package(CUDAToolkit REQUIRED)
 
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11")
-  add_definitions("-DENABLE_BF16")
+  # Enable BF16 support in all translation units. Use an explicit
+  # =1 value so `#if ENABLE_BF16` evaluates as true.
+  add_definitions(-DENABLE_BF16=1)
 endif()
+
+# Enable FP4 KV cache support.
+add_definitions(-DENABLE_FP4=1)
 
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
 
@@ -141,7 +146,7 @@ if(BUILD_MULTI_GPU)
         file(GLOB nccl_lib_files "${nccl_path}/lib/libnccl.so.*")
         if(nccl_lib_files)
           list(GET nccl_lib_files -1 latest_lib)
-          string(REGEX MATCH "\\.([0-9]+)$" version_match ${latest_lib})
+          string(REGEX MATCH "\.([0-9]+)$" version_match ${latest_lib})
           if(version_match)
             set(NCCL_ROOT ${nccl_path})
             set(ENV{NCCL_VERSION} ${CMAKE_MATCH_1})
@@ -219,30 +224,9 @@ endif()
 
 
 if(ARCH STREQUAL "x86_64")
-  if (NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "")
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS "13.0")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 70-real 75-real) # V100, 2080
-    endif()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 80-real) # A100
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11.1")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 86-real) # 3090
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11.8")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real) # 4090
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "12.0")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 90a-real) # H100
-    endif ()
-    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "12.8")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real) # 5090
-    endif ()
-    if (MSVC)
-      list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES 80-real 90a-real)
-    endif ()
-  endif ()
+  # Build for Ada/Hopper and Blackwell GPUs. This enables BF16/FP4 paths
+  # on 8.9/9.0a while also generating native kernels for sm_120.
+  set(CMAKE_CUDA_ARCHITECTURES "89-real;90a-real;120-real")
 elseif(ARCH STREQUAL "aarch64")
   if (NOT CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 72-real 87-real)  # Jetson
@@ -264,6 +248,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --std=c++${CXX_STD}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -g")
 
 string(REPLACE "-O2" "" CMAKE_CXX_FLAGS_RELEASE         "${CMAKE_CXX_FLAGS_RELEASE}")
 string(REPLACE "-O2" "" CMAKE_CUDA_FLAGS_RELEASE        "${CMAKE_CUDA_FLAGS_RELEASE}")
@@ -335,6 +321,23 @@ include_directories(
 link_directories(
   ${COMMON_LIB_DIRS}
 )
+
+# Ensure CUDA::cuda_driver exists even if FindCUDAToolkit wasn't called.
+# On environments like Kaggle we may only have libcuda.so on the system.
+if(NOT TARGET CUDA::cuda_driver)
+  find_library(CUDA_DRIVER_LIB cuda)
+  if(CUDA_DRIVER_LIB)
+    add_library(CUDA::cuda_driver INTERFACE IMPORTED)
+    # Link the system libcuda into this pseudo-target
+    set_target_properties(CUDA::cuda_driver PROPERTIES
+      INTERFACE_LINK_LIBRARIES "${CUDA_DRIVER_LIB}")
+  else()
+    message(WARNING
+      "libcuda (driver library) not found; creating empty CUDA::cuda_driver target. "
+      "Some GPU functionality may be unavailable.")
+    add_library(CUDA::cuda_driver INTERFACE IMPORTED)
+  endif()
+endif()
 
 add_subdirectory(src)
 

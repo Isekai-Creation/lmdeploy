@@ -4,7 +4,9 @@
 #include "block.h"
 #include "decoding.h"
 #include "kv_cache_utils_v2.h"
+#include "fp4_kv_utils.h"
 #include "src/turbomind/kernels/attention/attention_params.h"
+#include "src/turbomind/kernels/attention/fp4_kv_utils.h"
 #include "src/turbomind/kernels/attention/reference.h"
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/utils/cuda_utils.h"
@@ -19,6 +21,19 @@
 #include <utility>
 
 using namespace turbomind;
+
+// Forward declaration for FP4 MXFP4 probe harness defined in fp4_kv_probe.cu.
+struct Fp4KvProbeResult;
+cudaError_t fp4_kv_probe_host(Fp4KvProbeResult& out,
+                              char**            d_blocks,
+                              char**            d_scale_blocks,
+                              int               layer_id,
+                              int               head_idx,
+                              int               head_num,
+                              int               block_len,
+                              int               head_dim,
+                              int               local_ti,
+                              cudaStream_t      stream);
 
 // [b, h, s, d] : current -> stride_h=s, stride_s=1, stride_b=hs
 // [cu_q, h, d] : qkvgemm -> stride_h=1, stride_s=h, stride_b=0
@@ -139,6 +154,7 @@ void TestBlocks(const thrust::universal_vector<T>& k_cache,        // [B, H, S, 
     for (int i = 0; i < 1; ++i) {
         // (B, 2, H, S, D) -> blocks
         invokeProcessKV_v2(k_ptrs.data().get(),
+                           nullptr,
                            kv_cache.data().get(),
                            kv_cache.data().get() + head_num * seq_len * head_dim,
                            (T*)nullptr,
@@ -159,7 +175,8 @@ void TestBlocks(const thrust::universal_vector<T>& k_cache,        // [B, H, S, 
                            head_num,
                            head_dim,
                            batch_size,
-                           quant_policy);
+                           quant_policy,
+                           getSMVersion());
     }
 
     thrust::universal_vector<T> kv_cache_2(kv_cache.size());
@@ -414,6 +431,7 @@ int test_attention()
     params.max_k_len  = kContextLen;
 
     params.block_iter_params = BlockIteratorParams{k_ptrs.data().get(),  //
+                                                   nullptr,
                                                    cu_block_cnts.data().get(),
                                                    0,
                                                    kBlockSz};
@@ -570,7 +588,8 @@ int test_attention()
                        KvHeadNum,
                        kHeadDim,
                        kBatchSize,
-                       kQuantPolicy);
+                       kQuantPolicy,
+                       params.arch);
     cudaDeviceSynchronize();
 
     const size_t nbytes = blocks.size() / kContextLen * std::min(kContextLen, (size_t)params.window_size);
@@ -626,6 +645,174 @@ int test_attention()
 int main(int argc, char* argv[])
 {
     test_attention<half>();
+
+#if defined(ENABLE_FP4)
+    // Optional FP4 MXFP4 probe harness to validate scale pool layout and
+    // payload packing. This is a lightweight debug path and is only built
+    // when FP4 support is enabled.
+    auto run_fp4_probe = []() {
+        using T   = half;
+        using Tkv = fp4_e2m1_t;
+
+        constexpr int head_dim   = 64;
+        constexpr int head_num   = 1;
+        constexpr int block_len  = 64;
+        constexpr int batch_size = 1;
+        constexpr int layer_id   = 0;
+        constexpr int head_idx   = 0;
+
+        constexpr int q_len = block_len * 2;  // two blocks
+
+        RNG rng{};
+
+        // K/V tensors: [B, S, H, D] flattened as [S, D] since we force
+        // stride_b/stride_c/stride_h to 0 and stride_s=1 in invokeProcessKV_v2.
+        thrust::universal_vector<T> k(q_len * head_dim);
+        thrust::universal_vector<T> v(q_len * head_dim);
+        rng.GenerateNormal(k.data().get(), k.size());
+        rng.GenerateNormal(v.data().get(), v.size());
+
+        // Strengthen the probe: enforce a deterministic pattern on the
+        // first token so that the first two 16-dim blocks along head_dim
+        // clearly require different exponent scales. This lets us detect
+        // any bug where FP4 MXFP4 quantization or decode accidentally
+        // uses a block size != 16 or a wrong scale index.
+        //
+        // Token 0:
+        //   dims [0..15]   -> large magnitude (8.0)
+        //   dims [16..31]  -> small magnitude (0.125)
+        // Remaining dims keep random values.
+        {
+            const int token0_offset = 0 * head_dim;
+            for (int di = 0; di < 16 && di < head_dim; ++di) {
+                k[token0_offset + di] = T(8.0f);
+            }
+            for (int di = 16; di < 32 && di < head_dim; ++di) {
+                k[token0_offset + di] = T(0.125f);
+            }
+        }
+
+        // Cumulative sequence lengths (single batch).
+        thrust::universal_vector<int> cu_q_len(batch_size + 1);
+        thrust::universal_vector<int> cu_k_len(batch_size + 1);
+        cu_q_len[0] = 0;
+        cu_q_len[1] = q_len;
+        cu_k_len[0] = 0;
+        cu_k_len[1] = q_len;
+
+        // Block pointers for data pool.
+        using BlockConfig  = block::Config<T, Tkv, head_dim>;
+        block::Layout      block_layout{BlockConfig{head_num, block_len}};
+        const size_t       block_bytes = block_layout.block_size(1);  // layer_num = 1
+        const int          n_blocks    = (q_len + block_len - 1) / block_len;
+        thrust::universal_vector<char>  blocks(block_bytes * n_blocks * batch_size);
+        thrust::universal_vector<char*> block_ptrs(n_blocks * batch_size);
+        for (int i = 0; i < n_blocks * batch_size; ++i) {
+            block_ptrs[i] = blocks.data().get() + static_cast<size_t>(i) * block_bytes;
+        }
+
+        // Scale pool blocks for FP4 MXFP4.
+        const int   scales_per_head   = head_dim / 16;
+        const int   bytes_per_token   = 2 * scales_per_head;  // K scales + V scales
+        const size_t scale_block_bytes =
+            static_cast<size_t>(head_num) * block_len * static_cast<size_t>(bytes_per_token);  // layer_num = 1
+        thrust::universal_vector<char>  scale_blocks(scale_block_bytes * n_blocks * batch_size);
+        thrust::universal_vector<char*> scale_block_ptrs(n_blocks * batch_size);
+        for (int i = 0; i < n_blocks * batch_size; ++i) {
+            scale_block_ptrs[i] = scale_blocks.data().get() + static_cast<size_t>(i) * scale_block_bytes;
+        }
+
+        // Cumulative block counts.
+        thrust::universal_vector<int> cu_block_cnts(batch_size + 1);
+        cu_block_cnts[0] = 0;
+        cu_block_cnts[1] = n_blocks;
+
+        RopeKernelParam rope_param{};
+        cutlass::FastDivmod cp_size(1);
+
+        // Run ProcessKV_v2 in MXFP4 mode. We intentionally use simple
+        // strides so that index = (qi * HeadDim + di).
+        invokeProcessKV_v2((char**)block_ptrs.data().get(),
+                           (char**)scale_block_ptrs.data().get(),
+                           k.data().get(),
+                           v.data().get(),
+                           (T*)nullptr,
+                           (T*)nullptr,
+                           cu_q_len.data().get(),
+                           cu_k_len.data().get(),
+                           cu_block_cnts.data().get(),
+                           rope_param,
+                           /*stride_b*/ 0,
+                           /*stride_c*/ 0,
+                           /*stride_h*/ 0,
+                           /*stride_s*/ 1,
+                           block_len,
+                           layer_id,
+                           /*cp_rank*/ 0,
+                           cp_size,
+                           q_len,
+                           head_num,
+                           head_dim,
+                           batch_size,
+                           QuantPolicy::kCacheKVFp4,
+                           getSMVersion(),
+                           /*stream*/ nullptr);
+
+        cudaDeviceSynchronize();
+
+        // Probe two tokens: start of first block and start of second block.
+        Fp4KvProbeResult res0{}, res1{};
+        fp4_kv_probe_host(res0,
+                          (char**)block_ptrs.data().get(),
+                          (char**)scale_block_ptrs.data().get(),
+                          layer_id,
+                          head_idx,
+                          head_num,
+                          block_len,
+                          head_dim,
+                          /*local_ti*/ 0,
+                          nullptr);
+        fp4_kv_probe_host(res1,
+                          (char**)block_ptrs.data().get(),
+                          (char**)scale_block_ptrs.data().get(),
+                          layer_id,
+                          head_idx,
+                          head_num,
+                          block_len,
+                          head_dim,
+                          /*local_ti*/ block_len,
+                          nullptr);
+
+        std::cout << "[FP4Mx probe] token 0: "
+                  << "k_scale0=" << int(res0.k_scale0) << ", v_scale0=" << int(res0.v_scale0)
+                  << ", k_scale1=" << int(res0.k_scale1) << ", v_scale1=" << int(res0.v_scale1)
+                  << ", kv_byte0=" << int(res0.kv_byte0) << "\n";
+        std::cout << "[FP4Mx probe] token " << block_len << ": "
+                  << "k_scale0=" << int(res1.k_scale0) << ", v_scale0=" << int(res1.v_scale0)
+                  << ", k_scale1=" << int(res1.k_scale1) << ", v_scale1=" << int(res1.v_scale1)
+                  << ", kv_byte0=" << int(res1.kv_byte0) << "\n";
+
+        // Minimal di>>4 mapping assertion:
+        //
+        // For token 0 we constructed K so that dims [0..15] and [16..31]
+        // have very different magnitudes. If MXFP4 is using a 16-element
+        // block with scale index `scale_idx = di >> 4`, then the per-block
+        // maxima should produce different exponents for block 0 and block 1.
+        //
+        // If a future change accidentally switches to a 32-element block
+        // or miscomputes the scale index, k_scale0 and k_scale1 will tend
+        // to collapse to the same value and this check will fail loudly.
+        if (res0.k_scale0 == res0.k_scale1) {
+            std::cerr << "[FP4Mx probe][ERROR] Expected different K scale bytes for blocks 0 and 1 at token 0 "
+                      << "after enforcing a large magnitude difference between dims [0..15] and [16..31]. "
+                      << "Check the MXFP4 block size (should be 16) and scale index computation (di >> 4)."
+                      << std::endl;
+            std::abort();
+        }
+    };
+
+    run_fp4_probe();
+#endif
 
     // test_attention<nv_bfloat16>();
 }

@@ -4,6 +4,7 @@
 #include "src/turbomind/core/context.h"
 #include "src/turbomind/core/data_type.h"
 #include "src/turbomind/core/stream.h"
+#include "src/turbomind/utils/eagle_debug.h"
 namespace turbomind::core {
 
 Buffer Buffer::view(DataType dtype) const
@@ -71,13 +72,33 @@ void Copy(const Buffer& a, Ref<Buffer> b_)
 
 void* Copy(const void* a, ssize_t n, void* b, const Stream& stream)
 {
-    check_cuda_error(cudaMemcpyAsync(b, a, n, cudaMemcpyDefault, stream.handle()));
+    if (turbomind::isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+        TM_LOG_WARNING("[EAGLE][CopyDBG] Copy(a=%p, b=%p, n=%zd)", a, b, n);
+    }
+
+    auto err = cudaMemcpyAsync(b, a, n, cudaMemcpyDefault, stream.handle());
+    if (err != cudaSuccess && turbomind::isEagleDebugEnabled()
+        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+        TM_LOG_WARNING("[EAGLE][CopyDBG] cudaMemcpyAsync failed in Copy(a=%p, b=%p, n=%zd) with err=%d",
+                       a,
+                       b,
+                       n,
+                       static_cast<int>(err));
+    }
+    check_cuda_error(err);
     return (char*)b + n;
 }
 
 void Clear(Ref<Buffer> b_, const Stream& stream)
 {
     auto& b = b_.get();
+    // Skip zero-sized or uninitialized buffers. Some optional scratch
+    // buffers are represented as empty Buffer instances; treating those
+    // as "already cleared" avoids spurious null-pointer checks in the
+    // speculative decode and prefix-caching paths.
+    if (!b || b.byte_size() == 0) {
+        return;
+    }
     check_cuda_error(cudaMemsetAsync(b.raw_data(), 0, b.byte_size(), stream.handle()));
 }
 

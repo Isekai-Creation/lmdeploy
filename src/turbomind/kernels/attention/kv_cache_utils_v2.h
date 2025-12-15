@@ -9,6 +9,7 @@ namespace turbomind {
 
 template<class T>
 void invokeProcessKV_v2(char**                 blocks,
+                        char**                 scale_blocks,
                         const T*               k,
                         const T*               v,
                         const T*               k_bias,
@@ -30,12 +31,14 @@ void invokeProcessKV_v2(char**                 blocks,
                         int                    head_dim,
                         int                    batch_size,
                         int                    quant_policy,
+                        int                    arch,
                         cudaStream_t           stream = {});
 
 template<class T>
 void invokeProcessKV_v2_(const AttentionParams<T>& params)
 {
     invokeProcessKV_v2((char**)params.block_iter_params.block_ptrs,
+                       (char**)params.block_iter_params.scale_block_ptrs,
                        params.k,
                        params.v,
                        params.k_bias,
@@ -57,6 +60,7 @@ void invokeProcessKV_v2_(const AttentionParams<T>& params)
                        params.size_per_head,
                        params.batch_size,
                        params.quant_policy,
+                       params.arch,
                        params.stream);
 }
 
@@ -64,6 +68,7 @@ template<class T>
 void invokeFlattenKV_v2(T*                     k,
                         T*                     v,
                         char**                 blocks,
+                        char**                 scale_blocks,
                         const int*             cu_k_len,
                         const int*             cu_block_num,
                         const RopeKernelParam& rope_param,
@@ -80,6 +85,7 @@ void invokeFlattenKV_v2(T*                     k,
                         int                    head_dim,
                         int                    batch_size,
                         int                    quant_policy,
+                        int                    arch,
                         cudaStream_t           stream = {});
 
 /// TODO: remove `sum_k_len`
@@ -90,6 +96,7 @@ void invokeFlattenKV_v2_(const AttentionParams<T>& params, int sum_k_len)
     invokeFlattenKV_v2((T*)params.linear_iter_params.kv_cache,
                        (T*)params.linear_iter_params.kv_cache + sum_k_len * params.size_per_head,
                        (char**)params.block_iter_params.block_ptrs,
+                       (char**)params.block_iter_params.scale_block_ptrs,
                        params.cu_k_len,
                        params.block_iter_params.cu_block_nums,
                        RopeKernelParam{},
@@ -106,6 +113,7 @@ void invokeFlattenKV_v2_(const AttentionParams<T>& params, int sum_k_len)
                        params.size_per_head,
                        params.batch_size,
                        params.quant_policy,
+                       params.arch,
                        params.stream);
 }
 

@@ -23,8 +23,23 @@
 #include "src/turbomind/layers/BaseDynamicDecodeLayer.h"
 
 #include "src/turbomind/core/tensor.h"
+#include "src/turbomind/layers/sampling_layers/utils.h"
 
 namespace turbomind {
+
+struct ForcedTailContext {
+    const int* forced_tokens{nullptr};
+    const int* forced_lengths{nullptr};
+    // Per-slot number of tail tokens actually committed by the
+    // decode layer. May be null, in which case the tail loop
+    // will not report per-slot counts.
+    int*       committed_lengths{nullptr};
+    int        max_tail_len{0};
+    // When true, forced_tokens / forced_lengths are device pointers and
+    // may only be consumed by the GPU tail path. Host tail logic will
+    // treat this as "no tail" to avoid misinterpreting device memory.
+    bool       device_pointers{false};
+};
 
 class DynamicDecodeLayer {
 public:
@@ -41,8 +56,28 @@ public:
 
     void Forward(TensorMap& args);
 
+    void ForwardMultiStep(TensorMap& args, const ForcedTailContext* forced_ctx);
+
 private:
+    cudaStream_t                                          stream_{};
     std::vector<std::unique_ptr<BaseDynamicDecodeLayer>> layers_;
+
+    // Requests for the current batch, captured in Setup so tail
+    // handling can consult per-slot GenerationConfig (eos_ids, etc.).
+    std::vector<const Request*> requests_;
+
+    // Stop-words tensor for tail stop-criteria, mirroring the layout
+    // used by StopCriteriaLayer: [batch, 2, kMaxStopBadWordsLen].
+    Buffer_<int> stop_words_;
+    Buffer_<int> stop_words_buf_;
+    Tensor_<int> stop_words_ten_;
+
+    // Persistent EOS metadata for GPU-tail path. Layout:
+    //  eos_ids_:    [max_batch_size, kMaxEosPerSlot]
+    //  eos_counts_: [max_batch_size]
+    int           max_batch_size_{0};
+    Buffer_<int>  eos_ids_;
+    Buffer_<int>  eos_counts_;
 };
 
 }  // namespace turbomind

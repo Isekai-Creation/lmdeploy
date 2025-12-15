@@ -52,6 +52,9 @@ struct Mainloop<Sm80_CpAsync<Stages>, Impl_> {
     int cp_size_{1};
     int cp_rank_{0};
 
+    static constexpr int kBatch0 = Impl::kBatchK;
+    static constexpr int kBatch1 = Impl::kBatchV;
+
     __device__ void SetCpInfo(int cp_size, int cp_rank)
     {
         cp_size_ = cp_size;
@@ -157,11 +160,8 @@ struct Mainloop<Sm80_CpAsync<Stages>, Impl_> {
         auto& gmem_0 = Select<Stages % 2>(gmem_V, gmem_K);
         auto& gmem_1 = Select<Stages % 2>(gmem_K, gmem_V);
 
-        constexpr auto kBatch0 = Stages % 2 ? Impl::kBatchV : Impl::kBatchK;
-        constexpr auto kBatch1 = Stages % 2 ? Impl::kBatchK : Impl::kBatchV;
-
-        typename Impl::StateQK state_QK{storage, frag_Q};
-        typename Impl::StatePV state_PV{storage};
+        typename Impl::StateQK state_QK{storage, frag_Q, cache_iter};
+        typename Impl::StatePV state_PV{storage, false, cache_iter};
 
         Wait();
         state_QK.Load(0, (++pipe_iter).r);
@@ -248,8 +248,8 @@ struct Mainloop<Sm80_CpAsync<Stages>, Impl_> {
         gmem_K.Prefetch(true_c, cache_iter, max_step - offset_K, 0);
         __pipeline_commit();
 
-        typename Impl::StateQK state_QK{storage, frag_Q};
-        typename Impl::StatePV state_PV{storage};
+        typename Impl::StateQK state_QK{storage, frag_Q, cache_iter};
+        typename Impl::StatePV state_PV{storage, false, cache_iter};
 
         Wait();
         state_QK.Load(0, 0);
@@ -355,8 +355,8 @@ struct Mainloop<Sm80_CpAsync<Stages>, Impl_> {
         __pipeline_commit();
         cache_iter_K.Advance();
 
-        typename Impl::StateQK state_QK{storage, frag_Q};
-        typename Impl::StatePV state_PV{storage};
+        typename Impl::StateQK state_QK{storage, frag_Q, cache_iter_};
+        typename Impl::StatePV state_PV{storage, false, cache_iter_};
 
         Wait();
         state_QK.Load(0, 0);

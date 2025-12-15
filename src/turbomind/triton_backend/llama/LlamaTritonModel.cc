@@ -356,7 +356,23 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
     max_forward_token_num += engine_param_.max_batch_size;
 
     engine_param_.max_context_token_num = engine_reader["max_context_token_num"].as<int>(0);
-    engine_param_.session_len           = model_reader["session_len"].as<int>(0);
+
+    // Prefer an explicit engine-level session length when provided by the
+    // backend config (e.g. TurbomindEngineConfig.session_len in Python
+    // benchmarks). Falling back to the model's intrinsic `session_len`
+    // keeps backward compatibility, but avoids over-allocating KV/cache
+    // for very long contexts when the engine only ever uses shorter
+    // sequences (such as 8K/32K speculative benchmarks).
+    {
+        const int engine_session_len = engine_reader["session_len"].as<int>(0);
+        const int model_session_len  = model_reader["session_len"].as<int>(0);
+        if (engine_session_len > 0) {
+            engine_param_.session_len = engine_session_len;
+        }
+        else {
+            engine_param_.session_len = model_session_len;
+        }
+    }
 
     engine_param_.cache_max_block_count = engine_reader["cache_max_entry_count"].as<float>(0);
     engine_param_.cache_chunk_size      = engine_reader["cache_chunk_size"].as<int>(0);
@@ -378,6 +394,63 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
     engine_param_.mlp_tp_rank   = 0;
 
     engine_param_.devices = engine_reader["devices"].as<std::vector<int>>();
+    
+    // Parse speculative decoding config if present
+    if (engine_reader["speculative_config"]) {
+        const auto spec_reader = engine_reader["speculative_config"];
+        engine_param_.enable_speculative_decoding         = true;
+        engine_param_.spec_method                         = spec_reader["method"].as<std::string>("");
+        engine_param_.spec_max_draft_path_len             = spec_reader["max_path_len"].as<int>(5);
+        engine_param_.spec_max_decoding_draft_tokens      = spec_reader["num_speculative_tokens"].as<int>(5);
+        engine_param_.spec_max_decoding_tokens            = spec_reader["max_decoding_tokens"].as<int>(10);
+        engine_param_.spec_max_non_leaf_nodes             = spec_reader["max_non_leaves_per_layer"].as<int>(10);
+        engine_param_.spec_draft_model_path               = spec_reader["model"].as<std::string>("");
+        engine_param_.eagle_debug                         = spec_reader["eagle_debug"].as<bool>(false);
+        engine_param_.eagle_metrics_debug                 = spec_reader["eagle_metrics_debug"].as<bool>(false);
+        // Target-tree decode is an optional, more advanced EAGLE3 path.
+        // When not specified, default to false so the engine continues
+        // to rely on the current single-step target logits path.
+        engine_param_.enable_eagle_target_tree            = spec_reader["enable_target_tree"].as<bool>(false);
+
+        // SpecPV partial KV config (EAGLE3-only). These fields mirror the
+        // SpeculativeConfig attributes and control when TurboMind is allowed
+        // to run target-tree decode against a partial KV cache instead of
+        // the full prefix KV.
+        engine_param_.enable_specpv             = spec_reader["enable_specpv"].as<bool>(false);
+        engine_param_.specpv_block_size         = spec_reader["specpv_block_size"].as<int>(16);
+        engine_param_.specpv_n_sink_blocks      = spec_reader["specpv_n_sink_blocks"].as<int>(2);
+        engine_param_.specpv_n_retrieval_blocks = spec_reader["specpv_n_retrieval_blocks"].as<int>(256);
+        engine_param_.specpv_n_window_blocks    = spec_reader["specpv_n_window_blocks"].as<int>(8);
+        engine_param_.specpv_n_spec_tokens_buf  = spec_reader["specpv_n_spec_tokens_buf"].as<int>(128);
+        engine_param_.specpv_partial_threshold  = spec_reader["specpv_partial_threshold"].as<int>(4096);
+        engine_param_.specpv_full_refresh_steps = spec_reader["specpv_full_refresh_steps"].as<int>(32);
+
+        TM_LOG_INFO("[LlamaTritonModel] Speculative decoding enabled: method=%s, "
+                    "max_path_len=%d, num_speculative_tokens=%d, max_decoding_tokens=%d",
+                    engine_param_.spec_method.c_str(),
+                    engine_param_.spec_max_draft_path_len,
+                    engine_param_.spec_max_decoding_draft_tokens,
+                    engine_param_.spec_max_decoding_tokens);
+    } else {
+        engine_param_.enable_speculative_decoding    = false;
+        engine_param_.spec_method                    = "";
+        engine_param_.spec_max_draft_path_len        = 0;
+        engine_param_.spec_max_decoding_draft_tokens = 0;
+        engine_param_.spec_max_decoding_tokens       = 0;
+        engine_param_.spec_max_non_leaf_nodes        = 0;
+        engine_param_.spec_draft_model_path          = "";
+        engine_param_.eagle_debug                    = false;
+        engine_param_.eagle_metrics_debug            = false;
+        engine_param_.enable_eagle_target_tree       = false;
+        engine_param_.enable_specpv                  = false;
+        engine_param_.specpv_block_size              = 16;
+        engine_param_.specpv_n_sink_blocks           = 2;
+        engine_param_.specpv_n_retrieval_blocks      = 256;
+        engine_param_.specpv_n_window_blocks         = 8;
+        engine_param_.specpv_n_spec_tokens_buf       = 128;
+        engine_param_.specpv_partial_threshold       = 4096;
+        engine_param_.specpv_full_refresh_steps      = 32;
+    }
 
     {
         auto tp                             = engine_param_.attn_tp_size * engine_param_.attn_cp_size;
@@ -579,7 +652,11 @@ void LlamaTritonModel::createEngine(int device_id, int rank)
 
     auto& engine = *engines_[device_id];
 
-    if (first_create) {
+    // Skip GEMM warmup for speculative engines to avoid exercising
+    // partially-tuned or unstable draft paths during engine creation.
+    // Baseline (non-speculative) engines still run Warmup so their
+    // GEMM dispatch remains tuned as in upstream TurboMind.
+    if (first_create && !engine_param.enable_speculative_decoding) {
         try {
             engine.Warmup();
         }

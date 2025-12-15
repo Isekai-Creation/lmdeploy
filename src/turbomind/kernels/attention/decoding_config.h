@@ -12,6 +12,7 @@
 #include "src/turbomind/kernels/attention/attention_universal.h"
 #include "src/turbomind/kernels/attention/impl.h"
 #include "src/turbomind/kernels/attention/mainloop.h"
+#include "src/turbomind/kernels/core/data_type.h"
 
 namespace turbomind::attention {
 
@@ -37,6 +38,19 @@ struct DecodingConfig<arch::Sm80, T, T, Qh_, HeadDim, std::enable_if_t<(Qh_ > 2)
     using Attention         = Impl<MMA_81616, T, T, Qh, 1, 64, Qh, 1, 16, HeadDim, 3>;
     using CacheIter         = GetBlockIterFactory<T, T, 64, HeadDim>;
     using Kernel = AttentionUniversal<arch::Sm80, Mainloop<Sm80_CpAsync<3>, Attention>, CacheIter, DecodingCtaMap>;
+};
+
+// FP4 MXFP4 KV cache decode on Sm80:
+// Use SIMT mainloop for simplicity while we bring up FP4Mx end-to-end.
+// This specialization is only instantiated when Tkv == fp4_e2m1_t
+// (MXFP4); NVFP4 continues to use base KV (Tkv == T).
+template<class T, int Qh_, int HeadDim>
+struct DecodingConfig<arch::Sm80, T, fp4_e2m1_t, Qh_, HeadDim> {
+    static constexpr int Qh = (Qh_ + 7) / 8 * 8;
+
+    using Attention = Impl<MMA_SIMT, T, fp4_e2m1_t, 1, 1, 64, 1, 1, 16, HeadDim, 2>;
+    using CacheIter = GetBlockIterFactory<T, fp4_e2m1_t, 64, HeadDim>;
+    using Kernel    = AttentionUniversal<arch::Sm80, Mainloop<Sm80_CpAsync<3>, Attention>, CacheIter, DecodingCtaMap>;
 };
 
 template<class T, int Qh_, int HeadDim>

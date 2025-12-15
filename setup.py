@@ -11,7 +11,24 @@ version_file = 'lmdeploy/version.py'
 
 
 def get_target_device():
-    return os.getenv('LMDEPLOY_TARGET_DEVICE', 'cuda')
+    """Return the target device for this build.
+
+    Priority:
+    1. Respect explicit LMDEPLOY_TARGET_DEVICE if set.
+    2. Otherwise, auto-detect: if a working CUDA compiler is present,
+       default to 'cuda'; otherwise fall back to 'cpu'.
+    """
+    env = os.getenv('LMDEPLOY_TARGET_DEVICE')
+    if env:
+        return env
+
+    CUDA_COMPILER = os.getenv('CUDACXX', os.getenv('CMAKE_CUDA_COMPILER', 'nvcc'))
+    try:
+        subprocess.check_output([CUDA_COMPILER, '--version'], stderr=subprocess.DEVNULL)
+        return 'cuda'
+    except Exception:
+        # No nvcc available – treat this as a CPU-only build.
+        return 'cpu'
 
 
 def readme():
@@ -33,11 +50,22 @@ def get_version():
 
 
 def get_turbomind_deps():
+    """Return extra CUDA/NCCL deps for TurboMind when CUDA is available.
+
+    In CPU-only environments (no nvcc), this returns [] instead of raising.
+    """
     if os.name == 'nt':
         return []
 
     CUDA_COMPILER = os.getenv('CUDACXX', os.getenv('CMAKE_CUDA_COMPILER', 'nvcc'))
-    nvcc_output = subprocess.check_output([CUDA_COMPILER, '--version'], stderr=subprocess.DEVNULL).decode()
+    try:
+        nvcc_output = subprocess.check_output(
+            [CUDA_COMPILER, '--version'], stderr=subprocess.DEVNULL
+        ).decode()
+    except (OSError, subprocess.CalledProcessError):
+        # No working nvcc found – skip CUDA runtime deps; TurboMind extension
+        # will also be disabled by the logic below.
+        return []
     CUDAVER, = re.search(r'release\s+(\d+).', nvcc_output).groups()
     if int(CUDAVER) >= 13:
         return [
@@ -130,12 +158,54 @@ def parse_requirements(fname='requirements.txt', with_version=True):
     return packages
 
 
-if get_target_device() == 'cuda' and not os.getenv('DISABLE_TURBOMIND', '').lower() in ('yes', 'true', 'on', 't', '1'):
+target_device = get_target_device()
+
+def _is_turbomind_enabled():
+    """Decide whether to build the TurboMind C++/CUDA extension.
+
+    We only attempt this when:
+    - target_device == 'cuda'
+    - DISABLE_TURBOMIND is not set to a truthy value
+    - a working CUDA compiler (nvcc) is available
+    """
+    if target_device != 'cuda':
+        return False
+    if os.getenv('DISABLE_TURBOMIND', '').lower() in ('yes', 'true', 'on', 't', '1'):
+        return False
+
+    CUDA_COMPILER = os.getenv('CUDACXX', os.getenv('CMAKE_CUDA_COMPILER', 'nvcc'))
+    try:
+        subprocess.check_output([CUDA_COMPILER, '--version'], stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        # No nvcc – treat as CPU-only even if target_device was left as "cuda".
+        return False
+
+
+if _is_turbomind_enabled():
     import cmake_build_extension
 
     ext_modules = [
         cmake_build_extension.CMakeExtension(
             name='_turbomind',
+            install_prefix='lmdeploy/lib',
+            cmake_depends_on=['pybind11'],
+            source_dir=str(Path(__file__).parent.absolute()),
+            cmake_generator=None if os.name == 'nt' else 'Ninja',
+            cmake_build_type=os.getenv('CMAKE_BUILD_TYPE', 'RelWithDebInfo'),
+            cmake_configure_options=[
+                f'-DPython3_ROOT_DIR={Path(sys.prefix)}',
+                f'-DPYTHON_EXECUTABLE={Path(sys.executable)}',
+                '-DCALL_FROM_SETUP_PY:BOOL=ON',
+                '-DBUILD_SHARED_LIBS:BOOL=OFF',
+                # Select the bindings implementation
+                '-DBUILD_PY_FFI=ON',
+                '-DBUILD_MULTI_GPU=' + ('OFF' if os.name == 'nt' else 'ON'),
+                '-DUSE_NVTX=' + ('OFF' if os.name == 'nt' else 'ON'),
+            ],
+        ),
+        cmake_build_extension.CMakeExtension(
+            name='_xgrammar',
             install_prefix='lmdeploy/lib',
             cmake_depends_on=['pybind11'],
             source_dir=str(Path(__file__).parent.absolute()),
@@ -173,7 +243,7 @@ if __name__ == '__main__':
         include_package_data=True,
         setup_requires=parse_requirements('requirements/build.txt'),
         tests_require=parse_requirements('requirements/test.txt'),
-        install_requires=parse_requirements(f'requirements/runtime_{get_target_device()}.txt') + extra_deps,
+        install_requires=parse_requirements(f'requirements/runtime_{target_device}.txt') + extra_deps,
         extras_require={
             'all': parse_requirements(f'requirements_{get_target_device()}.txt'),
             'lite': parse_requirements('requirements/lite.txt'),

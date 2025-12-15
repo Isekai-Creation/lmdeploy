@@ -57,6 +57,95 @@ Our implementation of the LLaMa family models is modified from Gpt-NeoX model in
 
 TurboMind supports a Python API that enables streaming output and tensor parallel mode.
 
+## DriftEngine usage (TurboMind advanced scheduler)
+
+The TurboMind backend can also be driven by a new orchestration called **DriftEngine**, which adds an explicit engine‑level scheduler, KV cache manager, prefix cache, and KV‑aware capacity scheduler on top of the existing kernels. DriftEngine is exposed from Python via a dedicated config and `backend="drift"` selection.
+
+### 1. Using DriftEngine with `pipeline`
+
+The `lmdeploy.pipeline` API accepts a `backend_config` argument. When this is a `DriftEngineConfig` instance, the engine will run with the Drift backend:
+
+```python
+from lmdeploy import pipeline  # high-level API
+from lmdeploy.messages import DriftEngineConfig, TurboMindSchedulerConfig, TurboMindKVConfig
+
+scheduler_cfg = TurboMindSchedulerConfig(
+    max_num_batched_tokens=4096,
+    max_num_seqs=128,
+    enable_chunked_prefill=True,
+    max_num_partial_prefills=2,
+    long_prefill_token_threshold=2048,
+    prefer_decode_over_prefill=True,
+)
+
+kv_cfg = TurboMindKVConfig(
+    kv_page_size=128,
+    kv_capacity_bytes=None,          # derive from GPU memory and model layout
+    prefix_cache_enabled=True,
+    prefix_cache_eviction_policy='lru',
+)
+
+backend_cfg = DriftEngineConfig(
+    model_path="your-turbomind-model-or-gpt-oss-120b",
+    tp=1,
+    pp=1,
+    session_len=8192,
+    max_batch_size=256,
+    dtype="fp16",
+    scheduler=scheduler_cfg,
+    kv=kv_cfg,
+    prefer_high_throughput=True,
+    target_latency_ms_p50=50,
+    target_latency_ms_p95=200,
+)
+
+with pipeline(model_path="your-turbomind-model-or-gpt-oss-120b",
+              backend_config=backend_cfg) as pipe:
+    responses = pipe(["hello", "world"])
+    print(responses)
+```
+
+Key points:
+
+- **Backend selection**  
+  - `pipeline` inspects `backend_config`; when it is a `DriftEngineConfig`, the underlying engine uses `backend="drift"` internally instead of the legacy TurboMind loop.
+- **Scheduler knobs**  
+  - `TurboMindSchedulerConfig` drives the C++ `SchedulerConfig` and `EngineScheduler`: per‑step token budget, max sequences, chunked prefill, and decode‑vs‑prefill bias.
+- **KV / prefix knobs**  
+  - `TurboMindKVConfig` drives `KVLayout`, `KVCacheManager`, `PrefixCache`, and `CapacityScheduler`: KV page size, capacity, and whether prefix caching + LRU eviction are enabled.
+
+For the full list of fields and their intended semantics, see `LM/lmdeploy/ENGINE.md` and `LM/lmdeploy/ENGINE_TODOS.md` (Sections 1.1, 1.2, 2.1, 2.2, 4.1, 6.1–6.4).
+
+### 2. Using DriftEngine with `drift_api_server`
+
+For serving, you can either pass a `DriftEngineConfig` into `lmdeploy.serve` or use the convenience wrapper `drift_api_server`:
+
+```python
+from lmdeploy.api import drift_api_server
+from lmdeploy.messages import DriftEngineConfig
+
+backend_cfg = DriftEngineConfig(
+    model_path="your-turbomind-model-or-gpt-oss-120b",
+    tp=1,
+    pp=1,
+    session_len=8192,
+)
+
+server = drift_api_server(
+    model_path="your-turbomind-model-or-gpt-oss-120b",
+    model_name="drift-engine-model",
+    backend_config=backend_cfg,
+    server_name="0.0.0.0",
+    server_port=23333,
+    log_level="INFO",
+)
+```
+
+The wrapper simply calls `serve(..., backend="drift", backend_config=backend_cfg, ...)`. Existing OpenAI‑compatible clients can talk to this server in the same way they do for the TurboMind or PyTorch backends; the difference is entirely in how requests are scheduled and how KV is managed internally.
+
+> **Note**  
+> DriftEngine is designed as a **non‑speculative** engine for GPT‑OSS‑120B (and related large models). Speculative decoding (EAGLE/EAGLE3/SpecPV) is configured separately via `SpeculativeConfig` and the tasks in `EAGLE_TODOS.md` / `SPECPV_TODO.md`.
+
 ## Difference between FasterTransformer and TurboMind
 
 Apart of the features described above, there are still many minor differences that we don't cover in this document. Notably, many capabilities of FT are dropped in TurboMind because of the difference in objectives (e.g. prefix prompt, beam search, context embedding, sparse GEMM, GPT/T5/other model families, etc)

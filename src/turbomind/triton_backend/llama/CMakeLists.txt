@@ -15,13 +15,13 @@
 
 # Modified from https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/triton_backend/multi_gpu_gpt/CMakeLists.txt
 
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.11)
 
 set(llama_triton_backend_files
     LlamaTritonModel.cc
+    ../../models/llama/eagle3_attention_kernels.cu
 )
 
-find_package(CUDAToolkit REQUIRED)
 add_library(LlamaTritonBackend STATIC ${llama_triton_backend_files})
 set_property(TARGET LlamaTritonBackend PROPERTY POSITION_INDEPENDENT_CODE ON)
 

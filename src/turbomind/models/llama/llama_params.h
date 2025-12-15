@@ -111,6 +111,38 @@ struct EngineParam {
     int mlp_tp_rank;
 
     std::vector<int> devices;
+    
+    // speculative decoding params
+    bool        enable_speculative_decoding;
+    int         spec_max_draft_path_len;
+    int         spec_max_decoding_draft_tokens;
+    int         spec_max_decoding_tokens;
+    int         spec_max_non_leaf_nodes;
+    std::string spec_draft_model_path;
+    std::string spec_method;  // "eagle", "eagle3", "ngram", etc.
+
+    // EAGLE debug/metrics verbosity flags, derived from SpeculativeConfig
+    // when present. These gate EAGLE-specific debug traces and per-step
+    // metrics logging on the TurboMind backend.
+    bool eagle_debug{false};
+    bool eagle_metrics_debug{false};
+
+    // Optional: enable the target-tree decode path for EAGLE3. When true,
+    // TurboMind is allowed to run a dedicated target decode over the EAGLE
+    // speculation tree to produce per-node target token ids. When false,
+    // TurboMind will continue to rely on host-fabricated target_tokens.
+    bool enable_eagle_target_tree{false};
+
+    // SpecPV partial KV config (EAGLE3-only). When disabled, TurboMind
+    // must behave exactly like the full-KV EAGLE3 pipeline.
+    bool enable_specpv{false};
+    int  specpv_block_size{16};
+    int  specpv_n_sink_blocks{2};
+    int  specpv_n_retrieval_blocks{256};
+    int  specpv_n_window_blocks{8};
+    int  specpv_n_spec_tokens_buf{128};
+    int  specpv_partial_threshold{4096};
+    int  specpv_full_refresh_steps{32};
 };
 
 enum class LoraPolicy : int

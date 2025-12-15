@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.8)
-
-find_package(CUDAToolkit REQUIRED)
+cmake_minimum_required(VERSION 3.11)
 
 add_library(LogitsProcessorLayer STATIC LogitsProcessorLayer.cc)
 set_property(TARGET LogitsProcessorLayer PROPERTY POSITION_INDEPENDENT_CODE  ON)

@@ -4,6 +4,7 @@
 
 #include "src/turbomind/core/allocator.h"
 #include "src/turbomind/core/check.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind::core {
 
@@ -45,14 +46,43 @@ public:
 
     void* allocate(ssize_t size) override
     {
+        // Guard against callers passing negative or zero sizes. A negative
+        // `ssize_t` will be converted to a huge `size_t` inside cudaMalloc,
+        // which in turn looks like a multi‑TB allocation request and hides
+        // the real bug. Fail fast here instead so we can pinpoint the bad
+        // caller.
+        if (size <= 0) {
+            TM_LOG_ERROR("[CudaMemPoolAllocator] Invalid allocation size=%zd; "
+                         "refusing to call cudaMalloc with a non‑positive size.",
+                         size);
+            abort();
+        }
+
+        TM_LOG_WARNING("[CudaMemPoolAllocator] Requesting allocation of %zd bytes (%.2f MB, %.2f GB)",
+                       size,
+                       size / 1e6,
+                       size / 1e9);
         void* ptr{};
-        check_cuda_error(cudaMallocFromPoolAsync(&ptr, size, pool_, stream_.handle()));
+        // check_cuda_error(cudaMallocFromPoolAsync(&ptr, size, pool_, stream_.handle()));
+        const auto err = cudaMalloc(&ptr, size);
+        if (err != cudaSuccess) {
+             TM_LOG_ERROR("[CudaMemPoolAllocator] cudaMalloc failed! size=%zd, err=%d (%s)", size, err, cudaGetErrorString(err));
+             // check_cuda_error(err); // abort
+             abort();
+        }
+
+        // Allocation debug logging is gated separately from general
+        // EAGLE debug to avoid flooding logs during normal runs.
+        if (turbomind::isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALLOC_DEBUG")) {
+            TM_LOG_WARNING("[EAGLE][AllocDBG:pool] size=%zd ptr=%p", (ssize_t)size, ptr);
+        }
         return ptr;
     }
 
     void deallocate(void* p, ssize_t) override
     {
-        check_cuda_error(cudaFreeAsync(p, stream_.handle()));
+        // check_cuda_error(cudaFreeAsync(p, stream_.handle()));
+        check_cuda_error(cudaFree(p));
     }
 
     Device device() const noexcept override
@@ -83,6 +113,9 @@ public:
     {
         void* ptr{};
         check_cuda_error(cudaMalloc(&ptr, size));
+        if (turbomind::isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALLOC_DEBUG")) {
+            TM_LOG_WARNING("[EAGLE][AllocDBG:cuda] size=%zd ptr=%p", (ssize_t)size, ptr);
+        }
         return ptr;
     }
 

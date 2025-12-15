@@ -5,6 +5,7 @@ add_library(attention STATIC
             decoding.cu
             reduce.cu
             kv_cache_utils_v2.cu
+            fp4_kv_probe.cu
             utils.cc
             cp_utils.cu
             codegen/attention_sm70_128_f16.cu
@@ -21,6 +22,7 @@ add_library(attention STATIC
             codegen/decoding_sm80_128_bf16_u4.cu
             codegen/decoding_sm80_128_bf16_u8.cu
             codegen/decoding_sm80_128_f16_f16.cu
+            codegen/decoding_sm80_128_f16_fp4.cu
             codegen/decoding_sm80_128_f16_u4.cu
             codegen/decoding_sm80_128_f16_u8.cu
             codegen/attention_sm70_64_f16.cu
@@ -71,6 +73,13 @@ if (BUILD_TEST)
     target_compile_options(test_quant PRIVATE
         --generate-line-info -O3 -use_fast_math --expt-relaxed-constexpr)
     target_link_libraries(test_quant PRIVATE
+        nvidia::cutlass::cutlass
+    )
+
+    add_executable(test_fp4mx_quant test_fp4mx_quant.cu test_utils.cu)
+    target_compile_options(test_fp4mx_quant PRIVATE
+        --generate-line-info -O3 -use_fast_math --expt-relaxed-constexpr)
+    target_link_libraries(test_fp4mx_quant PRIVATE
         nvidia::cutlass::cutlass
     )
 endif ()

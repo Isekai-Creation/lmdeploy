@@ -2,18 +2,22 @@
 import os
 from typing import List, Literal, Optional, Union
 
-from .archs import autoget_backend_config, get_task
-from .messages import PytorchEngineConfig, SpeculativeConfig, TurbomindEngineConfig
+from .archs import get_task
+
+from .messages import PytorchEngineConfig, SpeculativeConfig, TurbomindEngineConfig, TurboMindEngineConfig, DriftEngineConfig
+
 from .model import ChatTemplateConfig
 
 
+
+
+
 def pipeline(model_path: str,
-             backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig]] = None,
+             backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig, TurboMindEngineConfig, DriftEngineConfig]] = None,
              chat_template_config: Optional[ChatTemplateConfig] = None,
              log_level: str = 'WARNING',
              max_log_len: int = None,
-             speculative_config: SpeculativeConfig = None,
-             **kwargs):
+             speculative_config: SpeculativeConfig = None):
     """
     Args:
         model_path (str): the path of a model.
@@ -29,7 +33,7 @@ def pipeline(model_path: str,
                     on huggingface.co, such as "internlm/internlm-chat-7b",
                     "Qwen/Qwen-7B-Chat ", "baichuan-inc/Baichuan2-7B-Chat"
                     and so on.
-        backend_config (TurbomindEngineConfig | PytorchEngineConfig): backend
+        backend_config (TurbomindEngineConfig | PytorchEngineConfig | DriftEngineConfig): backend
             config instance. Default to None.
         chat_template_config (ChatTemplateConfig): chat template configuration.
             Default to None.
@@ -61,47 +65,99 @@ def pipeline(model_path: str,
     logger = get_logger('lmdeploy')
     logger.setLevel(log_level)
 
+    _model_path = model_path
+    _log_level = log_level
+    _speculative_config = speculative_config
+    _backend_config_for_engine = backend_config
+
+    if isinstance(backend_config, (TurboMindEngineConfig, DriftEngineConfig)):
+        _model_path = backend_config.model_path if backend_config.model_path is not None else _model_path
+        _log_level = backend_config.log_level if backend_config.log_level is not None else _log_level
+        _speculative_config = backend_config.speculative_config if hasattr(backend_config, 'speculative_config') and backend_config.speculative_config is not None else _speculative_config
+        _backend_config_for_engine = backend_config
+    elif isinstance(backend_config, TurbomindEngineConfig):
+        # Ensure speculative_config is set if it exists in the top-level
+        if backend_config.speculative_config is None:
+            backend_config.speculative_config = _speculative_config
+        _backend_config_for_engine = backend_config
+    elif isinstance(backend_config, PytorchEngineConfig):
+        _backend_config_for_engine = backend_config
+    else:
+        # Fallback to autoget_backend_config if no specific config is provided
+        _backend_config_for_engine = autoget_backend_config(_model_path, backend_config)
+    
+    # Update logger level based on possibly updated _log_level
+    logger.setLevel(_log_level)
+
+    # model_path for get_model
+    # This ensures that the model_path used for downloading is the most relevant one
+    if hasattr(_backend_config_for_engine, 'model_path') and _backend_config_for_engine.model_path is not None:
+        _model_path = _backend_config_for_engine.model_path
+    
     # model_path is not local path.
-    if not os.path.exists(model_path):
-        download_dir = backend_config.download_dir \
-            if backend_config is not None else None
-        revision = backend_config.revision \
-            if backend_config is not None else None
-        model_path = get_model(model_path, download_dir, revision)
+    if not os.path.exists(_model_path):
+        download_dir = _backend_config_for_engine.download_dir \
+            if hasattr(_backend_config_for_engine, 'download_dir') else None
+        revision = _backend_config_for_engine.revision \
+            if hasattr(_backend_config_for_engine, 'revision') else None
+        _model_path = get_model(_model_path, download_dir, revision)
+        if hasattr(_backend_config_for_engine, 'model_path'):
+            _backend_config_for_engine.model_path = _model_path # Update model_path in the config too
 
     # spec model
-    if speculative_config is not None and speculative_config.model and not os.path.exists(speculative_config.model):
-        download_dir = backend_config.download_dir \
-            if backend_config is not None else None
-        speculative_config.model = get_model(speculative_config.model, download_dir)
-
-    _, pipeline_class = get_task(model_path)
-    if not isinstance(backend_config, PytorchEngineConfig):
-        # set auto backend mode
-        backend_config = autoget_backend_config(model_path, backend_config)
-    backend = 'pytorch' if isinstance(backend_config, PytorchEngineConfig) else 'turbomind'
+    # Handle speculative config for TurbomindEngineConfig and TurboMindEngineConfig
+    if isinstance(_backend_config_for_engine, (TurbomindEngineConfig, TurboMindEngineConfig, DriftEngineConfig)):
+        _spec_cfg_to_use = _backend_config_for_engine.speculative_config
+        if _spec_cfg_to_use is not None and _spec_cfg_to_use.model and not os.path.exists(_spec_cfg_to_use.model):
+            download_dir = _backend_config_for_engine.download_dir \
+                if hasattr(_backend_config_for_engine, 'download_dir') else None
+            _spec_cfg_to_use.model = get_model(_spec_cfg_to_use.model, download_dir)
+            _backend_config_for_engine.speculative_config = _spec_cfg_to_use # Update in config
+    elif _speculative_config is not None and _speculative_config.model and not os.path.exists(_speculative_config.model):
+        download_dir = _backend_config_for_engine.download_dir \
+            if hasattr(_backend_config_for_engine, 'download_dir') else None
+        _speculative_config.model = get_model(_speculative_config.model, download_dir)
+        
+    _, pipeline_class = get_task(_model_path)
+    backend = 'pytorch' if isinstance(_backend_config_for_engine, PytorchEngineConfig) else 'drift' if isinstance(_backend_config_for_engine, DriftEngineConfig) else 'turbomind'
     logger.info(f'Using {backend} engine')
 
-    return pipeline_class(model_path,
+    return pipeline_class(_model_path,
                           backend=backend,
-                          backend_config=backend_config,
+                          backend_config=_backend_config_for_engine,
                           chat_template_config=chat_template_config,
                           max_log_len=max_log_len,
-                          speculative_config=speculative_config,
-                          **kwargs)
+                          speculative_config=_speculative_config)
+
+
+def drift_pipeline(model_path: str,
+                   backend_config: Optional[DriftEngineConfig] = None,
+                   chat_template_config: Optional[ChatTemplateConfig] = None,
+                   log_level: str = 'WARNING',
+                   max_log_len: int = None,
+                   speculative_config: SpeculativeConfig = None):
+    """
+    Convenience wrapper for pipeline with DriftEngineConfig.
+    """
+    backend_config = backend_config or DriftEngineConfig(model_path=model_path)
+    return pipeline(model_path,
+                    backend_config=backend_config,
+                    chat_template_config=chat_template_config,
+                    log_level=log_level,
+                    max_log_len=max_log_len,
+                    speculative_config=speculative_config)
 
 
 def serve(model_path: str,
           model_name: Optional[str] = None,
-          backend: Literal['turbomind', 'pytorch'] = 'turbomind',
-          backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig]] = None,
+          backend: Literal['turbomind', 'pytorch', 'drift'] = 'turbomind',
+          backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig, TurboMindEngineConfig, DriftEngineConfig]] = None,
           chat_template_config: Optional[ChatTemplateConfig] = None,
           server_name: str = '0.0.0.0',
           server_port: int = 23333,
           log_level: str = 'ERROR',
           api_keys: Optional[Union[List[str], str]] = None,
-          ssl: bool = False,
-          **kwargs):
+          ssl: bool = False):
     """This will run the api_server in a subprocess.
 
     Args:
@@ -123,7 +179,7 @@ def serve(model_path: str,
             `model_path` will be adopted
         backend (str): either `turbomind` or `pytorch` backend. Default to
             `turbomind` backend.
-        backend_config (TurbomindEngineConfig | PytorchEngineConfig): backend
+        backend_config (TurbomindEngineConfig | PytorchEngineConfig | DriftEngineConfig): backend
             config instance. Default to none.
         chat_template_config (ChatTemplateConfig): chat template configuration.
             Default to None.
@@ -147,25 +203,51 @@ def serve(model_path: str,
     from multiprocessing import Process
 
     from lmdeploy.serve.openai.api_client import APIClient
-    from lmdeploy.serve.openai.api_server import serve
+    from lmdeploy.serve.openai.api_server import serve as run_api_server # Rename the imported serve to avoid conflict
 
-    if type(backend_config) is not PytorchEngineConfig:
-        # set auto backend mode
-        backend_config = autoget_backend_config(model_path, backend_config)
-    backend = 'pytorch' if type(backend_config) is PytorchEngineConfig else 'turbomind'
+    _model_path = model_path
+    _log_level = log_level
+    _backend_config_for_engine = backend_config
 
-    task = Process(target=serve,
-                   args=(model_path, ),
+    if isinstance(backend_config, (TurboMindEngineConfig, DriftEngineConfig)):
+        _model_path = backend_config.model_path if backend_config.model_path is not None else _model_path
+        _log_level = backend_config.log_level if backend_config.log_level is not None else _log_level
+        _backend_config_for_engine = backend_config
+    elif isinstance(backend_config, TurbomindEngineConfig):
+        _backend_config_for_engine = backend_config
+    elif isinstance(backend_config, PytorchEngineConfig):
+        _backend_config_for_engine = backend_config
+    else:
+        # Fallback to autoget_backend_config if no specific config is provided
+        _backend_config_for_engine = autoget_backend_config(_model_path, backend_config)
+    
+    # model_path for get_model
+    if hasattr(_backend_config_for_engine, 'model_path') and _backend_config_for_engine.model_path is not None:
+        _model_path = _backend_config_for_engine.model_path
+    
+    # model_path is not local path.
+    if not os.path.exists(_model_path):
+        download_dir = _backend_config_for_engine.download_dir \
+            if hasattr(_backend_config_for_engine, 'download_dir') else None
+        revision = _backend_config_for_engine.revision \
+            if hasattr(_backend_config_for_engine, 'revision') else None
+        _model_path = get_model(_model_path, download_dir, revision)
+        if hasattr(_backend_config_for_engine, 'model_path'):
+            _backend_config_for_engine.model_path = _model_path # Update model_path in the config too
+    
+    backend_val = 'pytorch' if isinstance(_backend_config_for_engine, PytorchEngineConfig) else 'drift' if isinstance(_backend_config_for_engine, DriftEngineConfig) else 'turbomind'
+
+    task = Process(target=run_api_server, # Use the renamed imported serve
+                   args=(_model_path, ),
                    kwargs=dict(model_name=model_name,
-                               backend=backend,
-                               backend_config=backend_config,
+                               backend=backend_val,
+                               backend_config=_backend_config_for_engine,
                                chat_template_config=chat_template_config,
                                server_name=server_name,
                                server_port=server_port,
-                               log_level=log_level,
+                               log_level=_log_level,
                                api_keys=api_keys,
-                               ssl=ssl,
-                               **kwargs),
+                               ssl=ssl),
                    daemon=True)
     task.start()
     client = APIClient(f'http://{server_name}:{server_port}')
@@ -179,6 +261,30 @@ def serve(model_path: str,
             return client
         except:  # noqa
             pass
+
+def drift_api_server(model_path: str,
+                     model_name: Optional[str] = None,
+                     backend_config: Optional[DriftEngineConfig] = None,
+                     chat_template_config: Optional[ChatTemplateConfig] = None,
+                     server_name: str = '0.0.0.0',
+                     server_port: int = 23333,
+                     log_level: str = 'ERROR',
+                     api_keys: Optional[Union[List[str], str]] = None,
+                     ssl: bool = False):
+    """
+    Convenience wrapper for serve with DriftEngineConfig.
+    """
+    backend_config = backend_config or DriftEngineConfig(model_path=model_path)
+    return serve(model_path,
+                 model_name=model_name,
+                 backend='drift',
+                 backend_config=backend_config,
+                 chat_template_config=chat_template_config,
+                 server_name=server_name,
+                 server_port=server_port,
+                 log_level=log_level,
+                 api_keys=api_keys,
+                 ssl=ssl)
 
 
 def client(api_server_url: str = 'http://0.0.0.0:23333', api_key: Optional[str] = None, **kwargs):

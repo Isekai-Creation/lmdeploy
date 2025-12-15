@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.11)
 
 add_library(ban_bad_words STATIC ban_bad_words.cu)
 set_property(TARGET ban_bad_words PROPERTY POSITION_INDEPENDENT_CODE  ON)
@@ -72,6 +72,23 @@ set_property(TARGET sampling_kernels PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)
 add_library(apply_token_bitmask_inplace_cuda STATIC apply_token_bitmask_inplace_cuda.cu)
 set_property(TARGET apply_token_bitmask_inplace_cuda PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET apply_token_bitmask_inplace_cuda PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)
+
+# EAGLE speculative decoding kernels
+set(EAGLE_KERNEL_DIR ${PROJECT_SOURCE_DIR}/lmdeploy/turbomind/kernels/speculative_decoding)
+add_library(eagle_kernels STATIC 
+    ${EAGLE_KERNEL_DIR}/eagle_kernels.cu
+    ${EAGLE_KERNEL_DIR}/optimized_kernels.cu
+    ${EAGLE_KERNEL_DIR}/leaf_mask_kernels.cu
+    ${EAGLE_KERNEL_DIR}/packed_mask_kernels.cu
+    ${EAGLE_KERNEL_DIR}/common.cu
+    ${EAGLE_KERNEL_DIR}/kv_rewind_helper.cu
+    ${EAGLE_KERNEL_DIR}/tree_accept_kernels.cu
+    ${EAGLE_KERNEL_DIR}/target_tree_decode.cu
+    ${EAGLE_KERNEL_DIR}/specpv_kv_kernels.cu
+)
+set_property(TARGET eagle_kernels PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET eagle_kernels PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(eagle_kernels PRIVATE ${EAGLE_KERNEL_DIR})
 
 add_subdirectory(attention)
 add_subdirectory(gemm)

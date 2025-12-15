@@ -113,8 +113,54 @@ UnifiedAttentionLayer::UnifiedAttentionLayer(const ModelParam&     model,
 
 void UnifiedAttentionLayer::Initialize(TensorMap& args)
 {
-    h_q_len_ = args.at("h_q_len").buffer();
-    h_k_len_ = args.at("h_k_len").buffer();
+    // Decode/prefill batch geometry.
+    decode_num_ = *args.at("decode_num").data<int>();
+    prefil_num_ = *args.at("prefil_num").data<int>();
+    const int batch_size = decode_num_ + prefil_num_;
+
+    // Prefer explicit per-slot lengths when provided. Older call sites
+    // that predate h_q_len/h_k_len may omit them; in that case we build
+    // a conservative fallback based on the decoder_input token count so
+    // that attention still runs correctly for simple cases (e.g., single
+    // sequence prefill).
+    auto* q_tensor = args.try_("h_q_len");
+    auto* k_tensor = args.try_("h_k_len");
+    if (q_tensor && k_tensor) {
+        h_q_len_ = q_tensor->buffer();
+        h_k_len_ = k_tensor->buffer();
+    }
+    else {
+        if (batch_size > 0) {
+            h_q_len_ = Buffer_<int>{{batch_size}, kCPUpinned};
+            h_k_len_ = Buffer_<int>{{batch_size}, kCPUpinned};
+
+            int* q_ptr = h_q_len_.data();
+            int* k_ptr = h_k_len_.data();
+            std::fill_n(q_ptr, batch_size, 0);
+            std::fill_n(k_ptr, batch_size, 0);
+
+            const auto& decoder_input = args.at("decoder_input");
+            const int   token_num     = decoder_input.shape(0);
+
+            if (batch_size == 1) {
+                q_ptr[0] = token_num;
+                k_ptr[0] = token_num;
+            }
+            else if (token_num > 0) {
+                const int base = token_num / batch_size;
+                const int rem  = token_num % batch_size;
+                for (int i = 0; i < batch_size; ++i) {
+                    const int len = base + (i < rem ? 1 : 0);
+                    q_ptr[i]      = len;
+                    k_ptr[i]      = len;
+                }
+            }
+        }
+        else {
+            h_q_len_ = {};
+            h_k_len_ = {};
+        }
+    }
 
     const int bsz = h_q_len_.size();
 
@@ -132,14 +178,15 @@ void UnifiedAttentionLayer::Initialize(TensorMap& args)
 
     event_.Record(core::Context::stream());
 
-    decode_num_ = *args.at("decode_num").data<int>();
-    prefil_num_ = *args.at("prefil_num").data<int>();
-
     finished_  = args.at("finished").buffer();
     rope_base_ = args.at("rope_base").buffer();
 
-    cu_block_nums_ = args.at("cu_block_nums").buffer();
-    kv_block_ptrs_ = args.at("kv_block_ptrs").buffer();
+    cu_block_nums_       = args.at("cu_block_nums").buffer();
+    kv_block_ptrs_       = args.at("kv_block_ptrs").buffer();
+    kv_scale_block_ptrs_ = Buffer_<uintptr_t>{};
+    if (auto it = args.find("kv_scale_block_ptrs"); it != args.end()) {
+        kv_scale_block_ptrs_ = it->second.buffer();
+    }
 
     partial_ML_ = args.at("partial_ML").borrow();
 
@@ -239,15 +286,75 @@ Tensor UnifiedAttentionLayer::core_attention(Tensor& qkv, const ForwardParam& p,
     const auto device = qkv.device();
     const auto dtype  = qkv.dtype();
 
-    const int batch_size = decode_num_ + prefil_num_;
+    // Decode + prefill batch geometry. `h_q_len_` / `h_k_len_` are built
+    // for `bsz = h_q_len_.size()` slots; in well-formed calls this should
+    // equal `decode_num_ + prefil_num_`. To keep the attention layer
+    // robust against mismatches (which can otherwise lead to out-of-bounds
+    // reads and absurd k_count values), clamp the effective batch size and
+    // derive `k_count` directly from `h_k_len_` instead of relying on
+    // `h_cu_k_len_` (which may have been corrupted by earlier bugs).
+    const int bsz         = h_q_len_.size();
+    int       batch_size  = decode_num_ + prefil_num_;
+    batch_size            = std::max(0, std::min(batch_size, bsz));
+    int decode_slots      = std::max(0, std::min(decode_num_, batch_size));
+
     const int q_count    = qkv.shape(0);
-    const int k_count    = h_cu_k_len_[batch_size] - h_cu_k_len_[decode_num_];
+    int       k_count    = 0;
+    if (batch_size > decode_slots && h_k_len_.size() >= batch_size) {
+        const int* hk = h_k_len_.data();
+        for (int i = decode_slots; i < batch_size; ++i) {
+            k_count += std::max(0, hk[i]);
+        }
+    }
+
+    // Guard against corrupted or overflowed k_count. In a healthy engine
+    // k_count should be non-negative and bounded by the configured
+    // max_context_token_num for this engine. When it falls outside this
+    // range we clamp it conservatively so that the temporary K/V staging
+    // buffer (`tmp_kv`) never attempts to allocate an absurd length.
+    const int max_ctx_tokens = std::max(1, engine_param_.max_context_token_num);
+    if (k_count < 0 || k_count > max_ctx_tokens) {
+        TM_LOG_WARNING(
+            "[UnifiedAttention] Clamping k_count from %d to [%d, %d] "
+            "(decode_num=%d, prefil_num=%d, bsz=%d)",
+            k_count,
+            0,
+            max_ctx_tokens,
+            decode_num_,
+            prefil_num_,
+            bsz);
+        k_count = std::max(0, std::min(k_count, max_ctx_tokens));
+    }
+
     const int layer_id   = p.layer_id;
 
     const int local_q_kv_head_num = local_head_num_ + 2 * local_kv_head_num_;
 
     Tensor attn{{q_count, (int)local_head_num_ * (int)size_per_head_}, dtype, device};
-    Tensor tmp_kv{{(int)local_kv_head_num_, 2, k_count + MAX_CTA_S, (int)size_per_head_}, dtype, device};
+    // Compute a safe extent for the temporary K/V staging buffer,
+    // guarding against integer overflow on the `k_count + MAX_CTA_S`
+    // expression. The extra MAX_CTA_S tokens are used as a small safety
+    // margin in the underlying kernels.
+    int64_t kv_extent64 = static_cast<int64_t>(k_count) + MAX_CTA_S;
+    if (kv_extent64 <= 0) {
+        kv_extent64 = MAX_CTA_S;
+    }
+    const int64_t max_kv_extent =
+        static_cast<int64_t>(max_ctx_tokens) + MAX_CTA_S;
+    if (kv_extent64 > max_kv_extent) {
+        TM_LOG_WARNING(
+            "[UnifiedAttention] Clamping tmp_kv extent from %ld to %ld "
+            "(k_count=%d, MAX_CTA_S=%d, max_ctx_tokens=%d)",
+            (long)kv_extent64,
+            (long)max_kv_extent,
+            k_count,
+            MAX_CTA_S,
+            max_ctx_tokens);
+        kv_extent64 = max_kv_extent;
+    }
+    const int kv_extent = static_cast<int>(kv_extent64);
+
+    Tensor tmp_kv{{(int)local_kv_head_num_, 2, kv_extent, (int)size_per_head_}, dtype, device};
 
     auto CreateParams = [&](int offset, int batch_size, int max_kv_splits, cudaStream_t stream) {
         AttentionParams<T> params{};
@@ -272,11 +379,28 @@ Tensor UnifiedAttentionLayer::core_attention(Tensor& qkv, const ForwardParam& p,
         params.max_q_len = *std::max_element(h_q_len_.data() + offset, h_q_len_.data() + offset + batch_size);
         params.max_k_len = *std::max_element(h_k_len_.data() + offset, h_k_len_.data() + offset + batch_size);
 
-        // Decoding use only
-        params.block_iter_params = BlockIteratorParams{(char**)kv_block_ptrs_.data(),  //
-                                                       cu_block_nums_.data() + offset,
-                                                       layer_id,
-                                                       (int)param_.cache_block_seq_len};
+        // Optional packed mask for tree/speculative decode. The tree
+        // decode path can pass a flattened [token_num, packed_dim]
+        // tensor via ForwardParam::packed_mask; baseline decode leaves
+        // it empty and the kernel ignores these fields.
+        params.spec_decoding_packed_mask        = nullptr;
+        params.spec_decoding_packed_mask_stride = 0;
+        if (p.packed_mask && p.packed_mask.size() > 0) {
+            params.spec_decoding_packed_mask = p.packed_mask.data<int32_t>();
+            if (p.packed_mask.ndim() >= 2) {
+                params.spec_decoding_packed_mask_stride = static_cast<int>(p.packed_mask.shape(1));
+            }
+        }
+
+        // Decoding use only. For FP4 KV cache modes a parallel scale pool
+        // can be provided via block_iter_params.scale_block_ptrs; for
+        // existing int4/int8/unquantized modes this remains null.
+        params.block_iter_params =
+            BlockIteratorParams{(char**)kv_block_ptrs_.data(),  //
+                                kv_scale_block_ptrs_ ? (char**)kv_scale_block_ptrs_.data() : nullptr,
+                                cu_block_nums_.data() + offset,
+                                layer_id,
+                                (int)param_.cache_block_seq_len};
 
         // Prefilling use only
         const int sum_k_len       = h_cu_k_len_[offset + prefil_num_] - h_cu_k_len_[offset];

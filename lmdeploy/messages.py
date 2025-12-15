@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from __future__ import annotations
 import enum
 import time
 from dataclasses import dataclass, field
@@ -8,12 +9,14 @@ import torch
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
+from lmdeploy.speculative_config import SpeculativeConfig
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationRequest
+from lmdeploy.pytorch.config import TurboMindSchedulerConfig, TurboMindKVConfig
 
 from .tokenizer import Tokenizer
 from .utils import get_logger
 
-logger = get_logger('lmdeploy')
+logger = get_logger("lmdeploy")
 
 LogitsProcessor = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 """LogitsProcessor is a function that takes a tensor of input_ids, the logits
@@ -108,9 +111,12 @@ class GenerationConfig:
     logprobs: int = None
     response_format: Optional[Dict] = None
     logits_processors: Optional[List[LogitsProcessor]] = None
-    output_logits: Literal['all', 'generation'] = None
-    output_last_hidden_state: Literal['all', 'generation'] = None
+    output_logits: Literal["all", "generation"] = None
+    output_last_hidden_state: Literal["all", "generation"] = None
     include_stop_str_in_output: bool = False
+
+    # for GPT-OSS reasoning control
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
 
     # for disaggregation
     with_cache: bool = False
@@ -126,9 +132,9 @@ class GenerationConfig:
 
         def special_word_token_ids(words):
             if words is not None:
-                assert isinstance(words, List) and \
-                    all(isinstance(elem, str) for elem in words), \
-                    f'stop_words must be a list of str but got {type(words)}'
+                assert isinstance(words, List) and all(
+                    isinstance(elem, str) for elem in words
+                ), f"stop_words must be a list of str but got {type(words)}"
                 indexes = []
                 for word in words:
                     indexes += tokenizer.indexes_containing_token(word)
@@ -152,7 +158,7 @@ class GenerationConfig:
 
         # add eos_token_id from model's generation_config.json file if there
         # is any.
-        eos_token_id = generation_config.get('eos_token_id')
+        eos_token_id = generation_config.get("eos_token_id")
         if eos_token_id is not None:
             if isinstance(eos_token_id, int):
                 stop_token_ids.add(eos_token_id)
@@ -163,12 +169,13 @@ class GenerationConfig:
 
     def __post_init__(self):
         """Check input validation."""
-        assert type(self.n) == int and self.n > 0, 'n is not a positive integer'
+        assert type(self.n) == int and self.n > 0, "n is not a positive integer"
         assert self.top_p >= 0 and self.top_p <= 1  # [0, 1]
-        assert self.top_k >= 0, 'top_k can not be a negative integer'
+        assert self.top_k >= 0, "top_k can not be a negative integer"
         assert self.temperature >= 0 and self.temperature <= 2  # [0,2]
-        assert 0 <= self.min_p <= 1, \
-            f'min_p should be in range [0, 1], but found {self.min_p}'
+        assert (
+            0 <= self.min_p <= 1
+        ), f"min_p should be in range [0, 1], but found {self.min_p}"
 
 
 @pydantic_dataclass
@@ -234,7 +241,7 @@ class TurbomindEngineConfig:
         enable_metrics (bool): enable metrics system
     """
 
-    dtype: str = 'auto'
+    dtype: str = "auto"
     model_format: Optional[str] = None
     tp: int = 1
     dp: int = 1
@@ -262,167 +269,363 @@ class TurbomindEngineConfig:
     max_prefill_iters: int = 1
     devices: Optional[List[int]] = None
     empty_init: bool = False
-    communicator: str = 'nccl'
+    communicator: str = "nccl"
     hf_overrides: Optional[Dict[str, Any]] = None
     enable_metrics: bool = True
+    speculative_config: Optional[SpeculativeConfig] = None
 
     def __post_init__(self):
         """Check input validation."""
-        assert self.dtype in ['auto', 'float16', 'bfloat16']
-        assert self.tp >= 1, 'tp must be a positive integer'
-        assert self.cache_max_entry_count > 0, 'invalid cache_max_entry_count'
-        assert self.quant_policy in (0, 4, 8), 'invalid quant_policy'
-        assert self.rope_scaling_factor >= 0, 'invalid rope_scaling_factor'
-        assert self.max_prefill_token_num >= 0, \
-            'invalid max_prefill_token_num'
-        assert self.num_tokens_per_iter >= 0, 'invalid num_tokens_per_iter'
+        assert self.dtype in ["auto", "float16", "bfloat16"]
+        assert self.tp >= 1, "tp must be a positive integer"
+        assert self.cache_max_entry_count > 0, "invalid cache_max_entry_count"
+        assert self.quant_policy in (0, 4, 8, 16), "invalid quant_policy"
+        assert self.rope_scaling_factor >= 0, "invalid rope_scaling_factor"
+        assert self.max_prefill_token_num >= 0, "invalid max_prefill_token_num"
+        assert self.num_tokens_per_iter >= 0, "invalid num_tokens_per_iter"
+
+
+class TurboMindEngineConfig(TurbomindEngineConfig):
+    """Backwards-compatible alias for newer API name."""
+    pass
+
+
+
 
 
 @dataclass
+
+class DriftEngineConfig:
+
+    # Model / parallelism
+
+    model_path: str
+
+    tp: int = 1
+
+    pp: int = 1
+
+    session_len: int = 8192
+
+    max_batch_size: int = 256
+
+    dtype: Literal["fp16", "bf16", "fp8"] = "fp16"
+
+
+
+    # Scheduler
+
+    scheduler: TurboMindSchedulerConfig = field(default_factory=TurboMindSchedulerConfig)
+
+    kv: TurboMindKVConfig = field(default_factory=TurboMindKVConfig)
+
+
+
+    # Drift-specific tuning
+
+    prefer_high_throughput: bool = True
+
+    # When True, bias scheduler toward larger batches and chunked prefill.
+
+    target_latency_ms_p50: int = 50
+
+    target_latency_ms_p95: int = 200
+
+    # Expose trade-off knobs:
+
+    decode_microbatch_size: int | None = None
+
+    prefill_microbatch_size: int | None = None
+
+
+
+    # Instrumentation / safety
+
+    max_queued_requests: int = 4096
+
+    abort_on_oom: bool = True
+
+    log_level: Literal["info", "debug", "warning"] = "info"
+
+
+
+
+
+@dataclass
+
 class PytorchEngineConfig:
+
     """PyTorch Engine Config.
 
+
+
     Args:
+
         dtype (str): data type for model weights and activations. It can be
+
             one of the following values, ['auto', 'float16', 'bfloat16']
+
             The `auto` option will use FP16 precision for FP32 and FP16
+
             models, and BF16 precision for BF16 models.
+
         tp (int): Tensor Parallelism. default 1.
+
         dp (int): Data Parallelism. default 1.
+
         dp_rank (int): rank of dp.
+
         ep (int): Expert Parallelism. default 1.
+
         session_len (int): Max session length. Default None.
+
         max_batch_size (int): Max batch size. If it is not specified,
+
             the engine will automatically set it according to the device
+
         attn_tp_size (int): tp size for attention, only works for dp>1
+
         mlp_tp_size (int): tp size for mlp, only works for dp>1
+
         moe_tp_size (int): tp size for moe, only works for dp>1
+
         cache_max_entry_count (float): the percentage of gpu memory occupied
+
             by the k/v cache. For lmdeploy versions greater than `v0.2.1`,
+
             it defaults to 0.8, signifying the percentage of FREE GPU memory
+
             to be reserved for the k/v cache
+
         prefill_interval (int): Interval to perform prefill,
+
             Default 16.
+
         block_size (int): paging cache block size, default 64.
+
         num_cpu_blocks (int): Num cpu blocks. If num is 0, cache
+
             would be allocate according to current environment.
+
         num_gpu_blocks (int): Num gpu blocks. If num is 0, cache
+
             would be allocate according to current environment.
+
         adapters (dict): The path configs to lora adapters.
+
         max_prefill_token_num (int): tokens per iteration.
+
         thread_safe (bool): thread safe engine instance.
+
         enable_prefix_caching (bool): Enable token match and sharing caches.
+
         device_type (str): The inference device type, options ['cuda']
+
         eager_mode (bool): Enable "eager" mode or not
+
         custom_module_map (Dict): nn module map customized by users. Once
+
             provided, the original nn modules of the model will be
+
             substituted by the mapping ones
+
         download_dir (str): Directory to download and load the weights,
+
             default to the default cache directory of huggingface.
+
         revision (str): The specific model version to use.
+
             It can be a branch name, a tag name, or a commit id.
+
             If unspecified, will use the default version.
+
         quant_policy (int): default to 0. When k/v is quantized into 4 or 8
+
             bit, set it to 4 or 8, respectively
+
         distributed_executor_backend (str): backend of distributed backend,
+
             options: ['uni', 'mp', 'ray']
+
         empty_init (bool): Whether to load the model weights, you should set
+
             it to True if you want to update weights after create the pipeline
+
         enable_microbatch (bool): enable microbatch for specified model
+
         enable_eplb (bool): enable eplb for specified model
+
         enable_metrics (bool): enable metrics system
+
         role (EngineRole): role of engin, options: ['Hybrid', 'Prefill',
+
             'Decode']. Default to `EngineRole.Hybrid`.
+
         migration_backend: migration backend. options: ['DLSlime'].
+
             Default to `MigrationBackend.DLSlime`.
+
         enable_mp_engine (bool): run engine in multi-process mode.
+
         mp_engine_backend (str): backend of mp engine, options:
+
             ['mp', 'ray']. Default to `mp`.
+
         model_format (str): weight quantization policy, options: ['fp8'].
+
         hf_overrides (Dict[str, Any]): Huggingface overrides for the model.
+
             It can be used to override the default config of the model,
+
         disable_vision_encoder (bool): Whether to disable loading vision
+
             encoder. Default to False.
+
         logprobs_mode (str): The mode of logprob, options: ['raw_logits', 'raw_logprobs']
+
         dllm_block_length (int): Block size of block diffusion model.
+
         dllm_unmasking_strategy (str): Dllm unmasking strategy, options:
+
             ['low_confidence_dynamic', 'low_confidence_static', 'sequential'].
+
         dllm_denoising_steps (int): Dllm denoising steps.
+
         dllm_confidence_threshold (float): dllm unmasking threshold for
+
             dynamic unmasking.
+
     """
-    dtype: str = 'auto'
+
+
+
+    dtype: str = "auto"
+
     tp: int = 1
+
     dp: int = 1
+
     dp_rank: int = 0
+
     ep: int = 1
+
     session_len: int = None
+
     max_batch_size: int = None
+
     attn_tp_size: int = None
+
     mlp_tp_size: int = None
+
     moe_tp_size: int = None
+
     cache_max_entry_count: float = 0.8
+
     prefill_interval: int = 16
+
     block_size: int = 64
+
     num_cpu_blocks: int = 0
+
     num_gpu_blocks: int = 0
+
     adapters: Dict[str, str] = None
+
     max_prefill_token_num: int = 4096
+
     thread_safe: bool = False
+
     enable_prefix_caching: bool = False
-    device_type: str = 'cuda'
+
+    device_type: str = "cuda"
+
     eager_mode: bool = False
+
     custom_module_map: Dict[str, str] = None
+
     download_dir: str = None
+
     revision: str = None
+
     quant_policy: Literal[0, 4, 8] = 0
+
     distributed_executor_backend: str = None
+
     empty_init: bool = False
+
     enable_microbatch: bool = False
+
     enable_eplb: bool = False
+
     enable_mp_engine: bool = False
-    mp_engine_backend: str = 'mp'
+
+    mp_engine_backend: str = "mp"
+
     model_format: str = None
+
     enable_metrics: bool = True
+
     hf_overrides: Optional[Dict[str, Any]] = None
+
     disable_vision_encoder: bool = False
+
     logprobs_mode: str = None
+
     # router replay
+
     enable_return_routed_experts: bool = False
+
     enable_transfer_obj_ref: bool = False
 
+
+
     # dllm
+
     dllm_block_length: int = None
-    dllm_unmasking_strategy: str = 'low_confidence_dynamic'
+
+    dllm_unmasking_strategy: str = "low_confidence_dynamic"
+
     dllm_denoising_steps: int = None
+
     dllm_confidence_threshold: float = 0.85
 
+
+
     role: EngineRole = EngineRole.Hybrid
+
     migration_backend: MigrationBackend = MigrationBackend.DLSlime
+
+    scheduler: TurboMindSchedulerConfig = field(default_factory=TurboMindSchedulerConfig)
+
+    kv: TurboMindKVConfig = field(default_factory=TurboMindKVConfig)
 
     def __post_init__(self):
         """Check input validation."""
-        assert self.dtype in ['auto', 'float16', 'bfloat16']
-        assert self.tp >= 1, 'invalid tp'
-        assert self.dp >= 1, 'invalid dp'
-        assert self.ep >= 1, 'invalid ep'
-        assert 0 < self.cache_max_entry_count < 1, \
-            'invalid cache_max_entry_count'
-        assert self.num_cpu_blocks >= 0, 'invalid num_cpu_blocks'
-        assert self.max_prefill_token_num >= 0, \
-            'invalid max_prefill_token_num'
-        assert self.num_gpu_blocks >= 0, 'invalid num_gpu_blocks'
-        assert self.quant_policy in (0, 4, 8), 'invalid quant_policy'
-        assert self.device_type in ['cuda', 'ascend', 'maca', 'camb'], (f'invalid device_type: {self.device_type}')
-        assert self.block_size >= 16 and (self.block_size & (self.block_size - 1)) == 0, \
-            f'block_size must be >= 16 and a power of 2, but got {self.block_size}'
-        if self.quant_policy > 0 and self.device_type not in ['cuda', 'ascend']:
-            assert False, \
-                   'kv cache quantization only works for CUDA and ASCEND.'
-        if self.device_type == 'camb' and self.block_size != 16:
+        assert self.dtype in ["auto", "float16", "bfloat16"]
+        assert self.tp >= 1, "invalid tp"
+        assert self.dp >= 1, "invalid dp"
+        assert self.ep >= 1, "invalid ep"
+        assert 0 < self.cache_max_entry_count < 1, "invalid cache_max_entry_count"
+        assert self.num_cpu_blocks >= 0, "invalid num_cpu_blocks"
+        assert self.max_prefill_token_num >= 0, "invalid max_prefill_token_num"
+        assert self.num_gpu_blocks >= 0, "invalid num_gpu_blocks"
+        assert self.device_type in [
+            "cuda",
+            "ascend",
+            "maca",
+            "camb",
+        ], f"invalid device_type: {self.device_type}"
+        assert (
+            self.block_size >= 16 and (self.block_size & (self.block_size - 1)) == 0
+        ), f"block_size must be >= 16 and a power of 2, but got {self.block_size}"
+        if self.quant_policy > 0 and self.device_type not in ["cuda", "ascend"]:
+            assert False, "kv cache quantization only works for CUDA and ASCEND."
+        if self.device_type == "camb" and self.block_size != 16:
             self.block_size = 16
-            logger.warning('Currently, camb device requires block size to be 16, \
-                    setting block size to 16')
+            logger.warning(
+                "Currently, camb device requires block size to be 16, \
+                    setting block size to 16"
+            )
 
 
 class ResponseType(enum.Enum):
@@ -461,11 +664,16 @@ class Response:
             position.
         index (int): it refers to the position index of the input request
             batch
+        reasoning_content (str | None): for GPT-OSS models, the chain-of-thought
+            reasoning content from the 'analysis' channel
+        tool_calls (List[Dict] | None): for GPT-OSS models, the extracted tool
+            calls from the 'commentary' channel
     """
+
     text: str
     generate_token_len: int
     input_token_len: int
-    finish_reason: Optional[Literal['stop', 'length']] = None
+    finish_reason: Optional[Literal["stop", "length"]] = None
     token_ids: List[int] = field(default_factory=list)
     logprobs: List[Dict[int, float]] = None
     logits: torch.Tensor = None
@@ -473,35 +681,41 @@ class Response:
     index: int = 0
     routed_experts: Any = None
 
+    # for GPT-OSS harmony format
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[Dict]] = None
+
     def __str__(self):
-        return f'text={self.text}\n{self._format_none_text_fields()}'
+        return f"text={self.text}\n{self._format_none_text_fields()}"
 
     def __repr__(self):
-        return f'text={self.text!r}\n{self._format_none_text_fields()}'
+        return f"text={self.text!r}\n{self._format_none_text_fields()}"
 
     def _format_none_text_fields(self):
         fields = []
-        fields.append(f'input_token_len={self.input_token_len}')
-        fields.append(f'generate_token_len={self.generate_token_len}')
+        fields.append(f"input_token_len={self.input_token_len}")
+        fields.append(f"generate_token_len={self.generate_token_len}")
         fields.append(f'finish_reason="{self.finish_reason}"')
-        fields.append(f'token_ids={self.token_ids}')
-        fields.append(f'logprobs={self.logprobs}')
+        fields.append(f"token_ids={self.token_ids}")
+        fields.append(f"logprobs={self.logprobs}")
 
         # Helper function to format tensor information
         def _format_tensor(name: str, tensor: Optional[torch.Tensor]) -> List[str]:
             if tensor is None:
-                return [f'{name}=None']
+                return [f"{name}=None"]
             try:
-                return [f'{name}.shape={tensor.shape}', f'{name}={tensor}']
+                return [f"{name}.shape={tensor.shape}", f"{name}={tensor}"]
             except:  # noqa
                 # in case tensor is not torch.Tensor or has no shape
-                return [f'{name}={tensor}']
+                return [f"{name}={tensor}"]
 
         # Format tensor fields
-        fields.extend(_format_tensor('logits', self.logits))
-        fields.extend(_format_tensor('last_hidden_state', self.last_hidden_state))
-        fields.extend(_format_tensor('routed_experts', self.routed_experts))
-        return '\n'.join(fields)
+        fields.extend(_format_tensor("logits", self.logits))
+        fields.extend(_format_tensor("last_hidden_state", self.last_hidden_state))
+        fields.extend(_format_tensor("routed_experts", self.routed_experts))
+        if self.req_metrics is not None:
+            fields.append(f"req_metrics={self.req_metrics}")
+        return "\n".join(fields)
 
 
 # modified from https://github.com/vllm-project/vllm/blob/main/vllm/v1/engine/__init__.py
@@ -513,6 +727,7 @@ class EventType(enum.IntEnum):
     PREEMPTED - the request has been put back in the waiting queue in order to make room for other requests to complete.
                 It will be re-scheduled in future and re-start its prefill phase
     """
+
     QUEUED = 1
     SCHEDULED = 2
     PREEMPTED = 3  # FIXME, currently ignored for simplicity
@@ -527,11 +742,14 @@ class EngineEvent:
         type: the type of an event associated with a request during its life cycle
         timestamp: the WALL-CLOCK time when the event happens.
     """
+
     type: EventType
     timestamp: float
 
     @classmethod
-    def new_event(cls, event_type: EventType, timestamp: Optional[float] = None) -> 'EngineEvent':
+    def new_event(
+        cls, event_type: EventType, timestamp: Optional[float] = None
+    ) -> "EngineEvent":
         # Timestamps MUST use wall-clock time (time.time()) to maintain consistency
         # between csrc(std::chrono::system_clock) and python
         timestamp = time.time() if timestamp is None else timestamp
@@ -555,10 +773,31 @@ class RequestMetrics:
     Attributes:
         token_timestamp: A wall-clock time when a token is generated.
         engine_events: List of engine events during inference.
+        enque_time: when a request is enqued (microseconds since Unix epoch).
+        scheduled_time: when a request is scheduled for inference (microseconds since Unix epoch).
+        eagle_total_draft_tokens: total number of draft tokens proposed.
+        eagle_total_accepted_tokens: total number of draft tokens accepted.
+        eagle_steps: number of speculative steps taken.
+        eagle_total_rewound_tokens: total number of tokens rewound from KV cache.
+        eagle_rewind_steps: number of steps where KV rewind was applied.
+        eagle_tree_draft_tokens: total number of tree draft tokens proposed.
+        eagle_tree_target_tokens: total number of tree target tokens evaluated.
+        eagle_tree_accepted_tokens: total number of accepted tokens along tree paths.
     """
+
     token_timestamp: float = 0.0
     engine_events: List[EngineEvent] = field(default_factory=list)
     spec_info: Optional[Dict[str, Any]] = None
+    enque_time: int = 0
+    scheduled_time: int = 0
+    eagle_total_draft_tokens: int = 0
+    eagle_total_accepted_tokens: int = 0
+    eagle_steps: int = 0
+    eagle_total_rewound_tokens: int = 0
+    eagle_rewind_steps: int = 0
+    eagle_tree_draft_tokens: int = 0
+    eagle_tree_target_tokens: int = 0
+    eagle_tree_accepted_tokens: int = 0
 
 
 @dataclass
@@ -574,6 +813,7 @@ class EngineOutput:
             Disaggregated LLM Serving when Prefill Engine is Done.
         req_metrics (RequestMetrics): request metrics information
     """
+
     status: ResponseType
     token_ids: List[int]
     logprobs: List[Dict[int, float]] = None
@@ -596,6 +836,7 @@ class VisionConfig:
             thread-safe. Please set it to True when using the pipeline
             in a multi-threaded environment.
     """
+
     max_batch_size: int = 1
     thread_safe: bool = False
 
@@ -609,6 +850,12 @@ class SpeculativeConfig:
         model (str): the path of speculative model.
         num_speculative_tokens (int): number of generated token of draft model per step
     """
+
     method: str
-    model: str = ''
+    model: str = ""
     num_speculative_tokens: int = 1
+    # Optional TurboMind-only EAGLE debug/metrics flags. When set, these
+    # map onto SpeculativeConfig.eagle_debug / eagle_metrics_debug in
+    # lmdeploy.speculative_config and ultimately into TurboMind EngineParam.
+    eagle_debug: bool = False
+    eagle_metrics_debug: bool = False

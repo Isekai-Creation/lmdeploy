@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import torch
 
-from lmdeploy.messages import PytorchEngineConfig
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
 from lmdeploy.pytorch.utils import maybe_register_config_serialize_by_value
 
@@ -71,6 +70,29 @@ class SchedulerConfig:
     eviction_type: str = 'recompute'
     prefill_interval: int = 16
     max_active_adapters: int = 64
+
+
+@dataclass
+class TurboMindSchedulerConfig:
+    """TurboMind scheduler config."""
+    max_num_batched_tokens: int = 2048
+    max_num_seqs: int = 128
+    enable_chunked_prefill: bool = True
+    max_num_partial_prefills: int = 1
+    long_prefill_token_threshold: int = 0
+    scheduler_policy: Literal['fcfs', 'priority'] = 'fcfs'
+    prefer_decode_over_prefill: bool = True  # when token budget tight
+
+
+@dataclass
+class TurboMindKVConfig:
+    """TurboMind KV cache config."""
+    kv_page_size: int = 128
+    kv_capacity_bytes: int | None = None  # auto if None
+    prefix_cache_enabled: bool = True
+    prefix_cache_eviction_policy: Literal['lru', 'priority'] = 'lru'
+    kv_alignment: int = 16  # bytes, for allocator
+
 
 
 @dataclass
@@ -188,7 +210,7 @@ class DistConfig:
             raise ValueError(f'Unknown layer type: {layer_type}')
 
     @classmethod
-    def from_engine_config(cls, engine_config: PytorchEngineConfig):
+    def from_engine_config(cls, engine_config: "PytorchEngineConfig"):
         """From engine config."""
         dist_config = cls(
             dp=engine_config.dp,
@@ -437,7 +459,7 @@ class MiscConfig:
     enable_return_routed_experts: bool = False
 
     @classmethod
-    def from_engine_config(cls, engine_config: PytorchEngineConfig):
+    def from_engine_config(cls, engine_config: "PytorchEngineConfig"):
         """From engine config."""
         dllm_unmasking_strategy = UnmaskingStrategy.from_str(engine_config.dllm_unmasking_strategy)
         dllm_config = DLLMConfig(block_length=engine_config.dllm_block_length,

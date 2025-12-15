@@ -46,6 +46,9 @@ public:
     struct ForwardParam {
         Tensor            input;
         Tensor            output;
+        // Optional packed attention mask for speculative / tree decode
+        // flows. When empty, baseline autoregressive masking is used.
+        Tensor            packed_mask;
         const WeightType* weights;
         int               layer_id;
     };
@@ -138,6 +141,7 @@ private:
 
     Buffer_<int>       cu_block_nums_;
     Buffer_<uintptr_t> kv_block_ptrs_;
+    Buffer_<uintptr_t> kv_scale_block_ptrs_;
     ///////////////////////////////////////////////////////
 };
 

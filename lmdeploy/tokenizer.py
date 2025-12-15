@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import json
+import os
 import os.path as osp
 from collections import deque
 from dataclasses import dataclass
@@ -287,21 +288,46 @@ class HuggingFaceTokenizer:
         """
         tokenizer = self.model
         ids_offset, prev_tokens, prefix_offset, read_offset = state.as_tuple()
+
+        def _safe_convert_ids_to_tokens(input_ids: Sequence[int]) -> List[str]:
+            """Convert token ids to tokens defensively.
+
+            Some fast tokenizers raise OverflowError when given negative ids
+            (e.g. padding values from backends). Treat such ids as invalid
+            and skip them instead of crashing the pipeline.
+            """
+            try:
+                tokens = tokenizer.convert_ids_to_tokens(
+                    input_ids, skip_special_tokens=skip_special_tokens
+                )
+            except Exception:
+                cleaned_ids: List[int] = []
+                for token_id in input_ids:
+                    try:
+                        token_int = int(token_id)
+                    except Exception:
+                        continue
+                    if token_int >= 0:
+                        cleaned_ids.append(token_int)
+                try:
+                    tokens = tokenizer.convert_ids_to_tokens(
+                        cleaned_ids, skip_special_tokens=skip_special_tokens
+                    )
+                except Exception:
+                    tokens = []
+            # `convert_ids_to_tokens` may return None for out-of-range token_id.
+            tokens = tokens or []
+            if None in tokens:
+                tokens = [x for x in tokens if x is not None]
+            return tokens
+
         # This is the first iteration for this sequence
-        new_tokens = tokenizer.convert_ids_to_tokens(all_input_ids[ids_offset:],
-                                                     skip_special_tokens=skip_special_tokens)
-        # `convert_ids_to_tokens` returns None for out-of-range token_id
-        new_tokens = new_tokens or []
-        new_tokens = [x for x in new_tokens if x is not None] if None in new_tokens else new_tokens
+        new_tokens = _safe_convert_ids_to_tokens(all_input_ids[ids_offset:])
         if prev_tokens is None:
             # Please notice that in VLLM, indexes are detokenized one by one
             # while in LMDeploy, every turn, the detokenized indexes length
             # can be different.
-            prev_tokens = tokenizer.convert_ids_to_tokens(all_input_ids[:ids_offset],
-                                                          skip_special_tokens=skip_special_tokens)
-            # `convert_ids_to_tokens` returns None for out-of-range token_id
-            prev_tokens = prev_tokens or []
-            prev_tokens = [x for x in prev_tokens if x is not None] if None in prev_tokens else prev_tokens
+            prev_tokens = _safe_convert_ids_to_tokens(all_input_ids[:ids_offset])
             read_offset = len(prev_tokens)
             if skip_special_tokens and new_tokens and new_tokens[0] in tokenizer.all_special_ids:
                 read_offset = read_offset + 1  # skip special token
@@ -394,19 +420,50 @@ class GptOssTokenizer(HuggingFaceTokenizer):
         encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
         self.role = Role.ASSISTANT
         self.parser = partial(StreamableParser, encoding, role=Role.ASSISTANT)
+        # Allow turning off Harmony parsing entirely when running offline
+        # benchmarks or when the model does not emit well-formed Harmony
+        # headers. When disabled, detokenization falls back to the generic
+        # HuggingFace path and never raises HarmonyError.
+        env_flag = os.getenv('LMDEPLOY_DISABLE_HARMONY', '').strip().lower()
+        self._disable_harmony = env_flag in ('1', 'true', 'yes', 'on')
 
     def detokenize_incrementally(self,
                                  all_input_ids: Sequence[int],
                                  state: DetokenizeState,
                                  skip_special_tokens: bool = True,
                                  spaces_between_special_tokens: bool = True):
+        # When Harmony parsing is disabled (or fails), fall back to the
+        # generic HuggingFace incremental detokenizer so that offline
+        # pipelines never crash with HarmonyError.
+        if self._disable_harmony:
+            return super(GptOssTokenizer, self).detokenize_incrementally(
+                all_input_ids,
+                state,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+
         if not hasattr(state, 'stream'):
             state.stream = self.parser()
 
         response = ''
         stream = state.stream
         for token_id in all_input_ids[state.ids_offset:]:
-            stream.process(token_id)
+            try:
+                stream.process(token_id)
+            except Exception as e:  # pragma: no cover - defensive against HarmonyError
+                # On any Harmony parsing failure, log once via the tokenizer
+                # logger and switch to the generic detokenizer for the rest
+                # of this sequence to avoid repeated exceptions.
+                self.logger.warning(f'GptOssTokenizer Harmony parsing failed: {e}; '
+                                    'falling back to generic detokenization.')
+                self._disable_harmony = True
+                return super(GptOssTokenizer, self).detokenize_incrementally(
+                    all_input_ids,
+                    state,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                )
             if stream.current_channel in ['final', 'analysis'] and stream.current_role == self.role:
                 response += stream.last_content_delta or ''
 

@@ -131,7 +131,7 @@ class ArgumentHelper:
         return parser.add_argument('--dtype',
                                    type=str,
                                    default=default,
-                                   choices=['auto', 'float16', 'bfloat16'],
+                                   choices=['auto', 'fp16', 'bf16', 'fp8'],
                                    help='data type for model weights and activations. '
                                    'The "auto" option will use FP16 precision '
                                    'for FP32 and FP16 models, and BF16 precision '
@@ -262,8 +262,12 @@ class ArgumentHelper:
         return parser.add_argument('--quant-policy',
                                    type=int,
                                    default=0,
-                                   choices=[0, 4, 8],
-                                   help='Quantize kv or not. 0: no quant; 4: 4bit kv; 8: 8bit kv')
+                                   choices=[0, 4, 8, 16],
+                                   help=('Quantize kv or not. '
+                                         '0: no quant; '
+                                         '4: 4bit int kv; '
+                                         '8: 8bit int kv; '
+                                         '16: FP4 (NVFP4/MXFP4) kv cache'))
 
     @staticmethod
     def rope_scaling_factor(parser):

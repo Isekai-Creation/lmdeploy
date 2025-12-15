@@ -3,6 +3,7 @@
 #include "src/turbomind/models/llama/BlockManager.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/debug_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/string_utils.h"
 #include <algorithm>
@@ -48,9 +49,9 @@ BlockManager::BlockManager(
         chunk_size_ = chunk_size;
     }
 
-    TM_LOG_INFO("[BlockManager] block_size = %.3f MB", (float)block_size_ / (1 << 20));
-    TM_LOG_INFO("[BlockManager] max_block_count = %d", max_block_count_);
-    TM_LOG_INFO("[BlockManager] chunk_size = %d", chunk_size_);
+    TM_LOG_WARNING("[BlockManager] block_size = %.3f MB", (float)block_size_ / (1 << 20));
+    TM_LOG_WARNING("[BlockManager] max_block_count = %d (free_mem ratio applied)", max_block_count_);
+    TM_LOG_WARNING("[BlockManager] chunk_size = %d", chunk_size_);
 
     blocks_.reserve(max_block_count_);
 
@@ -59,7 +60,9 @@ BlockManager::BlockManager(
     free_ids_.reserve(max_block_count_);
 
     // pre-allocate first chunk
-    Malloc();
+    if (!Malloc()) {
+        TM_LOG_ERROR("[BlockManager] Failed to allocate first chunk! size=%lu, chunk_size=%d", block_size_ * chunk_size_, chunk_size_);
+    }
     dbg(free_ids_);
 }
 
@@ -78,7 +81,10 @@ bool BlockManager::Malloc()
         return false;
     }
 
-    auto ptr = (std::byte*)allocator_->allocate(block_size_ * chunk_size);
+    size_t alloc_size = block_size_ * chunk_size;
+    TM_LOG_WARNING("[BlockManager][Malloc] alloc_size = %lu * %d = %lu bytes (%.2f GB)", block_size_, chunk_size, alloc_size, alloc_size/1e9);
+
+    auto ptr = (std::byte*)allocator_->allocate(alloc_size);
     if (!ptr) {
         return false;
     }
@@ -95,13 +101,73 @@ bool BlockManager::Malloc()
         free_ids_.push_back(block.id);
     }
 
+    // In invariants-debug runs, ensure that no CUDA error was raised
+    // during KV chunk allocation or any implicit device-side work
+    // before we return. This makes it easier to distinguish genuine
+    // allocator failures from illegal accesses caused by earlier kernels.
+    if (isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[BlockManager][invariants] CUDA error %d (%s) observed after Malloc "
+                "(alloc_size=%lu, chunk_size=%d); aborting to surface upstream bug.",
+                static_cast<int>(err),
+                cudaGetErrorString(err),
+                alloc_size,
+                chunk_size);
+            std::abort();
+        }
+    }
+
     return true;
 }
 
 size_t BlockManager::GetBlockCount(size_t block_size, double ratio, GetFreeMemSize get_free_size)
 {
     size_t free = get_free_size();
-    return static_cast<size_t>(free * ratio) / block_size;
+
+    // Treat `ratio` as an upper bound on the fraction of free device
+    // memory that can be reserved for KV blocks. On very large models
+    // (e.g. 120B with long contexts) an aggressive ratio such as 0.75
+    // can lead to allocator failures on the first chunk allocation even
+    // though the theoretical "free * ratio" budget exists. To make the
+    // BlockManager more robust, apply an internal safety cap while
+    // keeping the user-visible knob unchanged.
+    double effective_ratio = ratio;
+
+    // Optional environment override to tighten the KV budget without
+    // changing engine configs. When set to a value in (0,1], this caps
+    // the internal ratio used for block sizing.
+    if (const char* env = std::getenv("TM_KV_EFFECTIVE_RATIO")) {
+        char*  end = nullptr;
+        double v   = std::strtod(env, &end);
+        if (end != env && v > 0.0 && v <= 1.0) {
+            if (v < effective_ratio) {
+                effective_ratio = v;
+                TM_LOG_WARNING(
+                    "[BlockManager] TM_KV_EFFECTIVE_RATIO=%s clamping cache_max_entry_count from %.3f to %.3f",
+                    env,
+                    ratio,
+                    effective_ratio);
+            }
+        }
+    }
+    else {
+        // Default safety cap when no explicit override is provided.
+        // This leaves headroom for model weights, activations, and
+        // additional runtime buffers even when cache_max_entry_count
+        // is configured to aggressive values like 0.75.
+        constexpr double kMaxSafeRatio = 0.70;
+        if (effective_ratio > kMaxSafeRatio) {
+            TM_LOG_WARNING(
+                "[BlockManager] Clamping cache_max_entry_count from %.3f to %.3f to avoid KV overallocation.",
+                ratio,
+                kMaxSafeRatio);
+            effective_ratio = kMaxSafeRatio;
+        }
+    }
+
+    return static_cast<size_t>(free * effective_ratio) / block_size;
 }
 
 void BlockManager::Move(std::vector<int>& src, const std::vector<int>& delta, std::vector<int>& dst)

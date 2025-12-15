@@ -24,7 +24,10 @@ Registry::Registry(std::shared_ptr<cudaDeviceProp> device_prop):
     sm70_884_8();
     sm70_884_16();
 
-    sm90_64n32_8();
+    // sm90_64n32_8 is intentionally not invoked here because the
+    // corresponding kernel translation unit is excluded from the
+    // gemm2 build on this toolchain (see CMakeLists). Calling it
+    // would leave an unresolved symbol in the Python extension.
 
     cublas_float();
 }

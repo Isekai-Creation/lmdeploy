@@ -37,4 +37,27 @@ void invokeLengthCriterion(bool*        finished,  //
                            int          step,
                            cudaStream_t stream);
 
+// Apply forced tail tokens on device, updating output_ids, sequence_length,
+// finished flags, and optional per-slot committed_lengths. This mirrors the
+// tail loop in DynamicDecodeLayer::ForwardMultiStep but runs entirely on GPU.
+// `batch_size` is the logical number of active slots for this step, while
+// `stride_batch` is the physical stride used to index output_ids rows; in
+// flattened layouts this is typically the engine's max_batch_size.
+void invokeApplyForcedTail(const int*   forced_tokens,         // [batch_size, max_tail_len]
+                           const int*   forced_lengths,        // [batch_size]
+                           int*         output_ids,            // [max_seq_len, batch_size] (flat)
+                           int*         sequence_length,       // [batch_size]
+                           bool*        finished,              // [batch_size]
+                           const int*   sequence_limit_length, // [batch_size] or nullptr
+                           const int*   eos_ids,               // [batch_size, max_eos_per_slot] or nullptr
+                           const int*   eos_counts,            // [batch_size] or nullptr
+                           int          max_eos_per_slot,
+                           int*         committed_lengths,     // [batch_size] or nullptr
+                           int          batch_size,
+                           int          max_tail_len,
+                           int          max_seq_len,
+                           int          stride_batch,
+                           int          step,
+                           cudaStream_t stream);
+
 }  // namespace turbomind

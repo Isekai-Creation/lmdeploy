@@ -60,7 +60,7 @@ public:
 
     TM_HOST_DEVICE auto k_data(char* block, int ti) const
     {
-        if constexpr (std::is_same_v<Tkv, uint4_t>) {
+        if constexpr (std::is_same_v<Tkv, uint4_t> || std::is_same_v<Tkv, fp4_e2m1_t>) {
             return SubBytePtr<Tkv>{block + layout_.k_data(layer_id_, head_id_, ti)};
         }
         else {
@@ -70,7 +70,7 @@ public:
 
     TM_HOST_DEVICE auto v_data(char* block, int ti) const
     {
-        if constexpr (std::is_same_v<Tkv, uint4_t>) {
+        if constexpr (std::is_same_v<Tkv, uint4_t> || std::is_same_v<Tkv, fp4_e2m1_t>) {
             return SubBytePtr<Tkv>{block + layout_.v_data(layer_id_, head_id_, ti)};
         }
         else {

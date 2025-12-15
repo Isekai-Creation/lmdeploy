@@ -10,6 +10,18 @@
 
 namespace turbomind {
 
+// Runtime decode-time quantization kind. This is orthogonal to
+// quant_policy's bitmask and deduced from KvCacheMode at dispatch:
+//   - kNone:    unquantized KV
+//   - kAffineInt: int4/int8 affine (scale, zero) KV cache
+//   - kFp4Mx:  FP4(E2M1) MXFP4-style KV cache with exponent scales
+enum class KvQuantKind : int
+{
+    kNone = 0,
+    kAffineInt,
+    kFp4Mx,
+};
+
 // 64-bit offsets may be needed
 struct LinearIteratorParams {
     const void* kv_cache;
@@ -19,6 +31,7 @@ struct LinearIteratorParams {
 
 struct BlockIteratorParams {
     char**     block_ptrs;
+    char**     scale_block_ptrs;
     const int* cu_block_nums;
     int        layer_id;
     int        block_len;
@@ -59,6 +72,14 @@ struct AttentionParams {
     int max_q_len;
     int max_k_len;
 
+    // Optional packed masks for speculative/tree decoding.
+    //
+    // Layout is conceptually [num_tokens, packed_mask_dim], where the
+    // caller flattens the batch/time axes as needed. When null or the
+    // stride is zero, no tree/speculative masking is applied.
+    const int32_t* spec_decoding_packed_mask{nullptr};
+    int            spec_decoding_packed_mask_stride{0};
+
     // instance-level params
     int   num_heads;
     int   num_kv_heads;
@@ -75,10 +96,24 @@ struct AttentionParams {
 
     int quant_policy;
 
+    // Decode-time KV quantization kind derived from KvCacheMode.
+    // This is set on the host side in dispatchDecoding and can be
+    // used by device code for assertions and quant-specific paths.
+    KvQuantKind kv_quant_kind{KvQuantKind::kNone};
+
     int    max_split_k;
     int*   split_cnt;
     float* partial_O;
     float* partial_ML;
+
+    const int32_t* spec_kv_start_per_token{nullptr};
+    const int32_t* spec_kv_len_per_token{nullptr};
+    const int32_t* spec_token2seq{nullptr};
+    const int32_t* spec_runtime_offsets{nullptr};
+    const int32_t* spec_tree_offsets{nullptr};
+    const int32_t* spec_successor_offsets{nullptr};
+    const int32_t* spec_successor_counts{nullptr};
+    int            spec_tree_batch_size{0};
 
     // context parallel
     int                 cp_rank{0};

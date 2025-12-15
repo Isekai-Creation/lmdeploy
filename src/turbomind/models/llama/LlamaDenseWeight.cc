@@ -56,8 +56,12 @@ void LlamaDenseWeight::emplace(
     }
     else if (is_qweight) {
         TM_CHECK(input_dim % group_size == 0) << input_dim << " " << group_size;
-        scales       = Tensor{{input_dim / group_size, output_dim}, data_type, kDEVICE};
-        zeros        = Tensor{{input_dim / group_size, output_dim}, data_type, kDEVICE};
+        // For INT4/INT8 quantized weights, store scales and zeros
+        // in FP16 regardless of the activation dtype. Downstream
+        // conversion logic (fuse_scales_and_zeros) expects these
+        // tensors to be half so it can safely call data<half>().
+        scales       = Tensor{{input_dim / group_size, output_dim}, kHalf, kDEVICE};
+        zeros        = Tensor{{input_dim / group_size, output_dim}, kHalf, kDEVICE};
         weight_quant = QuantDesc{gemm::QuantType::kK, group_size};
         register_parameter("scales", scales);
         register_parameter("zeros", zeros);
@@ -275,7 +279,11 @@ LlamaAttentionWeight::LlamaAttentionWeight(int      hidden_dim,
                                            int      window_size,
                                            bool     sink)
 {
-    this->window_size = window_size;
+    // Cache basic attention geometry for downstream helpers.
+    this->head_num      = head_num;
+    this->kv_head_num   = kv_head_num;
+    this->size_per_head = head_dim;
+    this->window_size   = window_size;
 
     if (mla.kv_lora_rank == 0) {
         qkv.emplace(

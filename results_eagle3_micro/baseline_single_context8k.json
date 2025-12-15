@@ -1,0 +1,40 @@
+{
+  "latency_ms_per_token": {
+    "mean": 15.867013540166674,
+    "min": 15.867013540166674,
+    "max": 15.867013540166674,
+    "values": [
+      15.867013540166674
+    ]
+  },
+  "throughput_tokens_per_sec": {
+    "mean": 63.023832271179586,
+    "min": 63.023832271179586,
+    "max": 63.023832271179586,
+    "values": [
+      63.023832271179586
+    ]
+  },
+  "memory_gb": {
+    "mean": 0.0,
+    "max": 0.0,
+    "utilization_pct": 0.0
+  },
+  "total_runs": 1,
+  "scenario": {
+    "name": "Baseline_Single_Context8K",
+    "batch_size": 1,
+    "context_length": 8192,
+    "max_new_tokens": 8192,
+    "use_speculation": false,
+    "num_spec_tokens": 0,
+    "perf_mode": false,
+    "micro_run": true
+  },
+  "system": {
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_memory_total_gb": 101.958877184,
+    "timestamp": "2025-12-15T14:39:34.128299",
+    "turbomind_build_id": "eagle3-sm120-v2"
+  }
+}

@@ -1,24 +1,34 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.11)
 project(_turbomind LANGUAGES CXX CUDA)
 
-find_package(pybind11 CONFIG)
-if(NOT pybind11_FOUND)
-    execute_process(COMMAND "pybind11-config" "--cmakedir"
-                    RESULT_VARIABLE _COMMAND_SUCCESS
-                    OUTPUT_VARIABLE pybind11_DIR
-                    OUTPUT_STRIP_TRAILING_WHITESPACE)
-    find_package(pybind11 CONFIG)
-endif()
+execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-m" "pybind11" "--cmakedir"
+                RESULT_VARIABLE _COMMAND_SUCCESS
+                OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(pybind11_DIR "${PYBIND11_CMAKE_DIR}") # Set pybind11_DIR explicitly
+find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(${PROJECT_NAME} bind.cpp)
 target_link_libraries(${PROJECT_NAME} PRIVATE LlamaTritonBackend)
+
+set(DEST_DIR "${CMAKE_SOURCE_DIR}/lmdeploy/turbomind")
+set(TARGET_FILE_NAME "$<TARGET_FILE_NAME:${PROJECT_NAME}>")
+set(TARGET_FILE "$<TARGET_FILE:${PROJECT_NAME}>")
+
+message(STATUS "DEBUG: Source file for _turbomind: ${TARGET_FILE}")
+message(STATUS "DEBUG: Destination directory for _turbomind: ${DEST_DIR}")
+message(STATUS "DEBUG: Destination file name for _turbomind: ${TARGET_FILE_NAME}")
+
+
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_14)
 
 pybind11_add_module(_xgrammar xgrammar_bind.cpp)
 target_link_libraries(_xgrammar PRIVATE core xgrammar)
 target_compile_features(_xgrammar PRIVATE cxx_std_14)
+
+
 
 if (CALL_FROM_SETUP_PY)
   string(REPLACE "." ";" _ver ${CMAKE_CUDA_COMPILER_VERSION})

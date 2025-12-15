@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <limits>
 
 #include <cuda_runtime.h>
 
@@ -50,8 +51,56 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/debug_utils.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/eagle_debug.h"
+#include "lmdeploy/turbomind/kernels/speculative_decoding/kv_rewind_helper.h"
 
 namespace turbomind {
+
+namespace {
+
+// Aggregate per-reason multi-token disable counts so that we can emit a
+// single summary in PERF_MODE without per-step logging.
+struct EagleDisableDiag {
+    std::atomic<long long> disabled_finished{0};
+    std::atomic<long long> disabled_other{0};
+};
+
+EagleDisableDiag& eagleDisableDiag()
+{
+    static EagleDisableDiag diag;
+    return diag;
+}
+
+void LogEagleDisableDiagAtExit()
+{
+    if (!isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE")) {
+        return;
+    }
+
+    auto& diag        = eagleDisableDiag();
+    const auto fin    = diag.disabled_finished.load(std::memory_order_relaxed);
+    const auto other  = diag.disabled_other.load(std::memory_order_relaxed);
+    const auto total  = fin + other;
+    if (total <= 0) {
+        return;
+    }
+
+    TM_LOG_INFO(
+        "[LlamaBatch][EAGLE][multitoken_summary] disabled_finished=%lld disabled_other=%lld",
+        static_cast<long long>(fin),
+        static_cast<long long>(other));
+}
+
+struct EagleDisableDiagRegistrar {
+    EagleDisableDiagRegistrar()
+    {
+        std::atexit(LogEagleDisableDiagAtExit);
+    }
+};
+
+EagleDisableDiagRegistrar g_eagle_disable_diag_registrar;
+
+}  // namespace
 
 void PrintDecodeTokens(
     const int* token_ids, int max_seq_len, int batch_sizse, cudaStream_t stream, const std::string& msg)
@@ -361,9 +410,47 @@ void LlamaBatch::ProcessInferRequests(const Requests& reqs, std::vector<Signal>&
         if (model_->attn_param_.rope.type == RopeType::kMrope) {
             TM_CHECK(r->session.start_flag) << "Mrope doesn't support interactive chat";
             if (r->inputs.count("mrope_position_ids")) {
-                core::Copy(r->inputs.at("mrope_position_ids").data<int>(),
-                           input_length * 3,
-                           state.mrope.position_ids.data() + idx * state.mrope.position_ids.shape(1));
+                if (turbomind::isEagleDebugEnabled()
+                    && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:mrope_pos_ids] idx=%d a=%p b=%p n=%d",
+                        idx,
+                        r->inputs.at("mrope_position_ids").data<int>(),
+                        state.mrope.position_ids.data() + idx * state.mrope.position_ids.shape(1),
+                        input_length * 3);
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:mrope_pos_delta] idx=%d a=%p b=%p n=%d",
+                        idx,
+                        r->inputs.at("mrope_position_delta").data<int>(),
+                        state.mrope.position_delta.data() + idx,
+                        1);
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:mrope_length] idx=%d a=%p b=%p n=%d",
+                        idx,
+                        r->inputs.at("mrope_length").data<int>(),
+                        state.mrope.length.data() + idx,
+                        1);
+                }
+                {
+                    const int dst_stride = state.mrope.position_ids.shape(1);
+                    const int req_elems  = input_length * 3;
+                    const int n_elems    = std::min(req_elems, dst_stride);
+                    if (n_elems > 0) {
+                        if (turbomind::isEagleDebugEnabled()
+                            && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG") && req_elems > dst_stride) {
+                            TM_LOG_WARNING(
+                                "[LlamaBatch][EAGLE][mrope_pos_ids][clamp] idx=%d req_elems=%d dst_stride=%d; clamping "
+                                "copy to n=%d",
+                                idx,
+                                req_elems,
+                                dst_stride,
+                                n_elems);
+                        }
+                        core::Copy(r->inputs.at("mrope_position_ids").data<int>(),
+                                   n_elems,
+                                   state.mrope.position_ids.data() + idx * dst_stride);
+                    }
+                }
                 core::Copy(
                     r->inputs.at("mrope_position_delta").data<int>(), 1, state.mrope.position_delta.data() + idx);
                 core::Copy(r->inputs.at("mrope_length").data<int>(), 1, state.mrope.length.data() + idx);
@@ -590,7 +677,8 @@ void LlamaBatch::Initialize(GenerationState& g)
         // Prepare intermediate buffers
         h_cu_block_counts_[0] = 0;
 
-        auto block_ptrs = h_block_ptrs_.data();
+        auto block_ptrs       = h_block_ptrs_.data();
+        auto scale_block_ptrs = h_scale_block_ptrs_.data();
 
         const int batch_size = state_->active_size;
 
@@ -603,12 +691,22 @@ void LlamaBatch::Initialize(GenerationState& g)
             block_ptrs = std::transform(seq.blocks.cbegin(), seq.blocks.cend(), block_ptrs, [&](int block_id) {
                 return reinterpret_cast<uintptr_t>(sequence_manager_->GetBlockPtr(block_id));
             });
+
+            if (sequence_manager_->GetScaleBlockPtr(0)) {
+                scale_block_ptrs =
+                    std::transform(seq.blocks.cbegin(), seq.blocks.cend(), scale_block_ptrs, [&](int block_id) {
+                        return reinterpret_cast<uintptr_t>(sequence_manager_->GetScaleBlockPtr(block_id));
+                    });
+            }
         }
 
         static_assert(sizeof(uintptr_t) == sizeof(void*));
 
         Copy(h_cu_block_counts_, batch_size + 1, cu_block_counts_);
         Copy(h_block_ptrs_, h_cu_block_counts_[batch_size], block_ptrs_);
+        if (sequence_manager_->GetScaleBlockPtr(0)) {
+            Copy(h_scale_block_ptrs_, h_cu_block_counts_[batch_size], scale_block_ptrs_);
+        }
     }
 
     const int batch_size = state_->active_size;
@@ -752,8 +850,9 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
 
     sequence_lengths_ = {batchxbeam, kDEVICE};
 
-    cu_block_counts_ = {batch_size + 1, kDEVICE};
-    block_ptrs_      = {max_batch_block_count, kDEVICE};
+    cu_block_counts_  = {batch_size + 1, kDEVICE};
+    block_ptrs_       = {max_batch_block_count, kDEVICE};
+    scale_block_ptrs_ = {max_batch_block_count, kDEVICE};
 
     sampled_logprobs_ = {batchxbeam * kMaxLogProb, kDEVICE};
     sampled_indexes_  = {batchxbeam * kMaxLogProb, kDEVICE};
@@ -799,6 +898,7 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
     h_input_length_buf_ = {batch_size, kCPUpinned};
     h_cu_block_counts_  = {batch_size + 1, kCPUpinned};
     h_block_ptrs_       = {(ssize_t)max_batch_block_count, kCPUpinned};
+    h_scale_block_ptrs_ = {(ssize_t)max_batch_block_count, kCPUpinned};
 
     for (auto& s : states_) {
         s.h_prompt_length  = {batch_size, kCPUpinned};
@@ -815,6 +915,106 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
     h_sampled_logprobs_ = {batch_size * kMaxLogProb, kCPUpinned};
     h_sampled_indexes_  = {batch_size * kMaxLogProb, kCPUpinned};
     h_sampled_nums_     = {batch_size, kCPUpinned};
+
+    // In invariants-debug runs, surface any CUDA error that might have
+    // occurred during the bulk buffer allocation / Clear(...) calls
+    // above before we enter the decode loop. This helps attribute illegal
+    // accesses to the buffer setup phase rather than the first allocator
+    // that happens to run afterwards.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[LlamaBatch][EAGLE][invariants] CUDA error %d (%s) observed after AllocateBuffer; "
+                "KV/sequence buffers may be corrupted; aborting.",
+                static_cast<int>(err),
+                cudaGetErrorString(err));
+            std::abort();
+        }
+    }
+
+    // EAGLE KV rewind persistent buffers. These are only used when multi-token
+    // speculative decoding is enabled and the experimental flag is set.
+    eagle_kv_rewind_lengths_ = {max_batch_size_, kDEVICE};
+    eagle_kv_batch_slots_    = {max_batch_size_, kDEVICE};
+    if (kv_max_blocks_per_seq_ > 0) {
+        eagle_kv_block_tables_ = {ssize_t(max_batch_size_ * kv_max_blocks_per_seq_), kDEVICE};
+    }
+
+    // Per-request EOS id for EAGLE acceptance (first eos id or -1).
+    // These live on device memory; initialize them via cudaMemcpyAsync
+    // rather than std::fill_n on raw device pointers.
+    eagle_end_ids_             = {max_batch_size_, kDEVICE};
+    eagle_posterior_thresholds_ = {max_batch_size_, kDEVICE};
+    eagle_posterior_alphas_     = {max_batch_size_, kDEVICE};
+    eagle_temperatures_         = {max_batch_size_, kDEVICE};
+
+    // Multi-token per-slot kill switch, initially all zero (multi-token
+    // enabled). Length is fixed to `max_batch_size_`.
+    eagle_disable_multitoken_slot_.assign(max_batch_size_, 0);
+
+    {
+        // Host-side staging buffers for device initialization.
+        std::vector<int>   h_end_ids(max_batch_size_, -1);
+        std::vector<float> h_thresholds(max_batch_size_, 1.0f);
+        std::vector<float> h_alphas(max_batch_size_, 1.0f);
+        std::vector<float> h_temps(max_batch_size_, 1.0f);
+
+        check_cuda_error(cudaMemcpyAsync(eagle_end_ids_.raw_data(),
+                                         h_end_ids.data(),
+                                         sizeof(int) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+        check_cuda_error(cudaMemcpyAsync(eagle_posterior_thresholds_.raw_data(),
+                                         h_thresholds.data(),
+                                         sizeof(float) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+        check_cuda_error(cudaMemcpyAsync(eagle_posterior_alphas_.raw_data(),
+                                         h_alphas.data(),
+                                         sizeof(float) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+        check_cuda_error(cudaMemcpyAsync(eagle_temperatures_.raw_data(),
+                                         h_temps.data(),
+                                         sizeof(float) * max_batch_size_,
+                                         cudaMemcpyHostToDevice,
+                                         stream_));
+    }
+
+    if (turbomind::isEagleDebugEnabled() && tp_rank_ == 0
+        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALLOC_DEBUG")) {
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] token_ids_buf_ ptr=%p size=%zd",
+                       token_ids_buf_.data(),
+                       token_ids_buf_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] sequence_lengths_ ptr=%p size=%zd",
+                       sequence_lengths_.data(),
+                       sequence_lengths_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] seq_limit_len_ ptr=%p size=%zd",
+                       seq_limit_len_.data(),
+                       seq_limit_len_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] h_output_ids_ ptr=%p size=%zd",
+                       h_output_ids_.data(),
+                       h_output_ids_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_kv_rewind_lengths_ ptr=%p size=%zd",
+                       eagle_kv_rewind_lengths_.data(),
+                       eagle_kv_rewind_lengths_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_kv_block_tables_ ptr=%p size=%zd",
+                       eagle_kv_block_tables_.data(),
+                       eagle_kv_block_tables_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_end_ids_ ptr=%p size=%zd",
+                       eagle_end_ids_.data(),
+                       eagle_end_ids_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_posterior_thresholds_ ptr=%p size=%zd",
+                       eagle_posterior_thresholds_.data(),
+                       eagle_posterior_thresholds_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_posterior_alphas_ ptr=%p size=%zd",
+                       eagle_posterior_alphas_.data(),
+                       eagle_posterior_alphas_.size());
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][BufDBG] eagle_temperatures_ ptr=%p size=%zd",
+                       eagle_temperatures_.data(),
+                       eagle_temperatures_.size());
+    }
 }
 
 void LlamaBatch::AllocSymmBuffers()
@@ -900,6 +1100,623 @@ LlamaBatch::LlamaBatch(DataType                 data_type,
     UpdateMetrics();
 }
 
+void LlamaBatch::disableEagleMultitokenForSlot(int slot, const char* reason)
+{
+    if (slot < 0 || slot >= static_cast<int>(eagle_disable_multitoken_slot_.size())) {
+        return;
+    }
+
+    if (eagle_disable_multitoken_slot_[slot]) {
+        return;
+    }
+
+    eagle_disable_multitoken_slot_[slot] = 1;
+
+    auto& diag = eagleDisableDiag();
+
+    const bool perf_mode = isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
+    const bool is_finished_reason =
+        (reason != nullptr) && (std::strstr(reason, "finished slot") != nullptr);
+
+    if (is_finished_reason) {
+        diag.disabled_finished.fetch_add(1, std::memory_order_relaxed);
+    }
+    else {
+        diag.disabled_other.fetch_add(1, std::memory_order_relaxed);
+        if (perf_mode) {
+            TM_LOG_ERROR(
+                "[LlamaBatch][EAGLE][fatal] disableEagleMultitokenForSlot called for non-terminal slot=%d "
+                "reason=\"%s\" in PERF_MODE; aborting.",
+                slot,
+                reason ? reason : "(null)");
+            std::abort();
+        }
+    }
+
+    if (tp_rank_ == 0) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][fallback] step=%d seq=%d: %s; disabling multi-token for this slot",
+            eagle_last_step_,
+            slot,
+            reason ? reason : "no reason provided");
+    }
+}
+
+bool LlamaBatch::isEagleMultiTokenStepEnabled(const GenerationState& g) const
+{
+    // Debug-only invariant checks for multi-token enablement.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        if (param_.enable_speculative_decoding && (param_.spec_method == "eagle" || param_.spec_method == "eagle3")) {
+            // Multi-token path must never run with TP/DP/CP splits.
+            if (tp_size_ != 1 || param_.attn_dp_size > 1 || param_.outer_dp_size > 1 || param_.attn_cp_size > 1) {
+                TM_LOG_ERROR(
+                    "[LlamaBatch][EAGLE][invariant] multi-token requested with tp=%d attn_dp=%d outer_dp=%d attn_cp=%d",
+                    tp_size_,
+                    param_.attn_dp_size,
+                    param_.outer_dp_size,
+                    param_.attn_cp_size);
+                std::abort();
+            }
+        }
+    }
+
+    if (!param_.enable_speculative_decoding) {
+        return false;
+    }
+
+    // Multi-token speculative steps currently assume a single-GPU
+    // target model without tensor / data / pipeline parallel splits
+    // along the attention stack. When any of these parallel modes are
+    // active we conservatively disable multi-token behaviour and fall
+    // back to single-token EAGLE semantics for this engine.
+    if (tp_size_ != 1) {
+        static bool logged_tp_warning = false;
+        if (!logged_tp_warning && tp_rank_ == 0) {
+            logged_tp_warning = true;
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][fallback] Multi-token speculative decoding is only supported for tp_size==1; "
+                "multi-token behaviour will be disabled for this engine run.");
+        }
+        return false;
+    }
+    if (param_.attn_dp_size > 1 || param_.outer_dp_size > 1 || param_.attn_cp_size > 1) {
+        static bool logged_dp_pp_warning = false;
+        if (!logged_dp_pp_warning && tp_rank_ == 0) {
+            logged_dp_pp_warning = true;
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][fallback] Multi-token speculative decoding is only supported for "
+                "attn_dp_size==1, outer_dp_size==1, attn_cp_size==1; "
+                "multi-token behaviour will be disabled for this engine run.");
+        }
+        return false;
+    }
+    if (g.partial != 0) {
+        return false;
+    }
+    // Require the engine to have a multi-token speculative budget; when the
+    // per-step engine limit is <= 1 we treat EAGLE as single-token only.
+    if (model_->eagleMaxEngineTokensPerStep() <= 1) {
+        return false;
+    }
+    return true;
+}
+
+bool LlamaBatch::isEagleMultiTokenSlotEnabled(int slot) const
+{
+    if (slot < 0 || slot >= static_cast<int>(eagle_disable_multitoken_slot_.size())) {
+        return true;
+    }
+
+    // Per-slot kill switch driven by runtime invariants (mismatch, EOS in
+    // extra tokens, geometry issues, etc.). Once a slot is killed it never
+    // re-enters multi-token behaviour for the remainder of the request.
+    return eagle_disable_multitoken_slot_[slot] == 0;
+}
+
+void LlamaBatch::collectEagleStepHostState(const GenerationState& g,
+                                           int                    batch_size,
+                                           std::vector<int>&      h_token_ids,
+                                           std::vector<bool>&     h_finished_slots)
+{
+    if (batch_size <= 0) {
+        h_token_ids.clear();
+        h_finished_slots.clear();
+        return;
+    }
+
+    if (static_cast<int>(h_token_ids.size()) < batch_size) {
+        h_token_ids.resize(batch_size);
+        h_finished_slots.resize(batch_size);
+    }
+
+    // When g.step == 0 there is no "previous" base token row to copy.
+    // In that case, treat the token ids as unknown for this step and
+    // skip the device-to-host copy to avoid reading out-of-bounds
+    // from token_ids_buf_.
+    if (g.step > 0) {
+        if (isEagleDebugEnabled() && tp_rank_ == 0
+            && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:collect_step_tokens] step=%d batch=%d src_row=%d a=%p b=%p n=%d",
+                g.step,
+                batch_size,
+                g.step - 1,
+                token_ids_buf_.data() + (g.step - 1) * batch_size,
+                h_token_ids.data(),
+                batch_size);
+        }
+        core::Copy(token_ids_buf_.data() + (g.step - 1) * batch_size, batch_size, h_token_ids.data());
+    }
+    else {
+        std::fill_n(h_token_ids.data(), batch_size, -1);
+    }
+    // finished_buf_ is a device buffer of bools; std::vector<bool> has a
+    // specialized representation, so we cannot copy into it directly via
+    // core::Copy. Use a temporary byte buffer and then map to bools.
+    static std::vector<uint8_t> h_finished_tmp;
+    if (static_cast<int>(h_finished_tmp.size()) < batch_size) {
+        h_finished_tmp.resize(batch_size);
+    }
+    check_cuda_error(cudaMemcpyAsync(h_finished_tmp.data(),
+                                     finished_buf_.data(),
+                                     static_cast<size_t>(batch_size) * sizeof(bool),
+                                     cudaMemcpyDeviceToHost,
+                                     stream_));
+    check_cuda_error(cudaStreamSynchronize(stream_));
+    for (int i = 0; i < batch_size; ++i) {
+        h_finished_slots[i] = (h_finished_tmp[i] != 0);
+    }
+
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        // Sanity check: when a slot is marked finished, its latest context
+        // length must be >= seq_limit_len_ (or eos/max_new_tokens) so that
+        // multi-token acceptance cannot extend it further.
+        for (int i = 0; i < batch_size; ++i) {
+            if (!h_finished_slots[i]) {
+                continue;
+            }
+            const int seq_len = state_->h_context_length[i];
+            const int limit   = state_->seq_len_limit[i];
+            if (seq_len < limit) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][invariant] slot=%d finished but seq_len=%d < seq_limit_len=%d",
+                    i,
+                    seq_len,
+                    limit);
+            }
+        }
+    }
+}
+
+void LlamaBatch::updateEagleMetricsAndKVLengths(const GenerationState&   g,
+                                                const std::vector<int>&  /*h_token_ids*/,
+                                                const std::vector<bool>& h_finished_slots,
+                                                int                      batch_size,
+                                                int                      max_path_len,
+                                                int                      eagle_tokens_per_seq,
+                                                const std::vector<int>&  eagle_accepted_lens,
+                                                const std::vector<int>&  eagle_accepted_tokens,
+                                                std::vector<int>&        kv_draft_lengths,
+                                                std::vector<int>&        kv_accepted_lengths)
+{
+    if (!param_.enable_metrics || eagle_accepted_lens.empty() || eagle_tokens_per_seq <= 0 || batch_size <= 0) {
+        return;
+    }
+
+    const bool target_tree_active =
+        model_ && model_->isTargetTreeDecodeActiveStep();
+
+    int step_draft_total    = 0;
+    int step_accepted_total = 0;
+
+    if (static_cast<int>(kv_draft_lengths.size()) < batch_size) {
+        kv_draft_lengths.resize(batch_size, 0);
+        kv_accepted_lengths.resize(batch_size, 0);
+    }
+
+    int active_slots = 0;
+
+    for (int i = 0; i < batch_size; ++i) {
+        auto& req = state_->requests[i];
+        if (!req || !req->metrics) {
+            continue;
+        }
+
+        const bool multi_token_slot_enabled = isEagleMultiTokenSlotEnabled(i);
+        const bool finished                 = (i < static_cast<int>(h_finished_slots.size())) ? h_finished_slots[i]
+                                                                                            : false;
+
+        if (!finished) {
+            ++active_slots;
+        }
+
+        // Raw acceptance from EAGLE (prior to any alignment with
+        // DynamicDecode). We keep this for metrics so that aggregate
+        // acceptance can be inspected even when we conservatively
+        // clamp or reject tokens at the integration boundary.
+        int raw_accepted_len   = 0;
+        int raw_accepted_token = -1;
+
+        // Effective acceptance used for KV length and multi-token
+        // advancement decisions. This may be stricter than the raw
+        // acceptance (e.g. when DynamicDecode chooses a different
+        // first token).
+        int accepted_len   = 0;
+        int accepted_token = -1;
+
+        if (i < static_cast<int>(eagle_accepted_lens.size())) {
+            raw_accepted_len = eagle_accepted_lens[i];
+            accepted_len     = raw_accepted_len;
+            if (accepted_len > 0 && max_path_len > 0
+                && i * max_path_len < static_cast<int>(eagle_accepted_tokens.size())) {
+                raw_accepted_token = eagle_accepted_tokens[i * max_path_len];
+                accepted_token     = raw_accepted_token;
+            }
+        }
+
+        // If DynamicDecode has already marked this slot finished for the
+        // current step, treat any multi-token acceptance as a strong invariant
+        // violation and permanently disable multi-token for this request. For
+        // metrics/KV purposes, clamp to a single-token acceptance.
+        if (finished && accepted_len > 1) {
+            disableEagleMultitokenForSlot(i, "finished slot but EAGLE reported accepted_len > 1");
+            if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][invariant] slot=%d finished but accepted_len=%d; clamping to 1.",
+                    i,
+                    accepted_len);
+            }
+            accepted_len = 1;
+        }
+
+        int planned_tokens_per_seq = eagle_tokens_per_seq;
+        if (!eagle_planned_tokens_per_seq_.empty()
+            && i < static_cast<int>(eagle_planned_tokens_per_seq_.size())) {
+            planned_tokens_per_seq = eagle_planned_tokens_per_seq_[i];
+        }
+
+        if (!multi_token_slot_enabled) {
+            planned_tokens_per_seq = 1;
+            if (accepted_len > 1) {
+                if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][invariant] slot=%d multi-token disabled but accepted_len=%d; clamping to 1.",
+                        i,
+                        accepted_len);
+                }
+                accepted_len = 1;
+            }
+        }
+
+        const int kv_draft_len    = planned_tokens_per_seq;
+        const int kv_accepted_len = std::max(1, std::min(accepted_len, kv_draft_len));
+        const int rewind_len      = std::max(0, kv_draft_len - kv_accepted_len);
+        const int committed_extras = std::max(0, kv_accepted_len - 1);
+
+        kv_draft_lengths[i]    = kv_draft_len;
+        kv_accepted_lengths[i] = kv_accepted_len;
+
+        step_draft_total += planned_tokens_per_seq;
+        step_accepted_total += raw_accepted_len;
+
+        req->metrics->eagle_total_draft_tokens += planned_tokens_per_seq;
+        req->metrics->eagle_total_accepted_tokens += raw_accepted_len;
+        req->metrics->eagle_steps += 1;
+        req->metrics->eagle_max_tokens_per_seq =
+            std::max(req->metrics->eagle_max_tokens_per_seq, static_cast<int64_t>(planned_tokens_per_seq));
+        req->metrics->eagle_max_accepted_len =
+            std::max(req->metrics->eagle_max_accepted_len, static_cast<int64_t>(kv_accepted_len));
+        if (kv_accepted_len >= 2) {
+            req->metrics->eagle_steps_accept_ge2 += 1;
+        }
+        req->metrics->eagle_total_committed_extras += committed_extras;
+
+        // When target-tree decode is enabled for this engine, also track
+        // tree-aware metrics so benchmarks can distinguish how many tokens
+        // flowed through the tree path versus the regular speculative path.
+        if (target_tree_active) {
+            req->metrics->eagle_tree_draft_tokens += planned_tokens_per_seq;
+            req->metrics->eagle_tree_target_tokens += planned_tokens_per_seq;
+            req->metrics->eagle_tree_accepted_tokens += raw_accepted_len;
+        }
+
+        if (rewind_len > 0) {
+            req->metrics->eagle_total_rewound_tokens += rewind_len;
+            req->metrics->eagle_rewind_steps += 1;
+        }
+
+        TM_LOG_INFO(
+            "[LlamaBatch][EAGLE] step=%d, seq=%d, base_token=%d, raw_accepted_len=%d, "
+            "effective_accepted_len=%d, tokens_per_seq=%d, rewind_len=%d",
+            g.step,
+            i,
+            accepted_token,
+            raw_accepted_len,
+            accepted_len,
+            planned_tokens_per_seq,
+            rewind_len);
+    }
+
+    if (param_.eagle_metrics_debug && tp_rank_ == 0) {
+        const int effective_active = std::max(active_slots, 1);
+        TM_LOG_INFO(
+            "[LlamaBatch][EAGLE_METRICS] step=%d, batch=%d, active_slots=%d, "
+            "draft_tokens=%d, accepted_tokens=%d, accept_per_active_slot=%.4f",
+            g.step,
+            batch_size,
+            active_slots,
+            step_draft_total,
+            step_accepted_total,
+            static_cast<double>(step_accepted_total) / static_cast<double>(effective_active));
+    }
+}
+
+void LlamaBatch::runEagleMultiTokenAdvance(const std::vector<int>&  h_token_ids,
+                                           const std::vector<bool>& h_finished_slots,
+                                           int                      batch_size,
+                                           int                      eagle_tokens_per_seq,
+                                           const std::vector<int>&  eagle_accepted_lens,
+                                           const std::vector<int>&  eagle_accepted_tokens,
+                                           GenerationState&         g)
+{
+    TM_LOG_INFO("[LlamaBatch][EAGLE] step=%d, verified target tokens after DynamicDecode", g.step);
+
+    advanceSequencesByEagleAcceptance(h_token_ids,
+                                      h_finished_slots,
+                                      batch_size,
+                                      eagle_tokens_per_seq,
+                                      eagle_accepted_lens,
+                                      eagle_accepted_tokens,
+                                      g);
+}
+
+void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
+                                  const std::vector<int>& kv_accepted_lengths,
+                                  int                     batch_size,
+                                  const GenerationState&  g)
+{
+    if (!isEagleMultiTokenStepEnabled(g) || kv_block_size_ <= 0 || kv_max_blocks_per_seq_ <= 0
+        || kv_draft_lengths.empty()) {
+        return;
+    }
+
+    // Fast path: if no sequence has any rejected tokens (i.e. draft_len ==
+    // accepted_len for all slots), there is nothing to rewind and we can
+    // skip all KV-related work for this step.
+    bool any_rewind = false;
+    for (int i = 0; i < batch_size && i < static_cast<int>(kv_draft_lengths.size())
+                    && i < static_cast<int>(kv_accepted_lengths.size());
+         ++i) {
+        if (kv_draft_lengths[i] > kv_accepted_lengths[i]) {
+            any_rewind = true;
+            break;
+        }
+    }
+    if (!any_rewind) {
+        return;
+    }
+
+    using namespace turbomind::kernels::speculative_decoding;
+
+    const int max_batch_size = max_batch_size_;
+    const int num_layers     = model_->layer_num_;
+
+    EagleKVRewindConfig cfg{};
+    cfg.block_size         = static_cast<SizeType>(kv_block_size_);
+    cfg.max_batch_size     = static_cast<SizeType>(max_batch_size);
+    cfg.max_blocks_per_seq = static_cast<SizeType>(kv_max_blocks_per_seq_);
+    cfg.num_layers         = static_cast<SizeType>(num_layers);
+
+    static std::vector<SizeType> draft_lengths_storage;
+    static std::vector<SizeType> accepted_lengths_storage;
+    static std::vector<SizeType> batch_slots_storage;
+
+    const int bsz = batch_size;
+
+    if (draft_lengths_storage.size() < static_cast<size_t>(max_batch_size)) {
+        draft_lengths_storage.resize(max_batch_size);
+        accepted_lengths_storage.resize(max_batch_size);
+    }
+    if (batch_slots_storage.size() < static_cast<size_t>(bsz)) {
+        batch_slots_storage.resize(bsz);
+    }
+
+    std::fill_n(draft_lengths_storage.data(), max_batch_size, SizeType{0});
+    std::fill_n(accepted_lengths_storage.data(), max_batch_size, SizeType{0});
+
+    for (int i = 0; i < bsz; ++i) {
+        draft_lengths_storage[i]    = static_cast<SizeType>(kv_draft_lengths[i]);
+        accepted_lengths_storage[i] = static_cast<SizeType>(kv_accepted_lengths[i]);
+        batch_slots_storage[i]      = static_cast<SizeType>(i);  // local index == slot
+    }
+
+    // Build a logical block table from SequenceManager's host-side
+    // block IDs for each active slot. Unused entries are filled
+    // with -1 and may be cleared further by the rewind kernel.
+    static std::vector<int> h_block_tables_storage;
+    const int               total_block_entries = max_batch_size * kv_max_blocks_per_seq_;
+    if (h_block_tables_storage.size() < static_cast<size_t>(total_block_entries)) {
+        h_block_tables_storage.resize(total_block_entries);
+    }
+    std::fill_n(h_block_tables_storage.data(), total_block_entries, -1);
+    for (int slot = 0; slot < state_->active_size; ++slot) {
+        const auto* seq = state_->sequences[slot];
+        if (!seq) {
+            continue;
+        }
+        const int count = std::min<int>(seq->blocks.size(), kv_max_blocks_per_seq_);
+        for (int j = 0; j < count; ++j) {
+            h_block_tables_storage[slot * kv_max_blocks_per_seq_ + j] = seq->blocks[j];
+        }
+    }
+
+    if (!eagle_kv_block_tables_ || !eagle_kv_batch_slots_ || !eagle_kv_rewind_lengths_) {
+        return;
+    }
+
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(h_block_tables_storage.size());
+        const ssize_t dev_elems  = eagle_kv_block_tables_.size();
+        const ssize_t n_elems    = std::min(host_elems, dev_elems);
+        if (n_elems > 0) {
+            if (isEagleDebugEnabled() && tp_rank_ == 0 && host_elems > dev_elems
+                && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][kv_block_tables][clamp] host_elems=%zd dev_elems=%zd; clamping copy to n=%zd",
+                    host_elems,
+                    dev_elems,
+                    n_elems);
+            }
+            core::Copy(h_block_tables_storage.data(), n_elems, eagle_kv_block_tables_.data());
+        }
+    }
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(batch_slots_storage.size());
+        const ssize_t dev_elems  = eagle_kv_batch_slots_.size();
+        const ssize_t n_elems    = std::min(host_elems, dev_elems);
+        if (n_elems > 0) {
+            if (isEagleDebugEnabled() && tp_rank_ == 0 && host_elems > dev_elems
+                && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][kv_batch_slots][clamp] host_elems=%zd dev_elems=%zd; clamping copy to n=%zd",
+                    host_elems,
+                    dev_elems,
+                    n_elems);
+            }
+            core::Copy(batch_slots_storage.data(), n_elems, eagle_kv_batch_slots_.data());
+        }
+    }
+
+    // Optional: build a flat view over BlockManager's KV blocks so the
+    // rewind kernel can null-out pointers for rewound blocks.
+    if (!eagle_kv_cache_blocks_) {
+        const size_t total_entries =
+            static_cast<size_t>(num_layers) * static_cast<size_t>(kv_max_blocks_per_seq_);
+        check_cuda_error(cudaMalloc(&eagle_kv_cache_blocks_, total_entries * sizeof(void*)));
+    }
+    static std::vector<void*> h_kv_cache_blocks;
+    const int total_blocks = std::min(kv_max_blocks_per_seq_, sequence_manager_->total_count());
+    const size_t total_entries =
+        static_cast<size_t>(num_layers) * static_cast<size_t>(kv_max_blocks_per_seq_);
+    if (h_kv_cache_blocks.size() < total_entries) {
+        h_kv_cache_blocks.resize(total_entries);
+    }
+    std::fill_n(h_kv_cache_blocks.data(), total_entries, nullptr);
+    for (int block_id = 0; block_id < total_blocks; ++block_id) {
+        void* ptr = sequence_manager_->GetBlockPtr(block_id);
+        for (int layer = 0; layer < num_layers; ++layer) {
+            const size_t idx =
+                static_cast<size_t>(layer) * static_cast<size_t>(kv_max_blocks_per_seq_)
+                + static_cast<size_t>(block_id);
+            h_kv_cache_blocks[idx] = ptr;
+        }
+    }
+    check_cuda_error(cudaMemcpyAsync(eagle_kv_cache_blocks_,
+                                     h_kv_cache_blocks.data(),
+                                     total_entries * sizeof(void*),
+                                     cudaMemcpyHostToDevice,
+                                     stream_));
+
+    computeAndInvokeKVCacheRewind(cfg,
+                                  draft_lengths_storage.data(),
+                                  accepted_lengths_storage.data(),
+                                  batch_slots_storage.data(),
+                                  static_cast<SizeType>(bsz),
+                                  reinterpret_cast<SizeType*>(eagle_kv_rewind_lengths_.data()),
+                                  reinterpret_cast<SizeType const*>(eagle_kv_batch_slots_.data()),
+                                  reinterpret_cast<SizeType*>(eagle_kv_block_tables_.data()),
+                                  eagle_kv_cache_blocks_,
+                                  stream_);
+
+    // Mirror rewind lengths into SequenceManager's host-side
+    // sequences: trim tail blocks, unlock KV blocks in the
+    // BlockManager, and reduce cache_len.
+    static std::vector<SizeType> h_rewind_lengths_storage;
+    if (h_rewind_lengths_storage.size() < static_cast<size_t>(max_batch_size)) {
+        h_rewind_lengths_storage.resize(max_batch_size);
+    }
+    if (isEagleDebugEnabled() && tp_rank_ == 0
+        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][CopySITE:kv_rewind_lengths] step=%d max_batch=%d a=%p b=%p n=%d",
+            g.step,
+            max_batch_size,
+            eagle_kv_rewind_lengths_.data(),
+            h_rewind_lengths_storage.data(),
+            max_batch_size);
+    }
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(h_rewind_lengths_storage.size());
+        const ssize_t dev_elems  = eagle_kv_rewind_lengths_.size();
+        const ssize_t req_elems  = static_cast<ssize_t>(max_batch_size);
+        const ssize_t n_elems    = std::min(req_elems, std::min(host_elems, dev_elems));
+        if (n_elems > 0) {
+            if (isEagleDebugEnabled() && tp_rank_ == 0 && req_elems > dev_elems
+                && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][kv_rewind_lengths][clamp] req_elems=%zd dev_elems=%zd; clamping copy to n=%zd",
+                    req_elems,
+                    dev_elems,
+                    n_elems);
+            }
+            core::Copy(eagle_kv_rewind_lengths_.data(), n_elems, h_rewind_lengths_storage.data());
+        }
+        if (n_elems < req_elems) {
+            std::fill_n(h_rewind_lengths_storage.data() + n_elems, req_elems - n_elems, SizeType{0});
+        }
+    }
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    const int active_size = state_->active_size;
+    for (int slot = 0; slot < active_size; ++slot) {
+        const SizeType rewind_tokens = h_rewind_lengths_storage[slot];
+        if (rewind_tokens <= 0) {
+            continue;
+        }
+        auto* seq = const_cast<Sequence*>(state_->sequences[slot]);
+        if (!seq) {
+            continue;
+        }
+
+        const int blocks_to_free =
+            (rewind_tokens + kv_block_size_ - 1) / kv_block_size_;
+
+        if (blocks_to_free > 0 && !seq->blocks.empty()) {
+            const int old_size = static_cast<int>(seq->blocks.size());
+            const int new_size =
+                std::max(0, old_size - blocks_to_free);
+            if (new_size < old_size) {
+                BlockIds tail_blocks(seq->blocks.begin() + new_size, seq->blocks.end());
+                seq->blocks.resize(new_size);
+                // Unlock KV blocks for the rewound tail so they
+                // can be reused by the BlockManager.
+                sequence_manager_->UnlockBlocks(tail_blocks);
+
+                if (seq->cache_len > 0) {
+                    const int tokens_to_drop =
+                        std::min<int>(rewind_tokens, seq->cache_len);
+                    seq->cache_len = std::max(0, seq->cache_len - tokens_to_drop);
+                }
+
+                if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+                    if (seq->cache_len < 0) {
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][invariant] slot=%d cache_len became negative after KV rewind.",
+                            slot);
+                    }
+                    if (static_cast<int>(seq->blocks.size()) > old_size) {
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][invariant] slot=%d block count increased after KV rewind (%d -> %zu).",
+                            slot,
+                            old_size,
+                            seq->blocks.size());
+                    }
+                }
+            }
+        }
+    }
+}
+
 void LlamaBatch::FreeBuffer()
 {
     input_ids_buf_       = {};
@@ -910,6 +1727,7 @@ void LlamaBatch::FreeBuffer()
     sequence_lengths_    = {};
     cu_block_counts_     = {};
     block_ptrs_          = {};
+    scale_block_ptrs_    = {};
     sampled_logprobs_    = {};
     sampled_indexes_     = {};
     sampled_nums_        = {};
@@ -1111,6 +1929,17 @@ void LlamaBatch::OutputLastHiddenState(const Tensor& hidden_states, int first, i
                 // Skip previous chunks
                 int dst_base = std::max(0, cache_len - (history_len + offset));
 
+                if (turbomind::isEagleDebugEnabled()) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:last_hidden_state] src_base=%d dst_base=%d valid_len=%d a=%p "
+                        "b=%p bytes=%zu",
+                        src_base,
+                        dst_base,
+                        valid_len,
+                        src_buf.raw_data(src_base * model_->hidden_units_),
+                        dst_buf.raw_data(dst_base * model_->hidden_units_),
+                        byte_size(data_type, valid_len * model_->hidden_units_));
+                }
                 core::Copy(src_buf.raw_data(src_base * model_->hidden_units_),
                            byte_size(data_type, valid_len * model_->hidden_units_),
                            dst_buf.raw_data(dst_base * model_->hidden_units_));
@@ -1217,6 +2046,15 @@ void LlamaBatch::Finish(GenerationState& g, std::vector<Signal>& signals)
         for (int i = 0; i < batch_size; ++i) {
             // ss << (i ? ", " : "") << "(" << state_->h_context_length[i] << "," << state_->h_finished[i] << ")";
             std::vector<int> tokens(state_->h_context_length[i]);
+            if (turbomind::isEagleDebugEnabled()) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][CopySITE:dump_tokens_i] i=%d session_len=%d len=%zu a=%p b=%p",
+                    i,
+                    session_len_,
+                    tokens.size(),
+                    state_->output_ids.data() + i * session_len_,
+                    tokens.data());
+            }
             core::Copy(state_->output_ids.data() + i * session_len_, tokens.size(), tokens.data());
             cudaStreamSynchronize(stream_);
             std::stringstream ss;
@@ -1287,6 +2125,15 @@ auto LlamaBatch::Interrupt(int index, bool force_stop) -> Signal
 
     if (debug_ && tp_rank_ == 0) {
         std::vector<int> tokens(state_->h_context_length[index]);
+        if (turbomind::isEagleDebugEnabled()) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:dump_tokens_index] index=%d session_len=%d len=%zu a=%p b=%p",
+                index,
+                session_len_,
+                tokens.size(),
+                state_->output_ids.data() + index * session_len_,
+                tokens.data());
+        }
         core::Copy(state_->output_ids.data() + index * session_len_, tokens.size(), tokens.data());
         cudaStreamSynchronize(stream_);
         std::stringstream ss;
@@ -1316,6 +2163,14 @@ auto LlamaBatch::Interrupt(int index, bool force_stop) -> Signal
         // Save random state in host memory
         seq.random_state.resize(sizeof(curandState_t));
         // This async copy must be synchronized by the caller
+        if (turbomind::isEagleDebugEnabled()) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:curand_state_seq] index=%d a=%p b=%p n=%d",
+                index,
+                (curandState_t*)state_->curand_state.data() + index,
+                (curandState_t*)seq.random_state.data(),
+                1);
+        }
         core::Copy((curandState_t*)state_->curand_state.data() + index, 1, (curandState_t*)seq.random_state.data());
 
         // Set unlock flag for corresponding blocks, will be unlocked in the next `Materialize()`
@@ -1459,6 +2314,83 @@ bool LlamaBatch::Forward(GenerationState& g)
 
     FT_CHECK(max_context_token_num_ >= max_batch_size_);
 
+    const int batch_size = state_->active_size;
+
+    const bool eagle_enabled =
+        param_.enable_speculative_decoding
+        && (param_.spec_method == "eagle" || param_.spec_method == "eagle3");
+
+    // Per-step EAGLE acceptance bookkeeping. We keep these on the host so
+    // that, after DynamicDecode runs, we can reason about how many tokens
+    // were accepted per sequence and how that compares to the tokens that
+    // actually advanced the decode state. Clear per-step state up front so
+    // no stale entries from previous steps influence this iteration.
+    std::vector<int> eagle_accepted_lens;
+    std::vector<int> eagle_accepted_tokens;
+    int              eagle_tokens_per_seq = 0;
+
+    eagle_planned_tokens_per_seq_.clear();
+
+    // Helper for multi-token EAGLE: given the active decode batch size,
+    // compute how many draft tokens per sequence we would like to generate
+    // in this engine step, respecting both the per-sequence speculative
+    // token cap and the engine's per-step forward budget.
+    auto compute_eagle_draft_tokens_per_seq = [&](int decode_batch_size) -> int {
+        if (!eagle_enabled || decode_batch_size <= 0) {
+            return 0;
+        }
+        const int max_engine_tokens = model_->eagleMaxEngineTokensPerStep();
+        if (max_engine_tokens <= 0) {
+            return 0;
+        }
+
+        // When the engine-side budget resolves to 1, treat this as
+        // single-token EAGLE regardless of batch size.
+        if (max_engine_tokens <= 1) {
+            return 1;
+        }
+
+        const int per_seq_cap = param_.spec_max_decoding_draft_tokens;
+        if (per_seq_cap <= 0) {
+            return 1;
+        }
+
+        // Hard upper bound from the hardware forward budget: ensure that
+        // the planned per-sequence speculative tokens do not exceed what
+        // the engine can accommodate for this decode batch.
+        //
+        // max_forward_token_num_ is the per-step Q budget across the
+        // entire decode batch. Approximate a per-sequence share by
+        // dividing by the active decode batch size and clamp the
+        // speculative step size to that share.
+        int tokens_per_seq = max_engine_tokens;
+        if (max_forward_token_num_ > 0 && decode_batch_size > 0) {
+            const int per_seq_hw_cap = max_forward_token_num_ / decode_batch_size;
+            if (per_seq_hw_cap > 0) {
+                tokens_per_seq = std::min(tokens_per_seq, per_seq_hw_cap);
+            }
+        }
+
+        tokens_per_seq = std::max(1, std::min(per_seq_cap, tokens_per_seq));
+        return tokens_per_seq;
+    };
+
+    if (tp_rank_ == 0 && eagle_enabled) {
+        const int max_engine_tokens = model_->eagleMaxEngineTokensPerStep();
+        TM_LOG_INFO(
+            "[LlamaBatch][EAGLE] step=%d, method=%s, "
+            "config_num_speculative_tokens=%d, "
+            "spec_max_decoding_tokens=%d, "
+            "engine_max_tokens_per_step=%d, "
+            "max_non_leaf_nodes=%d",
+            g.step,
+            param_.spec_method.c_str(),
+            param_.spec_max_decoding_draft_tokens,
+            param_.spec_max_decoding_tokens,
+            max_engine_tokens,
+            param_.spec_max_non_leaf_nodes);
+    }
+
     const int active_size = state_->active_size;
 
     constexpr int kLogInterval = 10;
@@ -1558,6 +2490,20 @@ bool LlamaBatch::Forward(GenerationState& g)
                             max_q,
                             max_k);
             }
+            if (eagle_enabled) {
+                const int max_engine_tokens = model_->eagleMaxEngineTokensPerStep();
+                TM_LOG_INFO(
+                    "[LlamaBatch][EAGLE] candidate engine step: step=%d, "
+                    "range=[%d,%d), dc=%d, pf=%d, engine_tokens=%d, ctx_tokens=%d, engine_budget=%d",
+                    g.step,
+                    first,
+                    last,
+                    dc_batch_size,
+                    pf_batch_size,
+                    sum_q,
+                    sum_k,
+                    max_engine_tokens);
+            }
         }
 
         MropeRope mrope;
@@ -1574,13 +2520,20 @@ bool LlamaBatch::Forward(GenerationState& g)
 
         auto hidden_states = symm_hidden_states_buf_.slice(0, global_token_num);
 
+        // Scale block pointers are only populated when FP4 KV is active; in
+        // all other modes we pass an empty Buffer which UnifiedDecoder will
+        // treat as null.
+        Buffer kv_scale_block_ptrs;
+        if (sequence_manager_ && sequence_manager_->GetScaleBlockPtr(0)) {
+            kv_scale_block_ptrs = scale_block_ptrs_;
+        }
+
         model_->Forward(input_ids_buf_.slice(0, sum_q),  // temp
                         hidden_states,                   // temp
                         decoder_output_buf_.slice(first, mini_batch_size),
                         block_ptrs_,
+                        kv_scale_block_ptrs,
                         cu_block_counts_.slice(first, mini_batch_size + 1),
-                        h_input_length_buf_.slice(first, mini_batch_size),
-                        state_->h_context_length.slice(first, mini_batch_size),
                         rope_theta_.slice(first, mini_batch_size),
                         &mrope,
                         symm_partial_ML_,
@@ -1597,17 +2550,53 @@ bool LlamaBatch::Forward(GenerationState& g)
 
     if (const auto bsz = active_size - g.partial; bsz > 0) {
 
-        auto logits = model_->postDecodeEmbedding(decoder_output_buf_.slice(0, bsz), symm_logits_buf_.buffer());
+        auto decoder_features = decoder_output_buf_.slice(0, bsz);
+        auto logits           = model_->postDecodeEmbedding(decoder_features, symm_logits_buf_.buffer());
 
         // AnomalyHandler::instance().FixLogits(logits.data<nv_bfloat16>(), bsz, 1);
 
         OutputLogits(logits, 0, bsz, GenerationConfig::kGeneration);
+
+        auto sampling_logits = sampling_logits_.slice(0, bsz);
+        if (sampling_logits.dtype() != kFloat32) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][fallback] sampling_logits_ dtype=%s is not FP32; "
+                "treating this step as single-token decode while preserving EAGLE mode.",
+                to_string(sampling_logits.dtype()));
+            // In this rare case we skip the speculative path for this step
+            // but keep EAGLE enabled for the engine so subsequent steps can
+            // still use speculative decoding once logits numerics are valid.
+        }
+        else {
+            invokeCastFloat2D(logits, sampling_logits, stream_);
+            sync_check_cuda_error();
+        }
 
         TM_CHECK_GE(g.step, 0);
 
         if (!g.skip_init_sampling) {
             InitializeSampling(g);
         }
+
+        // Detect a strictly greedy-decoding batch so that EAGLE's view
+        // of target tokens can be aligned with DynamicDecode's commit
+        // token in offline validation scenarios. Behaviour for non-greedy
+        // configs remains unchanged.
+        auto is_greedy_batch = [&]() -> bool {
+            for (int i = 0; i < bsz; ++i) {
+                const auto& cfg = state_->requests[i]->gen_cfg;
+                if (cfg.temperature != 0.0f) {
+                    return false;
+                }
+                if (cfg.top_k > 1) {
+                    return false;
+                }
+                if (cfg.top_p < 1.0f) {
+                    return false;
+                }
+            }
+            return true;
+        };
 
         bool output_logprobs = [&] {
             for (int i = 0; i < bsz; ++i) {
@@ -1618,25 +2607,296 @@ bool LlamaBatch::Forward(GenerationState& g)
             return false;
         }();
 
-        auto sampling_logits = sampling_logits_.slice(0, bsz);
-        invokeCastFloat2D(logits, sampling_logits, stream_);
-        sync_check_cuda_error();
+        // Per-step EAGLE planning: decide how many speculative tokens per
+        // sequence we would like to attempt this step and clamp per-slot
+        // budgets by remaining max_new_tokens and per-slot kill switches.
+        if (eagle_enabled && tp_rank_ == 0) {
+            NvtxScope eagle_scope("eagle_draft_step");
+
+            const int draft_batch_size      = bsz;
+            const int draft_tokens_per_seq  = compute_eagle_draft_tokens_per_seq(draft_batch_size);
+            eagle_last_step_                = g.step;
+
+            TM_LOG_INFO(
+                "[LlamaBatch][EAGLE] step=%d, decode_batch=%d, planned_draft_tokens_per_seq=%d",
+                g.step,
+                draft_batch_size,
+                draft_tokens_per_seq);
+
+            if (draft_tokens_per_seq <= 0) {
+                TM_LOG_WARNING("[LlamaBatch][EAGLE] step=%d, decode_batch=%d, tokens_per_seq=0; "
+                               "skipping speculative draft planning for this step",
+                               g.step,
+                               draft_batch_size);
+            }
+            else {
+                const int tokens_per_seq = std::max(1, draft_tokens_per_seq);
+                eagle_planned_tokens_per_seq_.assign(draft_batch_size, tokens_per_seq);
+                for (int i = 0; i < draft_batch_size; ++i) {
+                    int planned = tokens_per_seq;
+
+                    auto&          req = state_->requests[i];
+                    const Sequence* seq = state_->sequences[i];
+                    if (req && seq) {
+                        const int max_new_tokens = req->gen_cfg.max_new_tokens;
+                        if (max_new_tokens > 0) {
+                            int prompt_len = 0;
+                            auto it        = req->inputs.find("input_ids");
+                            if (it != req->inputs.end()) {
+                                prompt_len = it->second.shape(0);
+                            }
+                            const int total_tokens =
+                                static_cast<int>(seq->tokens.size());
+                            const int generated_tokens =
+                                std::max(0, total_tokens - prompt_len);
+                            int remaining = max_new_tokens - generated_tokens;
+                            if (remaining <= 1) {
+                                // This request is essentially at the end of
+                                // its max_new_tokens budget. Disable
+                                // multi-token for this slot and fall back to
+                                // single-token semantics.
+                                disableEagleMultitokenForSlot(
+                                    i, "remaining max_new_tokens <= 1");
+                                planned = 1;
+                            }
+                            else {
+                                planned = std::min(planned, remaining);
+                            }
+                        }
+                    }
+
+                    if (!isEagleMultiTokenSlotEnabled(i)) {
+                        planned = 1;
+                    }
+
+                    eagle_planned_tokens_per_seq_[i] = std::max(1, planned);
+                }
+            }
+        }
 
         // stop-words & bad-words require the matched tokens to be contiguous, so item size > 1 is not supported
-        model_->dynamicDecode(token_ids_buf_,
-                              finished_buf_,
-                              sequence_lengths_,
-                              state_->curand_state,
-                              sampling_logits,  // <- batch size indicator
-                              seq_limit_len_,
-                              init_context_length_,
-                              state_->h_context_length,
-                              state_->h_prompt_length,
-                              output_logprobs ? sampled_logprobs_ : Buffer{},  // <- indicator
-                              sampled_indexes_,
-                              sampled_nums_,
-                              g.step,
-                              g.max_init_ctx_len);
+        if (eagle_enabled && model_->isEagleEnabled()) {
+            LlamaV2::SpecContext spec_ctx{};
+            spec_ctx.max_decoding_tokens_step = param_.spec_max_decoding_tokens;
+            spec_ctx.sequences                = state_->sequences.data();
+            spec_ctx.d_sequence_lengths       = sequence_lengths_.data();
+            spec_ctx.planned_tokens_per_seq   =
+                eagle_planned_tokens_per_seq_.empty() ? nullptr : eagle_planned_tokens_per_seq_.data();
+            spec_ctx.enable_eagle             = true;
+            spec_ctx.enable_eagle_target_tree = param_.enable_eagle_target_tree && model_->isTargetTreeDecodeEnabled();
+            // Populate per-slot end_ids (first EOS id per request or -1).
+            {
+                std::vector<int> host_end_ids(max_batch_size_, -1);
+                for (int i = 0; i < batch_size; ++i) {
+                    const auto* req = state_->requests[i].get();
+                    if (req && !req->gen_cfg.eos_ids.empty()) {
+                        host_end_ids[i] = req->gen_cfg.eos_ids.front();
+                    }
+                }
+                if (isEagleDebugEnabled() && tp_rank_ == 0
+                    && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                    TM_LOG_WARNING(
+                        "[LlamaBatch][EAGLE][CopySITE:eagle_end_ids_step] step=%d batch=%d a=%p b=%p n=%d",
+                        g.step,
+                        batch_size,
+                        host_end_ids.data(),
+                        eagle_end_ids_.data(),
+                        batch_size);
+                }
+                {
+                    const ssize_t host_elems = static_cast<ssize_t>(host_end_ids.size());
+                    const ssize_t dev_elems  = eagle_end_ids_.size();
+                    const ssize_t req_elems  = static_cast<ssize_t>(batch_size);
+                    const ssize_t n_elems    = std::min(req_elems, std::min(host_elems, dev_elems));
+                    if (n_elems > 0) {
+                        if (isEagleDebugEnabled() && tp_rank_ == 0 && req_elems > dev_elems
+                            && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                            TM_LOG_WARNING(
+                                "[LlamaBatch][EAGLE][eagle_end_ids][clamp] req_elems=%zd dev_elems=%zd; clamping copy "
+                                "to n=%zd",
+                                req_elems,
+                                dev_elems,
+                                n_elems);
+                        }
+                        core::Copy(host_end_ids.data(), n_elems, eagle_end_ids_.data());
+                    }
+                    if (n_elems < req_elems && !host_end_ids.empty()) {
+                        // Mark any missing entries as "no EOS" to keep downstream kernels safe.
+                        std::fill_n(host_end_ids.data() + n_elems, req_elems - n_elems, -1);
+                    }
+                }
+                spec_ctx.d_end_ids = eagle_end_ids_.data();
+            }
+            // Posterior/typical gating knobs (per TRT).
+            // Only enable entropy-based masking when at least one request
+            // provides an explicit posterior threshold or alpha, and when
+            // we are not in PERF_MODE. This keeps the EAGLE3 draft path
+            // fast by default while preserving the ability to opt into
+            // gating when desired outside perf runs.
+            {
+                const bool perf_mode = turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_PERF_MODE");
+                bool enable_posterior = false;
+                if (!perf_mode) {
+                    for (int i = 0; i < batch_size; ++i) {
+                        const auto* req = state_->requests[i].get();
+                        if (!req) {
+                            continue;
+                        }
+                        if (!req->gen_cfg.posterior_thresholds.empty()
+                            || !req->gen_cfg.posterior_alphas.empty()) {
+                            enable_posterior = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (enable_posterior) {
+                    std::vector<float> host_thr(max_batch_size_, 1.0f);
+                    std::vector<float> host_alpha(batch_size, 1.0f);
+                    std::vector<float> host_temp(batch_size, 1.0f);
+                    for (int i = 0; i < batch_size; ++i) {
+                        const auto* req = state_->requests[i].get();
+                        if (!req) {
+                            continue;
+                        }
+                        host_temp[i] = req->gen_cfg.temperature;
+                        if (!req->gen_cfg.posterior_thresholds.empty()) {
+                            host_thr[i] = req->gen_cfg.posterior_thresholds.front();
+                        }
+                        if (!req->gen_cfg.posterior_alphas.empty()) {
+                            host_alpha[i] = req->gen_cfg.posterior_alphas.front();
+                        }
+                    }
+                    if (isEagleDebugEnabled() && tp_rank_ == 0
+                        && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_thr_step] step=%d batch=%d a=%p b=%p n=%d",
+                            g.step,
+                            batch_size,
+                            host_thr.data(),
+                            eagle_posterior_thresholds_.data(),
+                            batch_size);
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][CopySITE:eagle_posterior_alpha_step] step=%d batch=%d a=%p b=%p n=%d",
+                            g.step,
+                            batch_size,
+                            host_alpha.data(),
+                            eagle_posterior_alphas_.data(),
+                            batch_size);
+                        TM_LOG_WARNING(
+                            "[LlamaBatch][EAGLE][CopySITE:eagle_temperature_step] step=%d batch=%d a=%p b=%p n=%d",
+                            g.step,
+                            batch_size,
+                            host_temp.data(),
+                            eagle_temperatures_.data(),
+                            batch_size);
+                    }
+                    {
+                        const ssize_t req_elems = static_cast<ssize_t>(batch_size);
+                        const ssize_t n_thr     = std::min(
+                            req_elems,
+                            std::min(static_cast<ssize_t>(host_thr.size()), eagle_posterior_thresholds_.size()));
+                        const ssize_t n_alpha   = std::min(
+                            req_elems,
+                            std::min(static_cast<ssize_t>(host_alpha.size()), eagle_posterior_alphas_.size()));
+                        const ssize_t n_temp    = std::min(
+                            req_elems,
+                            std::min(static_cast<ssize_t>(host_temp.size()), eagle_temperatures_.size()));
+                        const ssize_t n_elems   = std::min(n_thr, std::min(n_alpha, n_temp));
+                        if (n_elems > 0) {
+                            core::Copy(host_thr.data(), n_elems, eagle_posterior_thresholds_.data());
+                            core::Copy(host_alpha.data(), n_elems, eagle_posterior_alphas_.data());
+                            core::Copy(host_temp.data(), n_elems, eagle_temperatures_.data());
+                        }
+                    }
+                    spec_ctx.d_posterior_thresholds = eagle_posterior_thresholds_.data();
+                    spec_ctx.d_posterior_alphas     = eagle_posterior_alphas_.data();
+                    spec_ctx.d_temperatures         = eagle_temperatures_.data();
+                }
+                else {
+                    spec_ctx.d_posterior_thresholds = nullptr;
+                    spec_ctx.d_posterior_alphas     = nullptr;
+                    spec_ctx.d_temperatures         = nullptr;
+                }
+
+                if (perf_mode && tp_rank_ == 0) {
+                    static bool logged_entropy_perf = false;
+                    if (!logged_entropy_perf) {
+                        TM_LOG_WARNING("[LlamaBatch][EAGLE] entropy_gating=SKIPPED(LMDEPLOY_EAGLE_PERF_MODE)");
+                        logged_entropy_perf = true;
+                    }
+                }
+            }
+
+            model_->dynamicDecodeWithSpecMulti(g,
+                                               token_ids_buf_,
+                                               finished_buf_,
+                                               sequence_lengths_,
+                                               state_->curand_state,
+                                               decoder_features,
+                                               sampling_logits,  // <- batch size indicator
+                                               seq_limit_len_,
+                                               init_context_length_,
+                                               state_->h_context_length,
+                                               state_->h_prompt_length,
+                                               output_logprobs ? sampled_logprobs_ : Buffer{},  // <- indicator
+                                               sampled_indexes_,
+                                               sampled_nums_,
+                                               g.max_init_ctx_len,
+                                               spec_ctx);
+        }
+        else {
+            model_->dynamicDecode(token_ids_buf_,
+                                  finished_buf_,
+                                  sequence_lengths_,
+                                  state_->curand_state,
+                                  sampling_logits,  // <- batch size indicator
+                                  seq_limit_len_,
+                                  init_context_length_,
+                                  state_->h_context_length,
+                                  state_->h_prompt_length,
+                                  output_logprobs ? sampled_logprobs_ : Buffer{},  // <- indicator
+                                  sampled_indexes_,
+                                  sampled_nums_,
+                                  g.step,
+                                  g.max_init_ctx_len);
+        }
+
+        // Integrate EAGLE acceptance into decode state at the metrics level
+        // and, when enabled, perform experimental multi-token advancement and
+        // KV cache rewind.
+        if (eagle_enabled && tp_rank_ == 0) {
+            static std::vector<int>  h_token_ids_storage;
+            static std::vector<bool> h_finished_slots_storage;
+            static std::vector<int>  kv_draft_lengths;
+            static std::vector<int>  kv_accepted_lengths;
+
+            // Fetch per-step acceptance summary from the fused EAGLE path.
+            model_->getEagleAcceptanceForStep(eagle_accepted_lens, eagle_accepted_tokens, eagle_tokens_per_seq);
+
+            if (eagle_tokens_per_seq > 0 && !eagle_accepted_lens.empty()) {
+                collectEagleStepHostState(g, bsz, h_token_ids_storage, h_finished_slots_storage);
+
+                const int max_path_len = param_.spec_max_draft_path_len;
+                updateEagleMetricsAndKVLengths(g,
+                                               h_token_ids_storage,
+                                               h_finished_slots_storage,
+                                               bsz,
+                                               max_path_len,
+                                               eagle_tokens_per_seq,
+                                               eagle_accepted_lens,
+                                               eagle_accepted_tokens,
+                                               kv_draft_lengths,
+                                               kv_accepted_lengths);
+                if (isEagleMultiTokenStepEnabled(g)) {
+                    const int step_max_extra = model_->eagle_step_max_extra_;
+                    if (step_max_extra > 0) {
+                        g.step += step_max_extra;
+                    }
+                    runEagleKVRewind(kv_draft_lengths, kv_accepted_lengths, bsz, g);
+                }
+            }
+        }
     }
 
     std::fill(h_input_length_buf_.data(), h_input_length_buf_.data() + active_size, 0);
@@ -1661,6 +2921,16 @@ bool LlamaBatch::Forward(GenerationState& g)
 
     if (debug_ && tp_rank_ == 0) {
         std::vector<int> curr(active_size);
+        if (isEagleDebugEnabled()) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE][CopySITE:debug_step_tokens] step=%d active_size=%d src_row=%d a=%p b=%p n=%d",
+                g.step,
+                active_size,
+                g.step,
+                token_ids_buf_.data() + g.step * active_size,
+                curr.data(),
+                active_size);
+        }
         core::Copy(token_ids_buf_.data() + g.step * active_size, active_size, curr.data());
         cudaStreamSynchronize(stream_);
         std::stringstream scurr;
@@ -1675,6 +2945,340 @@ bool LlamaBatch::Forward(GenerationState& g)
     g.step += 1;
 
     return true;
+}
+
+void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dynamic_tokens,
+                                                   const std::vector<bool>& finished_slots,
+                                                   int                      batch_size,
+                                                   int                      eagle_tokens_per_seq,
+                                                   const std::vector<int>&  eagle_accepted_lens,
+                                                   const std::vector<int>&  eagle_accepted_tokens,
+                                                   GenerationState&         g)
+{
+    // Multi-token advancement is currently experimental and must preserve
+    // baseline behaviour when disabled. Guard aggressively and fall back to
+    // single-token semantics on any invariant violation.
+    if (!isEagleMultiTokenStepEnabled(g)) {
+        return;
+    }
+
+    if (eagle_tokens_per_seq <= 1 || eagle_accepted_lens.empty()) {
+        return;
+    }
+
+    const int max_path_len = param_.spec_max_draft_path_len;
+    if (max_path_len <= 0) {
+        return;
+    }
+
+    if (batch_size <= 0) {
+        return;
+    }
+
+    const int active_size = state_->active_size;
+    if (batch_size > active_size) {
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][fallback] batch_size=%d exceeds active_size=%d; skipping multi-token advance",
+                       batch_size,
+                       active_size);
+        return;
+    }
+
+    if (dynamic_tokens.size() < static_cast<size_t>(batch_size)) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][fallback] dynamic_tokens.size()=%zu < batch_size=%d; skipping multi-token advance",
+            dynamic_tokens.size(),
+            batch_size);
+        return;
+    }
+
+    const int base_step = g.step - 1;
+    const int max_steps = session_len_ * 2;
+
+    if (base_step < 0 || base_step >= max_steps) {
+        TM_LOG_WARNING("[LlamaBatch][EAGLE][fallback] Invalid base_step=%d (max_steps=%d); skipping multi-token advance",
+                       base_step,
+                       max_steps);
+        return;
+    }
+
+    int              max_extra     = 0;
+    std::vector<int> extra_per_seq(batch_size, 0);
+    std::vector<int> eos_extra_index(batch_size, -1);
+
+    for (int i = 0; i < batch_size; ++i) {
+        // Skip sequences that DynamicDecode has already marked finished on
+        // this step; their terminal token (e.g. EOS or max_new_tokens) must
+        // remain the last token in the sequence.
+        if (i < static_cast<int>(finished_slots.size()) && finished_slots[i]) {
+            continue;
+        }
+
+        // Per-request kill switch: once a hard invariant is violated for a
+        // slot, multi-token advance is permanently disabled for that slot.
+        if (!isEagleMultiTokenSlotEnabled(i)) {
+            continue;
+        }
+
+        const int len = (i < static_cast<int>(eagle_accepted_lens.size())) ? eagle_accepted_lens[i] : 0;
+
+        // `accepted_len == 0` means the draft was fully rejected. This is
+        // valid but offers no multi-token benefit, so we simply keep the
+        // single-token behaviour for this sequence.
+        if (len <= 1) {
+            continue;
+        }
+
+        const int max_path_len = param_.spec_max_draft_path_len;
+        if (len > max_path_len) {
+            disableEagleMultitokenForSlot(i, "accepted_len exceeds max_path_len");
+            continue;
+        }
+
+        // Per-sequence planned draft budget for this step. Default to the
+        // global scalar when the per-sequence vector is empty or out of
+        // range, but drive all per-slot bounds from the vector when
+        // available.
+        int planned_tokens_per_seq = eagle_tokens_per_seq;
+        if (!eagle_planned_tokens_per_seq_.empty()
+            && i < static_cast<int>(eagle_planned_tokens_per_seq_.size())) {
+            planned_tokens_per_seq = eagle_planned_tokens_per_seq_[i];
+        }
+        if (planned_tokens_per_seq <= 0) {
+            planned_tokens_per_seq = 1;
+        }
+
+        if (len > planned_tokens_per_seq) {
+            disableEagleMultitokenForSlot(i, "accepted_len exceeds planned_tokens_per_seq");
+            continue;
+        }
+
+        const int token_offset = i * max_path_len;
+        if (token_offset < 0 || token_offset + len > static_cast<int>(eagle_accepted_tokens.size())) {
+            disableEagleMultitokenForSlot(i, "accepted_len/token_offset out of range for accepted_tokens");
+            continue;
+        }
+
+        const int* seq_tokens = eagle_accepted_tokens.data() + token_offset;
+        const int  committed  = dynamic_tokens[i];
+
+        // For TurboMind's current EAGLE integration we do not require the
+        // first accepted token to exactly match DynamicDecode's committed
+        // token. Sampling layers (e.g. repetition penalties, guidance) can
+        // legitimately cause divergence between the greedy top-1 from the
+        // raw logits (used to build target_tokens) and the final decode
+        // decision. We still treat `committed` as the first token in the
+        // sequence and only append *extra* accepted tokens (positions
+        // 1..len-1) below.
+
+        // If an accepted extra token matches EOS, clamp extras so that we
+        // commit tokens up to and including that EOS and mark the sequence
+        // finished after multi-token advance.
+        if (i < state_->active_size && state_->requests[i]) {
+            const auto& eos_ids = state_->requests[i]->gen_cfg.eos_ids;
+            if (!eos_ids.empty()) {
+                for (int t = 1; t < len; ++t) {
+                    const int tok = seq_tokens[t];
+                    if (std::find(eos_ids.begin(), eos_ids.end(), tok) != eos_ids.end()) {
+                        eos_extra_index[i] = t;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Commit-time safety net: ensure we do not append more extra tokens
+        // for this request than its remaining max_new_tokens budget allows,
+        // even if planning or acceptance overestimated what is safe.
+        int max_extra_allowed = std::numeric_limits<int>::max();
+        if (i < state_->active_size) {
+            auto&          req = state_->requests[i];
+            const Sequence* seq = state_->sequences[i];
+            if (req && seq) {
+                const int max_new_tokens = req->gen_cfg.max_new_tokens;
+                if (max_new_tokens > 0) {
+                    int prompt_len = 0;
+                    auto it        = req->inputs.find("input_ids");
+                    if (it != req->inputs.end()) {
+                        prompt_len = it->second.shape(0);
+                    }
+                    const int total_tokens =
+                        static_cast<int>(seq->tokens.size());
+                    const int generated_tokens =
+                        std::max(0, total_tokens - prompt_len);
+                    int remaining = max_new_tokens - generated_tokens;
+                    int local_max_extra = remaining - 1;  // one token is the committed DD token
+                    if (local_max_extra <= 0) {
+                        disableEagleMultitokenForSlot(
+                            i,
+                            "no remaining max_new_tokens budget for extra tokens at commit time");
+                        continue;
+                    }
+                    max_extra_allowed = local_max_extra;
+                }
+            }
+        }
+
+        int effective_len = len;
+        if (eos_extra_index[i] >= 1) {
+            effective_len = eos_extra_index[i] + 1;
+        }
+
+        int extra = effective_len - 1;
+        if (extra <= 0) {
+            continue;
+        }
+
+        if (max_extra_allowed != std::numeric_limits<int>::max()) {
+            extra = std::min(extra, max_extra_allowed);
+            if (extra <= 0) {
+                continue;
+            }
+        }
+
+        if (base_step + extra >= max_steps) {
+            extra = std::max(0, max_steps - base_step - 1);
+            if (extra <= 0) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE][fallback] step=%d seq=%d extra tokens would exceed buffer (max_steps=%d); "
+                    "skipping",
+                    g.step,
+                    i,
+                    max_steps);
+                continue;
+            }
+        }
+
+        extra_per_seq[i] = extra;
+        max_extra        = std::max(max_extra, extra);
+    }
+
+    if (max_extra <= 0) {
+        return;
+    }
+
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        for (int i = 0; i < batch_size; ++i) {
+            const int extra = extra_per_seq[i];
+            if (extra <= 0) {
+                continue;
+            }
+            const int len_i =
+                (i < static_cast<int>(eagle_accepted_lens.size())) ? eagle_accepted_lens[i] : 0;
+            const int* seq_tokens = eagle_accepted_tokens.data() + i * max_path_len;
+            std::ostringstream accepted_ss;
+            for (int e = 0; e < len_i; ++e) {
+                if (e) {
+                    accepted_ss << ",";
+                }
+                accepted_ss << seq_tokens[e];
+            }
+            TM_LOG_INFO(
+                "[LlamaBatch][EAGLE] step=%d, seq=%d, committing %d extra accepted tokens (base_step=%d), "
+                "accepted_tokens=[%s]",
+                g.step,
+                i,
+                extra,
+                base_step,
+                accepted_ss.str().c_str());
+        }
+    }
+
+    // Write extra accepted tokens directly into token_ids_buf_ on device,
+    // without copying the existing slice back to host. Each extra token for
+    // sequence i is placed at row (base_step + 1 + e) and column i.
+    for (int i = 0; i < batch_size; ++i) {
+        int extra = extra_per_seq[i];
+        if (extra <= 0) {
+            continue;
+        }
+
+        const int token_offset = i * max_path_len;
+        const int* seq_tokens  = eagle_accepted_tokens.data() + token_offset;
+
+        for (int e = 0; e < extra; ++e) {
+            const int row_index = base_step + 1 + e;
+            const int col_index = i;
+            const int value     = seq_tokens[1 + e];
+            int*       dst      = token_ids_buf_.data() + row_index * active_size + col_index;
+            check_cuda_error(cudaMemcpyAsync(dst, &value, sizeof(int), cudaMemcpyHostToDevice, stream_));
+        }
+    }
+
+    // Update sequence_lengths_ so that DynamicDecode sees the extra accepted
+    // tokens as part of the sequence history on the next step. Only the
+    // first `batch_size` entries are relevant for this mini-batch.
+    std::vector<int> h_seq_lengths(batch_size);
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][CopySITE:seq_lengths_d2h] step=%d batch=%d a=%p b=%p n=%d",
+            g.step,
+            batch_size,
+            sequence_lengths_.data(),
+            h_seq_lengths.data(),
+            batch_size);
+    }
+    core::Copy(sequence_lengths_.data(), batch_size, h_seq_lengths.data());
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    for (int i = 0; i < batch_size; ++i) {
+        const int extra = extra_per_seq[i];
+        if (extra > 0) {
+            h_seq_lengths[i] += extra;
+        }
+    }
+
+    if (isEagleDebugEnabled() && tp_rank_ == 0) {
+        TM_LOG_WARNING(
+            "[LlamaBatch][EAGLE][CopySITE:seq_lengths_h2d] step=%d batch=%d a=%p b=%p n=%d",
+            g.step,
+            batch_size,
+            h_seq_lengths.data(),
+            sequence_lengths_.data(),
+            batch_size);
+    }
+    {
+        const ssize_t host_elems = static_cast<ssize_t>(h_seq_lengths.size());
+        const ssize_t dev_elems  = sequence_lengths_.size();
+        const ssize_t req_elems  = static_cast<ssize_t>(batch_size);
+        const ssize_t n_elems    = std::min(req_elems, std::min(host_elems, dev_elems));
+        if (n_elems > 0) {
+            core::Copy(h_seq_lengths.data(), n_elems, sequence_lengths_.data());
+        }
+    }
+    check_cuda_error(cudaStreamSynchronize(stream_));
+
+    // If an EOS token was committed as part of the extra accepted tokens
+    // for this sequence, mark it finished in the device-side finished_buf_
+    // so subsequent decode steps and Finish() see the terminal state.
+    for (int i = 0; i < batch_size; ++i) {
+        const int eos_idx = eos_extra_index[i];
+        const int extra   = extra_per_seq[i];
+        if (eos_idx >= 1 && extra >= eos_idx) {
+            const bool done = true;
+            check_cuda_error(cudaMemcpyAsync(
+                finished_buf_.data() + i, &done, sizeof(bool), cudaMemcpyHostToDevice, stream_));
+        }
+    }
+
+    // Advance the global generation step by the maximum number of extra
+    // accepted tokens so that subsequent steps and gatherOutput see the
+    // extended token range.
+    g.step += max_extra;
+
+    if (debug_ && tp_rank_ == 0) {
+        // Sanity-check that sequence lengths for sequences that actually
+        // received extra tokens do not outrun the global time index.
+        for (int i = 0; i < batch_size; ++i) {
+            const int extra = extra_per_seq[i];
+            if (extra <= 0) {
+                continue;
+            }
+            const int seq_len = h_seq_lengths[i];
+            if (seq_len > g.step) {
+                disableEagleMultitokenForSlot(i, "sequence_length exceeds global step after multi-token advance");
+            }
+        }
+    }
 }
 
 namespace {
@@ -1761,19 +3365,20 @@ void LlamaBatch::Warmup()
                 TM_LOG_INFO("[Gemm2] %d", token_num);
             }
 
-            int  input_length     = token_num;
             auto local_token_nums = AllGather(comm_.h_dp_group, token_num);
 
             const auto bsz = 1;
 
-            // A single sequence containing `token_num` prefill tokens
+            // A single sequence containing `token_num` prefill tokens. Use a
+            // pure prefill-style call into the decoder (decode_num=0,
+            // prefil_num=1) with no mrope or lora mask.
+            Buffer kv_scale_block_ptrs;
             model_->Forward(input_ids_buf.slice(0, token_num),
                             symm_hidden_states_buf_.slice(0, token_num * param_.attn_dp_size),
                             decoder_output_buf_.slice(0, bsz),
                             block_ptrs_,
+                            kv_scale_block_ptrs,
                             cu_block_counts_.slice(0, bsz + 1),
-                            Buffer{&input_length, 1, kCPU},
-                            Buffer{&input_length, 1, kCPU},
                             rope_theta_.slice(0, bsz),
                             nullptr,  // mrope
                             symm_partial_ML_,
@@ -1781,7 +3386,7 @@ void LlamaBatch::Warmup()
                             Buffer{local_token_nums.data(), (int)local_token_nums.size(), kCPU},
                             Buffer{},
                             0,
-                            bsz,
+                            1,
                             nullptr);
         }
 
@@ -1811,20 +3416,110 @@ void LlamaBatch::InitializeBufferAndKVCache()
     // initialize kvcache, BatchState and persist buffers
     core::ContextGuard guard{context_->core_stream, context_->allocator, Allocator{kCPUpinned}};
 
+    // If there is already a pending CUDA error at this point in the
+    // speculative engine path, treat it as a hard invariant violation
+    // and abort before we start allocating KV blocks. This helps
+    // pinpoint the first bad kernel in the EAGLE3/spec path instead of
+    // reporting the error later from the allocator.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[LlamaBatch][EAGLE][invariants] CUDA error %d (%s) observed at "
+                "InitializeBufferAndKVCache entry; aborting to surface earlier bug",
+                static_cast<int>(err),
+                cudaGetErrorString(err));
+            std::abort();
+        }
+    }
+
     const auto cache_block_seq_len = model_->attn_param_.cache_block_seq_len;
 
     const int dbits = byte_size(data_type_, 8);
 
     const auto quant_policy = model_->param_.quant_policy;
-    const int  elem_bits    = quant_policy ? quant_policy : dbits;
+
+    int sm_version = 0;
+    if (context_) {
+        sm_version = context_->device_prop.major * 10 + context_->device_prop.minor;
+    }
+
+    const KvCacheMode kv_mode = GetKvCacheMode(quant_policy, sm_version);
+
+    int    q_bits          = dbits;
+    int    t_bits          = 0;
+    size_t scale_block_size = 0;
+
+    switch (kv_mode) {
+        case KvCacheMode::kInt8:
+            q_bits = 8;
+            t_bits = dbits;
+            break;
+        case KvCacheMode::kInt4:
+            q_bits = 4;
+            t_bits = dbits;
+            break;
+        case KvCacheMode::kFp4Mx:
+            // MXFP4 KV cache: 4-bit payload with a separate per-16-element
+            // scale pool. The data pool layout uses q_bits=4, t_bits=0 so
+            // there is no per-token (scale, zero) region inside the main
+            // KV blocks.
+            q_bits = 4;
+            t_bits = 0;
+
+            // Each FP4 block stores per-16-element scales for both K and V:
+            //   scales_per_head   = head_dim / 16
+            //   bytes_per_token   = 2 * scales_per_head  (K scales, then V)
+            //   block_size_scales = layer_num * kv_head_num * block_seq_len
+            //                       * bytes_per_token
+            {
+                const int head_dim = static_cast<int>(model_->size_per_head_);
+                FT_CHECK(head_dim % 16 == 0);
+                const int scales_per_head   = head_dim / 16;
+                const int bytes_per_token   = 2 * scales_per_head;
+                const int kv_head_num       = static_cast<int>(model_->local_kv_head_num_);
+                const int layer_num         = static_cast<int>(model_->layer_num_);
+                scale_block_size            = static_cast<size_t>(layer_num)
+                                   * static_cast<size_t>(kv_head_num)
+                                   * static_cast<size_t>(cache_block_seq_len)
+                                   * static_cast<size_t>(bytes_per_token);
+            }
+            break;
+        case KvCacheMode::kFp4Nv:
+            // NVFP4 path is kept logically separate and currently falls back
+            // to an unquantized KV layout until true NVFP4 (FP8 E4M3 scales)
+            // is wired end-to-end. No separate scale pool is allocated.
+            q_bits = dbits;
+            t_bits = 0;
+            break;
+        case KvCacheMode::kNone:
+        default:
+            q_bits = dbits;
+            t_bits = 0;
+            break;
+    }
 
     SequenceManager::BlockConfig block_config{
         (int)model_->size_per_head_,
         (int)model_->local_kv_head_num_,
         cache_block_seq_len,
-        elem_bits == dbits ? 0 : dbits,
-        elem_bits,
+        t_bits,
+        q_bits,
     };
+
+    bool enable_prefix_caching = param_.enable_prefix_caching;
+    if (scale_block_size > 0 && enable_prefix_caching) {
+        // Prefix caching relies on BlockTrie and currently only supports
+        // a single KV pool. Until BlockTrie is extended to understand a
+        // paired data+scale KV layout, disable prefix caching when FP4 KV
+        // cache is active to avoid mismatched allocations between pools.
+        enable_prefix_caching = false;
+        if (tp_rank_ == 0) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][FP4] Prefix caching is not yet supported with FP4 KV cache; "
+                "disabling prefix caching for this engine.");
+        }
+    }
 
     const auto get_free_size = [&] {  //
         size_t free{}, total{};
@@ -1832,17 +3527,57 @@ void LlamaBatch::InitializeBufferAndKVCache()
         return AllReduce(model_->comm_->h_tp_group, free, comm::RedOp::kMin);
     };
 
+    // Optionally over‑provision KV blocks when EAGLE speculative decoding
+    // is enabled so there is headroom for draft tree tokens in addition to
+    // committed tokens. The factor is conservative and kept close to 1.0
+    // to avoid surprising memory usage spikes.
+    double cache_block_budget = param_.cache_max_block_count;
+    if (param_.enable_speculative_decoding
+        && (param_.spec_method == "eagle" || param_.spec_method == "eagle3")) {
+        const double max_decoding_tokens =
+            std::max(0, param_.spec_max_decoding_tokens);
+        const double max_path_len =
+            std::max(0, param_.spec_max_draft_path_len);
+        const double session_len = std::max(1, param_.session_len);
+
+        // Rough upper bound on extra transient KV usage from EAGLE per
+        // sequence relative to the session length.
+        const double extra_tokens = max_decoding_tokens + max_path_len;
+        double       eagle_factor = 1.0 + extra_tokens / session_len;
+        // Keep factor within a reasonable envelope.
+        eagle_factor = std::min(eagle_factor, 2.0);
+
+        cache_block_budget *= eagle_factor;
+
+        if (tp_rank_ == 0) {
+            TM_LOG_INFO("[LlamaBatch][EAGLE] KV over‑provisioning enabled: "
+                        "base_cache_max_block_count=%.3f, eagle_factor=%.3f, "
+                        "effective_cache_block_budget=%.3f",
+                        param_.cache_max_block_count,
+                        eagle_factor,
+                        cache_block_budget);
+        }
+    }
+
+    TM_LOG_WARNING("[LlamaBatch] Creating SequenceManager. block_size(from layout)=?, scale_block_size=%lu", scale_block_size);
+
     sequence_manager_.reset(new SequenceManager{model_->layer_num_,
                                                 block_config,
-                                                param_.cache_max_block_count,
+                                                cache_block_budget,
                                                 param_.cache_chunk_size,
-                                                param_.enable_prefix_caching,
+                                                enable_prefix_caching,
                                                 tp_rank_,
                                                 param_.attn_cp_size,
                                                 core::Context::alloc(kDEVICE),
-                                                get_free_size});
+                                                get_free_size,
+                                                scale_block_size});
 
-    const size_t max_session_len = sequence_manager_->max_block_count() * cache_block_seq_len * param_.attn_cp_size;
+    // Cache basic KV layout parameters for EAGLE KV rewind integration.
+    kv_block_size_         = cache_block_seq_len;
+    kv_max_blocks_per_seq_ = sequence_manager_->max_block_count();
+
+    const size_t max_session_len =
+        sequence_manager_->max_block_count() * cache_block_seq_len * param_.attn_cp_size;
     if (max_session_len < session_len_) {
         if (tp_rank_ == 0) {
             TM_LOG_WARNING("No enough blocks for `session_len` (%d), `session_len` truncated to %d.",
@@ -1867,11 +3602,23 @@ void LlamaBatch::InitializeBufferAndKVCache()
 
     AllocSymmBuffers();
 
+
     AllocateBuffer(max_batch_size_, session_len_, model_->attn_param_.cache_block_seq_len);
+
+    // Allow the model to observe the live SequenceManager so that
+    // specialized decode paths (e.g. EAGLE target-tree decode) can
+    // reuse prefix KV block pointers as read-only when building
+    // scratch decode passes.
+    model_->sequence_manager_ = sequence_manager_.get();
 }
 
 void LlamaBatch::FreeBufferAndKVCache()
 {
+    if (eagle_kv_cache_blocks_) {
+        check_cuda_error(cudaFree(eagle_kv_cache_blocks_));
+        eagle_kv_cache_blocks_ = nullptr;
+    }
+
     sequence_manager_.reset();
 
     for (auto& s : states_) {

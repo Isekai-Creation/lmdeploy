@@ -11,11 +11,32 @@
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/models/llama/moe_ffn_layer.h"
 #include "src/turbomind/models/llama/unified_attention_layer.h"
+#include "src/turbomind/models/llama/eagle3_attention_layer.h"
 #include "src/turbomind/models/llama/unified_decoder.h"
 #include "src/turbomind/utils/anomaly_handler.h"
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
+
+namespace {
+
+inline void EagleCudaCheckAt(const char* site)
+{
+    if (!turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        return;
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TM_LOG_ERROR("[UnifiedDecoder][EAGLE][invariants] CUDA error %d (%s) at %s",
+                     static_cast<int>(err),
+                     cudaGetErrorString(err),
+                     site);
+        std::abort();
+    }
+}
+
+}  // namespace
 
 UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
                                const EngineParam&    engine,
@@ -36,14 +57,168 @@ UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
     tune_layer_num_(model.tune_layer_num)
 {
     attn_layer_ = std::make_unique<UnifiedAttentionLayer>(model, attn, engine, lora, attn_tp_size_, ctx);
+    eagle3_attn_layer_ = std::make_unique<Eagle3AttentionLayer>(&ctx.device_prop, ctx.stream);
 
     if (std::accumulate(moe.expert_num.begin(), moe.expert_num.end(), 0LL)) {
         moe_ffn_layer_ = std::make_unique<MoeFfnLayer>(model, moe, engine, ctx);
     }
 
-    if (std::accumulate(model.inter_size.begin(), model.inter_size.end(), 0LL)) {
-        ffn_layer_ = std::make_unique<LlamaFfnLayer>(model, ctx);
+    // Always construct a usable FFN backend so that Eagle3 draft layers
+    // can rely on a full 2H (embedding_norm + FC_norm) path instead of
+    // silently degrading to attention-only drafts when inter_size happens
+    // to be zero or omitted in the model config.
+    ffn_layer_ = std::make_unique<LlamaFfnLayer>(model, ctx);
+
+    // Enable multi-layer hidden capture for Eagle3 when requested by the
+    // engine. For Eagle3 we follow the TensorRT-LLM convention and capture
+    // three spread-out layers when there are enough layers; otherwise we
+    // fall back to the last few layers.
+    if (engine.enable_speculative_decoding && engine.spec_method == "eagle3") {
+        const int L = static_cast<int>(layer_num_);
+        if (L > 5) {
+            // Match Eagle3OneModelSpecMetadata default:
+            //   (1, num_layers // 2 - 1, num_layers - 4)
+            eagle_capture_layers_ = {1, L / 2 - 1, L - 4};
+            eagle_capture_enabled_ = true;
+        }
+        else if (L >= 3) {
+            // Shallow models: capture the last three layers.
+            eagle_capture_layers_ = {L - 3, L - 2, L - 1};
+            eagle_capture_enabled_ = true;
+        }
+        else if (L > 0) {
+            // Degenerate case: single capture layer at the top.
+            eagle_capture_layers_ = {L - 1};
+            eagle_capture_enabled_ = true;
+        }
     }
+}
+
+UnifiedDecoder::~UnifiedDecoder() = default;
+
+void UnifiedDecoder::setEagle3DraftLayer(const Eagle3DraftLayerWeight* w)
+{
+    eagle3_draft_weight_ = w;
+
+    if (w && attn_layer_ && ffn_layer_) {
+        // With a valid FFN backend, enable the full Eagle3 draft layer
+        // (attention + FFN) and avoid the older attention-only shallow
+        // fallback that masked real Eagle3 issues.
+        eagle3_draft_layer_ = std::make_unique<Eagle3DraftLayer>(
+            w,
+            attn_layer_.get(),
+            eagle3_attn_layer_.get(),
+            ffn_layer_.get(),
+            rmsnorm_eps_);
+    } else {
+        TM_LOG_WARNING(
+            "[UnifiedDecoder][EAGLE3][fallback] draft layer disabled "
+            "(weights=%p, attn_layer=%p, eagle3_attn_layer=%p, ffn_layer=%p); "
+            "Eagle3 speculative decoding will fall back to baseline.",
+            static_cast<const void*>(w),
+            static_cast<void*>(attn_layer_.get()),
+            static_cast<void*>(eagle3_attn_layer_.get()),
+            static_cast<void*>(ffn_layer_.get()));
+        eagle3_draft_layer_.reset();
+    }
+}
+
+void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
+                                  const Tensor& captured_hidden,
+                                  const Tensor& input_ids,
+                                  const Tensor& embed_tokens_weights,
+                                  const Tensor& position_ids,
+                                  const Tensor& packed_mask,
+                                  const Tensor& tree_offsets,
+                                  const Tensor& runtime_offsets,
+                                  const Tensor& kv_lens_runtime,
+                                  const Tensor& successor_offsets,
+                                  const Tensor& successor_counts,
+                                  int           q_len,
+                                  int           kv_len,
+                                  int           past_kv_len,
+                                  Tensor&       output_hidden,
+                                  int           num_tokens,
+                                  cudaStream_t  stream)
+{
+    TM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    if (!eagle3_draft_layer_ || !eagle3_draft_weight_) {
+        TM_LOG_WARNING(
+            "[UnifiedDecoder][EAGLE3][fallback] draft layer unavailable; passing through hidden states.");
+        output_hidden = input_hidden;
+        return;
+    }
+
+    if (!input_hidden || input_hidden.ndim() != 2 || input_hidden.shape(0) != num_tokens
+        || input_hidden.shape(1) != static_cast<int>(hidden_units_)) {
+        TM_LOG_WARNING(
+            "[UnifiedDecoder][EAGLE3][fallback] input_hidden shape mismatch in ForwardDraft "
+            "(got=[%d,%d], expected=[%d,%zu]); passing through.",
+            input_hidden ? input_hidden.shape(0) : -1,
+            input_hidden ? input_hidden.shape(1) : -1,
+            num_tokens,
+            hidden_units_);
+        output_hidden = input_hidden;
+        return;
+    }
+
+    if (!output_hidden || output_hidden.ndim() != 2 || output_hidden.shape(0) != num_tokens
+        || output_hidden.shape(1) != static_cast<int>(hidden_units_)
+        || output_hidden.dtype() != input_hidden.dtype()
+        || output_hidden.device().type != input_hidden.device().type) {
+        output_hidden = Tensor{{num_tokens, static_cast<int>(hidden_units_)}, input_hidden.dtype(), kDEVICE};
+    }
+
+    Tensor mask_tensor = packed_mask;
+    // Attach position ids / masks to Eagle3 attention via optional params.
+    eagle3_draft_layer_->Forward(input_hidden,
+                                 captured_hidden,
+                                 input_ids,
+                                 embed_tokens_weights,
+                                 position_ids,
+                                 mask_tensor,
+                                 tree_offsets,
+                                 runtime_offsets,
+                                 kv_lens_runtime,
+                                 successor_offsets,
+                                 successor_counts,
+                                 q_len,
+                                 kv_len,
+                                 past_kv_len,
+                                 output_hidden,
+                                 stream);
+    EagleCudaCheckAt("UnifiedDecoder::ForwardDraft::Eagle3DraftLayer::Forward");
+}
+
+const Tensor& UnifiedDecoder::debug_fc_out() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_fc_out() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_qkv() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_qkv() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_attn_out() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_attn_out() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_ffn_out() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_ffn_out() : empty;
+}
+
+const Tensor& UnifiedDecoder::debug_pre_head_hidden() const
+{
+    static Tensor empty;
+    return eagle3_draft_layer_ ? eagle3_draft_layer_->debug_pre_head_hidden() : empty;
 }
 
 void UnifiedDecoder::AllreduceResidualRMSnorm(Tensor&       hidden_states,
@@ -131,6 +306,22 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
 
     Tensor local_hidden_states = global_hidden_states;
 
+    // Optional buffer where multi-layer Eagle3 captures will be stored.
+    Tensor eagle_capture_hidden;
+    int    eagle_num_capture_layers = 0;
+    if (eagle_capture_enabled_ && args.find("eagle_capture_hidden") != args.end()) {
+        eagle_capture_hidden = args.at("eagle_capture_hidden");
+        eagle_num_capture_layers = static_cast<int>(eagle_capture_layers_.size());
+        if (!eagle_capture_hidden
+            || eagle_capture_hidden.shape(0) != batch_size
+            || eagle_capture_hidden.shape(1) != static_cast<int>(hidden_units_ * eagle_num_capture_layers)) {
+            eagle_capture_hidden = Tensor{{batch_size, static_cast<int>(hidden_units_ * eagle_num_capture_layers)},
+                                          local_hidden_states.dtype(),
+                                          kDEVICE};
+            args.at("eagle_capture_hidden") = eagle_capture_hidden;
+        }
+    }
+
     const auto global_token_num = global_hidden_states.shape(0);
     const auto local_token_num  = local_residual.size() ? local_residual.shape(0) : 0;
 
@@ -141,6 +332,23 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
             local_token_nums.data(), local_token_nums.data() + attn_dp_size_, cumul_token_nums.begin() + 1);
         const int offset    = cumul_token_nums[attn_dp_rank_];
         local_hidden_states = global_hidden_states.slice({offset, 0}, {local_token_num, -1});
+    }
+
+    // Optional packed mask for speculative/tree decode. Baseline decode
+    // never sets this key in `args`, so attention runs with standard
+    // autoregressive masking only. A separate tree-decode path can
+    // provide a flattened [token_num, packed_dim] tensor via this key.
+    Tensor spec_packed_mask;
+    auto   it_mask = args.find("spec_packed_mask");
+    if (it_mask != args.end()) {
+        spec_packed_mask = it_mask->second;
+    }
+
+    // Optional runtime kv lengths for speculative/tree decode: when present,
+    // prefer these over the default h_k_len to match TRT kv_lens_runtime.
+    auto it_k_rt = args.find("spec_runtime_k_len");
+    if (it_k_rt != args.end()) {
+        args["h_k_len"] = it_k_rt->second;
     }
 
     attn_layer_->Initialize(args);
@@ -162,10 +370,13 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
 
         /////////////////////////////////////////////
         /// self-attention
-        attn_layer_->Forward({local_hidden_states,  //
-                              local_hidden_states,
-                              weights.at(layer)->self_attn_weights.get(),
-                              layer});
+        UnifiedAttentionLayer::ForwardParam attn_param{};
+        attn_param.input       = local_hidden_states;
+        attn_param.output      = local_hidden_states;
+        attn_param.packed_mask = spec_packed_mask;
+        attn_param.weights     = weights.at(layer)->self_attn_weights.get();
+        attn_param.layer_id    = layer;
+        attn_layer_->Forward(attn_param);
 
         TM_DEBUG_TENSOR(local_hidden_states, Concat("attn_block", layer), 2);
 
@@ -222,6 +433,44 @@ void UnifiedDecoder::Forward(TensorMap& args, const std::vector<WeightType*>& we
 
         TM_DEBUG_TENSOR(local_residual, Concat("residual1", layer), 2);
         TM_DEBUG_TENSOR(local_hidden_states, Concat("norm0", layer + 1), 2);
+
+        // After the final RMSNorm for this layer, capture last-token hidden
+        // states for Eagle3 when this layer is one of the configured capture
+        // layers.
+        if (eagle_capture_enabled_ && eagle_capture_hidden) {
+            auto it = std::find(eagle_capture_layers_.begin(), eagle_capture_layers_.end(), layer);
+            if (it != eagle_capture_layers_.end()) {
+                const int slot        = static_cast<int>(it - eagle_capture_layers_.begin());
+                const int num_capture = eagle_num_capture_layers;
+                using T = uint16_t;  // matches last_token_hidden_units dtype
+
+                T* capture_base = (T*)eagle_capture_hidden.raw_data();
+                // Layout: [batch, hidden * num_capture_layers]
+                // Slot `slot` occupies a contiguous [batch, hidden] chunk.
+                T* layer_dst = capture_base + static_cast<size_t>(slot) * hidden_units_;
+
+                if (decode_num) {
+                    // For decode tokens, copy the last-token hidden states for
+                    // each sequence directly from local_hidden_states.
+                    check_cuda_error(cudaMemcpyAsync(layer_dst,
+                                                     (T*)local_hidden_states.raw_data(),
+                                                     sizeof(T) * decode_num * hidden_units_,
+                                                     cudaMemcpyDefault,
+                                                     stream_));
+                }
+
+                if (prefil_num) {
+                    invokeGetFeatureOfLastToken(
+                        layer_dst + static_cast<size_t>(decode_num) * hidden_units_,  //
+                        (T*)local_hidden_states.raw_data(),
+                        attn_layer_->d_cu_q_len() + decode_num,
+                        hidden_units_,
+                        prefil_num,
+                        stream_);
+                    sync_check_cuda_error();
+                }
+            }
+        }
     }
 
     /// TODO

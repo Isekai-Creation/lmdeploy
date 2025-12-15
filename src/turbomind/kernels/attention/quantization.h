@@ -785,6 +785,70 @@ struct ConvertKvCache<fp4_e2m1_t, T> {
     }
 };
 
+// FP4 MXFP4 encode: floating point -> fp4_e2m1_t
+template<class T>
+struct ConvertKvCache<T, fp4_e2m1_t, std::enable_if_t<!std::is_same_v<T, fp4_e2m1_t>>> {
+    __device__ __host__ ConvertKvCache(float, float) {}
+
+    template<int N>
+    __device__ static auto convert(const Array<T, N>& vi)
+    {
+        static_assert(N % 8 == 0, "FP4 encode assumes Vec multiple of 8");
+
+        Array<fp4_e2m1_t, N> vo{};
+        PRAGMA_UNROLL
+        for (int i = 0; i < N; i += 8) {
+            uint32_t packed = 0;
+            PRAGMA_UNROLL
+            for (int j = 0; j < 8; ++j) {
+                const int idx = i + j;
+                float      x  = static_cast<float>(vi[idx]);
+                float      z  = fabsf(x);
+                auto       f  = [](float z_val) {
+                    if (z_val <= .25f) {
+                        return 0;
+                    }
+                    else if (z_val < .75f) {
+                        return 1;
+                    }
+                    else if (z_val <= 1.25f) {
+                        return 2;
+                    }
+                    else if (z_val < 1.75f) {
+                        return 3;
+                    }
+                    else if (z_val <= 2.5f) {
+                        return 4;
+                    }
+                    else if (z_val < 3.5f) {
+                        return 5;
+                    }
+                    else if (z_val <= 5.f) {
+                        return 6;
+                    }
+                    else {
+                        return 7;
+                    }
+                };
+
+                const uint8_t mag  = static_cast<uint8_t>(f(z));
+                const uint8_t sign = static_cast<uint8_t>((__float_as_uint(x) >> 31) << 3);
+                const uint8_t code = static_cast<uint8_t>(sign | mag);
+
+                packed |= static_cast<uint32_t>(code & 0xF) << (4 * j);
+            }
+            reinterpret_cast<uint32_t&>(vo[i / 8]) = packed;
+        }
+        return vo;
+    }
+
+    template<int N>
+    inline __device__ auto operator()(const Array<T, N>& vi) const -> Array<fp4_e2m1_t, N>
+    {
+        return convert(vi);
+    }
+};
+
 __device__ inline Array<bfloat16_t, 4> cvt_bf16x4_e4m3(const Array<fp8_e4m3_t, 4>& vi)
 {
     const uint32_t& x = (const uint32_t&)vi;

@@ -29,6 +29,8 @@ struct GenerationConfig {
     int   top_k       = 1;
     float top_p       = 0.f;
     float min_p       = 0.f;
+    std::vector<float> posterior_thresholds; // For EAGLE/EAGLE3 posterior gating
+    std::vector<float> posterior_alphas;     // For EAGLE/EAGLE3 posterior gating
     float temperature = 1.f;
 
     float repetition_penalty = 1.f;

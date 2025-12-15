@@ -183,8 +183,72 @@ class CLI(object):
         main(**kwargs)
 
     @staticmethod
+    def add_parser_convert():
+        """Add parser for convert command."""
+        parser = CLI.subparsers.add_parser('convert',
+                                           formatter_class=DefaultsAndTypesHelpFormatter,
+                                           description=CLI.convert.__doc__,
+                                           help=CLI.convert.__doc__)
+        parser.set_defaults(run=CLI.convert)
+        parser.add_argument('--model-path',
+                            type=str,
+                            required=True,
+                            help='The path of the input model')
+        parser.add_argument('--model-name',
+                            type=str,
+                            default=None,
+                            help='The name of the model')
+        parser.add_argument('--dst-path',
+                            type=str,
+                            default=None,
+                            help='The destination path to save the converted model')
+        parser.add_argument('--tp',
+                            type=int,
+                            default=1,
+                            help='Tensor parallelism size')
+        parser.add_argument('--quant-policy',
+                            type=int,
+                            default=0,
+                            help='Quantization policy. 0: no quant, 4: 4-bit, 8: 8-bit')
+        parser.add_argument('--group-size',
+                            type=int,
+                            default=128,
+                            help='Group size for quantization')
+        parser.add_argument('--model-format',
+                            type=str,
+                            default=None,
+                            choices=['awq', 'gptq', 'fp8', 'mxfp4'],
+                            help='The format of the input model')
+
+    @staticmethod
+    def convert(args):
+        """Convert a model to turbomind format."""
+        from lmdeploy.turbomind.deploy.converter import get_tm_model
+        from lmdeploy.messages import TurbomindEngineConfig
+
+        engine_config = TurbomindEngineConfig(
+            tp=args.tp,
+            quant_policy=args.quant_policy,
+            model_format=args.model_format
+        )
+
+        tm_model = get_tm_model(
+            model_path=args.model_path,
+            model_name=args.model_name,
+            chat_template_name=None,
+            engine_config=engine_config,
+            group_size=args.group_size,
+            out_dir=args.dst_path
+        )
+        
+        if args.dst_path:
+            tm_model.save(args.dst_path)
+            print(f'Model converted and saved to {args.dst_path}')
+
+    @staticmethod
     def add_parsers():
         """Add all parsers."""
         CLI.add_parser_list()
         CLI.add_parser_checkenv()
         CLI.add_parser_chat()
+        CLI.add_parser_convert()

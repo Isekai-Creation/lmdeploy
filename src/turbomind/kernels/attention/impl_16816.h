@@ -151,7 +151,8 @@ struct Impl<MMA_16816, T_, T_, CTA_H_, CTA_Q_, CTA_S_, WARP_H, WARP_Q, WARP_S, H
         FragQ frag_Q;
         FragK frag_K;
 
-        __device__ StateQK(SharedStorage& storage, FragQ frag_Q_): smem_K{storage.KV}
+        template<class CacheIter>
+        __device__ StateQK(SharedStorage& storage, FragQ frag_Q_, const CacheIter&): smem_K{storage.KV}
         {
             if constexpr (!kUseSmemQ) {
                 PRAGMA_UNROLL
@@ -231,7 +232,8 @@ struct Impl<MMA_16816, T_, T_, CTA_H_, CTA_Q_, CTA_S_, WARP_H, WARP_Q, WARP_S, H
         FragP frag_P;
         FragV frag_V;
 
-        __device__ StatePV(SharedStorage& storage, bool offset = false):
+        template<class CacheIter>
+        __device__ StatePV(SharedStorage& storage, bool offset, const CacheIter&):
             smem_V{storage.KV + (offset ? SmemLayoutK::kSize : 0)}
         {
         }

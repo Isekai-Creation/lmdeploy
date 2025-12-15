@@ -22,6 +22,7 @@
 #include "src/turbomind/kernels/sampling_topk_kernels.h"
 #include "src/turbomind/kernels/sampling_topp_kernels.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
 
@@ -151,9 +152,38 @@ void SamplingLayer<T>::Setup(const std::vector<const Request*>& rs, const Tensor
     min_topp_ = *std::min_element(top_p_.begin(), top_p_.begin() + bsz);
     max_minp_ = *std::max_element(min_p_.begin(), min_p_.begin() + bsz);
 
-    core::Copy(top_k_.data(), bsz, top_k_buf_.data());
-    core::Copy(top_p_.data(), bsz, top_p_buf_.data());
-    core::Copy(min_p_.data(), bsz, min_p_buf_.data());
+    if (isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_COPY_DEBUG")) {
+        TM_LOG_WARNING("[SamplingLayer][EAGLE][CopySITE:top_k_host_to_dev] bsz=%zu a=%p b=%p n=%zu",
+                       (size_t)bsz,
+                       top_k_.raw_data(),
+                       top_k_buf_.raw_data(),
+                       (size_t)bsz);
+        TM_LOG_WARNING("[SamplingLayer][EAGLE][CopySITE:top_p_host_to_dev] bsz=%zu a=%p b=%p n=%zu",
+                       (size_t)bsz,
+                       top_p_.raw_data(),
+                       top_p_buf_.raw_data(),
+                       (size_t)bsz);
+        TM_LOG_WARNING("[SamplingLayer][EAGLE][CopySITE:min_p_host_to_dev] bsz=%zu a=%p b=%p n=%zu",
+                       (size_t)bsz,
+                       min_p_.raw_data(),
+                       min_p_buf_.raw_data(),
+                       (size_t)bsz);
+    }
+    {
+        const ssize_t req_elems = static_cast<ssize_t>(bsz);
+        const ssize_t n_topk =
+            std::min(req_elems, std::min(static_cast<ssize_t>(top_k_.size()), static_cast<ssize_t>(top_k_buf_.size())));
+        const ssize_t n_topp =
+            std::min(req_elems, std::min(static_cast<ssize_t>(top_p_.size()), static_cast<ssize_t>(top_p_buf_.size())));
+        const ssize_t n_minp =
+            std::min(req_elems, std::min(static_cast<ssize_t>(min_p_.size()), static_cast<ssize_t>(min_p_buf_.size())));
+        const ssize_t n_elems = std::min(n_topk, std::min(n_topp, n_minp));
+        if (n_elems > 0) {
+            core::Copy(top_k_.data(), n_elems, top_k_buf_.data());
+            core::Copy(top_p_.data(), n_elems, top_p_buf_.data());
+            core::Copy(min_p_.data(), n_elems, min_p_buf_.data());
+        }
+    }
 }
 
 template class SamplingLayer<float>;

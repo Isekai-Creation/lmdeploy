@@ -5,58 +5,12 @@
 #include <functional>
 
 #include "src/turbomind/core/allocator.h"
+#include "src/turbomind/core/sequence.h" // Add include for new Sequence.h
 
 #include "src/turbomind/models/llama/BlockManager.h"
 #include "src/turbomind/models/llama/BlockTrie.h"
 
 namespace turbomind {
-
-struct Sequence {
-
-    enum Status
-    {
-        kCached = 0,
-        kLocked,
-        kActive
-    };
-
-    uint64_t id;
-    Status   status = kCached;
-
-    BlockIds  blocks;
-    UniqueIds block_unique_ids;
-
-    int input_length = 0;  // the number of tokens to be processed in each forward iter
-
-    mutable std::vector<int> prompt;
-
-    mutable std::vector<int> tokens;  // update by user or when the sequence is finished
-
-    mutable int cache_len = 0;
-
-    // additional data kept round-to-round
-    mutable std::vector<std::byte> random_state;  // update by user
-
-    mutable float rope_theta = 0.f;
-
-    // embedding data
-    mutable std::vector<std::vector<std::byte>> input_embeddings;
-    mutable std::vector<std::pair<int, int>>    input_embedding_ranges;
-
-    explicit Sequence(uint64_t _id): id(_id) {}
-
-    friend std::ostream& operator<<(std::ostream& os, const Sequence& seq);
-};
-
-using Sequences = std::vector<const Sequence*>;
-
-inline std::ostream& operator<<(std::ostream& os, const Sequence& seq)
-{
-    os << "id=" << seq.id << ", status=" << seq.status << ", token_count=" << seq.tokens.size()
-       << ", block_count=" << seq.blocks.size() << ", cache_len=" << seq.cache_len
-       << ", random_state_size=" << seq.random_state.size() << ", input_length=" << seq.input_length;
-    return os;
-}
 
 class SequenceManager {
 public:
@@ -83,7 +37,8 @@ public:
                              int                rank,
                              int                attn_cp_size,
                              core::Allocator    allocator,
-                             GetFreeMemSize     get_free_size);
+                             GetFreeMemSize     get_free_size,
+                             size_t             scale_block_size = 0);
 
     SequenceManager(const SequenceManager&)     = delete;
     SequenceManager(SequenceManager&&) noexcept = default;
@@ -159,8 +114,25 @@ public:
         return block_manager_->cached_count();
     }
 
+    // Unlock the given blocks in the underlying BlockManager, decreasing
+    // their use_count and moving them from the active set to the cached
+    // set when no sequences reference them any longer.
+    void UnlockBlocks(const BlockIds& ids);
+
     // return #total_seq, #active_seq, #cached_seq
     std::tuple<int, int, int> seq_stats() const noexcept;
+
+    // Optional: bind a secondary BlockManager that stores FP4/NVFP4
+    // per-block scale factors. When present, all allocation / lock /
+    // unlock / eviction operations are mirrored onto this manager
+    // using the same block ids so that data and scale pools form a
+    // single logical allocation unit.
+    void AttachScaleBlockManager(std::shared_ptr<BlockManager> scale_block_manager);
+
+    [[nodiscard]] void* GetScaleBlockPtr(int block_id)
+    {
+        return scale_block_manager_ ? scale_block_manager_->block(block_id).data : nullptr;
+    }
 
 private:
     void Erase(std::map<uint64_t, Sequence>::iterator& it);
@@ -193,6 +165,11 @@ private:
     std::map<uint64_t, Sequence> sequences_;
 
     std::shared_ptr<BlockManager> block_manager_;
+    // Optional FP4/NVFP4 scale pool. When non-null, this BlockManager
+    // must have the same max_block_count() as block_manager_, and all
+    // block ids managed by SequenceManager are interpreted identically
+    // in both pools.
+    std::shared_ptr<BlockManager> scale_block_manager_;
     std::shared_ptr<BlockTrie>    block_trie_;
 
     BlockIds unlocked_;

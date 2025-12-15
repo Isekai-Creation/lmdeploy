@@ -1,14 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.11)
 
-
-find_package(CUDAToolkit REQUIRED)
 
 add_library(Llama STATIC
         LlamaV2.cc
         LlamaBatch.cc
+        ../common/model_layout.cc
+        specpv_kv_cache.cc
         LlamaLinear.cu
+        eagle3_attention_kernels.cu
+        eagle3_attention_layer.cc
+        EagleDraftLayer.cu
         BlockManager.cc
         BlockTrie.cc
         SequenceManager.cc
@@ -22,6 +25,10 @@ add_library(Llama STATIC
         llama_kernels.cu
         llama_utils.cu
         mla_utils.cu
+        EagleModule.cc
+        EagleBuffers.cc
+        LlamaV2_eagle.cc
+        ${CMAKE_SOURCE_DIR}/lmdeploy/turbomind/eagle_tree.cpp
 )
 set_property(TARGET Llama PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET Llama PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)
@@ -30,6 +37,7 @@ target_link_libraries(Llama PUBLIC CUDA::cudart
         core
         gemm2
         CUDA::cublas
+        yaml-cpp::yaml-cpp
         nvidia::cutlass::cutlass
         rms_norm
         DynamicDecodeLayer
@@ -43,4 +51,5 @@ target_link_libraries(Llama PUBLIC CUDA::cudart
         memory_utils
         cuda_utils
         logger
+        eagle_kernels
         anomaly_handler)

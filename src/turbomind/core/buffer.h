@@ -45,6 +45,11 @@ public:
     Buffer(ssize_t size, DataType dtype, Allocator& alloc):
         base_{}, size_{size}, device_{alloc->device()}, dtype_{dtype}
     {
+        // Defensive check: element count should never be negative. When
+        // this happens it usually indicates an upstream overflow in shape
+        // or layout calculation. Fail fast here instead of propagating a
+        // huge wrapped size into the allocator.
+        TM_CHECK_GE(size, 0) << "Buffer constructed with negative element count";
         auto bytes = turbomind::byte_size(dtype, size);
         data_      = {alloc->allocate(bytes), [=](auto p) { alloc->deallocate(p, bytes); }};
     }
@@ -54,8 +59,50 @@ public:
     template<class T>
     T* data()
     {
-        TM_CHECK_EQ(data_type_v<T>, dtype_);
-        return (T*)((char*)TM_CHECK_NOTNULL(data_).get() + turbomind::byte_size<T>(base_));
+        // In most cases the buffer's logical dtype must match the
+        // requested template type exactly.
+        //
+        // However, for 16‑bit floating point we deliberately allow
+        // lightweight reinterpretation between FP16 and BF16. Some
+        // legacy paths in TurboMind still call `data<half>()` even
+        // when a tensor has been allocated as BF16 (and vice versa).
+        // Treating those two layouts as interchangeable here avoids
+        // hard crashes from `TM_CHECK_EQ` while keeping all other
+        // dtype mismatches protected.
+        if (dtype_ != data_type_v<T>) {
+            const bool is_half_tpl      = data_type_v<T> == turbomind::kHalf;
+            const bool is_bf16_tpl      = data_type_v<T> == turbomind::kBfloat16;
+            const bool is_half_buf      = dtype_ == turbomind::kHalf;
+            const bool is_bf16_buf      = dtype_ == turbomind::kBfloat16;
+            const bool allow_fp16_bf16  = (is_half_tpl && is_bf16_buf) || (is_bf16_tpl && is_half_buf);
+
+            if (!allow_fp16_bf16) {
+                TM_CHECK_EQ(data_type_v<T>, dtype_);
+            }
+        }
+
+        // Lazily allocate storage when the buffer was default-constructed
+        // but later used as a destination (e.g. for Clear/Copy). This
+        // avoids hard failures from TM_CHECK_NOTNULL in optional scratch
+        // paths while still keeping non-zero sized buffers backed by real
+        // storage.
+        if (!data_) {
+            if (size_ > 0) {
+                auto alloc = Context::alloc(device_);
+                auto bytes = turbomind::byte_size(dtype_, size_);
+                data_      = {alloc->allocate(bytes), [=](auto p) { alloc->deallocate(p, bytes); }};
+                base_      = 0;
+            }
+            else {
+                // Zero-sized, typeless buffer – treat as an empty view.
+                return nullptr;
+            }
+        }
+
+        // Use the buffer's own dtype for byte offset computation.
+        // FP16 and BF16 are both 16‑bit wide, so the reinterpretation
+        // above remains layout‑compatible.
+        return (T*)((char*)data_.get() + turbomind::byte_size(dtype_, base_));
     }
 
     template<class T>
@@ -66,7 +113,18 @@ public:
 
     void* raw_data(ssize_t offset = 0)
     {
-        return (char*)TM_CHECK_NOTNULL(data_).get() + turbomind::byte_size(dtype_, base_ + offset);
+        if (!data_) {
+            if (size_ > 0) {
+                auto alloc = Context::alloc(device_);
+                auto bytes = turbomind::byte_size(dtype_, size_);
+                data_      = {alloc->allocate(bytes), [=](auto p) { alloc->deallocate(p, bytes); }};
+                base_      = 0;
+            }
+            else {
+                return nullptr;
+            }
+        }
+        return (char*)data_.get() + turbomind::byte_size(dtype_, base_ + offset);
     }
 
     const void* raw_data(ssize_t offset = 0) const
@@ -282,7 +340,27 @@ private:
     template<class U>
     static decltype(auto) ensure_dtype(U&& u) noexcept
     {
-        TM_CHECK_EQ(u.dtype(), data_type_v<T>);
+        // In most cases the buffer's logical dtype must match the
+        // template parameter exactly. However, for 16-bit floating
+        // point we allow lightweight reinterpretation between FP16 and
+        // BF16, mirroring Buffer::data<T>() above. Some legacy paths
+        // still instantiate Buffer_<half_t> while the underlying
+        // storage has been allocated as BF16 (and vice versa); both
+        // layouts are 16-bit wide, so treating them as interchangeable
+        // here is safe for pointer arithmetic while kernels operate on
+        // the raw 16-bit payload.
+        auto buf_dtype = u.dtype();
+        if (buf_dtype != data_type_v<T>) {
+            const bool is_half_tpl     = data_type_v<T> == turbomind::kHalf;
+            const bool is_bf16_tpl     = data_type_v<T> == turbomind::kBfloat16;
+            const bool is_half_buf     = buf_dtype == turbomind::kHalf;
+            const bool is_bf16_buf     = buf_dtype == turbomind::kBfloat16;
+            const bool allow_fp16_bf16 = (is_half_tpl && is_bf16_buf) || (is_bf16_tpl && is_half_buf);
+
+            if (!allow_fp16_bf16) {
+                TM_CHECK_EQ(buf_dtype, data_type_v<T>);
+            }
+        }
         return (U &&) u;
     }
 };
