@@ -83,6 +83,21 @@ struct EagleBatch4Diag {
     std::atomic<long long> accept_sum{0};
 };
 
+inline void EagleCudaCheckAt(const char* site)
+{
+    if (!turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        return;
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TM_LOG_ERROR("[LlamaV2][EAGLE][invariants] CUDA error %d (%s) at %s",
+                     static_cast<int>(err),
+                     cudaGetErrorString(err),
+                     site);
+        std::abort();
+    }
+}
+
 // Once-per-process planner summary flag so PERF_MODE logging stays
 // lightweight even when many decode steps are executed.
 std::atomic<bool>& eaglePlannerLogged()
@@ -222,6 +237,11 @@ LlamaV2::LlamaV2(DataType                     dtype,
     // using float to avoid data overflow
     dynamic_decode_ = std::make_unique<DynamicDecodeLayer>(
         kFloat32, max_batch_size, vocab_size_, vocab_size_padded_, stream_, &ctx.device_prop);
+
+    // In invariants-debug runs, surface any CUDA error that might have
+    // occurred during UnifiedDecoder / DynamicDecode construction
+    // before we proceed to EAGLE-specific initialization.
+    EagleCudaCheckAt("LlamaV2::ctor::post_unified_decoder_dynamic_decode");
     
     // Compute an upper bound on how many draft tokens per step the engine
     // should attempt when running in EAGLE speculative mode. This budget is
@@ -462,6 +482,12 @@ LlamaV2::LlamaV2(DataType                     dtype,
             TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE disabled; falling back to baseline decoding for this engine");
         }
     }
+
+    // Final CUDA invariant check at the end of the constructor so that
+    // any EAGLE3 / EagleBuffers initialization errors are reported
+    // close to their origin rather than being detected later by KV
+    // allocators or decode kernels.
+    EagleCudaCheckAt("LlamaV2::ctor::post_eagle_init");
 }
 
 LlamaV2::~LlamaV2()
@@ -3796,6 +3822,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     if (engine_param_.spec_method == "eagle3") {
         runEagle3DraftTreeDecode(
             decoder_features, logits, batch_size, tokens_per_seq, *eagle_buffers_, draft_logits, active_slots, stream_);
+        EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::runEagle3DraftTreeDecode");
     }
     else {
         eagle_module_->forward_draft_tree(
@@ -3807,6 +3834,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
             draft_logits,
             linear_,
             stream_);
+        EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::forward_draft_tree");
     }
 
     const int total_draft = batch_size * tokens_per_seq;
@@ -3926,6 +3954,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         static_cast<int32_t>(batch_size),
         static_cast<int32_t>(max_decoding_tokens),
         stream_);
+    EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::invokeReplicatePathsFromFlat");
 
     // Build per-slot tree/runtime offsets for the draft pass. For now each
     // slot contributes a contiguous tokens_per_seq range; runtime offsets
@@ -3957,6 +3986,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         d_successor_counts.data(),
         d_num_successors.data(),
         stream_);
+    EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::invokeExtractSuccessorsFromPaths");
 
     // Optional linked-list style tree metadata (positions and child/sibling
     // lists) used by future EAGLE3 kernels. This is built entirely on GPU
@@ -3973,6 +4003,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
         reinterpret_cast<int32_t*>(eagle_buffers_->inputs.retrive_next_token),
         reinterpret_cast<int32_t*>(eagle_buffers_->inputs.retrive_next_sibling),
         stream_);
+    EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::invokeBuildLinkedTreeFromDraftPaths");
 
     // Materialize draft-side offsets / successors for attention. Shapes:
     //  - tree_offsets: [batch+1], runtime_offsets: [batch+1]
@@ -4088,6 +4119,8 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
             engine_param_.spec_max_draft_path_len),
         stream_);
 
+    EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::invokeGetPackedMaskFromPath");
+
     logEagleProgress(80, "EAGLE3 leaf + packed masks generated for this step");
 
     sync_check_cuda_error();
@@ -4122,6 +4155,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                 max_tokens,
                 skip_decode,
                 stream_);
+            EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::launch_set_skip_decode");
 
             const float* logits_ptr = static_cast<const float*>(draft_logits.raw_data());
 
@@ -4133,6 +4167,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                 rows,
                 cols,
                 stream_);
+            EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::invokeSoftmaxWithEntropy");
 
             // Apply posterior/typical masking in-place on draft_logits.
             kernels::speculative_decoding::EntropyMaskParams mask_params{};
@@ -4153,6 +4188,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
             mask_params.stream               = stream_;
 
             kernels::speculative_decoding::maskLogitsBasedOnEntropy(mask_params);
+            EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::maskLogitsBasedOnEntropy");
 
             // Regenerate draft_tokens using masked logits (Top-1) while honoring skip_decode.
             if (eagle_buffers_->inputs.draft_tokens) {
@@ -4164,6 +4200,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
                     skip_decode,
                     argmax_out.data<int>(),
                     stream_);
+                EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::launch_argmax_rows");
 
                 // Fill draft_tokens on device for downstream acceptance.
                 check_cuda_error(cudaMemcpyAsync(
@@ -4462,6 +4499,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
             static_cast<SpecSizeType>(paths_per_seq),
             static_cast<SpecSizeType>(max_path_len),
             stream_);
+        EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::invokePackAcceptedPaths");
         // d_batch_slots tensor will be released with scope; no explicit free.
     }
 

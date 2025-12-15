@@ -15,8 +15,28 @@
 #include "src/turbomind/models/llama/unified_decoder.h"
 #include "src/turbomind/utils/anomaly_handler.h"
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 
 namespace turbomind {
+
+namespace {
+
+inline void EagleCudaCheckAt(const char* site)
+{
+    if (!turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        return;
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TM_LOG_ERROR("[UnifiedDecoder][EAGLE][invariants] CUDA error %d (%s) at %s",
+                     static_cast<int>(err),
+                     cudaGetErrorString(err),
+                     site);
+        std::abort();
+    }
+}
+
+}  // namespace
 
 UnifiedDecoder::UnifiedDecoder(const ModelParam&     model,
                                const EngineParam&    engine,
@@ -168,6 +188,7 @@ void UnifiedDecoder::ForwardDraft(const Tensor& input_hidden,
                                  past_kv_len,
                                  output_hidden,
                                  stream);
+    EagleCudaCheckAt("UnifiedDecoder::ForwardDraft::Eagle3DraftLayer::Forward");
 }
 
 const Tensor& UnifiedDecoder::debug_fc_out() const

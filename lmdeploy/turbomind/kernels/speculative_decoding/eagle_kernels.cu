@@ -7,12 +7,21 @@
 
 #include "eagle_kernels.h"
 #include <cuda_runtime.h>
+#include "src/turbomind/utils/eagle_debug.h"
+#include "src/turbomind/utils/logger.h"
 
 namespace turbomind {
 namespace kernels {
 namespace eagle {
 
 namespace {
+
+inline __device__ void eagleKernelsDeviceAssert(bool cond, const char* msg)
+{
+    if (!cond) {
+        printf("[EAGLE][kernels][device_assert] %s\n", msg);
+    }
+}
 
 // CUB-style block scan for computing offsets
 template <int BLOCK_SIZE>
@@ -298,6 +307,21 @@ __global__ void getPackedMaskFromPathKernel(
 
 // Public API implementations
 
+static inline void EagleKernelsCudaCheckAt(const char* site)
+{
+    if (!::turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        return;
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TM_LOG_ERROR("[EAGLE][kernels][invariants] CUDA error %d (%s) at %s",
+                     static_cast<int>(err),
+                     cudaGetErrorString(err),
+                     site);
+        std::abort();
+    }
+}
+
 void invokePrepareCtxEagleNetInputs(PrepareCtxEagleNetParams const& params) {
     constexpr int BLOCK_SIZE = 512;
     
@@ -321,6 +345,8 @@ void invokePrepareCtxEagleNetInputs(PrepareCtxEagleNetParams const& params) {
         params.maxPathLen,
         params.maxDecodingTokens
     );
+
+    EagleKernelsCudaCheckAt("eagle_kernels::invokePrepareCtxEagleNetInputs");
 }
 
 void invokeBuildLeafMask(
@@ -370,6 +396,8 @@ void invokeGetPackedMaskFromPath(
     getPackedMaskFromPathKernel<<<1, BLOCK_SIZE, sharedMemSize, stream>>>(
         packedMask, batchSlots, paths, maxDecodingTokens, maxPathLen
     );
+
+    EagleKernelsCudaCheckAt("eagle_kernels::invokeGetPackedMaskFromPath");
 }
 
 } // namespace eagle

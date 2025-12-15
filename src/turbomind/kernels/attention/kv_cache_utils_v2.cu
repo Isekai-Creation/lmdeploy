@@ -3,6 +3,7 @@
 #include <type_traits>
 
 #include "src/turbomind/kernels/attention/block.h"
+#include "src/turbomind/utils/eagle_debug.h"
 #include "src/turbomind/kernels/attention/kv_cache_utils_v2.h"
 #include "src/turbomind/kernels/attention/quantization.h"
 #include "src/turbomind/kernels/attention/rotary_embedding.h"
@@ -571,6 +572,20 @@ void invokeProcessKV_v2(char**                 blocks,
     }
     else {
         dispatch(T{});
+    }
+
+    if (::turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR("[kv_cache_utils_v2][invariants] CUDA error %d (%s) after invokeProcessKV_v2 "
+                         "(block_seq_len=%d, head_dim=%d, batch_size=%d)",
+                         static_cast<int>(err),
+                         cudaGetErrorString(err),
+                         block_seq_len,
+                         head_dim,
+                         batch_size);
+            std::abort();
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 #include "src/turbomind/models/llama/BlockManager.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/debug_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/string_utils.h"
 #include <algorithm>
@@ -98,6 +99,24 @@ bool BlockManager::Malloc()
         block.data      = ptr;
 
         free_ids_.push_back(block.id);
+    }
+
+    // In invariants-debug runs, ensure that no CUDA error was raised
+    // during KV chunk allocation or any implicit device-side work
+    // before we return. This makes it easier to distinguish genuine
+    // allocator failures from illegal accesses caused by earlier kernels.
+    if (isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[BlockManager][invariants] CUDA error %d (%s) observed after Malloc "
+                "(alloc_size=%lu, chunk_size=%d); aborting to surface upstream bug.",
+                static_cast<int>(err),
+                cudaGetErrorString(err),
+                alloc_size,
+                chunk_size);
+            std::abort();
+        }
     }
 
     return true;

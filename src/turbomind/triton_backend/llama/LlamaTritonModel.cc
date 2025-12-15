@@ -652,7 +652,11 @@ void LlamaTritonModel::createEngine(int device_id, int rank)
 
     auto& engine = *engines_[device_id];
 
-    if (first_create) {
+    // Skip GEMM warmup for speculative engines to avoid exercising
+    // partially-tuned or unstable draft paths during engine creation.
+    // Baseline (non-speculative) engines still run Warmup so their
+    // GEMM dispatch remains tuned as in upstream TurboMind.
+    if (first_create && !engine_param.enable_speculative_decoding) {
         try {
             engine.Warmup();
         }

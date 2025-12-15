@@ -916,6 +916,23 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
     h_sampled_indexes_  = {batch_size * kMaxLogProb, kCPUpinned};
     h_sampled_nums_     = {batch_size, kCPUpinned};
 
+    // In invariants-debug runs, surface any CUDA error that might have
+    // occurred during the bulk buffer allocation / Clear(...) calls
+    // above before we enter the decode loop. This helps attribute illegal
+    // accesses to the buffer setup phase rather than the first allocator
+    // that happens to run afterwards.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[LlamaBatch][EAGLE][invariants] CUDA error %d (%s) observed after AllocateBuffer; "
+                "KV/sequence buffers may be corrupted; aborting.",
+                static_cast<int>(err),
+                cudaGetErrorString(err));
+            std::abort();
+        }
+    }
+
     // EAGLE KV rewind persistent buffers. These are only used when multi-token
     // speculative decoding is enabled and the experimental flag is set.
     eagle_kv_rewind_lengths_ = {max_batch_size_, kDEVICE};
@@ -3398,6 +3415,23 @@ void LlamaBatch::InitializeBufferAndKVCache()
 {
     // initialize kvcache, BatchState and persist buffers
     core::ContextGuard guard{context_->core_stream, context_->allocator, Allocator{kCPUpinned}};
+
+    // If there is already a pending CUDA error at this point in the
+    // speculative engine path, treat it as a hard invariant violation
+    // and abort before we start allocating KV blocks. This helps
+    // pinpoint the first bad kernel in the EAGLE3/spec path instead of
+    // reporting the error later from the allocator.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[LlamaBatch][EAGLE][invariants] CUDA error %d (%s) observed at "
+                "InitializeBufferAndKVCache entry; aborting to surface earlier bug",
+                static_cast<int>(err),
+                cudaGetErrorString(err));
+            std::abort();
+        }
+    }
 
     const auto cache_block_seq_len = model_->attn_param_.cache_block_seq_len;
 

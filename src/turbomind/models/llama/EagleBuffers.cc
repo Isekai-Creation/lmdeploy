@@ -3,6 +3,7 @@
 
 #include "EagleBuffers.h"
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 #include "src/turbomind/utils/logger.h"
 #include <cuda_runtime.h>
 
@@ -81,6 +82,22 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMemsetAsync(outputs.accepted_lens, 0, batch_size_ * sizeof(SizeType), stream);
     
     check_cuda_error(cudaStreamSynchronize(stream));
+
+    // Catch any CUDA errors triggered during EagleBuffers allocation
+    // (cudaMalloc / cudaMemsetAsync) as early as possible in
+    // invariants-debug runs, so that upstream bugs are surfaced here
+    // instead of being reported later by unrelated allocators.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[EagleBuffers][invariants] CUDA error %d (%s) observed after allocate(); "
+                "EAGLE buffers may be corrupted; aborting.",
+                static_cast<int>(err),
+                cudaGetErrorString(err));
+            std::abort();
+        }
+    }
     
     allocated_ = true;
     TM_LOG_INFO("EagleBuffers allocated successfully");
