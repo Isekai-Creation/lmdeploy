@@ -3,11 +3,15 @@
 #pragma once
 
 #include <curand_kernel.h>
+#include <cuda_runtime.h>
+#include <unordered_map>
 
 #include "src/turbomind/core/core.h"
 
 #include "src/turbomind/engine/gateway.h"
 #include "src/turbomind/engine/request.h"
+#include "src/turbomind/core/kv_cache_manager.h"
+#include "src/turbomind/core/prefix_cache.h"
 
 #include "src/turbomind/models/llama/SequenceManager.h"
 #include "src/turbomind/models/llama/context.h"
@@ -24,6 +28,68 @@ struct MropeRope {
     Tensor_<int> position_ids;
     Buffer_<int> position_delta;
     Buffer_<int> length;
+};
+
+// Execution result feedback from LlamaBatch to EngineScheduler
+struct ExecutionResult {
+    uint64_t               sequence_id;
+    int                    tokens_processed;    // actual tokens processed (may differ from scheduled)
+    int                    tokens_generated;   // actual tokens generated  
+    bool                   is_finished;
+    std::vector<int>       generated_token_ids; // for real model forward (placeholder for now)
+    
+    // Step D: Speculative decoding tracking
+    int                    draft_tokens_generated{0};  // Number of draft tokens produced
+    int                    draft_tokens_accepted{0};   // Number of draft tokens actually accepted
+    double                 acceptance_rate{0.0};      // Acceptance rate for this step
+};
+
+// Step C: Unified KV cache interface that works with both KVCacheManager and SequenceManager
+class UnifiedKVCache {
+public:
+    virtual ~UnifiedKVCache() = default;
+    
+    // Common KV operations
+    virtual bool allocate_kv_space(uint64_t seq_id, int tokens_needed, int max_tokens) = 0;
+    virtual void* get_kv_data(uint64_t seq_id, int position) = 0;
+    virtual void release_kv_space(uint64_t seq_id) = 0;
+    
+    // Prefix cache operations
+    virtual bool lookup_prefix(uint64_t seq_id, const std::vector<int>& tokens, int& matched_len) = 0;
+    virtual void store_prefix(uint64_t seq_id, const std::vector<int>& tokens) = 0;
+    
+    // Status queries
+    virtual size_t get_used_capacity() const = 0;
+    virtual size_t get_total_capacity() const = 0;
+    virtual bool has_sequence(uint64_t seq_id) const = 0;
+};
+
+// Step C: Concrete implementation that bridges KVCacheManager and SequenceManager
+class DriftEngineKVCache : public UnifiedKVCache {
+public:
+    DriftEngineKVCache(KVCacheManager* kv_mgr, 
+                        PrefixCache* prefix_cache,
+                        SequenceManager* seq_manager,
+                        const KVLayout& layout);
+    
+    // UnifiedKVCache interface
+    bool allocate_kv_space(uint64_t seq_id, int tokens_needed, int max_tokens) override;
+    void* get_kv_data(uint64_t seq_id, int position) override;
+    void release_kv_space(uint64_t seq_id) override;
+    bool lookup_prefix(uint64_t seq_id, const std::vector<int>& tokens, int& matched_len) override;
+    void store_prefix(uint64_t seq_id, const std::vector<int>& tokens) override;
+    size_t get_used_capacity() const override;
+    size_t get_total_capacity() const override;
+    bool has_sequence(uint64_t seq_id) const override;
+
+private:
+    KVCacheManager*  kv_cache_manager_;
+    PrefixCache*      prefix_cache_;
+    SequenceManager*   sequence_manager_;
+    KVLayout          kv_layout_;
+    
+    // Mapping between DriftEngine reservations and SequenceManager blocks
+    std::unordered_map<uint64_t, std::vector<int>> seq_to_blocks_;
 };
 
 struct BatchState {
@@ -54,6 +120,7 @@ struct BatchState {
 };
 
 class LlamaV2;
+struct PrefillChunk;
 
 struct GenerationState {
     int max_init_ctx_len;
@@ -122,9 +189,12 @@ public:
 
     void InitializeBufferAndKVCache();
 
-    void FreeBufferAndKVCache();
+     void FreeBufferAndKVCache();
 
-    void Start();
+     // DriftEngine KV cache bridge method
+     void bridge_kv_cache_manager(KVCacheManager* kv_mgr, PrefixCache* prefix_cache);
+
+     void Start();
 
     LlamaV2& model() noexcept
     {
@@ -137,8 +207,21 @@ public:
     }
 
     void Warmup();
+ 
+     // Enable DriftEngine executor mode. In this mode the internal
+     // gateway-driven engine loop is not used; instead, external
+     // callers drive execution via ExecuteScheduled/attach_scheduled.
+     void set_executor_mode();
+ 
+     // Executor-mode helpers for DriftEngine. These are intentionally
+     // conservative and currently focus on TP=1 single-device usage.
+     void attach_new_requests(const Requests& infer_reqs, const Requests& kill_reqs);
+     void attach_scheduled(const std::vector<PrefillChunk>& prefill,
+                           const std::vector<std::shared_ptr<Request>>& decode);
+     void detach_finished(std::vector<Signal>& signals);
+ 
+     ScheduleMetrics getScheduleMetrics()
 
-    ScheduleMetrics getScheduleMetrics()
     {
         const std::lock_guard<std::mutex> lock(metrics_mutex_);
         return schedule_metrics_;
@@ -152,10 +235,44 @@ public:
                                            const std::vector<int>&  eagle_accepted_tokens,
                                            GenerationState&         g);
 
+    // DriftEngine hook: execute a scheduled batch (prefill/decode) without
+    // relying on LlamaBatch's internal request pump. Initially minimal and can
+    // be expanded to drive full forwards once integrated end-to-end.
+    void ExecuteScheduled(const std::vector<PrefillChunk>& prefill,
+                          const std::vector<std::shared_ptr<Request>>& decode);
+
+    // Get execution results for feedback to EngineScheduler
+    std::vector<ExecutionResult> get_execution_results() const;
+
+    // Step E: Performance optimization interface
+    void enable_cuda_graphs(bool enable = true);
+    
+    // Memory optimization for executor mode
+    void optimize_memory_usage();
+    void compact_kv_cache();
+
 private:
     void FindCanceledIndices(std::vector<int>& indices);
 
     void ProcessCancelRequests(std::vector<int>& indices, std::vector<Signal>& signals);
+
+     // Helper methods for executor mode
+     void process_scheduled_prefill(const std::vector<PrefillChunk>& prefill);
+     void process_scheduled_decode(const std::vector<std::shared_ptr<Request>>& decode);
+     void capture_executor_pre_lengths(const std::vector<PrefillChunk>& prefill,
+                                       const std::vector<std::shared_ptr<Request>>& decode,
+                                       std::unordered_map<uint64_t, int>& lengths) const;
+     void build_execution_results(const std::vector<PrefillChunk>& prefill,
+                                  const std::vector<std::shared_ptr<Request>>& decode,
+                                  const std::unordered_map<uint64_t, int>& pre_lengths);
+     int  read_sequence_length(const std::shared_ptr<Request>& req) const;
+     bool request_finished(const std::shared_ptr<Request>& req) const;
+    
+     // Step B: Initialize method that uses scheduler-driven batch composition
+     void InitializeFromScheduler(GenerationState& g, 
+                                const std::vector<PrefillChunk>& prefill,
+                                const std::vector<std::shared_ptr<Request>>& decode);
+
 
     void InternalThreadEntry();
 
@@ -305,8 +422,41 @@ private:
     Buffer_<float> eagle_temperatures_;          // [max_batch_size_]
 
     Communicators& comm_;
+ 
+     Allocator symm_alloc_;
+ 
+     // Execution mode: legacy internal engine loop vs external executor
+     enum class Mode {
+         kEngine,
+         kExecutor,
+     };
+ 
+     Mode            mode_{Mode::kEngine};
+     GenerationState exec_state_{};
+     bool            executor_initialized_{false};
+     
+     // Store execution results for feedback to EngineScheduler
+     std::vector<ExecutionResult> execution_results_;
+     
+     // KV cache bridge for DriftEngine integration
+     KVCacheManager* kv_cache_manager_{nullptr};
+     PrefixCache*    prefix_cache_{nullptr};
+     
+     // Step C: Unified KV cache interface
+     std::unique_ptr<UnifiedKVCache> unified_kv_cache_;
+     
+     // Step E: Performance optimization - CUDA graph support
+     bool                enable_cuda_graphs_{false};
+     cudaGraph_t         prefill_graph_{nullptr};
+     cudaGraphExec_t     prefill_graph_exec_{nullptr};
+     cudaGraph_t         decode_graph_{nullptr};
+     cudaGraphExec_t     decode_graph_exec_{nullptr};
+     
+     // CUDA graph management methods
+     void capture_and_initialize_cuda_graphs();
+     void execute_cuda_graph_forward(GenerationState& g);
+     int  get_graph_node_count(cudaGraph_t graph) const;
 
-    Allocator symm_alloc_;
 
     ///////////////////////////////////////////////////////////////////
     // k/v cache block buffers

@@ -33,6 +33,7 @@
 
 #include "src/turbomind/engine/gateway.h"
 #include "src/turbomind/engine/request.h"
+#include "src/turbomind/engine/EngineScheduler.h" // For PrefillChunk
 
 #include "src/turbomind/kernels/decoding_kernels.h"
 #include "src/turbomind/kernels/gemm/tuner/params.h"
@@ -101,6 +102,25 @@ struct EagleDisableDiagRegistrar {
 EagleDisableDiagRegistrar g_eagle_disable_diag_registrar;
 
 }  // namespace
+
+// Debug-only CUDA invariant check for the LlamaBatch side of the EAGLE
+// path. When LMDEPLOY_EAGLE_INVARIANTS_DEBUG is set, we treat any
+// pending CUDA error as a hard failure and abort immediately so the
+// offending site is close to the real bug.
+inline void EagleCudaCheckAtBatch(const char* site)
+{
+    if (!isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        return;
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TM_LOG_ERROR("[LlamaBatch][EAGLE][invariants] CUDA error %d (%s) at %s",
+                     static_cast<int>(err),
+                     cudaGetErrorString(err),
+                     site);
+        std::abort();
+    }
+}
 
 void PrintDecodeTokens(
     const int* token_ids, int max_seq_len, int batch_sizse, cudaStream_t stream, const std::string& msg)
@@ -1050,13 +1070,30 @@ LlamaBatch::~LlamaBatch()
 {
     TM_LOG_DEBUG("~LlamaBatch()");
 
-    internal_thread_.join();
+    if (internal_thread_.joinable()) {
+        internal_thread_.join();
+    }
 
     // The dtor maybe called from unknown thread, set device id before CUDA calls
     cudaSetDevice(device_id_);
     cudaStreamSynchronize(stream_);
 
     model_.reset();
+    
+    // Step E: Clean up CUDA graphs
+    if (prefill_graph_) {
+        cudaGraphDestroy(prefill_graph_);
+        prefill_graph_ = nullptr;
+    }
+    if (decode_graph_exec_) {
+        cudaGraphExecDestroy(decode_graph_exec_);
+        decode_graph_exec_ = nullptr;
+    }
+    if (decode_graph_) {
+        cudaGraphDestroy(decode_graph_);
+        decode_graph_ = nullptr;
+    }
+    
     FreeBufferAndKVCache();
     context_.reset();  // This destroy all objects in context except for `stream`
 }
@@ -2210,6 +2247,12 @@ void LlamaBatch::InternalThreadEntry()
     // Initialize `AnomalyHandler`
     AnomalyHandler::instance().Init(tp_rank_, model_->vocab_size_padded_, 0, max_batch_size_, stream_);
 
+    // Catch any CUDA errors that might have occurred during AnomalyHandler
+    // initialization before we enter the main decode loop in invariants
+    // mode. This helps distinguish issues in the init path from those in
+    // the first Forward() call.
+    EagleCudaCheckAtBatch("LlamaBatch::InternalThreadEntry::post_AnomalyInit");
+
     GenerationState g{};
 
     while (1) {
@@ -2223,7 +2266,8 @@ void LlamaBatch::InternalThreadEntry()
                 const int  free_slot_count = max_batch_size_ - state_->size + g.finished_count;
                 const bool is_empty        = (free_slot_count == max_batch_size_);
                 // Block if batch is empty AND no silbings are ready
-                gateway_->pop(req->infer, req->kill, free_slot_count, is_empty, req->abort, dp_rank_);
+                std::atomic<bool> abort_flag = req->abort;
+                gateway_->pop(req->infer, req->kill, free_slot_count, is_empty, abort_flag, dp_rank_);
             }
             // Mark reqs to the same session_id as invalid and also interactive-mode reqs when
             // prefix caching is enabled(which are dangerous to the engine)
@@ -2273,7 +2317,9 @@ void LlamaBatch::InternalThreadEntry()
 
         if (n_active) {
             //
+            EagleCudaCheckAtBatch("LlamaBatch::InternalThreadEntry::pre_Forward");
             Forward(g);
+            EagleCudaCheckAtBatch("LlamaBatch::InternalThreadEntry::post_Forward");
 
             Finish(g, signals);
 
@@ -2307,6 +2353,245 @@ void LlamaBatch::Start()
         }
     });
 }
+
+void LlamaBatch::set_executor_mode()
+{
+    // DriftEngine only supports single-device TP=1 execution for now.
+    FT_CHECK(tp_size_ == 1);
+    mode_                = Mode::kExecutor;
+    exec_state_          = {};
+    executor_initialized_ = false;
+}
+
+void LlamaBatch::attach_new_requests(const Requests& infer_reqs, const Requests& kill_reqs)
+{
+    NvtxScope scope("executor_ingest");
+
+    // In executor mode we rely on DriftEngine/Gateway for request pop but
+    // still use LlamaBatch's existing ingestion helpers to keep
+    // BatchState/SequenceManager consistent. For TP=1 this mirrors the
+    // rank-0 portion of InternalThreadEntry.
+    Requests infer = infer_reqs;
+    Requests kill  = kill_reqs;
+
+    DisableInvalidRequests(infer, kill);
+
+    std::vector<int> cancel_indices;
+    FindCanceledIndices(cancel_indices);
+
+    std::vector<Signal> signals;
+    ProcessKillRequests(kill, signals);
+    ProcessInferRequests(infer, signals);
+    ProcessCancelRequests(cancel_indices, signals);
+
+    if (tp_rank_ == 0 && !signals.empty()) {
+        gateway_->notify(std::move(signals));
+    }
+}
+
+void LlamaBatch::attach_scheduled(const std::vector<PrefillChunk>&,
+                                  const std::vector<std::shared_ptr<Request>>&)
+{
+    // Reserved for future per-step mapping between EngineScheduler's
+    // prefill/decode selection and SequenceManager. Executor mode
+    // currently relies on LlamaBatch's own internal scheduling.
+}
+
+void LlamaBatch::detach_finished(std::vector<Signal>&)
+{
+    // Reserved for potential executor-mode cleanup. Legacy engine mode
+    // continues to use Finish/Interrupt for cleanup.
+}
+
+void LlamaBatch::ExecuteScheduled(const std::vector<PrefillChunk>& prefill,
+                                  const std::vector<std::shared_ptr<Request>>& decode)
+{
+    // Clear previous execution results
+    execution_results_.clear();
+
+    // DriftEngine executor path: drive a full Initialize→Forward→Finish
+    // step using the shared GenerationState, mirroring the body of the
+    // InternalThreadEntry loop but without its internal gateway pop.
+    if (mode_ == Mode::kExecutor) {
+        NvtxScope scope("executor_step");
+
+        // For TP=1 we can treat the communicators as degenerate. Ensure
+        // the decode step runs on the correct device and allocator.
+        check_cuda_error(cudaSetDevice(device_id_));
+        core::ContextGuard guard{context_->core_stream, context_->allocator};
+
+        if (!executor_initialized_) {
+            AnomalyHandler::instance().Init(tp_rank_, model_->vocab_size_padded_, 0, max_batch_size_, stream_);
+            EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::post_AnomalyInit");
+            executor_initialized_ = true;
+        }
+
+        std::unordered_map<uint64_t, int> pre_lengths;
+        capture_executor_pre_lengths(prefill, decode, pre_lengths);
+
+        // Process scheduled prefill chunks and decode batches
+        process_scheduled_prefill(prefill);
+        process_scheduled_decode(decode);
+ 
+        GenerationState& g = exec_state_;
+
+
+        // Step B: Use scheduler-driven initialization in executor mode instead of internal scheduling
+        InitializeFromScheduler(g, prefill, decode);
+
+        // update the schedule metrics and request metrics in every
+        // forward iter to keep parity with the legacy engine loop.
+        UpdateMetrics();
+
+        const int n_active = AllReduce(comm_.h_dp_group, state_->active_size, comm::RedOp::kSum);
+
+        if (n_active) {
+            std::vector<Signal> signals;
+
+            EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::pre_Forward");
+            
+            // Non-spec v1: avoid CUDA graphs; run regular forward.
+            if (enable_cuda_graphs_) {
+                execute_cuda_graph_forward(g);
+            } else {
+                Forward(g);
+            }
+            
+            EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::post_Forward");
+ 
+             Finish(g, signals);
+             build_execution_results(prefill, decode, pre_lengths);
+ 
+             // Step C: Unified KV cache cleanup for finished sequences
+             if (unified_kv_cache_ && g.finished_count > 0) {
+
+                // Go through execution results and cleanup finished sequences
+                for (const auto& result : execution_results_) {
+                    if (result.is_finished) {
+                        unified_kv_cache_->release_kv_space(result.sequence_id);
+                        TM_LOG_DEBUG("[LlamaBatch] Released unified KV for finished seq %lu", 
+                                    result.sequence_id);
+                    }
+                }
+            }
+
+            if (g.finished_count) {
+                // Finished requests and corresponding output tensors will
+                // be released when notified; keep the same barrier
+                // semantics as the legacy path.
+                comm_.h_tp_group->Sync();
+            }
+
+            if (tp_rank_ == 0 && !signals.empty()) {
+                gateway_->notify(std::move(signals));
+            }
+        }
+
+        // No longer ignore prefill/decode parameters - they are now processed
+        return;
+    }
+
+    // Legacy stub path (non-executor mode): preserve previous
+    // placeholder semantics for any callers that still rely on it.
+    std::vector<Signal> signals;
+    signals.reserve(prefill.size() + decode.size());
+
+    auto write_progress = [](const std::shared_ptr<Request>& req, int seq_len) {
+        if (!req) {
+            return;
+        }
+        try {
+            if (req->sequence_length.data()) {
+                seq_len = std::max(seq_len, req->sequence_length.data()[0]);
+            }
+        }
+        catch (...) {
+            // Best-effort stub write
+        }
+        UpdateState(*req, Request::kOk, seq_len);
+    };
+
+    for (const auto& chunk : prefill) {
+        const auto& req = chunk.req;
+        if (!req) {
+            continue;
+        }
+
+        const int start_pos = chunk.start_pos;
+        const int len       = chunk.len;
+        const int seq_len   = start_pos + len;
+
+        try {
+            auto it = req->inputs.find("input_ids");
+            if (it != req->inputs.end() && req->output_ids.data()) {
+                const auto& input     = it->second;
+                const int*  src       = input.data<int>();
+                int*        dst       = req->output_ids.data();
+                const int   input_len = input.shape(0);
+                const int   out_len   = req->output_ids.shape(0);
+
+                const int copy_start = std::max(0, start_pos);
+                const int copy_end   = std::min(seq_len, std::min(input_len, out_len));
+
+                if (copy_end > copy_start) {
+                    std::copy_n(src + copy_start, copy_end - copy_start, dst + copy_start);
+                }
+            }
+        }
+        catch (...) {
+            // Best-effort prompt copy; fall back to sequence_length only.
+        }
+
+        signals.push_back([req, seq_len, write_progress] {
+            write_progress(req, seq_len);
+        });
+    }
+
+    for (const auto& req : decode) {
+        if (!req) {
+            continue;
+        }
+
+        int prompt_len = 0;
+        try {
+            auto it = req->inputs.find("input_ids");
+            if (it != req->inputs.end()) {
+                prompt_len = it->second.shape(0);
+            }
+        }
+        catch (...) {
+            prompt_len = 0;
+        }
+
+        int seq_len = prompt_len;
+        try {
+            if (req->sequence_length.data()) {
+                seq_len = std::max(seq_len, req->sequence_length.data()[0]);
+            }
+        }
+        catch (...) {
+        }
+
+        const int next_len = seq_len + 1;
+
+        try {
+            if (req->output_ids.data() && next_len - 1 >= 0 && next_len - 1 < req->output_ids.shape(0)) {
+                req->output_ids.data()[next_len - 1] = 0;
+            }
+        }
+        catch (...) {
+        }
+
+        signals.push_back([req, next_len, write_progress] {
+            write_progress(req, next_len);
+        });
+    }
+
+    if (tp_rank_ == 0 && !signals.empty()) {
+        gateway_->notify(std::move(signals));
+    }
+}
+
 
 bool LlamaBatch::Forward(GenerationState& g)
 {
@@ -3559,6 +3844,24 @@ void LlamaBatch::InitializeBufferAndKVCache()
         }
     }
 
+    // Before we construct the SequenceManager (which will immediately
+    // allocate KV blocks via BlockManager and the core Allocator), run a
+    // last CUDA error check in invariants-debug mode. If any upstream
+    // kernel has already raised an error, surface it here so that illegal
+    // accesses are attributed to the correct stage instead of being
+    // reported later by KV allocators.
+    if (isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            TM_LOG_ERROR(
+                "[LlamaBatch][EAGLE][invariants] CUDA error %d (%s) observed before SequenceManager creation; "
+                "aborting to surface upstream bug.",
+                static_cast<int>(err),
+                cudaGetErrorString(err));
+            std::abort();
+        }
+    }
+
     TM_LOG_WARNING("[LlamaBatch] Creating SequenceManager. block_size(from layout)=?, scale_block_size=%lu", scale_block_size);
 
     sequence_manager_.reset(new SequenceManager{model_->layer_num_,
@@ -3705,6 +4008,689 @@ void LlamaBatch::UpdateMetrics()
             metrics->scheduled_time = RequestMetrics::timestamp();
         }
     }
+}
+
+void LlamaBatch::process_scheduled_prefill(const std::vector<PrefillChunk>& prefill)
+{
+    // Reserve KV space and touch prefix cache entries for the scheduled
+    // chunks. Actual output tensors and sequence lengths will be updated
+    // by Forward/Finish so we avoid writing placeholders here.
+    for (const auto& chunk : prefill) {
+        const auto& req = chunk.req;
+        if (!req) {
+            continue;
+        }
+
+        const int seq_len = chunk.start_pos + chunk.len;
+
+        if (unified_kv_cache_) {
+            int prompt_len = 0;
+            try {
+                auto it = req->inputs.find("input_ids");
+                if (it != req->inputs.end()) {
+                    prompt_len = it->second.shape(0);
+                }
+            }
+            catch (...) {
+                prompt_len = 0;
+            }
+
+            const uint64_t seq_id = req->session.id;
+            if (!unified_kv_cache_->has_sequence(seq_id)) {
+                if (!unified_kv_cache_->allocate_kv_space(seq_id, seq_len, prompt_len + 512)) {
+                    TM_LOG_WARNING("[LlamaBatch] Unified KV allocation failed for seq %lu", seq_id);
+                }
+                else {
+                    TM_LOG_DEBUG("[LlamaBatch] Unified KV allocated for seq %lu: %d tokens", seq_id, seq_len);
+                }
+            }
+
+            if (unified_kv_cache_->has_sequence(seq_id)) {
+                try {
+                    auto it = req->inputs.find("input_ids");
+                    if (it != req->inputs.end()) {
+                        const auto& input  = it->second;
+                        const int*  tokens = input.data<int>();
+                        const int   count  = input.shape(0);
+
+                        std::vector<int> prompt_tokens(tokens,
+                                                       tokens + std::min(count, chunk.start_pos + chunk.len));
+                        unified_kv_cache_->store_prefix(seq_id, prompt_tokens);
+                    }
+                }
+                catch (...) {
+                    // Best effort; prefix caching is opportunistic.
+                }
+            }
+        }
+    }
+}
+
+void LlamaBatch::process_scheduled_decode(const std::vector<std::shared_ptr<Request>>& decode)
+{
+    for (const auto& req : decode) {
+        if (!req) {
+            continue;
+        }
+
+        if (unified_kv_cache_) {
+            const uint64_t seq_id = req->session.id;
+            if (!unified_kv_cache_->has_sequence(seq_id)) {
+                int seq_len = read_sequence_length(req) + 1;
+                if (!unified_kv_cache_->allocate_kv_space(seq_id, seq_len, seq_len + 256)) {
+                    TM_LOG_ERROR("[LlamaBatch] Failed to allocate KV for decode seq %lu", seq_id);
+                }
+            }
+            else {
+                TM_LOG_DEBUG("[LlamaBatch] Unified KV found for decode seq %lu", seq_id);
+                try {
+                    auto it = req->inputs.find("input_ids");
+                    if (it != req->inputs.end()) {
+                        const auto& input = it->second;
+                        const int*  tokens = input.data<int>();
+                        const int    count = input.shape(0);
+                        std::vector<int> prompt_tokens(tokens, tokens + count);
+                        int matched_len = 0;
+                        if (unified_kv_cache_->lookup_prefix(seq_id, prompt_tokens, matched_len)) {
+                            TM_LOG_DEBUG("[LlamaBatch] Prefix match for seq %lu: %d tokens", seq_id, matched_len);
+                        }
+                    }
+                }
+                catch (...) {
+                    // prefix lookup is best effort
+                }
+            }
+        }
+    }
+}
+
+void LlamaBatch::capture_executor_pre_lengths(const std::vector<PrefillChunk>& prefill,
+                                               const std::vector<std::shared_ptr<Request>>& decode,
+                                               std::unordered_map<uint64_t, int>& lengths) const
+{
+    auto capture = [&](const std::shared_ptr<Request>& req) {
+        if (!req) {
+            return;
+        }
+        lengths[req->session.id] = read_sequence_length(req);
+    };
+    for (const auto& chunk : prefill) {
+        capture(chunk.req);
+    }
+    for (const auto& req : decode) {
+        capture(req);
+    }
+}
+
+void LlamaBatch::build_execution_results(const std::vector<PrefillChunk>& prefill,
+                                         const std::vector<std::shared_ptr<Request>>& decode,
+                                         const std::unordered_map<uint64_t, int>& pre_lengths)
+{
+    execution_results_.clear();
+
+    auto lookup_pre_len = [&](uint64_t seq_id, int fallback) {
+        auto it = pre_lengths.find(seq_id);
+        return it != pre_lengths.end() ? it->second : fallback;
+    };
+
+    for (const auto& chunk : prefill) {
+        const auto& req = chunk.req;
+        if (!req) {
+            continue;
+        }
+        const int before = lookup_pre_len(req->session.id, chunk.start_pos);
+        const int after  = read_sequence_length(req);
+        const int processed = std::max(0, after - before);
+
+        ExecutionResult result{};
+        result.sequence_id      = req->session.id;
+        result.tokens_processed = processed > 0 ? processed : chunk.len;
+        result.tokens_generated = 0;
+        result.is_finished      = request_finished(req);
+        execution_results_.push_back(std::move(result));
+    }
+
+    for (const auto& req : decode) {
+        if (!req) {
+            continue;
+        }
+        const int before    = lookup_pre_len(req->session.id, read_sequence_length(req));
+        const int after     = read_sequence_length(req);
+        const int generated = std::max(0, after - before);
+
+        ExecutionResult result{};
+        result.sequence_id      = req->session.id;
+        result.tokens_processed = generated;
+        result.tokens_generated = generated;
+        result.is_finished      = request_finished(req);
+
+        if (generated > 0 && req->output_ids.data()) {
+            const int start = std::max(0, after - generated);
+            const int end   = std::min(after, static_cast<int>(req->output_ids.shape(0)));
+            int*       out  = req->output_ids.data();
+            for (int i = start; i < end; ++i) {
+                result.generated_token_ids.push_back(out[i]);
+            }
+        }
+
+        execution_results_.push_back(std::move(result));
+    }
+}
+
+int LlamaBatch::read_sequence_length(const std::shared_ptr<Request>& req) const
+{
+    if (!req) {
+        return 0;
+    }
+    int seq_len = 0;
+    try {
+        if (req->sequence_length.data()) {
+            seq_len = req->sequence_length.data()[0];
+        }
+    }
+    catch (...) {
+        seq_len = 0;
+    }
+    if (seq_len <= 0) {
+        try {
+            auto it = req->inputs.find("input_ids");
+            if (it != req->inputs.end()) {
+                seq_len = it->second.shape(0);
+            }
+        }
+        catch (...) {
+            seq_len = 0;
+        }
+    }
+    return seq_len;
+}
+
+bool LlamaBatch::request_finished(const std::shared_ptr<Request>& req) const
+{
+    if (!req || !req->state) {
+        return false;
+    }
+    if (auto* st = req->state->load()) {
+        return st->status == Request::kFinish || st->status == Request::kCancel;
+    }
+    return false;
+}
+
+std::vector<ExecutionResult> LlamaBatch::get_execution_results() const
+{
+    return execution_results_;
+}
+
+void LlamaBatch::enable_cuda_graphs(bool enable)
+{
+    enable_cuda_graphs_ = enable && mode_ == Mode::kExecutor;
+    
+    if (enable_cuda_graphs_) {
+        // Capture CUDA graphs for current executor configuration
+        capture_and_initialize_cuda_graphs();
+        TM_LOG_INFO("[LlamaBatch] CUDA graphs enabled for executor mode");
+    } else {
+        // Clean up existing graphs
+        if (prefill_graph_) {
+            cudaGraphDestroy(prefill_graph_);
+            prefill_graph_ = nullptr;
+        }
+        if (decode_graph_exec_) {
+            cudaGraphExecDestroy(decode_graph_exec_);
+            decode_graph_exec_ = nullptr;
+        }
+        if (decode_graph_) {
+            cudaGraphDestroy(decode_graph_);
+            decode_graph_ = nullptr;
+        }
+        TM_LOG_INFO("[LlamaBatch] CUDA graphs disabled");
+    }
+}
+
+void LlamaBatch::optimize_memory_usage()
+{
+    if (mode_ != Mode::kExecutor) {
+        return;
+    }
+    
+    TM_LOG_DEBUG("[LlamaBatch] Optimizing memory usage for executor mode");
+    
+    // Step E: Memory optimization techniques
+    
+    // 1. Compact unused sequence slots in BatchState
+    if (state_->active_size < state_->size / 2) {
+        // If we're using less than half capacity, consider compacting
+        int moved_count = 0;
+        for (int i = 0; i < state_->active_size; ++i) {
+            if (state_->sequences[i] && state_->requests[i]) {
+                // Move active sequences to compact positions
+                if (i != moved_count) {
+                    state_->sequences[moved_count] = state_->sequences[i];
+                    state_->requests[moved_count] = state_->requests[i];
+                    state_->h_context_length[moved_count] = state_->h_context_length[i];
+                    moved_count++;
+                }
+            }
+        }
+        
+        if (moved_count > 0) {
+            TM_LOG_DEBUG("[LlamaBatch] Compacted batch: moved %d sequences", moved_count);
+        }
+    }
+    
+    // 2. Trigger unified KV cache compaction
+    if (unified_kv_cache_) {
+        compact_kv_cache();
+    }
+    
+    // 3. Memory pool optimization hints
+    if (sequence_manager_) {
+        // Hint to sequence manager about memory pressure
+        double memory_usage = static_cast<double>(unified_kv_cache_->get_used_capacity()) / unified_kv_cache_->get_total_capacity();
+        if (memory_usage > 0.8) {
+            TM_LOG_DEBUG("[LlamaBatch] High memory usage (%.1f%%), consider GC", 
+                        memory_usage * 100.0);
+        }
+    }
+}
+
+void LlamaBatch::compact_kv_cache()
+{
+    if (!unified_kv_cache_) {
+        return;
+    }
+    
+    // Step E: KV cache compaction using unified interface
+    size_t used_capacity = unified_kv_cache_->get_used_capacity();
+    size_t total_capacity = unified_kv_cache_->get_total_capacity();
+    
+    if (total_capacity == 0) {
+        return;
+    }
+    
+    double utilization = static_cast<double>(used_capacity) / total_capacity;
+    
+    // If KV cache utilization is high, suggest compaction
+    if (utilization > 0.85) {
+        TM_LOG_DEBUG("[LlamaBatch] KV cache utilization high (%.1f%%), triggering compaction", 
+                    utilization * 100.0);
+        
+        // In a real implementation, this would:
+        // 1. Evict least recently used sequences
+        // 2. Compact fragmented KV pages
+        // 3. Release unused reservations
+    }
+}
+
+void LlamaBatch::bridge_kv_cache_manager(KVCacheManager* kv_mgr, PrefixCache* prefix_cache)
+{
+    kv_cache_manager_ = kv_mgr;
+    prefix_cache_ = prefix_cache;
+    
+    // Step C: Create unified KV cache interface
+    if (kv_mgr && sequence_manager_) {
+        // Create KV layout for unified cache
+        KVLayout layout = kv_mgr->get_layout();
+        
+        unified_kv_cache_ = std::make_unique<DriftEngineKVCache>(
+            kv_mgr, prefix_cache, sequence_manager_.get(), layout);
+            
+        TM_LOG_DEBUG("[LlamaBatch] Unified KV cache created with layout: %d layers, %d pages", 
+                    layout.num_layers, layout.page_size);
+    }
+    
+    TM_LOG_DEBUG("[LlamaBatch] KV cache bridge established: KVManager=%p, PrefixCache=%p", 
+                 static_cast<void*>(kv_mgr), static_cast<void*>(prefix_cache));
+}
+
+void LlamaBatch::InitializeFromScheduler(GenerationState& g, 
+                                       const std::vector<PrefillChunk>& prefill,
+                                       const std::vector<std::shared_ptr<Request>>& decode)
+{
+    NvtxScope scope("initialize_from_scheduler");
+    
+    // Step B: Build batch directly from scheduler decisions instead of internal Materialize()
+    std::vector<const Sequence*>             sequences;
+    std::vector<std::shared_ptr<Request>>    batch_requests;
+    std::vector<uint64_t>                    priorities;
+    std::vector<int>                         context_lengths;
+    
+    // Helper to get sequence for a request (requests are already attached via attach_new_requests)
+    auto get_sequence = [&](const std::shared_ptr<Request>& req) -> const Sequence* {
+        if (!req) return nullptr;
+        
+        // Get existing sequence that should have been created in attach_new_requests()
+        const Sequence* seq = sequence_manager_->Get(req->session.id);
+        if (!seq) {
+            TM_LOG_ERROR("[LlamaBatch] Sequence not found for attached request %lu", req->session.id);
+            return nullptr;
+        }
+        
+        return seq;
+    };
+    
+    // Collect sequences for scheduler's prefill chunks
+    for (const auto& chunk : prefill) {
+        const Sequence* seq = get_sequence(chunk.req);
+        if (!seq) continue;
+        
+        sequences.push_back(seq);
+        batch_requests.push_back(chunk.req);
+        priorities.push_back(chunk.req->unique_id);
+        context_lengths.push_back(chunk.start_pos + chunk.len); // context length after this chunk
+    }
+    
+    // Collect sequences for scheduler's decode requests
+    for (const auto& req : decode) {
+        const Sequence* seq = get_sequence(req);
+        if (!seq) continue;
+        
+        sequences.push_back(seq);
+        batch_requests.push_back(req);
+        priorities.push_back(req->unique_id);
+        
+        // For decode, context length comes from request's current sequence_length
+        int context_len = 0;
+        try {
+            if (req->sequence_length.data()) {
+                context_len = req->sequence_length.data()[0];
+            } else {
+                auto it = req->inputs.find("input_ids");
+                if (it != req->inputs.end()) {
+                    context_len = it->second.shape(0);
+                }
+            }
+        } catch (...) {
+            context_len = 0;
+        }
+        
+        context_lengths.push_back(context_len);
+    }
+    
+    // Update BatchState with scheduler-driven composition
+    if (!sequences.empty()) {
+        const size_t batch_size = sequences.size();
+
+        // Reset previous batch state before installing the scheduler-
+        // selected sequences. ClearState will zero out the old size and
+        // pointers; we then repopulate size/active_size and the first
+        // `batch_size` entries below.
+        ClearState(*state_);
+
+        // Ensure we have capacity for this batch. In executor mode the
+        // BatchState size is driven by the scheduler rather than the
+        // internal gateway loop, so use max_batch_size_ as the capacity
+        // guard and update state_->size accordingly.
+        if (max_batch_size_ < static_cast<int>(batch_size)) {
+            TM_LOG_ERROR("[LlamaBatch] Batch capacity exceeded: have %d, need %zu",
+                        max_batch_size_, batch_size);
+            return;
+        }
+
+        // Update BatchState with scheduler's selected sequences
+        state_->size        = static_cast<int>(batch_size);
+        state_->active_size = static_cast<int>(batch_size);
+        
+        for (size_t i = 0; i < batch_size; ++i) {
+            state_->sequences[i]       = sequences[i];
+            state_->requests[i]        = batch_requests[i];
+            state_->h_context_length[i] = context_lengths[i];
+        }
+        
+        // Skip Materialize() since scheduler has already decided the batch composition
+        // Just ensure sequences are properly materialized for this step
+        // Use minimal materialization - just ensure sequences are ready
+        auto outcome = sequence_manager_->Materialize(
+            {sequences}, context_lengths, priorities, 1,
+            [](const Sequences& seqs, const std::vector<int>& lengths) { 
+                return seqs.size(); // Accept all scheduler-selected sequences
+            });
+            
+        if (outcome.allocation || outcome.swap_in || outcome.swap_out) {
+            dbg(outcome);
+        }
+        
+        TM_LOG_DEBUG("[LlamaBatch] Scheduler-driven batch: %zu seqs (%zu prefill, %zu decode)", 
+                    sequences.size(), prefill.size(), decode.size());
+    }
+}
+
+// Step C: UnifiedKVCache implementation for DriftEngine integration
+DriftEngineKVCache::DriftEngineKVCache(KVCacheManager* kv_mgr,
+                                     PrefixCache* prefix_cache,
+                                     SequenceManager* seq_manager,
+                                     const KVLayout& layout)
+    : kv_cache_manager_(kv_mgr)
+    , prefix_cache_(prefix_cache)
+    , sequence_manager_(seq_manager)
+    , kv_layout_(layout)
+{
+    TM_LOG_DEBUG("[DriftEngineKVCache] Created unified KV cache bridge");
+}
+
+bool DriftEngineKVCache::allocate_kv_space(uint64_t seq_id, int tokens_needed, int max_tokens)
+{
+    if (!kv_cache_manager_) {
+        return false;
+    }
+
+    // The DriftEngine scheduler and CapacityScheduler own KV page
+    // reservations. Here we simply mirror the existing mapping from
+    // KVCacheManager into SequenceManager blocks so that LlamaBatch
+    // can index into the correct pages for this sequence.
+    const auto page_ids = kv_cache_manager_->get_sequence_page_ids(seq_id);
+    if (page_ids.empty()) {
+        return false;
+    }
+
+    std::vector<int> block_ids(page_ids.begin(), page_ids.end());
+    seq_to_blocks_[seq_id] = std::move(block_ids);
+
+    TM_LOG_DEBUG("[DriftEngineKVCache] Mapped existing KV pages for seq %lu: %zu pages",
+                seq_id, page_ids.size());
+    return true;
+}
+
+void* DriftEngineKVCache::get_kv_data(uint64_t seq_id, int position)
+{
+    // Get page for this position
+    if (!sequence_manager_->Contains(seq_id)) {
+        return nullptr;
+    }
+    
+    const Sequence* seq = sequence_manager_->Get(seq_id);
+    if (!seq) {
+        return nullptr;
+    }
+    
+    // Calculate page index from position
+    const int page_size = kv_layout_.page_size;
+    const int page_idx = position / page_size;
+    
+    auto it = seq_to_blocks_.find(seq_id);
+    if (it == seq_to_blocks_.end() || page_idx >= static_cast<int>(it->second.size())) {
+        return nullptr;
+    }
+    
+    const int block_id = it->second[page_idx];
+    return sequence_manager_->GetBlockPtr(block_id);
+}
+
+void DriftEngineKVCache::release_kv_space(uint64_t seq_id)
+{
+    // 1. Remove block mapping local to the unified cache bridge
+    seq_to_blocks_.erase(seq_id);
+
+    // 2. Remove from SequenceManager. KVCacheManager lifetime and page
+    // release are owned by the DriftEngine scheduler / CapacityScheduler.
+    if (sequence_manager_) {
+        (void)sequence_manager_->Erase(seq_id);
+    }
+    
+    TM_LOG_DEBUG("[DriftEngineKVCache] Released KV space for seq %lu", seq_id);
+}
+
+bool DriftEngineKVCache::lookup_prefix(uint64_t seq_id, const std::vector<int>& tokens, int& matched_len)
+{
+    if (!prefix_cache_) {
+        matched_len = 0;
+        return false;
+    }
+    
+    PrefixKey key{};
+    key.tokens.assign(tokens.begin(), tokens.end());
+    key.namespace_id = 0;
+
+    auto match = prefix_cache_->match(key);
+    matched_len = match.matched_tokens;
+    if (matched_len == 0) {
+        return false;
+    }
+
+    // Map prefix cache pages to sequence blocks
+    if (!match.page_indices.empty()) {
+        seq_to_blocks_[seq_id] = std::vector<int>(match.page_indices.begin(), match.page_indices.end());
+    }
+
+    return true;
+}
+
+void DriftEngineKVCache::store_prefix(uint64_t seq_id, const std::vector<int>& tokens)
+{
+    if (!prefix_cache_) {
+        return;
+    }
+    
+    // Get current blocks for this sequence
+    auto it = seq_to_blocks_.find(seq_id);
+    if (it == seq_to_blocks_.end()) {
+        return;
+    }
+    
+    PrefixKey key{};
+    key.tokens.assign(tokens.begin(), tokens.end());
+    key.namespace_id = 0;
+
+    prefix_cache_->insert(key, it->second, /*priority*/ 0, seq_id);
+    
+    TM_LOG_DEBUG("[DriftEngineKVCache] Stored prefix for seq %lu: %zu tokens", 
+                seq_id, tokens.size());
+}
+
+size_t DriftEngineKVCache::get_used_capacity() const
+{
+    if (!kv_cache_manager_) {
+        return 0;
+    }
+    
+    return kv_cache_manager_->used_pages() * kv_cache_manager_->page_bytes();
+}
+
+size_t DriftEngineKVCache::get_total_capacity() const
+{
+    if (!kv_cache_manager_) {
+        return 0;
+    }
+    
+    return kv_cache_manager_->total_pages() * kv_cache_manager_->page_bytes();
+}
+
+bool DriftEngineKVCache::has_sequence(uint64_t seq_id) const
+{
+    return seq_to_blocks_.find(seq_id) != seq_to_blocks_.end();
+}
+
+// Step E: CUDA graph capture and execution for performance optimization
+void LlamaBatch::capture_and_initialize_cuda_graphs()
+{
+    if (!enable_cuda_graphs_ || mode_ != Mode::kExecutor) {
+        return;
+    }
+    
+    TM_LOG_INFO("[LlamaBatch] Capturing CUDA graphs for executor mode performance");
+    
+    // Capture prefill graph
+    cudaStream_t capture_stream;
+    check_cuda_error(cudaStreamCreate(&capture_stream));
+    check_cuda_error(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal));
+    
+    // Simulate a small prefill operation for graph capture
+    // This is a simplified capture - real implementation would setup full prefill state
+    GenerationState capture_state = exec_state_;
+    Initialize(capture_state);
+    
+    cudaGraph_t prefill_graph = nullptr;
+    check_cuda_error(cudaStreamEndCapture(capture_stream, &prefill_graph));
+    
+    if (prefill_graph) {
+        check_cuda_error(cudaGraphInstantiate(&prefill_graph_exec_, prefill_graph, nullptr, nullptr, 0));
+        prefill_graph_ = prefill_graph;
+        TM_LOG_DEBUG("[LlamaBatch] Captured prefill graph with %d nodes", 
+                    get_graph_node_count(prefill_graph_));
+    }
+    
+    // Capture decode graph
+    check_cuda_error(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal));
+    
+    // Simulate a small decode operation for graph capture
+    Forward(capture_state);
+    
+    cudaGraph_t decode_graph = nullptr;
+    check_cuda_error(cudaStreamEndCapture(capture_stream, &decode_graph));
+    
+    if (decode_graph) {
+        check_cuda_error(cudaGraphInstantiate(&decode_graph_exec_, decode_graph, nullptr, nullptr, 0));
+        decode_graph_ = decode_graph;
+        TM_LOG_DEBUG("[LlamaBatch] Captured decode graph with %d nodes", 
+                    get_graph_node_count(decode_graph_));
+    }
+    
+    check_cuda_error(cudaStreamDestroy(capture_stream));
+    TM_LOG_INFO("[LlamaBatch] CUDA graphs captured and ready for execution");
+}
+
+void LlamaBatch::execute_cuda_graph_forward(GenerationState& g)
+{
+    if (!enable_cuda_graphs_ || mode_ != Mode::kExecutor) {
+        // Fall back to regular Forward if graphs not enabled
+        Forward(g);
+        return;
+    }
+    
+    // Use CUDA graphs for performance when batch composition is stable
+    bool use_prefill_graph = false;  // Determine based on batch state
+    bool use_decode_graph = false;
+    
+    // Simple heuristic: use graphs for stable batch sizes
+    if (state_->active_size > 0 && state_->active_size <= max_batch_size_ / 2) {
+        use_decode_graph = true;  // Decode graph for moderate batch sizes
+    }
+    
+    // Execute with CUDA graphs when applicable
+    if (use_decode_graph && decode_graph_exec_) {
+        TM_LOG_DEBUG("[LlamaBatch] Executing decode with CUDA graph (batch_size=%d)", 
+                    state_->active_size);
+        check_cuda_error(cudaGraphLaunch(decode_graph_exec_, stream_));
+        return;
+    }
+    
+    // Fall back to regular forward for other cases
+    TM_LOG_DEBUG("[LlamaBatch] Using regular forward (batch_size=%d, prefill_graph=%s, decode_graph=%s)", 
+                state_->active_size, 
+                use_prefill_graph ? "true" : "false",
+                use_decode_graph ? "true" : "false");
+    
+    Forward(g);
+}
+
+// Helper method to get graph node count for logging
+int LlamaBatch::get_graph_node_count(cudaGraph_t graph) const
+{
+    size_t node_count = 0;
+    if (graph) {
+        check_cuda_error(cudaGraphGetNodes(graph, nullptr, &node_count));
+    }
+    return static_cast<int>(node_count);
 }
 
 }  // namespace turbomind

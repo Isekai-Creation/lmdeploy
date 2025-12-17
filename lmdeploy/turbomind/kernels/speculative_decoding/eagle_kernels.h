@@ -103,6 +103,7 @@ void invokeGetPackedMask(
  * @param packedMask output [batchSize, maxDecodingTokens, numPackedMasks]
  * @param batchSlots batch slot mapping [batchSize]
  * @param paths tree paths [batchSize, maxDecodingTokens, maxPathLen]
+ * @param batchSize number of active requests
  * @param maxDecodingTokens maximum tokens per request
  * @param maxPathLen maximum path length
  * @param stream CUDA stream
@@ -111,6 +112,7 @@ void invokeGetPackedMaskFromPath(
     SizeType* packedMask,
     SizeType const* batchSlots,
     SizeType const* paths,
+    SizeType batchSize,
     SizeType maxDecodingTokens,
     SizeType maxPathLen,
     cudaStream_t stream

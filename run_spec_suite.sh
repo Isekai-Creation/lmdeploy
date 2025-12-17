@@ -11,37 +11,43 @@ mkdir -p "${MICRO_DIR}"
 
 # Paths to models (adjust if needed or override via env)
 MODEL_PATH="${MODEL_PATH:-/workspace/aimo/models/gpt-oss-120b}"
-SPEC_MODEL_PATH="${SPEC_MODEL_PATH:-/workspace/aimo/models/gpt-oss-120b-eagle3}"
 
 echo "[run_spec_suite] Environment:"
 echo "  MODEL_PATH: ${MODEL_PATH}"
-echo "  SPEC_MODEL_PATH: ${SPEC_MODEL_PATH}"
 echo "  MICRO_DIR: ${MICRO_DIR}"
 
-# 1. Run Baseline Scenarios (8K Context)
-# This tests standard generation without speculation hooks active
-echo ""
-echo "[run_spec_suite] Running Baseline (8K Context)..."
-python3 benchmark_speculative.py \
-  --model-path "${MODEL_PATH}" \
-  --spec-model-path "${SPEC_MODEL_PATH}" \
-  --output-dir "${MICRO_DIR}" \
-  --scenario baseline \
-  --warmup-runs "${SPEC_SUITE_WARMUP_RUNS:-1}" \
-  --measurement-runs "${SPEC_SUITE_MEASUREMENT_RUNS:-1}"
+read -r -a BASELINE_CONTEXTS <<< "${SPEC_SUITE_CONTEXTS:-8192 16384 32768}"
+read -r -a BASELINE_BATCHES <<< "${SPEC_SUITE_BATCH_SIZES:-1 4 8}"
+MAX_NEW_ARGS=()
+if [[ -n "${SPEC_SUITE_MAX_NEW_TOKENS:-}" ]]; then
+  MAX_NEW_ARGS+=(--max-new-tokens "${SPEC_SUITE_MAX_NEW_TOKENS}")
+fi
 
-# 2. Run Single-Batch 32K Scenarios (Baseline + Spec)
-# This uses EAGLE3 and tests the core speculative decoding loop
+echo "  BASELINE_CONTEXTS: ${BASELINE_CONTEXTS[*]}"
+echo "  BASELINE_BATCHES: ${BASELINE_BATCHES[*]}"
+if [[ ${#MAX_NEW_ARGS[@]} -gt 0 ]]; then
+  echo "  MAX_NEW_TOKENS: ${SPEC_SUITE_MAX_NEW_TOKENS}"
+fi
+
+# Run baseline-only drift benchmarks (non-speculative)
 echo ""
-echo "[run_spec_suite] Running Single 32K Scenarios (Baseline + Spec)..."
-python3 benchmark_speculative.py \
-  --model-path "${MODEL_PATH}" \
-  --spec-model-path "${SPEC_MODEL_PATH}" \
-  --output-dir "${MICRO_DIR}" \
-  --scenario single \
-  --warmup-runs "${SPEC_SUITE_WARMUP_RUNS:-1}" \
+echo "[run_spec_suite] Running DriftEngine baseline scenarios..."
+python_args=(
+  "${ROOT_DIR}/benchmark_speculative.py"
+  --model-path "${MODEL_PATH}"
+  --output-dir "${MICRO_DIR}"
+  --scenario baseline
+  --warmup-runs "${SPEC_SUITE_WARMUP_RUNS:-1}"
   --measurement-runs "${SPEC_SUITE_MEASUREMENT_RUNS:-1}"
+)
+python_args+=(--baseline-contexts)
+python_args+=("${BASELINE_CONTEXTS[@]}")
+python_args+=(--baseline-batch-sizes)
+python_args+=("${BASELINE_BATCHES[@]}")
+if [[ ${#MAX_NEW_ARGS[@]} -gt 0 ]]; then
+  python_args+=("${MAX_NEW_ARGS[@]}")
+fi
+python3 "${python_args[@]}"
 
 echo ""
 echo "[run_spec_suite] Benchmarks completed. Results are in ${MICRO_DIR}"
-

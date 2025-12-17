@@ -10,6 +10,10 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from lmdeploy import GenerationConfig, PytorchEngineConfig, TurbomindEngineConfig, pipeline
+try:
+    from lmdeploy import DriftEngineConfig
+except ImportError:
+    DriftEngineConfig = None
 from lmdeploy.cli.utils import ArgumentHelper, DefaultsAndTypesHelpFormatter
 from lmdeploy.profiler import Profiler, Session
 from lmdeploy.utils import get_logger
@@ -132,10 +136,23 @@ def sample_random_requests(
 class Engine:
 
     def __init__(self, model_path: str, engine_config, csv: str):
+        # Determine backend based on config type
+        if hasattr(engine_config, '__class__') and 'DriftEngineConfig' in str(type(engine_config)):
+            backend = 'drift'
+        elif hasattr(engine_config, '__class__') and 'TurbomindEngineConfig' in str(type(engine_config)):
+            backend = 'turbomind'
+        elif hasattr(engine_config, '__class__') and 'PytorchEngineConfig' in str(type(engine_config)):
+            backend = 'pytorch'
+        else:
+            # Fallback detection
+            backend = getattr(engine_config, 'backend', 'turbomind')
+        
+        # Pipeline automatically detects backend from config type
         self.pipe = pipeline(model_path, backend_config=engine_config, log_level='ERROR')
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.return_routed_experts = getattr(self.pipe.backend_config, 'enable_return_routed_experts', False)
         self.csv = csv
+        self.backend = backend
 
     def process_request(self, requests, profiler: Profiler, temperature, top_p, top_k, stream_output):
 
@@ -276,6 +293,49 @@ def parse_args():
     ArgumentHelper.max_prefill_iters(tb_group)
     ArgumentHelper.communicator(tb_group)
 
+    # DriftEngine engine args
+    drift_group = parser.add_argument_group('DriftEngine engine argument')
+    drift_group._group_actions.append(tp_act)
+    drift_group._group_actions.append(cache_count_act)
+    drift_group._group_actions.append(session_len_act)
+    drift_group._group_actions.append(cache_block_seq_len_act)
+    drift_group._group_actions.append(prefix_caching_act)
+    
+    # DriftEngine-specific arguments
+    drift_group.add_argument('--prefer-high-throughput', action='store_true', 
+                          help='Prefer high throughput over latency')
+    drift_group.add_argument('--enable-cuda-graphs', action='store_true',
+                          help='Enable CUDA graphs for optimization')
+    drift_group.add_argument('--decode-microbatch-size', type=int, default=None,
+                          help='Decode microbatch size for optimization')
+    drift_group.add_argument('--prefill-microbatch-size', type=int, default=None,
+                          help='Prefill microbatch size for optimization')
+    drift_group.add_argument('--target-latency-ms-p50', type=int, default=100,
+                          help='Target P50 latency in milliseconds')
+    drift_group.add_argument('--target-latency-ms-p95', type=int, default=200,
+                          help='Target P95 latency in milliseconds')
+    drift_group.add_argument('--max-queued-requests', type=int, default=4096,
+                          help='Maximum number of queued requests')
+    drift_group.add_argument('--scheduler-policy', type=str, default='fcfs',
+                          choices=['fcfs', 'lwt', 'priority'],
+                          help='Scheduler policy (fcfs, lwt, priority)')
+    drift_group.add_argument('--kv-layout', type=str, default='standard',
+                          choices=['standard', 'optimized'],
+                          help='KV cache layout (standard, optimized)')
+    drift_group.add_argument('--enable-adaptive-batching', action='store_true',
+                          help='Enable adaptive batching')
+    drift_group.add_argument('--enable-memory-compaction', action='store_true',
+                          help='Enable memory compaction')
+    drift_group.add_argument('--enable-speculative-decoding', action='store_true',
+                          help='Enable speculative decoding')
+    drift_group.add_argument('--speculative-method', type=str, default='eagle3',
+                          choices=['eagle', 'eagle3'],
+                          help='Speculative decoding method')
+    drift_group.add_argument('--max-draft-tokens', type=int, default=16,
+                          help='Maximum number of draft tokens for speculation')
+    drift_group.add_argument('--abort-on-oom', action='store_true', default=True,
+                          help='Abort on out of memory errors')
+
     args = parser.parse_args()
     return args
 
@@ -310,6 +370,38 @@ def main():
             enable_prefix_caching=args.enable_prefix_caching,
             enable_return_routed_experts=args.enable_return_routed_experts,
         )
+    elif args.backend == 'drift':
+        if DriftEngineConfig is None:
+            raise ImportError("DriftEngineConfig not available. Please ensure DriftEngine is properly installed.")
+        
+        # Convert args to DriftEngine config
+        drift_config = {
+            'max_batch_size': args.concurrency,
+            'tp': args.tp,
+            'cache_max_entry_count': args.cache_max_entry_count,
+            'session_len': args.session_len,
+            'cache_block_seq_len': args.cache_block_seq_len,
+            'enable_prefix_caching': args.enable_prefix_caching,
+        }
+        
+        # Add any DriftEngine-specific args if they exist
+        drift_specific_args = [
+            'prefer_high_throughput', 'enable_cuda_graphs', 'decode_microbatch_size',
+            'prefill_microbatch_size', 'target_latency_ms_p50', 'target_latency_ms_p95',
+            'max_queued_requests', 'scheduler_policy', 'kv_layout',
+            'enable_adaptive_batching', 'enable_memory_compaction',
+            'enable_speculative_decoding', 'speculative_method', 'max_draft_tokens'
+        ]
+        
+        for arg in drift_specific_args:
+            if hasattr(args, arg):
+                value = getattr(args, arg)
+                if value is not None:
+                    drift_config[arg] = value
+        
+        engine_config = DriftEngineConfig.from_dict(drift_config)
+    else:
+        raise ValueError(f"Unknown backend: {args.backend}")
 
     engine = Engine(args.model_path, engine_config, csv=args.csv)
 

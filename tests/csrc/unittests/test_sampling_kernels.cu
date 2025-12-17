@@ -15,7 +15,7 @@
 #include "src/turbomind/kernels/sampling_topp_kernels.h"
 #include "src/turbomind/layers/DynamicDecodeLayer.h"
 #include "src/turbomind/macro.h"
-#include "src/turbomind/utils/Tensor.h"
+#include "src/turbomind/core/tensor.h"
 #include "src/turbomind/utils/constant.h"
 #include "src/turbomind/utils/cublasMMWrapper.h"
 #include "src/turbomind/utils/cuda_utils.h"

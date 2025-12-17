@@ -363,6 +363,8 @@ void invokeBuildLeafMask(
     buildLeafMaskKernel<<<grid, BLOCK_SIZE, 0, stream>>>(
         isLeafMask, paths, maxDecodingTokens, maxPathLen
     );
+
+    EagleKernelsCudaCheckAt("eagle_kernels::invokeBuildLeafMask");
 }
 
 void invokeGetPackedMask(
@@ -379,12 +381,15 @@ void invokeGetPackedMask(
     getPackedMaskKernel<<<grid, BLOCK_SIZE, sharedMemSize, stream>>>(
         packedMask, mask, maxDecodingTokens
     );
+
+    EagleKernelsCudaCheckAt("eagle_kernels::invokeGetPackedMask");
 }
 
 void invokeGetPackedMaskFromPath(
     SizeType* packedMask,
     SizeType const* batchSlots,
     SizeType const* paths,
+    SizeType batchSize,
     SizeType maxDecodingTokens,
     SizeType maxPathLen,
     cudaStream_t stream
@@ -393,7 +398,7 @@ void invokeGetPackedMaskFromPath(
     size_t sharedMemSize = maxDecodingTokens * maxDecodingTokens * sizeof(char);
     
     // One block per batch item
-    getPackedMaskFromPathKernel<<<1, BLOCK_SIZE, sharedMemSize, stream>>>(
+    getPackedMaskFromPathKernel<<<batchSize, BLOCK_SIZE, sharedMemSize, stream>>>(
         packedMask, batchSlots, paths, maxDecodingTokens, maxPathLen
     );
 

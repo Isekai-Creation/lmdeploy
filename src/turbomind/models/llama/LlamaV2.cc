@@ -324,15 +324,21 @@ LlamaV2::LlamaV2(DataType                     dtype,
 
         if (eagle_ok) {
             eagle_buffers_ = std::make_unique<EagleBuffers>();
-            eagle_buffers_->allocate(max_batch_size, eagle_module_.get(), stream_);
+            eagle_buffers_->allocate(max_batch_size,
+                                     eagle_module_.get(),
+                                     static_cast<EagleBuffers::SizeType>(engine.spec_max_decoding_tokens),
+                                     static_cast<EagleBuffers::SizeType>(engine.spec_max_draft_path_len),
+                                     stream_);
             TM_LOG_INFO("[LlamaV2][EAGLE] EAGLE module initialized successfully");
 
-            // Enable target-tree decode only when requested and when we
-            // can provision dedicated hidden-state and FP32 logits
-            // buffers for tree tokens. This keeps tree argmax numerics
-            // stable while reusing the same BF16/MXFP4 compute path as
-            // baseline decode for hidden states and weights.
-            target_tree_supported_ = engine.enable_eagle_target_tree;
+            // Target-tree decode is an experimental EAGLE3 optimisation.
+            // Until its kernels and geometry invariants are fully hardened
+            // in the TurboMind integration, we keep it disabled at the
+            // engine level and rely on the baseline full-KV EAGLE3 path
+            // (single-step target logits + KV rewind / multi-token
+            // advance). This avoids stability issues in the current
+            // target-tree branch while preserving core EAGLE3 behaviour.
+            target_tree_supported_ = false;
             if (target_tree_supported_) {
                 const int64_t max_tree_tokens =
                     static_cast<int64_t>(max_batch_size)
@@ -2196,22 +2202,18 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
                 }
             }
         }
-        else if (d_cum_tree_runtime.size() > 0 && num_packed > 0) {
-            Tensor slot_packed_mask{
-                {batch_size, max_decoding_tokens, num_packed},
-                kInt32,
-                kDEVICE};
-
-            ::lmdeploy::turbomind::kernels::speculative_decoding::invokeGetPackedMask(
-                slot_packed_mask.data<int32_t>(),
-                d_batch_slots, // This should be the d_batch_slots variable declared earlier
-                static_cast<int32_t>(batch_size),
-                static_cast<int32_t>(
-                    max_decoding_tokens),
-                stream_);
-
-            gather_and_attach(slot_packed_mask.data<int32_t>());
-        }
+        // NOTE: A fallback path that attempted to derive a prefix-style
+        // packed mask directly from cumulative tree lengths
+        // (d_cum_tree_runtime) used to call invokeGetPackedMask with an
+        // incorrect second argument (d_batch_slots instead of a boolean
+        // mask). That produced out-of-bounds accesses in
+        // getPackedMaskKernel and manifested as CUDA illegal memory
+        // access errors long after the offending kernel had run. Until a
+        // correct prefix-mask construction is implemented, we disable
+        // this fallback and rely solely on the explicit path-based
+        // packed masks populated in EagleBuffers->inputs.packed_masks.
+        // This keeps the tree decode numerically safe while we continue
+        // to harden the EAGLE3 mask pipeline.
     }
 
     unified_decoder_->Forward(args, weights_->decoder_layer_weights);
@@ -4066,9 +4068,9 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     for (int i = 0; i < batch_size; ++i) {
         batch_slots[i] = i;
     }
-    Tensor d_batch_slots{{batch_size}, kInt32, kDEVICE};
+    Buffer_<int> d_batch_slots(batch_size, kDEVICE);
     check_cuda_error(cudaMemcpyAsync(
-        d_batch_slots.raw_data(),
+        d_batch_slots.data(),
         batch_slots.data(),
         batch_size * sizeof(int),
         cudaMemcpyHostToDevice,
@@ -4089,9 +4091,22 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     else {
         active_batch_slots = batch_slots;
     }
-    Tensor d_active_batch_slots{{accept_batch_size}, kInt32, kDEVICE};
+
+    // Host-side invariants: ensure that the tree geometry we are about to
+    // expose to device kernels is self-consistent and bounded by the
+    // engine-level EAGLE configuration. These checks are cheap and help
+    // catch planner or bookkeeping bugs before they turn into illegal
+    // memory accesses inside the CUDA kernels.
+    TM_CHECK_GE(accept_batch_size, 0);
+    TM_CHECK_LE(accept_batch_size, batch_size);
+    TM_CHECK_GE(tokens_per_seq, 1);
+    TM_CHECK_LE(tokens_per_seq, engine_param_.spec_max_decoding_tokens);
+    TM_CHECK_GE(paths_per_seq, 1);
+    TM_CHECK_LE(paths_per_seq, engine_param_.spec_max_draft_path_len);
+
+    Buffer_<int> d_active_batch_slots(accept_batch_size, kDEVICE);
     check_cuda_error(cudaMemcpyAsync(
-        d_active_batch_slots.raw_data(),
+        d_active_batch_slots.data(),
         active_batch_slots.data(),
         accept_batch_size * sizeof(int),
         cudaMemcpyHostToDevice,
@@ -4110,13 +4125,11 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
 
     ::lmdeploy::turbomind::kernels::speculative_decoding::invokeGetPackedMaskFromPath(
         reinterpret_cast<int32_t*>(eagle_buffers_->inputs.packed_masks),
-        reinterpret_cast<int32_t*>(d_active_batch_slots.raw_data()),
-        reinterpret_cast<int32_t const*>(
-            eagle_buffers_->inputs.draft_paths),
+        reinterpret_cast<int32_t*>(d_active_batch_slots.data()),
+        reinterpret_cast<int32_t const*>(eagle_buffers_->inputs.draft_paths),
         static_cast<int32_t>(accept_batch_size),
         static_cast<int32_t>(max_tokens_for_masks),
-        static_cast<int32_t>(
-            engine_param_.spec_max_draft_path_len),
+        static_cast<int32_t>(engine_param_.spec_max_draft_path_len),
         stream_);
 
     EagleCudaCheckAt("LlamaV2::dynamicDecodeWithSpecMulti::invokeGetPackedMaskFromPath");
@@ -4130,7 +4143,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     // Optional target-tree decode over the speculative tree.
     if (spec_ctx.enable_eagle_target_tree && isTargetTreeDecodeEnabled()) {
         runEagleTargetTreeDecode(
-            batch_size, spec_ctx.d_sequence_lengths, spec_ctx.sequences, d_batch_slots.data<int>());
+            batch_size, spec_ctx.d_sequence_lengths, spec_ctx.sequences, d_batch_slots.data());
     }
 
         // Posterior/typical gating (entropy-based) on draft logits if provided.
@@ -4226,12 +4239,28 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
     const SpecSizeType num_paths_device = static_cast<SpecSizeType>(paths_per_seq);
     const SpecSizeType max_path_len_dev = static_cast<SpecSizeType>(max_path_len);
 
+    // Re-assert key geometry relationships and buffer presence before
+    // launching the acceptance kernel so that any obvious misuse is
+    // caught on the host.
+    TM_CHECK_GE(inferred_tokens_per_seq, 1);
+    TM_CHECK_LE(inferred_tokens_per_seq, engine_param_.spec_max_decoding_tokens);
+    TM_CHECK_GE(num_paths, 1);
+    TM_CHECK_LE(num_paths, engine_param_.spec_max_decoding_tokens);
+    TM_CHECK_GE(max_path_len, 1);
+    TM_CHECK_LE(max_path_len, engine_param_.spec_max_draft_path_len);
+    TM_CHECK(eagle_buffers_->inputs.draft_tokens);
+    TM_CHECK(eagle_buffers_->inputs.target_tokens);
+    TM_CHECK(eagle_buffers_->inputs.draft_paths);
+    TM_CHECK(eagle_buffers_->outputs.best_path_ids);
+    TM_CHECK(eagle_buffers_->outputs.accepted_lens);
+    TM_CHECK(eagle_buffers_->outputs.accepted_tokens);
+
     kernels::speculative_decoding::invokeTreeAcceptByIdsWithPaths(
         reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.draft_tokens),
         reinterpret_cast<SpecTokenIdType const*>(eagle_buffers_->inputs.target_tokens),
         reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
         reinterpret_cast<SpecTokenIdType const*>(spec_ctx.d_end_ids),
-        reinterpret_cast<SpecSizeType const*>(d_active_batch_slots.raw_data()),
+        reinterpret_cast<SpecSizeType const*>(d_active_batch_slots.data()),
         static_cast<SpecSizeType>(accept_batch_size),
         max_batch_size,
         num_paths_device,
@@ -4493,7 +4522,7 @@ void LlamaV2::dynamicDecodeWithSpecMulti(GenerationState& g,
             reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.accepted_lens),
             reinterpret_cast<SpecSizeType const*>(eagle_buffers_->outputs.best_path_ids),
             reinterpret_cast<SpecSizeType const*>(eagle_buffers_->inputs.draft_paths),
-            reinterpret_cast<SpecSizeType const*>(d_active_batch_slots.data<int>()),
+            reinterpret_cast<SpecSizeType const*>(d_active_batch_slots.data()),
             static_cast<SpecSizeType>(accept_batch_size),
             static_cast<SpecSizeType>(batch_size),
             static_cast<SpecSizeType>(paths_per_seq),

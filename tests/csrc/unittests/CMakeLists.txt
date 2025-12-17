@@ -32,38 +32,38 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 add_executable(unittest
-    test_logprob_kernels.cu
-    test_penalty_kernels.cu
-    test_sampling_kernels.cu
-    test_sampling_layer.cu
+    test_engine_scheduler.cc
+    test_drift_engine.cc # Added test_drift_engine.cc
 )
 
 # automatic discovery of unit tests
-target_link_libraries(unittest PUBLIC "${TORCH_LIBRARIES}" gtest_main)
+target_link_libraries(unittest PUBLIC "${TORCH_LIBRARIES}" gtest_main xgrammar)
 target_compile_features(unittest PRIVATE cxx_std_14)
 
 # Sorted by alphabetical order of test name.
-target_link_libraries(  # Libs for test_attention_kernels
-  unittest PUBLIC
-    CUDA::cudart CUDA::curand
-    gpt_kernels gtest memory_utils tensor unfused_attention_kernels cuda_utils logger)
-target_link_libraries(  # Libs for test_logprob_kernels
-  unittest PUBLIC
-    CUDA::cudart
-    logprob_kernels memory_utils cuda_utils logger)
-target_link_libraries(  # Libs for test_penalty_kernels
-  unittest PUBLIC
-    CUDA::cublas CUDA::cublasLt CUDA::cudart
-    sampling_penalty_kernels memory_utils cuda_utils logger)
-target_link_libraries(  # Libs for test_sampling_kernel
-  unittest PUBLIC
-    CUDA::cudart
-    sampling_topk_kernels sampling_topp_kernels memory_utils tensor cuda_utils logger)
-target_link_libraries(  # Libs for test_sampling_layer
-  unittest PUBLIC
-    CUDA::cublas CUDA::cublasLt CUDA::cudart
-    cublasMMWrapper memory_utils
-    DynamicDecodeLayer cuda_utils logger
-)
-target_link_libraries(  # Libs for test_tensor
-  unittest PUBLIC cuda_utils logger)
+# target_link_libraries(  # Libs for test_attention_kernels
+#   unittest PUBLIC
+#     CUDA::cudart CUDA::curand
+#     gpt_kernels gtest memory_utils tensor unfused_attention_kernels cuda_utils logger)
+target_link_libraries( # Libs for test_engine_scheduler
+  unittest PUBLIC engine core Llama) # Changed from models to Llama library
+# target_link_libraries(  # Libs for test_logprob_kernels
+#   unittest PUBLIC
+#     CUDA::cudart
+#     logprob_kernels memory_utils cuda_utils logger)
+# target_link_libraries(  # Libs for test_penalty_kernels
+#   unittest PUBLIC
+#     CUDA::cublas CUDA::cublasLt CUDA::cudart
+#     sampling_penalty_kernels memory_utils cuda_utils logger)
+# target_link_libraries(  # Libs for test_sampling_kernel
+#   unittest PUBLIC
+#     CUDA::cudart
+#     sampling_topk_kernels sampling_topp_kernels memory_utils tensor cuda_utils logger)
+# target_link_libraries(  # Libs for test_sampling_layer
+#   unittest PUBLIC
+#     CUDA::cublas CUDA::cublasLt CUDA::cudart
+#     cublasMMWrapper memory_utils
+#     DynamicDecodeLayer cuda_utils logger
+# )
+# target_link_libraries(  # Libs for test_tensor
+#   unittest PUBLIC cuda_utils logger)

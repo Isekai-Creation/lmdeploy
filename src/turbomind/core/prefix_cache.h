@@ -56,12 +56,14 @@ class PrefixCache {
 public:
     explicit PrefixCache(int page_size, KVCacheManager* kv_cache_manager); // Add KVCacheManager
 
-    PrefixMatchResult match(const PrefixKey& key) const;
-    void insert(const PrefixKey& key,
-                const std::vector<int32_t>& page_indices,
-                int priority = 0,
-                uint64_t seq_id = 0);
-    void erase(uint64_t seq_id); // Erase by sequence ID, not PrefixKey
+    virtual ~PrefixCache() = default;
+
+    virtual PrefixMatchResult match(const PrefixKey& key) const;
+    virtual void insert(const PrefixKey& key,
+                        const std::vector<int32_t>& page_indices,
+                        int priority = 0,
+                        uint64_t seq_id = 0);
+    virtual void erase(uint64_t seq_id); // Erase by sequence ID, not PrefixKey
 
     // Eviction logic
     void evict_lru_entry(); // Evict the least recently used entry

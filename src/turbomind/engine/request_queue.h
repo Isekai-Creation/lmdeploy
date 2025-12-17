@@ -66,7 +66,7 @@ public:
              std::vector<std::shared_ptr<Request>>& kill_reqs,
              unsigned                               max_infer,
              bool                                   blocking,
-             bool&                                  abort)
+             std::atomic<bool>&                     abort)
     {
         std::unique_lock lock{mutex_};
 

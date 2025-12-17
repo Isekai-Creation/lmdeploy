@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <cub/cub.cuh>
 
+#include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
+
 namespace turbomind {
 namespace kernels {
 namespace speculative_decoding {
@@ -186,6 +189,15 @@ void invokeTreeAcceptByIdsWithPaths(
         best_path_ids,
         accepted_lens,
         accepted_tokens);
+
+    // Attribute any illegal memory access in the acceptance kernel to
+    // this callsite when EAGLE invariants debugging is enabled. This
+    // mirrors the behaviour of EagleKernelsCudaCheckAt in eagle_kernels.cu
+    // but leverages the generic sync_check_cuda_error() hook so that
+    // the error is surfaced with file/line information.
+    if (::turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        sync_check_cuda_error();
+    }
 }
 
 }  // namespace speculative_decoding

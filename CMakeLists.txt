@@ -85,6 +85,8 @@ FetchContent_Declare(
 set(YAML_BUILD_SHARED_LIBS OFF CACHE BOOL "Build static library of yaml-cpp")
 FetchContent_MakeAvailable(yaml-cpp)
 
+set(pybind11_DIR "/workspace/aimo/miniconda/envs/lmdeploy/lib/python3.11/site-packages/pybind11/share/cmake/pybind11")
+
 FetchContent_Declare(
   xgrammar
   GIT_REPOSITORY          https://github.com/mlc-ai/xgrammar.git
@@ -341,9 +343,9 @@ endif()
 
 add_subdirectory(src)
 
-# if(BUILD_TEST)
-#     add_subdirectory(tests/csrc)
-# endif()
+if(BUILD_TEST)
+    add_subdirectory(tests/csrc)
+endif()
 
 # install python api
 if (BUILD_PY_FFI)

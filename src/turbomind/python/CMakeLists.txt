@@ -3,15 +3,11 @@
 cmake_minimum_required(VERSION 3.11)
 project(_turbomind LANGUAGES CXX CUDA)
 
-execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-m" "pybind11" "--cmakedir"
-                RESULT_VARIABLE _COMMAND_SUCCESS
-                OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
-set(pybind11_DIR "${PYBIND11_CMAKE_DIR}") # Set pybind11_DIR explicitly
 find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(${PROJECT_NAME} bind.cpp)
-target_link_libraries(${PROJECT_NAME} PRIVATE LlamaTritonBackend)
+# Link order matters for static archives; place providers after dependents.
+target_link_libraries(${PROJECT_NAME} PRIVATE LlamaTritonBackend engine Llama core)
 
 set(DEST_DIR "${CMAKE_SOURCE_DIR}/lmdeploy/turbomind")
 set(TARGET_FILE_NAME "$<TARGET_FILE_NAME:${PROJECT_NAME}>")

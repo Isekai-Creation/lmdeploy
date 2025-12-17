@@ -2,7 +2,7 @@
 import os
 from typing import List, Literal, Optional, Union
 
-from .archs import get_task
+from .archs import get_task, autoget_backend_config
 
 from .messages import PytorchEngineConfig, SpeculativeConfig, TurbomindEngineConfig, TurboMindEngineConfig, DriftEngineConfig
 
@@ -72,7 +72,14 @@ def pipeline(model_path: str,
 
     if isinstance(backend_config, (TurboMindEngineConfig, DriftEngineConfig)):
         _model_path = backend_config.model_path if backend_config.model_path is not None else _model_path
-        _log_level = backend_config.log_level if backend_config.log_level is not None else _log_level
+        # Convert DriftEngineConfig log_level from lowercase to proper Python logging levels
+        if hasattr(backend_config, 'log_level') and backend_config.log_level is not None:
+            if isinstance(backend_config, DriftEngineConfig):
+                _log_level = backend_config.log_level.upper()
+            else:
+                _log_level = backend_config.log_level
+        else:
+            _log_level = _log_level
         _speculative_config = backend_config.speculative_config if hasattr(backend_config, 'speculative_config') and backend_config.speculative_config is not None else _speculative_config
         _backend_config_for_engine = backend_config
     elif isinstance(backend_config, TurbomindEngineConfig):

@@ -36,7 +36,12 @@ struct Context {
 
     Context(int device_id):
         core_stream{core::Stream::create()},
-        allocator{core::Allocator(core_stream, false)},
+        // Use a simple device allocator (plain cudaMalloc/cudaFree) by
+        // default. The mem-pool-backed allocator is reserved for custom
+        // contexts and is not needed for the standard Llama execution
+        // path, which simplifies debugging of illegal accesses in the
+        // KV/EAGLE3 stack.
+        allocator{core::Allocator(kDEVICE)},
         stream{core_stream.handle()},
         linear{std::make_unique<LlamaLinear>(stream)}
     {

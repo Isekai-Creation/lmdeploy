@@ -15,6 +15,7 @@
  */
 
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/utils/eagle_debug.h"
 #include "src/turbomind/macro.h"
 #include <driver_types.h>
 #include <regex>
@@ -23,22 +24,25 @@ namespace turbomind {
 
 void syncAndCheck(const char* const file, int const line)
 {
-    // When FT_DEBUG_LEVEL=DEBUG, must check error
-    static char* level_name = std::getenv("TM_DEBUG_LEVEL");
-    if (level_name != nullptr) {
-        static std::string level = std::string(level_name);
-        if (level == "DEBUG") {
-            cudaDeviceSynchronize();
-            cudaError_t result = cudaGetLastError();
-            if (result) {
-                TM_LOG_ERROR((std::string("CUDA runtime error: ") + (_cudaGetErrorEnum(result)) + " " + file + ":"
-                              + std::to_string(line))
-                                 .c_str());
-                std::abort();
-            }
-            TM_LOG_DEBUG(fmtstr("run syncAndCheck at %s:%d", file, line));
-        }
+    static char*       level_name = std::getenv("TM_DEBUG_LEVEL");
+    static std::string level      = level_name ? std::string(level_name) : std::string();
+
+    const bool tm_debug_enabled     = (level == "DEBUG");
+    const bool sync_check_requested = tm_debug_enabled;
+
+    if (!sync_check_requested) {
+        return;
     }
+
+    cudaDeviceSynchronize();
+    cudaError_t result = cudaGetLastError();
+    if (result) {
+        TM_LOG_ERROR((std::string("CUDA runtime error: ") + (_cudaGetErrorEnum(result)) + " " + file + ":"
+                      + std::to_string(line))
+                         .c_str());
+        std::abort();
+    }
+    TM_LOG_DEBUG(fmtstr("run syncAndCheck at %s:%d", file, line));
 }
 
 /* **************************** debug tools ********************************* */

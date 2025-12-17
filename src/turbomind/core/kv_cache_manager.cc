@@ -1,7 +1,10 @@
 #include "src/turbomind/core/kv_cache_manager.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/cuda_utils.h"
 #include <numeric> // For std::iota
 #include <cuda_runtime_api.h> // For cudaMalloc and cudaFree
+#include <cassert>
+#include <unordered_set>
 
 namespace turbomind {
 
@@ -28,7 +31,28 @@ static void free_device_memory(void* ptr) {
 KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_bytes)
     : layout_(layout), total_capacity_bytes_(total_capacity_bytes)
 {
-    page_bytes_ = static_cast<size_t>(layout_.num_layers) * layout_.num_kv_heads * layout_.head_dim * layout_.page_size * layout_.bytes_per_value;
+    FT_CHECK_WITH_INFO(layout_.num_layers > 0, "KVLayout.num_layers must be positive");
+    FT_CHECK_WITH_INFO(layout_.num_kv_heads > 0, "KVLayout.num_kv_heads must be positive");
+    FT_CHECK_WITH_INFO(layout_.head_dim > 0, "KVLayout.head_dim must be positive");
+    FT_CHECK_WITH_INFO(layout_.page_size > 0, "KVLayout.page_size must be positive");
+
+    int effective_bpv      = layout_.bytes_per_value > 0 ? layout_.bytes_per_value : bytes_per_value_from_dtype(layout_.kv_dtype);
+    layout_.bytes_per_value = effective_bpv;
+    page_bytes_             = static_cast<size_t>(layout_.num_layers) * layout_.num_kv_heads * layout_.head_dim * layout_.page_size * effective_bpv;
+
+    TM_LOG_INFO("[KVCacheManager] layout: layers=%d kv_heads=%d head_dim=%d page_size=%d dtype=%d bpv=%d page_bytes=%zu",
+                layout_.num_layers,
+                layout_.num_kv_heads,
+                layout_.head_dim,
+                layout_.page_size,
+                static_cast<int>(layout_.kv_dtype),
+                effective_bpv,
+                page_bytes_);
+
+    if (page_bytes_ == 0) {
+        TM_LOG_ERROR("KVCacheManager page_bytes computed as 0. Invalid layout.");
+        return;
+    }
 
     size_t num_pages = total_capacity_bytes_ / page_bytes_;
     if (num_pages == 0) {
@@ -123,9 +147,18 @@ bool KVCacheManager::reserve(uint64_t seq_id,
     allocated_page_ids.reserve(est.pages_needed); // Pre-reserve capacity
 
     // First, incorporate pre-existing pages from the prefix cache
+    std::unordered_set<int> seen_pages;
     for (int page_id : pre_existing_page_ids) {
         if (page_id < 0 || page_id >= all_pages_.size()) {
             TM_LOG_ERROR("Pre-existing page ID %d for sequence %lu is invalid. Failing reservation.", page_id, seq_id);
+            return false;
+        }
+        if (all_pages_[page_id].is_free) {
+            TM_LOG_ERROR("Pre-existing page ID %d for sequence %lu is marked free. Failing reservation.", page_id, seq_id);
+            return false;
+        }
+        if (!seen_pages.insert(page_id).second) {
+            TM_LOG_ERROR("Duplicate pre-existing page ID %d for sequence %lu.", page_id, seq_id);
             return false;
         }
         // Increment ref count for pre-existing pages
@@ -140,6 +173,14 @@ bool KVCacheManager::reserve(uint64_t seq_id,
         TM_LOG_DEBUG("Insufficient free pages to reserve for sequence ID: %lu. Needed: %zu, Available: %zu (after pre-existing: %zu)",
                   seq_id, est.pages_needed, free_page_ids_.size(), remaining_pages_needed);
         // If not enough pages are available, revert the ref count increments
+        for (int page_id : pre_existing_page_ids) {
+            page_ref_counts_[page_id]--;
+        }
+        return false;
+    }
+    if (allocated_page_ids.size() > est.pages_needed) {
+        TM_LOG_ERROR("Pre-existing pages (%zu) exceed requested pages (%zu) for sequence %lu",
+                     allocated_page_ids.size(), est.pages_needed, seq_id);
         for (int page_id : pre_existing_page_ids) {
             page_ref_counts_[page_id]--;
         }
@@ -176,6 +217,9 @@ void KVCacheManager::release(uint64_t seq_id)
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto res_it = seq_reservations_.find(seq_id);
+    
+    assert(res_it != seq_reservations_.end() && "Attempted to release non-existent reservation");
+
     if (res_it == seq_reservations_.end()) {
         TM_LOG_WARNING("Attempted to release non-existent reservation for sequence ID: %lu", seq_id);
         return;
@@ -193,8 +237,12 @@ void KVCacheManager::release(uint64_t seq_id)
             TM_LOG_ERROR("Internal error: Invalid page ID %d in allocated_page_ids for sequence %lu", page_id, seq_id);
             continue;
         }
-        
+        if (page_ref_counts_[page_id] <= 0) {
+            TM_LOG_ERROR("Page ref count underflow for page %d during release of seq %lu", page_id, seq_id);
+            continue;
+        }
         page_ref_counts_[page_id]--;
+
         if (page_ref_counts_[page_id] == 0) {
             all_pages_[page_id].is_free = true;
             free_page_ids_.push(page_id);
@@ -255,26 +303,23 @@ KVUsageEstimate KVCacheManager::estimate_usage(const ModelLayout& layout,
                                               int prompt_len,
                                               int max_new_tokens)
 {
-    // As defined in ENGINE_TODOS.md section 4.1.1
     int total_tokens = prompt_len + max_new_tokens;
-    // Ensure at least one page is allocated even for 0 tokens if page_size > 0
-    int pages = (total_tokens > 0 && layout.page_size > 0) ? (total_tokens + layout.page_size - 1) / layout.page_size : 0;
-    if (pages == 0 && total_tokens > 0 && layout.page_size > 0) { // If total_tokens > 0 but pages rounded to 0
-        pages = 1; // At least one page to store any token data
+    int pages        = (total_tokens > 0 && layout.page_size > 0)
+                           ? (total_tokens + layout.page_size - 1) / layout.page_size
+                           : 0;
+
+    if (pages == 0 && total_tokens > 0 && layout.page_size > 0) {
+        pages = 1;
     }
-    if (pages == 0 && total_tokens == 0) { // No tokens, no pages needed
-        pages = 0;
-    }
-    
-    // Default bytes_per_value to 2 for half (fp16/bf16)
-    // ModelLayout doesn't have bytes_per_value field, so we use a constant
-    int bytes_per_value_eff = 2;
+
+    int bytes_per_value_eff = bytes_per_value_from_dtype(layout.kv_dtype);
 
     size_t bytes = static_cast<size_t>(pages)
                  * layout.num_layers
                  * layout.num_kv_heads
                  * layout.head_dim
-                 * bytes_per_value_eff; // Use effective bytes_per_value
+                 * layout.page_size
+                 * bytes_per_value_eff;
 
     return {static_cast<size_t>(pages), bytes};
 }

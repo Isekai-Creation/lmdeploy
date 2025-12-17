@@ -1,10 +1,19 @@
 #include "src/turbomind/engine/EngineScheduler.h"
 #include "src/turbomind/engine/capacity_scheduler.h"
 #include "src/turbomind/engine/drift_metrics.h"
+#include "src/turbomind/engine/drift_engine_config.h" // Added for from_engine_config implementation
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/core/allocator.h"
+#include "src/turbomind/models/llama/LlamaBatch.h"  // For ExecutionResult
 #include <algorithm> // For std::min, std::max
+#include <cstring>
 
 namespace turbomind {
+
+// Implementation of from_engine_config
+SchedulerConfig SchedulerConfig::from_engine_config(const DriftEngineConfig& engine_config) {
+    return engine_config.scheduler_config;
+}
 
 EngineScheduler::EngineScheduler(const SchedulerConfig& cfg,
                                  KVCacheManager*        kv_mgr,
@@ -17,9 +26,10 @@ EngineScheduler::EngineScheduler(const SchedulerConfig& cfg,
     prefix_cache_(prefix_cache),
     capacity_scheduler_(capacity_scheduler),
     metrics_{},
-    decode_token_ratio_(1.0),
-    prefill_token_ratio_(0.0)
+    decode_token_ratio_(0.5),
+    prefill_token_ratio_(0.5)
 {
+    session_len_limit_ = model_layout_.max_seq_len;
 }
 
 EngineScheduler::EngineScheduler(const SchedulerConfig& cfg, KVCacheManager* kv_mgr):
@@ -29,14 +39,33 @@ EngineScheduler::EngineScheduler(const SchedulerConfig& cfg, KVCacheManager* kv_
     prefix_cache_(nullptr),
     capacity_scheduler_(nullptr),
     metrics_{},
-    decode_token_ratio_(1.0),
-    prefill_token_ratio_(0.0)
+    decode_token_ratio_(0.5),
+    prefill_token_ratio_(0.5)
 {
+    session_len_limit_ = 0;
 }
 
 void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>>& infer_reqs,
                                       const std::vector<std::shared_ptr<Request>>& kill_reqs)
 {
+    auto extract_prompt_tokens = [&](const std::shared_ptr<Request>& req, std::vector<int>& tokens_out) -> bool {
+        auto it = req->inputs.find("input_ids");
+        if (it == req->inputs.end()) {
+            return false;
+        }
+        const auto& tensor = it->second;
+        if (tensor.device().type != DeviceType::kCPU && tensor.device().type != DeviceType::kCPUpinned) {
+            return false; // skip prefix cache if not host-accessible
+        }
+        const int prompt_len = tensor.shape(0);
+        if (prompt_len <= 0) {
+            return false;
+        }
+        tokens_out.resize(prompt_len);
+        std::memcpy(tokens_out.data(), tensor.data<int>(), sizeof(int) * prompt_len);
+        return true;
+    };
+
     // Admit new requests and perform basic KV capacity checks.
     for (const auto& r : infer_reqs) {
         if (!r) {
@@ -45,78 +74,110 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
 
         // Enforce SessionParam legal state transitions
         if (r->session.start_flag) {
-            // New session must start with step 0, and not be marked as end or kill
-            if (r->session.step != 0 || r->session.end_flag || r->session.kill_flag) {
-                TM_LOG_WARNING("[EngineScheduler] Rejecting new request %llu due to inconsistent SessionParam: start_flag=true implies step=0, end_flag=false, kill_flag=false. (step=%d, end=%d, kill=%d)",
-                               r->session.id, r->session.step, r->session.end_flag, r->session.kill_flag);
+            // Allow start + end=true for single-shot requests; only
+            // disallow non-zero step or kill on a start.
+            if (r->session.step != 0 || r->session.kill_flag) {
+                TM_LOG_WARNING(
+                    "[EngineScheduler] Rejecting new request %llu due to inconsistent SessionParam: start_flag=true implies step=0 and kill_flag=false. (step=%d, kill=%d)",
+                    r->session.id,
+                    r->session.step,
+                    r->session.kill_flag);
                 r->ec = Request::kInconsistency;
                 continue;
             }
-        } else {
-            // Continuation request must have a step > 0 (or look up existing sequence)
-            // And can have end_flag or kill_flag set.
+        }
+        else {
             if (r->session.step == 0 && !r->session.end_flag && !r->session.kill_flag) {
-                // If not starting, not ending, not killing, and step is 0, this is likely an error.
-                TM_LOG_WARNING("[EngineScheduler] Rejecting continuation request %llu due to inconsistent SessionParam: step=0 for a non-start, non-end, non-kill request.", r->session.id);
+                TM_LOG_WARNING(
+                    "[EngineScheduler] Rejecting continuation request %llu due to inconsistent SessionParam: step=0 for a non-start, non-end, non-kill request.",
+                    r->session.id);
                 r->ec = Request::kInconsistency;
                 continue;
             }
-            // Further checks on consistency with existing sequence state will be done later.
+            auto seq_it = seq_states_.find(r->session.id);
+            if (seq_it == seq_states_.end()) {
+                TM_LOG_WARNING("[EngineScheduler] Continuation request %llu for unknown sequence. Rejecting.", r->session.id);
+                r->ec = Request::kInvalid;
+                continue;
+            }
+
+            if (r->session.kill_flag) {
+                // Treat as kill
+                prefill_request_queue_.remove_if([&](const std::shared_ptr<Request>& req){ return req->session.id == r->session.id; });
+                decode_request_queue_.remove_if([&](const std::shared_ptr<Request>& req){ return req->session.id == r->session.id; });
+                seq_states_.erase(r->session.id);
+                active_requests_.erase(r->session.id);
+                if (kv_mgr_) kv_mgr_->release(r->session.id);
+                if (capacity_scheduler_) capacity_scheduler_->finish_request(r->session.id);
+                r->ec = Request::kCancel;
+                continue;
+            }
+
+            if (r->session.end_flag) {
+                // Graceful finish: mark sequence finished and release resources.
+                update_sequence_state(r->session.id, 0, seq_it->second.max_new_tokens - seq_it->second.generated_len);
+                continue;
+            }
         }
 
-        // Capacity check only for new sequences.
         if (kv_mgr_ && r->session.start_flag) {
-            int prompt_len = r->inputs.at("input_ids").shape(0);
+            const int prompt_len = r->inputs.at("input_ids").shape(0);
+            if (session_len_limit_ > 0) {
+                const int total_required = prompt_len + r->gen_cfg.max_new_tokens;
+                if (total_required > session_len_limit_) {
+                    TM_LOG_WARNING("[EngineScheduler] Rejecting request %llu: prompt(%d) + max_new_tokens(%d) exceeds session_len limit %d",
+                                   r->session.id,
+                                   prompt_len,
+                                   r->gen_cfg.max_new_tokens,
+                                   session_len_limit_);
+                    r->ec = Request::kTooLong;
+                    continue;
+                }
+            }
+            std::vector<int> prompt_tokens;
             std::vector<int> pre_existing_page_ids;
             int matched_tokens = 0;
 
-            if (prefix_cache_ && cfg_.enable_prefix_caching) {
-                PrefixKey key;
-                key.tokens.assign(r->inputs.at("input_ids").data<int>(), r->inputs.at("input_ids").data<int>() + prompt_len);
-                key.namespace_id = 0; // Default namespace for now
-
+            if (prefix_cache_ && cfg_.enable_prefix_caching && extract_prompt_tokens(r, prompt_tokens)) {
+                PrefixKey key{prompt_tokens, 0};
                 PrefixMatchResult result = prefix_cache_->match(key);
                 if (result.matched_tokens > 0) {
-                    matched_tokens = result.matched_tokens;
+                    matched_tokens        = result.matched_tokens;
                     pre_existing_page_ids = result.page_indices;
                     TM_LOG_DEBUG("[EngineScheduler] PrefixCache matched %d tokens for sequence %llu.", matched_tokens, r->session.id);
                 }
             }
 
-            // Estimate usage considering potentially pre-existing pages
-            const KVUsageEstimate est = KVCacheManager::estimate_usage(
-                model_layout_, prompt_len, r->gen_cfg.max_new_tokens); // est.pages_needed should be total pages for the full sequence
+            const KVUsageEstimate est = KVCacheManager::estimate_usage(model_layout_, prompt_len, r->gen_cfg.max_new_tokens);
 
             KVReservation reservation{};
-            bool reservation_success = false;
+            bool          reservation_success = false;
 
-            if (capacity_scheduler_) { // Use capacity_scheduler if available
+            if (capacity_scheduler_) {
                 reservation_success = capacity_scheduler_->try_start_request(r->session.id, est, &reservation, pre_existing_page_ids);
                 if (!reservation_success) {
                     TM_LOG_WARNING(
-                        "[EngineScheduler] Rejecting request %llu due to insufficient KV capacity "
-                        "(needed %zu pages) via CapacityScheduler.",
+                        "[EngineScheduler] Rejecting request %llu due to insufficient KV capacity (needed %zu pages) via CapacityScheduler.",
                         r->session.id,
                         est.pages_needed);
-                    r->ec = Request::kTooLong; // Set error code for rejection
+                    r->ec = Request::kTooLong;
                     continue;
                 }
-            } else if (kv_mgr_) { // Fallback to direct KVCacheManager if no CapacityScheduler
+            }
+            else if (kv_mgr_) {
                 reservation_success = kv_mgr_->reserve(r->session.id, est, &reservation, pre_existing_page_ids);
                 if (!reservation_success) {
                     TM_LOG_WARNING(
-                        "[EngineScheduler] Rejecting request %llu due0to insufficient KV capacity "
-                        "(needed %zu pages) via KVCacheManager.",
+                        "[EngineScheduler] Rejecting request %llu due to insufficient KV capacity (needed %zu pages) via KVCacheManager.",
                         r->session.id,
                         est.pages_needed);
-                    r->ec = Request::kTooLong; // Set error code for rejection
+                    r->ec = Request::kTooLong;
                     continue;
                 }
-            } else {
-                TM_LOG_WARNING(
-                    "[EngineScheduler] No KV manager or capacity scheduler. Request %llu admitted without KV checks.",
-                    r->session.id);
-                reservation_success = true; // Assume success if no checks can be performed
+            }
+            else {
+                reservation_success = true;
+                TM_LOG_WARNING("[EngineScheduler] No KV manager or capacity scheduler. Request %llu admitted without KV checks.", r->session.id);
             }
 
             if (reservation_success) {
@@ -125,65 +186,47 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
                 SequenceState state{};
                 state.seq_id          = r->session.id;
                 state.prompt_len      = prompt_len;
-                state.prefilled_len   = matched_tokens; // Start with matched tokens as prefilled
+                state.prefilled_len   = matched_tokens;
                 state.generated_len   = 0;
                 state.max_new_tokens  = r->gen_cfg.max_new_tokens;
                 state.phase           = (matched_tokens == prompt_len) ? SequencePhase::kDecode : SequencePhase::kPrefill;
-                state.prefill_chunk_size = 0; // Will be determined during scheduling
-                
+                state.queue_tag       = (state.phase == SequencePhase::kPrefill) ? SequenceQueue::kPrefill : SequenceQueue::kDecode;
+                state.kv_reservation_handle = reservation.first_page;
+
                 seq_states_[state.seq_id] = state;
                 if (state.phase == SequencePhase::kPrefill) {
-                    FT_CHECK_WITH_INFO(std::find(prefill_request_queue_.begin(), prefill_request_queue_.end(), r) == prefill_request_queue_.end(),
-                                       "New request already exists in prefill queue.");
                     prefill_request_queue_.push_back(r);
-                    FT_CHECK_WITH_INFO(std::find(decode_request_queue_.begin(), decode_request_queue_.end(), r) == decode_request_queue_.end(),
-                                       "New request added to prefill queue is also in decode queue.");
-                } else { // Matched full prompt, goes to decode
-                    FT_CHECK_WITH_INFO(std::find(decode_request_queue_.begin(), decode_request_queue_.end(), r) == decode_request_queue_.end(),
-                                       "New request already exists in decode queue.");
+                }
+                else {
                     decode_request_queue_.push_back(r);
-                    FT_CHECK_WITH_INFO(std::find(prefill_request_queue_.begin(), prefill_request_queue_.end(), r) == prefill_request_queue_.end(),
-                                       "New request added to decode queue is also in prefill queue.");
                 }
             }
-        } else if (r->session.start_flag) { // No KV manager, but still a start flag
+        }
+        else if (r->session.start_flag) {
+            const int prompt_len = r->inputs.at("input_ids").shape(0);
+            if (session_len_limit_ > 0 && prompt_len + r->gen_cfg.max_new_tokens > session_len_limit_) {
+                TM_LOG_WARNING("[EngineScheduler] Rejecting request %llu: prompt(%d) + max_new_tokens(%d) exceeds session_len limit %d",
+                               r->session.id,
+                               prompt_len,
+                               r->gen_cfg.max_new_tokens,
+                               session_len_limit_);
+                r->ec = Request::kTooLong;
+                continue;
+            }
             FT_CHECK_WITH_INFO(seq_states_.find(r->session.id) == seq_states_.end(),
                                "Attempting to add new sequence that already exists in seq_states_ (no KV manager).");
             SequenceState state{};
             state.seq_id          = r->session.id;
-            state.prompt_len      = r->inputs.at("input_ids").shape(0);
+            state.prompt_len      = prompt_len;
             state.prefilled_len   = 0;
             state.generated_len   = 0;
             state.max_new_tokens  = r->gen_cfg.max_new_tokens;
             state.phase           = SequencePhase::kPrefill;
-            state.prefill_chunk_size = 0;
+            state.queue_tag       = SequenceQueue::kPrefill;
             seq_states_[state.seq_id] = state;
             prefill_request_queue_.push_back(r);
-            FT_CHECK_WITH_INFO(std::find(decode_request_queue_.begin(), decode_request_queue_.end(), r) == decode_request_queue_.end(),
-                               "New request added to prefill queue is also in decode queue (no KV manager).");
-        } else {
-            // Continuation request
-            auto it = seq_states_.find(r->session.id);
-            if (it != seq_states_.end()) {
-                if (it->second.phase == SequencePhase::kPrefill) {
-                    prefill_request_queue_.push_back(r);
-                    FT_CHECK_WITH_INFO(std::find(decode_request_queue_.begin(), decode_request_queue_.end(), r) == decode_request_queue_.end(),
-                                       "Continuation request added to prefill queue is also in decode queue.");
-                } else if (it->second.phase == SequencePhase::kDecode) { // Already in decode phase
-                    decode_request_queue_.push_back(r);
-                    FT_CHECK_WITH_INFO(std::find(prefill_request_queue_.begin(), prefill_request_queue_.end(), r) == prefill_request_queue_.end(),
-                                       "Continuation request added to decode queue is also in prefill queue.");
-                } else { // Should be kFinished, implies an issue if it's a continuation
-                     TM_LOG_WARNING("[EngineScheduler] Continuation request %llu for finished sequence. Rejecting.", r->session.id);
-                     r->ec = Request::kInvalid;
-                }
-            } else {
-                TM_LOG_WARNING("[EngineScheduler] Continuation request %llu for unknown sequence. Rejecting.", r->session.id);
-                r->ec = Request::kInvalid;
-            }
         }
 
-        // Add to active requests map if not rejected
         if (!r->ec) {
             active_requests_[r->session.id] = r;
         }
@@ -222,10 +265,7 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
 }
 
 
-void EngineScheduler::update_sequence_state(uint64_t      seq_id,
-                                            SequencePhase new_phase,
-                                            int           prefilled_len,
-                                            int           generated_len)
+void EngineScheduler::update_sequence_state(uint64_t seq_id, int prefilled_tokens_added, int generated_tokens_added)
 {
     auto it = seq_states_.find(seq_id);
     if (it == seq_states_.end()) {
@@ -234,11 +274,44 @@ void EngineScheduler::update_sequence_state(uint64_t      seq_id,
     }
 
     SequenceState& state = it->second;
-    state.phase          = new_phase;
-    state.prefilled_len  = prefilled_len;
-    state.generated_len  = generated_len;
+    
+    state.prefilled_len += prefilled_tokens_added;
+    state.generated_len += generated_tokens_added;
 
-    if (new_phase == SequencePhase::kFinished) {
+    if (state.phase == SequencePhase::kPrefill && state.prefilled_len >= state.prompt_len) {
+        state.phase     = SequencePhase::kDecode;
+        state.queue_tag = SequenceQueue::kNone;
+        TM_LOG_DEBUG("[EngineScheduler] Sequence %lu completed prefill, moving to decode phase.", seq_id);
+        
+        // After prefill completes, insert the prefix into the cache
+        if (prefix_cache_ && kv_mgr_) {
+            auto req_it = active_requests_.find(seq_id);
+            if (req_it != active_requests_.end()) {
+                const auto& req = req_it->second;
+                PrefixKey key;
+                key.tokens.assign(req->inputs.at("input_ids").data<int>(), req->inputs.at("input_ids").data<int>() + state.prompt_len);
+                key.namespace_id = 0; // Default namespace
+
+                // Get allocated KV page indices for this sequence
+                std::vector<int> page_indices = kv_mgr_->get_sequence_page_ids(seq_id);
+                if (!page_indices.empty()) {
+                    prefix_cache_->insert(key, page_indices, 0, seq_id); // priority 0, pass seq_id for internal mapping
+                    TM_LOG_DEBUG("[EngineScheduler] Inserted prefix for sequence %lu into PrefixCache.", seq_id);
+                } else {
+                    TM_LOG_WARNING("[EngineScheduler] Sequence %lu completed prefill but has no allocated KV pages. Not inserting to PrefixCache.", seq_id);
+                }
+            } else {
+                TM_LOG_WARNING("[EngineScheduler] Sequence %lu completed prefill, but request not found in active_requests_. Cannot insert to PrefixCache.", seq_id);
+            }
+        }
+    }
+
+    if (state.generated_len >= state.max_new_tokens) {
+        state.phase     = SequencePhase::kFinished;
+        state.queue_tag = SequenceQueue::kNone;
+    }
+
+    if (state.phase == SequencePhase::kFinished) {
         TM_LOG_DEBUG("[EngineScheduler] Sequence %lu finished. Releasing resources.", seq_id);
         if (kv_mgr_) {
             kv_mgr_->release(seq_id);
@@ -249,32 +322,8 @@ void EngineScheduler::update_sequence_state(uint64_t      seq_id,
         seq_states_.erase(seq_id);
         active_requests_.erase(seq_id);
 
-        // Assert that the sequence is no longer in any queues
-        FT_CHECK_WITH_INFO(std::find_if(prefill_request_queue_.begin(), prefill_request_queue_.end(),
-                                       [&](const auto& r_ptr){ return r_ptr->session.id == seq_id; }) == prefill_request_queue_.end(),
-                           "Finished sequence still in prefill queue.");
-        FT_CHECK_WITH_INFO(std::find_if(decode_request_queue_.begin(), decode_request_queue_.end(),
-                                       [&](const auto& r_ptr){ return r_ptr->session.id == seq_id; }) == decode_request_queue_.end(),
-                           "Finished sequence still in decode queue.");
-
-    } else if (state.phase == SequencePhase::kPrefill && state.prefilled_len >= state.prompt_len) {
-        // Transition from prefill to decode
-        TM_LOG_DEBUG("[EngineScheduler] Sequence %lu completed prefill, moving to decode phase.", seq_id);
-        // Find the request in the prefill queue.
-        auto req_it = active_requests_.find(seq_id);
-        if (req_it != active_requests_.end()) {
-            FT_CHECK_WITH_INFO(std::find(prefill_request_queue_.begin(), prefill_request_queue_.end(), req_it->second) != prefill_request_queue_.end(),
-                               "Request to move from prefill to decode not found in prefill queue.");
-            prefill_request_queue_.remove(req_it->second); // Remove from prefill
-            
-            FT_CHECK_WITH_INFO(std::find(decode_request_queue_.begin(), decode_request_queue_.end(), req_it->second) == decode_request_queue_.end(),
-                               "Request already in decode queue before moving from prefill.");
-            decode_request_queue_.push_back(req_it->second); // Add to decode
-            
-            FT_CHECK_WITH_INFO(std::find(prefill_request_queue_.begin(), prefill_request_queue_.end(), req_it->second) == prefill_request_queue_.end(),
-                               "Request still in prefill queue after moving to decode.");
-        }
-        state.phase = SequencePhase::kDecode; // Set new phase AFTER successful queue manipulation.
+        prefill_request_queue_.remove_if([&](const auto& r_ptr){ return r_ptr->session.id == seq_id; });
+        decode_request_queue_.remove_if([&](const auto& r_ptr){ return r_ptr->session.id == seq_id; });
     }
 }
 
@@ -303,26 +352,72 @@ void EngineScheduler::update_metrics(const DriftMetrics& new_metrics)
                  (int)metrics_.ema_p95_latency_ms, cfg_.target_latency_ms_p95, decode_token_ratio_);
 }
 
-double EngineScheduler::get_decode_token_ratio() const {
+DriftMetrics EngineScheduler::snapshot_metrics() const
+{
+    DriftMetrics snapshot{};
+
+    {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+        snapshot.active_requests = active_requests_.size();
+        snapshot.queued_prefill  = prefill_request_queue_.size();
+        snapshot.queued_decode   = decode_request_queue_.size();
+    }
+
+    if (kv_mgr_) {
+        snapshot.kv_total_pages = kv_mgr_->total_pages();
+        snapshot.kv_used_pages  = kv_mgr_->used_pages();
+        snapshot.kv_free_pages  = kv_mgr_->free_pages();
+    }
+
+    if (capacity_scheduler_) {
+        snapshot.kv_blocked  = capacity_scheduler_->blocked_due_to_capacity();
+        snapshot.kv_rejected = capacity_scheduler_->rejected_never_schedulable();
+    }
+
+    if (prefix_cache_) {
+        snapshot.prefix_hits          = prefix_cache_->get_hit_count();
+        snapshot.prefix_misses        = prefix_cache_->get_miss_count();
+        snapshot.prefix_evictions     = prefix_cache_->get_eviction_count();
+        snapshot.prefix_bytes_evicted = prefix_cache_->get_bytes_evicted();
+    }
+
+    snapshot.ema_tokens_per_second = metrics_.ema_tokens_per_second;
+    snapshot.ema_p50_latency_ms    = metrics_.ema_p50_latency_ms;
+    snapshot.ema_p95_latency_ms    = metrics_.ema_p95_latency_ms;
+
+    return snapshot;
+}
+double EngineScheduler::get_decode_token_ratio() const
+{
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     return decode_token_ratio_;
 }
 
 int EngineScheduler::get_active_requests_count() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_); // Protects access to active_requests_
     return active_requests_.size();
 }
 
 int EngineScheduler::get_queued_requests_count() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_); // Protects access to prefill_request_queue_ and decode_request_queue_
     return prefill_request_queue_.size() + decode_request_queue_.size();
 }
 
 bool EngineScheduler::empty() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_); // Protects access to queues and active_requests_
     return active_requests_.empty() && prefill_request_queue_.empty() && decode_request_queue_.empty();
 }
 
-int EngineScheduler::tokens_for_decode_step(const SequenceState& state) const {
-    // For standard decoding, 1 token per step.
-    // Future: Support for speculative decoding where we might budget more slots.
+bool EngineScheduler::has_oom_detected() const {
+    return oom_detected_;
+}
+
+void EngineScheduler::clear_oom_detected() {
+    oom_detected_ = false;
+}
+int EngineScheduler::tokens_for_decode_step(const SequenceState& state) const
+{
+    // Non-spec mode: always 1 token per decode step.
     return 1;
 }
 
@@ -343,204 +438,272 @@ int EngineScheduler::tokens_for_prefill_chunk(const SequenceState& state) const 
 
 
 void EngineScheduler::schedule_step(std::vector<PrefillChunk>&             prefill_batch,
-                                    std::vector<std::shared_ptr<Request>>& decode_batch)
+                                     std::vector<std::shared_ptr<Request>>& decode_batch)
 {
     prefill_batch.clear();
     decode_batch.clear();
 
-    int current_num_seqs = 0;
-    int current_tokens_prefill = 0;
-    int current_tokens_decode = 0;
+    // Apply scheduling policy to the prefill queue
+    if (cfg_.schedule_policy == SchedulerConfig::SchedulePolicy::kSmallFirst) {
+        prefill_request_queue_.sort([&](const std::shared_ptr<Request>& a, const std::shared_ptr<Request>& b) {
+            auto it_a = seq_states_.find(a->session.id);
+            auto it_b = seq_states_.find(b->session.id);
+            if (it_a != seq_states_.end() && it_b != seq_states_.end()) {
+                return it_a->second.prompt_len < it_b->second.prompt_len;
+            }
+            return false; // Should not happen if queues are consistent
+        });
+    }
+    // FCFS is the default order of std::list
 
-    // Calculate token budgets based on ratios
-    int decode_budget_tokens;
-    int prefill_budget_tokens;
+    int current_num_seqs         = 0;
+    int current_tokens_prefill   = 0;
+    int current_tokens_decode    = 0;
+    int total_tokens_in_batch    = 0;
 
-    // Ensure atomic access to ratios if they can be updated by another thread (update_metrics)
-    {
-        std::lock_guard<std::mutex> lock(metrics_mutex_);
-        decode_budget_tokens = static_cast<int>(cfg_.max_num_batched_tokens * decode_token_ratio_);
-        prefill_budget_tokens = cfg_.max_num_batched_tokens - decode_budget_tokens;
+    // Two-pass scheduling:
+    // 1. Decode pass
+    // 2. Prefill pass
+    // The `prefer_decode_over_prefill` flag determines which pass runs first.
+
+    int max_decode_tokens_budget = static_cast<int>(cfg_.max_num_batched_tokens * get_decode_token_ratio());
+    int max_prefill_tokens_budget = cfg_.max_num_batched_tokens - max_decode_tokens_budget;
+
+    max_decode_tokens_budget = std::max(0, max_decode_tokens_budget);
+    max_prefill_tokens_budget = std::max(0, max_prefill_tokens_budget);
+    if (max_decode_tokens_budget + max_prefill_tokens_budget > cfg_.max_num_batched_tokens) {
+        max_prefill_tokens_budget = cfg_.max_num_batched_tokens - max_decode_tokens_budget;
     }
 
-    // Prioritize decode requests if configured
-    if (cfg_.prefer_decode_over_prefill) {
-        // Fill decode_batch first
-        for (auto it = decode_request_queue_.begin(); it != decode_request_queue_.end(); ) {
-            const auto& req = *it;
-            auto state_it = seq_states_.find(req->session.id);
+    std::vector<std::list<std::shared_ptr<Request>>::iterator> decode_selected;
+    std::vector<std::list<std::shared_ptr<Request>>::iterator> prefill_selected;
 
-            // Handle kFinished or unknown sequences
-            if (state_it == seq_states_.end() || state_it->second.phase == SequencePhase::kFinished) {
-                TM_LOG_DEBUG("[EngineScheduler][schedule_step] Removing finished/unknown decode request %llu from queue.", req->session.id);
+    auto schedule_decode_pass = [&]() {
+        auto it = decode_request_queue_.begin();
+        while (it != decode_request_queue_.end()) {
+            if (current_num_seqs >= cfg_.max_num_seqs ||
+                total_tokens_in_batch >= cfg_.max_num_batched_tokens ||
+                current_tokens_decode >= max_decode_tokens_budget) {
+                break;
+            }
+
+            auto& req      = *it;
+            auto  state_it = seq_states_.find(req->session.id);
+
+            if (state_it == seq_states_.end() || state_it->second.phase != SequencePhase::kDecode) {
                 it = decode_request_queue_.erase(it);
                 continue;
             }
 
-            if (current_num_seqs >= cfg_.max_num_seqs) break;
-            if (current_tokens_decode >= decode_budget_tokens) break;
+            int tokens_needed = tokens_for_decode_step(state_it->second);
+            if (tokens_needed <= 0) {
+                it = decode_request_queue_.erase(it);
+                continue;
+            }
 
-            const auto& state = state_it->second;
-            int tokens_needed = tokens_for_decode_step(state);
-
-            if (current_tokens_decode + tokens_needed <= decode_budget_tokens) {
+            if (total_tokens_in_batch + tokens_needed <= cfg_.max_num_batched_tokens &&
+                current_tokens_decode + tokens_needed <= max_decode_tokens_budget) {
                 decode_batch.push_back(req);
+                total_tokens_in_batch += tokens_needed;
                 current_tokens_decode += tokens_needed;
                 current_num_seqs++;
-                it = decode_request_queue_.erase(it); // Remove from queue and advance iterator
-            } else {
-                ++it; // Cannot fit this request, try next
+                state_it->second.queue_tag = SequenceQueue::kNone;
+                decode_selected.push_back(it++);
+            }
+            else {
+                ++it;
             }
         }
+    };
 
-        // Fill prefill_batch with remaining capacity
-        for (auto it = prefill_request_queue_.begin(); it != prefill_request_queue_.end(); ) {
-            const auto& req = *it;
+    auto schedule_prefill_pass = [&]() {
+        auto it = prefill_request_queue_.begin();
+        while (it != prefill_request_queue_.end()) {
+            if (current_num_seqs >= cfg_.max_num_seqs ||
+                total_tokens_in_batch >= cfg_.max_num_batched_tokens ||
+                current_tokens_prefill >= max_prefill_tokens_budget) {
+                break;
+            }
+
+            auto& req = *it;
             auto state_it = seq_states_.find(req->session.id);
 
-            // Handle kFinished or unknown sequences
-            if (state_it == seq_states_.end() || state_it->second.phase == SequencePhase::kFinished) {
-                TM_LOG_DEBUG("[EngineScheduler][schedule_step] Removing finished/unknown prefill request %llu from queue.", req->session.id);
+            if (state_it == seq_states_.end() || state_it->second.phase != SequencePhase::kPrefill) {
                 it = prefill_request_queue_.erase(it);
                 continue;
             }
 
-            if (current_num_seqs >= cfg_.max_num_seqs) break;
-            if (current_tokens_prefill >= prefill_budget_tokens) break;
-
-            const auto& state = state_it->second;
-
-            if (state.phase != SequencePhase::kPrefill) { // Should already be in decode_request_queue_ or finished
-                TM_LOG_DEBUG("[EngineScheduler][schedule_step] Prefill request %llu in unexpected phase %d. Removing.", req->session.id, (int)state.phase);
-                it = prefill_request_queue_.erase(it);
-                continue;
-            }
-
-            // Chunked prefill logic
+            auto& state = state_it->second;
             int chunk_len = tokens_for_prefill_chunk(state);
-            if (chunk_len == 0) { // Prefill complete, move to decode queue
-                TM_LOG_DEBUG("[EngineScheduler] Sequence %lu prefill complete, calling update_sequence_state to transition to decode phase.", req->session.id);
-                // Call update_sequence_state to handle the transition and queue movement
-                update_sequence_state(req->session.id, SequencePhase::kDecode, state.prompt_len, state.generated_len);
-                // The request will be moved to decode_request_queue_ and erased from prefill_request_queue_ by update_sequence_state.
-                it = prefill_request_queue_.erase(it);
-                continue;
-            }
 
-            if (current_tokens_prefill + chunk_len <= prefill_budget_tokens) {
-                // Check if this is a "long" prefill and respect max_num_partial_prefills
-                if (cfg_.max_num_partial_prefills > 0 && 
-                    state.prompt_len > cfg_.long_prefill_token_threshold) 
-                {
-                    // Count how many long prefill requests are already in batch
-                    int long_prefill_count = 0;
-                    for(const auto& pc : prefill_batch) {
-                        const auto& pc_state_it = seq_states_.find(pc.req->session.id);
-                        if (pc_state_it != seq_states_.end() && pc_state_it->second.prompt_len > cfg_.long_prefill_token_threshold) {
-                            long_prefill_count++;
-                        }
-                    }
-                    if (long_prefill_count >= cfg_.max_num_partial_prefills) {
-                        ++it; // Skip this long prefill for now, try next
-                        continue;
-                    }
-                }
-
+            if (chunk_len > 0 &&
+                total_tokens_in_batch + chunk_len <= cfg_.max_num_batched_tokens &&
+                current_tokens_prefill + chunk_len <= max_prefill_tokens_budget) {
                 prefill_batch.push_back({req, state.prefilled_len, chunk_len});
+                total_tokens_in_batch += chunk_len;
                 current_tokens_prefill += chunk_len;
                 current_num_seqs++;
-                // Update the state for the scheduled chunk (this will be finalized by LlamaBatch)
-                seq_states_[req->session.id].prefilled_len += chunk_len; 
-                it = prefill_request_queue_.erase(it); // Remove from queue and advance iterator
-            } else {
-                ++it; // Cannot fit this chunk, try next
+                state.queue_tag = SequenceQueue::kNone;
+                prefill_selected.push_back(it++);
+            }
+            else {
+                ++it;
             }
         }
-    } else { // No prioritization, or prefer prefill (not implemented yet, default to balance)
-        // For now, a simple round-robin or first-come-first-served approach.
-        // This section will be refined.
-        // For simplicity, let's still try to fill decode first, then prefill, up to limits.
-        // Re-use logic above without explicit preference.
-        
-        // Temporarily copy requests to a combined list to simplify iteration
-        std::list<std::shared_ptr<Request>> combined_queue;
-        combined_queue.splice(combined_queue.end(), decode_request_queue_);
-        combined_queue.splice(combined_queue.end(), prefill_request_queue_);
+    };
 
-        for (auto it = combined_queue.begin(); it != combined_queue.end(); ) {
-            const auto& req = *it;
-            auto state_it = seq_states_.find(req->session.id);
+    if (cfg_.prefer_decode_over_prefill) {
+        schedule_decode_pass();
+        schedule_prefill_pass();
+    }
+    else {
+        schedule_prefill_pass();
+        schedule_decode_pass();
+    }
 
-            // Handle kFinished or unknown sequences
-            if (state_it == seq_states_.end() || state_it->second.phase == SequencePhase::kFinished) {
-                TM_LOG_DEBUG("[EngineScheduler][schedule_step] Removing finished/unknown combined request %llu from queue.", req->session.id);
-                it = combined_queue.erase(it);
-                continue;
-            }
+    for (auto it_sel : decode_selected) {
+        decode_request_queue_.erase(it_sel);
+    }
+    for (auto it_sel : prefill_selected) {
+        prefill_request_queue_.erase(it_sel);
+    }
+ 
+     FT_CHECK_WITH_INFO(total_tokens_in_batch <= cfg_.max_num_batched_tokens, "Total tokens scheduled exceeds max_num_batched_tokens.");
+     FT_CHECK_WITH_INFO(static_cast<int>(prefill_batch.size() + decode_batch.size()) <= cfg_.max_num_seqs, "Total sequences scheduled exceeds max_num_seqs.");
+ 
+     TM_LOG_DEBUG("[EngineScheduler] scheduled step: prefill_seqs=%zu decode_seqs=%zu prefill_tokens=%d decode_tokens=%d total_tokens=%d",
+                  prefill_batch.size(),
+                  decode_batch.size(),
+                  current_tokens_prefill,
+                  current_tokens_decode,
+                  total_tokens_in_batch);
+ }
 
-            if (current_num_seqs >= cfg_.max_num_seqs) break;
 
-            const auto& state = state_it->second;
-
-            if (state.phase == SequencePhase::kPrefill) {
-                int chunk_len = tokens_for_prefill_chunk(state);
-                if (chunk_len == 0) { // Prefill complete, move to decode queue
-                    TM_LOG_DEBUG("[EngineScheduler] Sequence %lu prefill complete, calling update_sequence_state to transition to decode phase.", req->session.id);
-                    // Call update_sequence_state to handle the transition and queue movement
-                    update_sequence_state(req->session.id, SequencePhase::kDecode, state.prompt_len, state.generated_len);
-                    // The request will be moved to decode_request_queue_ and erased from combined_queue by update_sequence_state.
-                    it = combined_queue.erase(it);
-                    continue;
-                }
-
-                if (current_tokens_prefill + chunk_len <= prefill_budget_tokens) {
-                    prefill_batch.push_back({req, state.prefilled_len, chunk_len});
-                    current_tokens_prefill += chunk_len;
-                    current_num_seqs++;
-                    seq_states_[req->session.id].prefilled_len += chunk_len;
-                    it = combined_queue.erase(it);
-                } else {
-                    ++it;
-                }
-            } else if (state.phase == SequencePhase::kDecode) {
-                int tokens_needed = tokens_for_decode_step(state);
-
-                if (current_tokens_decode + tokens_needed <= decode_budget_tokens) {
-                    decode_batch.push_back(req);
-                    current_tokens_decode += tokens_needed;
-                    current_num_seqs++;
-                    it = combined_queue.erase(it);
-                } else {
-                    ++it;
-                }
-            } else { // kFinished or invalid state
-                TM_LOG_DEBUG("[EngineScheduler][schedule_step] Combined request %llu in unexpected phase %d. Removing.", req->session.id, (int)state.phase);
-                it = combined_queue.erase(it);
-            }
+void EngineScheduler::on_step_executed(const std::vector<PrefillChunk>&             prefill_batch,
+                                       const std::vector<std::shared_ptr<Request>>& decode_batch,
+                                       const std::unordered_map<uint64_t, int>&     pre_lengths)
+{
+    auto get_pre_len = [&](uint64_t seq_id) -> int {
+        auto it = pre_lengths.find(seq_id);
+        if (it != pre_lengths.end()) {
+            return it->second;
         }
-        // Return remaining requests to their original queues.
-        // This is a simplified approach, a more robust solution would be needed
-        // to handle requests that couldn't be scheduled.
-        for(const auto& req : combined_queue) {
-            const auto& state_it = seq_states_.find(req->session.id);
-            if (state_it != seq_states_.end()) {
-                if (state_it->second.phase == SequencePhase::kPrefill) {
-                    prefill_request_queue_.push_back(req);
-                } else if (state_it->second.phase == SequencePhase::kDecode) {
-                    decode_request_queue_.push_back(req);
-                }
-            }
+        auto st_it = seq_states_.find(seq_id);
+        if (st_it != seq_states_.end()) {
+            return st_it->second.prefilled_len + st_it->second.generated_len;
+        }
+        return 0;
+    };
+
+    auto compute_delta = [&](const std::shared_ptr<Request>& req, bool is_decode) -> int {
+        if (!req) {
+            return 0;
+        }
+        const uint64_t seq_id   = req->session.id;
+        const int      pre_len  = get_pre_len(seq_id);
+        int            post_len = pre_len;
+ 
+         try {
+             if (req->sequence_length.data()) {
+                 post_len = req->sequence_length.data()[0];
+             }
+             else {
+                 auto it = req->inputs.find("input_ids");
+                 if (it != req->inputs.end()) {
+                     post_len = it->second.shape(0);
+                 }
+             }
+         }
+         catch (...) {
+             // Fall back to scheduler state when sequence_length is not readable.
+         }
+ 
+         int delta = post_len - pre_len;
+         if (delta <= 0) {
+             auto st_it = seq_states_.find(seq_id);
+             if (st_it != seq_states_.end()) {
+                 const int planned = is_decode ? tokens_for_decode_step(st_it->second) : tokens_for_prefill_chunk(st_it->second);
+                 TM_LOG_DEBUG("[EngineScheduler] Backend reported non-positive delta for seq %lu (pre=%d post=%d). Using planned budget %d",
+                              seq_id,
+                              pre_len,
+                              post_len,
+                              planned);
+                 delta = planned;
+             }
+         }
+
+
+        return std::max(delta, 0);
+    };
+
+    // Update states for scheduled requests using actual per-sequence deltas
+    // derived from Request.sequence_length where available.
+    for (const auto& req : decode_batch) {
+        const int delta = compute_delta(req, /*is_decode=*/true);
+        if (!req || delta == 0) {
+            continue;
+        }
+        update_sequence_state(req->session.id, 0, delta);
+        if (auto st_it = seq_states_.find(req->session.id); st_it != seq_states_.end()) {
+            TM_LOG_DEBUG("[EngineScheduler] seq %lu decode advanced by %d tokens (prefilled=%d generated=%d phase=%d)",
+                         req->session.id,
+                         delta,
+                         st_it->second.prefilled_len,
+                         st_it->second.generated_len,
+                         static_cast<int>(st_it->second.phase));
         }
     }
-    // Assert invariants at the end of schedule_step
-    FT_CHECK_WITH_INFO(current_tokens_prefill + current_tokens_decode <= cfg_.max_num_batched_tokens,
-                       "Total tokens scheduled exceeds max_num_batched_tokens.");
-    FT_CHECK_WITH_INFO(prefill_batch.size() + decode_batch.size() <= cfg_.max_num_seqs,
-                       "Total sequences scheduled exceeds max_num_seqs.");
-    
-    // Check for invariant violations regarding empty queues with non-empty seq_states_
-    FT_CHECK_WITH_INFO((!prefill_request_queue_.empty() || !decode_request_queue_.empty() || seq_states_.empty()),
-                       "Queues are empty but seq_states_ is not. Potentially stuck sequences.");
+    for (const auto& chunk : prefill_batch) {
+        if (!chunk.req) {
+            continue;
+        }
+        const int delta = compute_delta(chunk.req, /*is_decode=*/false);
+        if (delta == 0) {
+            continue;
+        }
+        update_sequence_state(chunk.req->session.id, delta, 0);
+        if (auto st_it = seq_states_.find(chunk.req->session.id); st_it != seq_states_.end()) {
+            TM_LOG_DEBUG("[EngineScheduler] seq %lu prefill advanced by %d tokens (prefilled=%d/%d phase=%d)",
+                         chunk.req->session.id,
+                         delta,
+                         st_it->second.prefilled_len,
+                         st_it->second.prompt_len,
+                         static_cast<int>(st_it->second.phase));
+        }
+    }
+
+    // Requeue active sequences based on updated phases
+    for (const auto& req : decode_batch) {
+        auto st_it = seq_states_.find(req->session.id);
+        if (st_it != seq_states_.end() && st_it->second.phase == SequencePhase::kDecode) {
+            st_it->second.queue_tag = SequenceQueue::kDecode;
+            decode_request_queue_.push_back(req);
+        }
+    }
+    for (const auto& chunk : prefill_batch) {
+        if (!chunk.req) {
+            continue;
+        }
+        auto st_it = seq_states_.find(chunk.req->session.id);
+        if (st_it == seq_states_.end()) {
+            continue;
+        }
+        if (st_it->second.phase == SequencePhase::kPrefill && st_it->second.prefilled_len < st_it->second.prompt_len) {
+            st_it->second.queue_tag = SequenceQueue::kPrefill;
+            prefill_request_queue_.push_back(chunk.req);
+        }
+        else if (st_it->second.phase == SequencePhase::kDecode) {
+            st_it->second.queue_tag = SequenceQueue::kDecode;
+            decode_request_queue_.push_back(chunk.req);
+        }
+    }
+}
+
+void EngineScheduler::on_speculative_execution(const std::vector<turbomind::ExecutionResult>& results)
+{
+    // Speculative decoding disabled in v1.
+    (void)results;
 }
 
 }  // namespace turbomind

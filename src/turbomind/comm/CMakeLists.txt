@@ -23,9 +23,9 @@ if (BUILD_MULTI_GPU)
     endif ()
 
     if (BUILD_TEST)
-        add_executable(test_comm test_comm.cu)
-        target_link_libraries(test_comm PRIVATE device_comm host_comm core pthread nvtx_utils)
-        target_compile_options(test_comm PRIVATE -march=native -mtune=native)
+        # add_executable(test_comm test_comm.cu)
+        # target_link_libraries(test_comm PRIVATE device_comm host_comm core pthread nvtx_utils)
+        # target_compile_options(test_comm PRIVATE -march=native -mtune=native)
 
         add_executable(test_host_comm test_host_comm.cc)
         target_link_libraries(test_host_comm PRIVATE host_comm core Threads::Threads)

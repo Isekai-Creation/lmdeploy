@@ -425,6 +425,14 @@ class AsyncEngine(LogitsMixin):
                 **kwargs,
             )
             self.hf_tm_cfg = getattr(self.engine.model_config, "hf_config", None)
+        elif backend == "drift":
+            self.engine = self._build_turbomind(
+                model_path=model_path,
+                backend_config=backend_config,
+                speculative_config=speculative_config,
+                **kwargs,
+            )
+            self.hf_tm_cfg = self.engine.config
         else:
             raise ValueError(f"unsupported backend {backend}")
         self.backend_config = self.engine.engine_config

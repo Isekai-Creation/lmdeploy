@@ -145,12 +145,28 @@ struct EagleBuffers {
     
     /**
      * @brief Allocate all buffers on GPU
-     * 
-     * @param batch_size Maximum batch size
-     * @param module EAGLE module with configuration
-     * @param stream CUDA stream for allocation
+     *
+     * @param batch_size        Maximum batch size for this engine.
+     * @param module            EAGLE module with configuration. The module
+     *                          owns the authoritative max_decoding_tokens
+     *                          and max draft path length used by kernels.
+     * @param expected_max_decoding_tokens
+     *                          Optional host-side expectation for
+     *                          spec_max_decoding_tokens (e.g. from
+     *                          EngineParam). When > 0, invariants mode
+     *                          will assert that this matches the module.
+     * @param expected_max_path_len
+     *                          Optional host-side expectation for
+     *                          spec_max_draft_path_len. When > 0,
+     *                          invariants mode will assert that this
+     *                          matches the module.
+     * @param stream            CUDA stream for allocation and zeroing.
      */
-    void allocate(SizeType batch_size, const EagleModule* module, cudaStream_t stream);
+    void allocate(SizeType batch_size,
+                  const EagleModule* module,
+                  SizeType expected_max_decoding_tokens,
+                  SizeType expected_max_path_len,
+                  cudaStream_t stream);
     
     /**
      * @brief Free all GPU buffers

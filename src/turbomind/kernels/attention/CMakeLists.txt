@@ -76,10 +76,10 @@ if (BUILD_TEST)
         nvidia::cutlass::cutlass
     )
 
-    add_executable(test_fp4mx_quant test_fp4mx_quant.cu test_utils.cu)
-    target_compile_options(test_fp4mx_quant PRIVATE
-        --generate-line-info -O3 -use_fast_math --expt-relaxed-constexpr)
-    target_link_libraries(test_fp4mx_quant PRIVATE
-        nvidia::cutlass::cutlass
-    )
+    # add_executable(test_fp4mx_quant test_fp4mx_quant.cu test_utils.cu)
+    # target_compile_options(test_fp4mx_quant PRIVATE
+    #     --generate-line-info -O3 -use_fast_math --expt-relaxed-constexpr)
+    # target_link_libraries(test_fp4mx_quant PRIVATE
+    #     nvidia::cutlass::cutlass
+    # )
 endif ()

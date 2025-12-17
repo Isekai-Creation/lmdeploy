@@ -284,68 +284,133 @@ class TurbomindEngineConfig:
         assert self.max_prefill_token_num >= 0, "invalid max_prefill_token_num"
         assert self.num_tokens_per_iter >= 0, "invalid num_tokens_per_iter"
 
+        # Optional fast baseline path for TurboMind:
+        #
+        # When LMDEPLOY_TURBOMIND_BASELINE_FASTPATH is set and there is no
+        # speculative_config attached, we treat this engine instance as a
+        # pure non-speculative baseline run and disable higher-level metrics
+        # overhead. This keeps the advanced EAGLE/NVFP4/Drift features
+        # available while making it easy to reproduce 8da9-style baseline
+        # performance for int8/unquantized KV.
+        #
+        # The flag intentionally does NOT change model numerics or KV sizing.
+        import os as _os
+
+        if _os.getenv("LMDEPLOY_TURBOMIND_BASELINE_FASTPATH", "").strip():
+            if self.speculative_config is None and self.quant_policy in (0, 4, 8, 16):
+                # Keep behaviour identical but avoid metrics book-keeping
+                # and logging overhead in tight decode loops.
+                self.enable_metrics = False
+
 
 class TurboMindEngineConfig(TurbomindEngineConfig):
     """Backwards-compatible alias for newer API name."""
     pass
 
 
-
-
-
 @dataclass
-
 class DriftEngineConfig:
+    """Python-side Drift engine configuration.
+
+    This is the canonical config used by pipeline/serve for the DriftEngine
+    backend and is converted into the C++ DriftEngineConfig via
+    `to_cpp_drift_engine_config`.
+    """
 
     # Model / parallelism
-
     model_path: str
-
     tp: int = 1
-
     pp: int = 1
-
     session_len: int = 8192
-
     max_batch_size: int = 256
+    dtype: Literal["fp16", "bf16", "fp8"] = "bf16"
+    cache_max_entry_count: float = 0.75
 
-    dtype: Literal["fp16", "bf16", "fp8"] = "fp16"
-
-
-
-    # Scheduler
-
+    # Scheduler / KV
     scheduler: TurboMindSchedulerConfig = field(default_factory=TurboMindSchedulerConfig)
-
     kv: TurboMindKVConfig = field(default_factory=TurboMindKVConfig)
 
-
-
     # Drift-specific tuning
-
     prefer_high_throughput: bool = True
-
-    # When True, bias scheduler toward larger batches and chunked prefill.
-
     target_latency_ms_p50: int = 50
-
     target_latency_ms_p95: int = 200
-
-    # Expose trade-off knobs:
-
-    decode_microbatch_size: int | None = None
-
-    prefill_microbatch_size: int | None = None
-
-
-
-    # Instrumentation / safety
-
     max_queued_requests: int = 4096
-
     abort_on_oom: bool = True
 
-    log_level: Literal["info", "debug", "warning"] = "info"
+    # Instrumentation / safety
+    enable_metrics: bool = False
+    log_level: Literal["INFO", "DEBUG", "WARNING"] = "INFO"
+
+    # Non-spec MVP: disable speculative/cuda graphs; keep knobs for future
+    enable_prefix_caching: bool = False
+    enable_speculative_decoding: bool = False
+    enable_cuda_graphs: bool = False
+    enable_memory_compaction: bool = False
+    enable_adaptive_batching: bool = False
+    speculative_config: any = None
+    empty_init: bool = False
+    decode_microbatch_size: int | None = None
+    prefill_microbatch_size: int | None = None
+
+    def __post_init__(self):
+        """Validate and derive configuration after initialization."""
+        self._validate_config()
+        self._set_derived_values()
+
+    def _validate_config(self):
+        """Validate configuration parameters."""
+        if self.max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
+
+        if self.tp < 1 or self.pp < 1:
+            raise ValueError("tp and pp must be positive integers")
+
+        if self.target_latency_ms_p50 <= 0 or self.target_latency_ms_p95 <= 0:
+            raise ValueError("latency targets must be positive")
+
+        if self.target_latency_ms_p50 > self.target_latency_ms_p95:
+            raise ValueError("P50 latency target cannot be greater than P95")
+
+        if self.cache_max_entry_count <= 0:
+            raise ValueError("cache_max_entry_count must be positive")
+
+    def _set_derived_values(self):
+        """Set derived values based on configuration."""
+        if self.prefer_high_throughput and self.enable_memory_compaction is False:
+            # Hook for future memory compaction; no-op in MVP.
+            pass
+
+    @classmethod
+    def conservative_baseline(cls, model_path: str = "") -> "DriftEngineConfig":
+        """Create conservative baseline configuration (no optimizations)."""
+        return cls(
+            model_path=model_path,
+            prefer_high_throughput=False,
+            enable_cuda_graphs=False,
+            decode_microbatch_size=None,
+            prefill_microbatch_size=None,
+            target_latency_ms_p50=100,
+            target_latency_ms_p95=200,
+            enable_prefix_caching=False,
+            enable_speculative_decoding=False,
+        )
+
+    @classmethod
+    def optimized(cls, model_path: str = "") -> "DriftEngineConfig":
+        """Create optimized configuration for maximum performance."""
+        return cls(
+            model_path=model_path,
+            prefer_high_throughput=True,
+            enable_cuda_graphs=True,
+            decode_microbatch_size=64,
+            prefill_microbatch_size=128,
+            target_latency_ms_p50=50,
+            target_latency_ms_p95=150,
+            enable_prefix_caching=True,
+            enable_adaptive_batching=True,
+            enable_memory_compaction=True,
+            enable_speculative_decoding=False,  # Enable separately if needed
+        )
 
 
 

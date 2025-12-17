@@ -4,7 +4,7 @@ from typing import Dict, List, Literal, Optional, Union
 
 from transformers import AutoConfig
 
-from .messages import PytorchEngineConfig, TurboMindEngineConfig
+from .messages import PytorchEngineConfig, TurboMindEngineConfig, DriftEngineConfig
 from .utils import get_logger
 
 logger = get_logger('lmdeploy')
@@ -57,17 +57,17 @@ def autoget_backend(model_path: str) -> Literal['turbomind', 'pytorch']:
 
 def autoget_backend_config(
     model_path: str,
-    backend_config: Optional[Union[PytorchEngineConfig, TurboMindEngineConfig]] = None
-) -> Union[PytorchEngineConfig, TurboMindEngineConfig]:
+    backend_config: Optional[Union[PytorchEngineConfig, TurboMindEngineConfig, DriftEngineConfig]] = None
+) -> Union[PytorchEngineConfig, TurboMindEngineConfig, DriftEngineConfig]:
     """Get backend config automatically.
 
     Args:
         model_path (str): The input model path.
-        backend_config (PytorchEngineConfig | TurboMindEngineConfig): The
+        backend_config (PytorchEngineConfig | TurboMindEngineConfig | DriftEngineConfig): The
             input backend config. Default to None.
 
     Returns:
-        (PytorchEngineConfig | TurboMindEngineConfig): The auto-determined
+        (PytorchEngineConfig | TurboMindEngineConfig | DriftEngineConfig): The auto-determined
             backend engine config.
     """
     from dataclasses import asdict
@@ -75,8 +75,16 @@ def autoget_backend_config(
     backend = autoget_backend(model_path)
     if backend == 'pytorch':
         config = PytorchEngineConfig()
+    elif backend == 'drift':
+        # For DriftEngine, return the provided config or create a default one
+        if backend_config is not None:
+            return backend_config
+        else:
+            from .messages import DriftEngineConfig
+            return DriftEngineConfig(model_path=model_path)
     else:
         config = TurboMindEngineConfig()
+    
     if backend_config is not None:
         if type(backend_config) == type(config):
             return backend_config
@@ -85,11 +93,6 @@ def autoget_backend_config(
             for k, v in data.items():
                 if v and hasattr(config, k):
                     setattr(config, k, v)
-            # map attributes with different names
-            if type(backend_config) is TurboMindEngineConfig:
-                config.block_size = backend_config.kv.kv_page_size
-            else:
-                config.kv.kv_page_size = backend_config.block_size
     return config
 
 

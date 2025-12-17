@@ -7,6 +7,12 @@ from .messages import (
     TurbomindEngineConfig,
     VisionConfig,
 )
+
+# Import DriftEngine configuration from messages.py (canonical source)
+try:
+    from .messages import DriftEngineConfig
+except ImportError:  # pragma: no cover
+    DriftEngineConfig = None
 from .model import ChatTemplateConfig
 from .tokenizer import Tokenizer
 from .version import __version__, version_info
@@ -33,4 +39,5 @@ __all__ = [
     "TurbomindEngineConfig",
     "VisionConfig",
     "TurboMind",
+    "DriftEngineConfig",
 ]

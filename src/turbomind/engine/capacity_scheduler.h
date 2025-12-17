@@ -12,16 +12,24 @@ class CapacityScheduler {
 public:
     explicit CapacityScheduler(KVCacheManager* kv_mgr, PrefixCache* prefix_cache);
 
-    bool try_start_request(uint64_t seq_id,
-                           const KVUsageEstimate& est,
-                           KVReservation* out,
-                           const std::vector<int>& pre_existing_page_ids = {});
-    void finish_request(uint64_t seq_id);
+    virtual ~CapacityScheduler() = default;
+
+    virtual bool try_start_request(uint64_t seq_id,
+                                   const KVUsageEstimate& est,
+                                   KVReservation* out,
+                                   const std::vector<int>& pre_existing_page_ids = {});
+    virtual void finish_request(uint64_t seq_id);
+
+    size_t blocked_due_to_capacity() const;
+    size_t rejected_never_schedulable() const;
+    size_t active_reservation_count() const;
+
 private:
     KVCacheManager* kv_mgr_;
     PrefixCache*    prefix_cache_; // New member
-    // Keep track of active reservations (seq_id -> KVReservation)
-    std::unordered_map<uint64_t, KVReservation> active_reservations_; 
+    std::unordered_map<uint64_t, KVReservation> active_reservations_;
+    size_t blocked_due_to_capacity_{0};
+    size_t rejected_never_schedulable_{0};
     mutable std::mutex mutex_;
 };
 

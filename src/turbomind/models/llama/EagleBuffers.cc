@@ -9,7 +9,11 @@
 
 namespace turbomind {
 
-void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cudaStream_t stream) {
+void EagleBuffers::allocate(SizeType   batch_size,
+                            const EagleModule* module,
+                            SizeType   expected_max_decoding_tokens,
+                            SizeType   expected_max_path_len,
+                            cudaStream_t stream) {
     if (allocated_) {
         TM_LOG_WARNING("EagleBuffers already allocated, freeing first");
         free();
@@ -17,13 +21,16 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     
     batch_size_ = batch_size;
     max_decoding_tokens_ = module->getMaxDecodingTokens();
-    max_path_len_ = module->getMaxDraftPathLen();
-    num_packed_masks_ = module->getNumPackedMasks();
-    
+    max_path_len_        = module->getMaxDraftPathLen();
+    num_packed_masks_    = module->getNumPackedMasks();
+
     TM_LOG_INFO("Allocating EagleBuffers: batch_size=%d, max_decoding_tokens=%d, "
                 "max_path_len=%d, num_packed_masks=%d",
-                batch_size_, max_decoding_tokens_, max_path_len_, num_packed_masks_);
-    
+                batch_size_,
+                max_decoding_tokens_,
+                max_path_len_,
+                num_packed_masks_);
+
     // Allocate input buffers
     cudaMalloc(&inputs.draft_tokens, batch_size_ * max_decoding_tokens_ * sizeof(TokenIdType));
     cudaMalloc(&inputs.draft_lens, batch_size_ * sizeof(SizeType));
@@ -80,7 +87,7 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMemsetAsync(inputs.target_tokens, 0, batch_size_ * max_decoding_tokens_ * sizeof(TokenIdType), stream);
     cudaMemsetAsync(inputs.draft_paths, -1, batch_size_ * max_decoding_tokens_ * max_path_len_ * sizeof(SizeType), stream);
     cudaMemsetAsync(outputs.accepted_lens, 0, batch_size_ * sizeof(SizeType), stream);
-    
+
     check_cuda_error(cudaStreamSynchronize(stream));
 
     // Catch any CUDA errors triggered during EagleBuffers allocation
@@ -95,6 +102,29 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
                 "EAGLE buffers may be corrupted; aborting.",
                 static_cast<int>(err),
                 cudaGetErrorString(err));
+            std::abort();
+        }
+    }
+
+    // In invariants mode, ensure that EagleBuffers' structural capacities
+    // line up with the engine's view of EAGLE3 geometry. This guards
+    // against subtle mismatches between EagleModule config.yaml and
+    // EngineParam (spec_max_decoding_tokens / spec_max_draft_path_len)
+    // which would otherwise manifest as out-of-bounds accesses in
+    // tree/mask kernels.
+    if (turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_INVARIANTS_DEBUG")) {
+        if (expected_max_decoding_tokens > 0 && max_decoding_tokens_ != expected_max_decoding_tokens) {
+            TM_LOG_ERROR(
+                "[EagleBuffers][invariants] max_decoding_tokens mismatch: module=%d, engine=%d; aborting.",
+                static_cast<int>(max_decoding_tokens_),
+                static_cast<int>(expected_max_decoding_tokens));
+            std::abort();
+        }
+        if (expected_max_path_len > 0 && max_path_len_ != expected_max_path_len) {
+            TM_LOG_ERROR(
+                "[EagleBuffers][invariants] max_path_len mismatch: module=%d, engine=%d; aborting.",
+                static_cast<int>(max_path_len_),
+                static_cast<int>(expected_max_path_len));
             std::abort();
         }
     }

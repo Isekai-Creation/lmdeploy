@@ -27,7 +27,7 @@ using std::vector;
 
 [[maybe_unused]] static constexpr bool is_ncu = 0;
 
-struct Context {
+struct TestContext {
 
     cudaStream_t stream;
 
@@ -71,14 +71,14 @@ struct Context {
         check_cuda_error(cudaStreamSynchronize(stream));
     }
 
-    Context(int device_id)
+    TestContext(int device_id)
     {
         check_cuda_error(cudaSetDevice(device_id));
         check_cuda_error(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         check_cuda_error(cudaEventCreate(&ev_start));
         check_cuda_error(cudaEventCreate(&ev_end));
     }
-    ~Context()
+    ~TestContext()
     {
         for (auto& p : buffers) {
             cudaFreeAsync(p, stream);
@@ -233,7 +233,7 @@ struct TestComm {
                 std::cout << "done.\n";
             }
 
-            Context ctx{g_rank};
+            TestContext ctx{g_rank};
 
             T* d_data = ctx.malloc<T>(max_count);
 
@@ -388,7 +388,7 @@ struct TestComm {
                 std::cout << "done.\n";
             }
 
-            Context ctx{g_rank};
+            TestContext ctx{g_rank};
 
             T* d_bias   = ctx.malloc<T>(dim);
             T* d_weight = ctx.malloc<T>(dim);
@@ -533,7 +533,7 @@ struct TestComm {
                 std::cout << "done.\n";
             }
 
-            Context ctx{g_rank};
+            TestContext ctx{g_rank};
 
             T* d_data = ctx.malloc<T>(max_count);
 
@@ -648,7 +648,7 @@ struct TestComm {
 
             h_comm->Sync();
 
-            Context ctx{g_rank};
+            TestContext ctx{g_rank};
 
             T* d_data = ctx.malloc<T>(max_count);
 
@@ -827,7 +827,7 @@ struct TestComm {
 
             const size_t max_count = max_tokens * dim;
 
-            Context ctx{g_rank};
+            TestContext ctx{g_rank};
 
             T* d_bias    = ctx.malloc<T>(dim);
             T* d_weight  = ctx.malloc<T>(dim);

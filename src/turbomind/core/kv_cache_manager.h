@@ -18,11 +18,12 @@ struct KVUsageEstimate {
 };
 
 struct KVLayout {
-    int num_layers;
-    int num_kv_heads;
-    int head_dim;
-    int page_size;      // tokens per page
-    int bytes_per_value;
+    int        num_layers{0};
+    int        num_kv_heads{0};
+    int        head_dim{0};
+    int        page_size{0};      // tokens per page
+    int        bytes_per_value{0}; // derived from kv_dtype
+    KVDataType kv_dtype{KVDataType::kFP16};
 };
 
 struct KVReservation {
@@ -44,7 +45,7 @@ public:
     KVCacheManager(const KVLayout& layout,
                    size_t total_capacity_bytes);
 
-    ~KVCacheManager(); // Destructor to free memory
+    virtual ~KVCacheManager(); // Destructor to free memory
 
     size_t total_pages() const;
     size_t used_pages() const;
@@ -54,20 +55,20 @@ public:
 
     bool   can_reserve(uint64_t seq_id,
                        const KVUsageEstimate& est) const;
-    bool   reserve(uint64_t seq_id,
-                   const KVUsageEstimate& est,
-                   KVReservation* out);
-    bool   reserve(uint64_t seq_id,
-                   const KVUsageEstimate& est,
-                   KVReservation* out,
-                   const std::vector<int>& pre_existing_page_ids);
-    void   release(uint64_t seq_id);
+    virtual bool   reserve(uint64_t seq_id,
+                           const KVUsageEstimate& est,
+                           KVReservation* out);
+    virtual bool   reserve(uint64_t seq_id,
+                           const KVUsageEstimate& est,
+                           KVReservation* out,
+                           const std::vector<int>& pre_existing_page_ids);
+    virtual void   release(uint64_t seq_id);
 
     // Translate (seq_id, position) -> physical page index(es)
-    int    page_for(uint64_t seq_id, int position) const;
-    void*  get_page_data_ptr(int page_id) const; // New method
-    const KVLayout& get_layout() const { return layout_; } // New method
-    std::vector<int> get_sequence_page_ids(uint64_t seq_id) const; // New method
+    virtual int    page_for(uint64_t seq_id, int position) const;
+    virtual void*  get_page_data_ptr(int page_id) const; // New method
+    virtual const KVLayout& get_layout() const { return layout_; } // New method
+    virtual std::vector<int> get_sequence_page_ids(uint64_t seq_id) const; // New method
 
     // For testing
     int get_page_ref_count(int page_id) const;

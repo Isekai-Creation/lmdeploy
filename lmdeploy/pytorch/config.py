@@ -79,9 +79,12 @@ class TurboMindSchedulerConfig:
     max_num_seqs: int = 128
     enable_chunked_prefill: bool = True
     max_num_partial_prefills: int = 1
+    max_long_partial_prefills: int = 1 # Added
     long_prefill_token_threshold: int = 0
     scheduler_policy: Literal['fcfs', 'priority'] = 'fcfs'
     prefer_decode_over_prefill: bool = True  # when token budget tight
+    target_latency_ms_p50: int = 50 # Added
+    target_latency_ms_p95: int = 200 # Added
 
 
 @dataclass

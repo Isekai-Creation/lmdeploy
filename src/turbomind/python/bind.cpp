@@ -1,9 +1,13 @@
 // Copyright (c) OpenMMLab. All rights reserved.
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
-#include <cstdint>
+#include <thread>
 
 #include <cuda_runtime.h>
 
@@ -21,6 +25,17 @@
 #include "src/turbomind/core/tensor.h"
 #include "src/turbomind/core/context.h"
 #include "src/turbomind/engine/model_request.h"
+#include "src/turbomind/engine/drift_metrics.h"
+#include "src/turbomind/engine/drift_engine.h"
+#include "src/turbomind/engine/drift_engine_config.h"
+#include "src/turbomind/engine/gateway.h"
+#include "src/turbomind/engine/model_request.h"
+#include "src/turbomind/engine/request.h"
+#include "src/turbomind/core/kv_cache_manager.h"
+#include "src/turbomind/core/prefix_cache.h"
+#include "src/turbomind/models/llama/LlamaBatch.h"
+#include "src/turbomind/core/kv_cache_manager.h"
+#include "src/turbomind/core/prefix_cache.h"
 #include "src/turbomind/models/llama/EagleModule.h"
 #include "src/turbomind/models/llama/EagleDraftLayer.h"
 #include "src/turbomind/models/llama/eagle3_attention_layer.h"
@@ -32,6 +47,554 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/metrics.h"
 #include "src/turbomind/utils/eagle_debug.h"
+
+// Minimal DriftEngine wrapper class for Python binding
+class DriftEngineWrapper {
+public:
+    std::unique_ptr<turbomind::DriftEngine>       engine;
+    std::shared_ptr<turbomind::Gateway>           gateway;
+    std::shared_ptr<turbomind::KVCacheManager>    kv_mgr;
+    std::shared_ptr<turbomind::PrefixCache>       prefix_cache;
+    std::shared_ptr<turbomind::LlamaBatch>        llama_batch;
+    std::thread                                   worker_thread;
+    std::atomic<bool>                             running{false};
+    bool                                          initialized{false};
+
+    DriftEngineWrapper() = default;
+
+    ~DriftEngineWrapper() { shutdown(); }
+
+    static turbomind::DataType parse_dtype(const std::string& dtype)
+    {
+        const auto lower = [&dtype]() {
+            std::string out = dtype;
+            std::transform(out.begin(), out.end(), out.begin(), ::tolower);
+            return out;
+        }();
+        if (lower == "bf16" || lower == "bfloat16") {
+            return turbomind::DataType::kBfloat16;
+        }
+        if (lower == "fp32" || lower == "float" || lower == "float32") {
+            return turbomind::DataType::kFloat32;
+        }
+        return turbomind::DataType::kFloat16;
+    }
+
+    static turbomind::KVDataType parse_kv_dtype(const std::string& dtype)
+    {
+        const auto lower = [&dtype]() {
+            std::string out = dtype;
+            std::transform(out.begin(), out.end(), out.begin(), ::tolower);
+            return out;
+        }();
+        if (lower == "bf16" || lower == "bfloat16") {
+            return turbomind::KVDataType::kBF16;
+        }
+        if (lower == "nvfp4" || lower == "fp4") {
+            return turbomind::KVDataType::kNVFP4;
+        }
+        return turbomind::KVDataType::kFP16;
+    }
+
+    static void complete_request(const std::shared_ptr<turbomind::Request>& req)
+    {
+        if (!req) {
+            return;
+        }
+
+        int prompt_len = 0;
+        try {
+            auto it = req->inputs.find("input_ids");
+            if (it != req->inputs.end()) {
+                prompt_len = it->second.shape(0);
+                if (req->output_ids.data() && it->second.data<int>()) {
+                    const int copy_len = std::min(prompt_len, static_cast<int>(req->output_ids.shape(0)));
+                    std::copy_n(it->second.data<int>(), copy_len, req->output_ids.data());
+                }
+            }
+        }
+        catch (...) {
+            // Best-effort: fall through with prompt_len
+        }
+
+        if (req->sequence_length.data()) {
+            req->sequence_length.data()[0] = prompt_len;
+        }
+
+        turbomind::UpdateState(*req, turbomind::Request::kFinish, prompt_len);
+    }
+
+    void initialize(const std::string& model_path,
+                    int tp,
+                    int pp,
+                    int session_len,
+                    int max_batch_size,
+                    const std::string& dtype,
+                    int max_num_batched_tokens,
+                    int max_num_seqs,
+                    bool enable_chunked_prefill,
+                    int max_num_partial_prefills,
+                    int long_prefill_token_threshold,
+                    bool prefer_decode_over_prefill,
+                    int kv_page_size,
+                    int kv_capacity_bytes,
+                    bool enable_prefix_caching,
+                    bool prefer_high_throughput,
+                    int target_latency_ms_p50,
+                    int target_latency_ms_p95,
+                    int max_queued_requests,
+                    bool abort_on_oom,
+                    const std::string& log_level)
+    {
+        turbomind::DriftEngineConfig cfg{};
+
+        cfg.tp             = tp;
+        cfg.pp             = pp;
+        cfg.session_len    = session_len;
+        cfg.max_batch_size = max_batch_size;
+        cfg.dtype          = dtype;
+        cfg.log_level      = log_level;
+
+        // Scheduler
+        cfg.scheduler_config.max_num_batched_tokens       = max_num_batched_tokens;
+        cfg.scheduler_config.max_num_seqs                 = max_num_seqs;
+        cfg.scheduler_config.enable_chunked_prefill       = enable_chunked_prefill;
+        cfg.scheduler_config.max_num_partial_prefills     = max_num_partial_prefills;
+        cfg.scheduler_config.long_prefill_token_threshold = long_prefill_token_threshold;
+        cfg.scheduler_config.prefer_decode_over_prefill   = prefer_decode_over_prefill;
+        cfg.scheduler_config.enable_prefix_caching        = enable_prefix_caching;
+        cfg.scheduler_config.target_latency_ms_p50        = target_latency_ms_p50;
+        cfg.scheduler_config.target_latency_ms_p95        = target_latency_ms_p95;
+        cfg.scheduler_config.enable_speculative_decoding  = false;  // MVP: force non-speculative
+
+        // KV layout
+        cfg.kv_layout.page_size       = kv_page_size;
+        cfg.kv_layout.kv_dtype        = parse_kv_dtype(dtype);
+        cfg.kv_layout.bytes_per_value = bytes_per_value_from_dtype(cfg.kv_layout.kv_dtype);
+        cfg.kv_capacity_bytes         = static_cast<size_t>(std::max(0, kv_capacity_bytes));
+        cfg.model_layout.max_seq_len  = session_len;
+        cfg.model_layout.kv_dtype     = cfg.kv_layout.kv_dtype;
+
+        // Drift flags
+        cfg.prefer_high_throughput = prefer_high_throughput;
+        cfg.target_latency_ms_p50  = target_latency_ms_p50;
+        cfg.target_latency_ms_p95  = target_latency_ms_p95;
+        cfg.max_queued_requests    = max_queued_requests;
+        cfg.abort_on_oom           = abort_on_oom;
+
+        initialize_with_config(cfg, nullptr);
+    }
+
+    void initialize_from_dict(const std::string& model_path, const pybind11::dict& cfg_dict)
+    {
+        turbomind::DriftEngineConfig cfg{};
+        cfg.tp             = cfg_dict.contains("tp") ? cfg_dict["tp"].cast<int>() : 1;
+        cfg.pp             = cfg_dict.contains("pp") ? cfg_dict["pp"].cast<int>() : 1;
+        cfg.session_len    = cfg_dict.contains("session_len") ? cfg_dict["session_len"].cast<int>() : 8192;
+        cfg.max_batch_size = cfg_dict.contains("max_batch_size") ? cfg_dict["max_batch_size"].cast<int>() : 256;
+        cfg.dtype          = cfg_dict.contains("dtype") ? cfg_dict["dtype"].cast<std::string>() : "bf16";
+        cfg.log_level      = cfg_dict.contains("log_level") ? cfg_dict["log_level"].cast<std::string>() : "INFO";
+
+        if (cfg_dict.contains("scheduler")) {
+            auto sched = cfg_dict["scheduler"].cast<pybind11::dict>();
+            cfg.scheduler_config.max_num_batched_tokens =
+                sched.contains("max_num_batched_tokens") ? sched["max_num_batched_tokens"].cast<int>() : cfg.scheduler_config.max_num_batched_tokens;
+            cfg.scheduler_config.max_num_seqs =
+                sched.contains("max_num_seqs") ? sched["max_num_seqs"].cast<int>() : cfg.scheduler_config.max_num_seqs;
+            cfg.scheduler_config.enable_chunked_prefill =
+                sched.contains("enable_chunked_prefill") ? sched["enable_chunked_prefill"].cast<bool>() : cfg.scheduler_config.enable_chunked_prefill;
+            cfg.scheduler_config.max_num_partial_prefills =
+                sched.contains("max_num_partial_prefills") ? sched["max_num_partial_prefills"].cast<int>() : cfg.scheduler_config.max_num_partial_prefills;
+            cfg.scheduler_config.long_prefill_token_threshold =
+                sched.contains("long_prefill_token_threshold") ? sched["long_prefill_token_threshold"].cast<int>() : cfg.scheduler_config.long_prefill_token_threshold;
+            cfg.scheduler_config.prefer_decode_over_prefill =
+                sched.contains("prefer_decode_over_prefill") ? sched["prefer_decode_over_prefill"].cast<bool>() : cfg.scheduler_config.prefer_decode_over_prefill;
+            cfg.scheduler_config.enable_prefix_caching =
+                cfg_dict.contains("enable_prefix_caching") ? cfg_dict["enable_prefix_caching"].cast<bool>() : cfg.scheduler_config.enable_prefix_caching;
+        }
+        else if (cfg_dict.contains("enable_prefix_caching")) {
+            cfg.scheduler_config.enable_prefix_caching = cfg_dict["enable_prefix_caching"].cast<bool>();
+        }
+
+        if (cfg_dict.contains("kv")) {
+            auto kv           = cfg_dict["kv"].cast<pybind11::dict>();
+            cfg.kv_layout.page_size = kv.contains("kv_page_size") ? kv["kv_page_size"].cast<int>() : cfg.kv_layout.page_size;
+            if (kv.contains("kv_capacity_bytes")) {
+                pybind11::object cap_obj = kv["kv_capacity_bytes"];
+                if (!cap_obj.is_none()) {
+                    cfg.kv_capacity_bytes = cap_obj.cast<size_t>();
+                }
+            }
+        }
+
+        cfg.kv_layout.kv_dtype        = parse_kv_dtype(cfg.dtype);
+        cfg.kv_layout.bytes_per_value = bytes_per_value_from_dtype(cfg.kv_layout.kv_dtype);
+        cfg.model_layout.max_seq_len  = cfg.session_len;
+        cfg.model_layout.kv_dtype     = cfg.kv_layout.kv_dtype;
+
+        cfg.prefer_high_throughput = cfg_dict.contains("prefer_high_throughput") ? cfg_dict["prefer_high_throughput"].cast<bool>() : cfg.prefer_high_throughput;
+        cfg.target_latency_ms_p50  = cfg_dict.contains("target_latency_ms_p50") ? cfg_dict["target_latency_ms_p50"].cast<int>() : cfg.target_latency_ms_p50;
+        cfg.target_latency_ms_p95  = cfg_dict.contains("target_latency_ms_p95") ? cfg_dict["target_latency_ms_p95"].cast<int>() : cfg.target_latency_ms_p95;
+        cfg.max_queued_requests    = cfg_dict.contains("max_queued_requests") ? cfg_dict["max_queued_requests"].cast<int>() : cfg.max_queued_requests;
+        cfg.abort_on_oom           = cfg_dict.contains("abort_on_oom") ? cfg_dict["abort_on_oom"].cast<bool>() : cfg.abort_on_oom;
+        cfg.scheduler_config.enable_speculative_decoding = false;
+
+        initialize_with_config(cfg, nullptr);
+    }
+
+    void initialize_from_dict_with_model(
+        const std::string&                                        model_path,
+        const pybind11::dict&                                     cfg_dict,
+        const std::shared_ptr<turbomind::LlamaTritonModel>&       model_comm)
+    {
+        turbomind::DriftEngineConfig cfg{};
+        cfg.tp             = cfg_dict.contains("tp") ? cfg_dict["tp"].cast<int>() : 1;
+        cfg.pp             = cfg_dict.contains("pp") ? cfg_dict["pp"].cast<int>() : 1;
+        cfg.session_len    = cfg_dict.contains("session_len") ? cfg_dict["session_len"].cast<int>() : 8192;
+        cfg.max_batch_size = cfg_dict.contains("max_batch_size") ? cfg_dict["max_batch_size"].cast<int>() : 256;
+        cfg.dtype          = cfg_dict.contains("dtype") ? cfg_dict["dtype"].cast<std::string>() : "bf16";
+        cfg.log_level      = cfg_dict.contains("log_level") ? cfg_dict["log_level"].cast<std::string>() : "INFO";
+
+        if (cfg_dict.contains("scheduler")) {
+            auto sched = cfg_dict["scheduler"].cast<pybind11::dict>();
+            cfg.scheduler_config.max_num_batched_tokens =
+                sched.contains("max_num_batched_tokens") ? sched["max_num_batched_tokens"].cast<int>() : cfg.scheduler_config.max_num_batched_tokens;
+            cfg.scheduler_config.max_num_seqs =
+                sched.contains("max_num_seqs") ? sched["max_num_seqs"].cast<int>() : cfg.scheduler_config.max_num_seqs;
+            cfg.scheduler_config.enable_chunked_prefill =
+                sched.contains("enable_chunked_prefill") ? sched["enable_chunked_prefill"].cast<bool>() : cfg.scheduler_config.enable_chunked_prefill;
+            cfg.scheduler_config.max_num_partial_prefills =
+                sched.contains("max_num_partial_prefills") ? sched["max_num_partial_prefills"].cast<int>() : cfg.scheduler_config.max_num_partial_prefills;
+            cfg.scheduler_config.long_prefill_token_threshold =
+                sched.contains("long_prefill_token_threshold") ? sched["long_prefill_token_threshold"].cast<int>() : cfg.scheduler_config.long_prefill_token_threshold;
+            cfg.scheduler_config.prefer_decode_over_prefill =
+                sched.contains("prefer_decode_over_prefill") ? sched["prefer_decode_over_prefill"].cast<bool>() : cfg.scheduler_config.prefer_decode_over_prefill;
+            cfg.scheduler_config.enable_prefix_caching =
+                cfg_dict.contains("enable_prefix_caching") ? cfg_dict["enable_prefix_caching"].cast<bool>() : cfg.scheduler_config.enable_prefix_caching;
+        }
+        else if (cfg_dict.contains("enable_prefix_caching")) {
+            cfg.scheduler_config.enable_prefix_caching = cfg_dict["enable_prefix_caching"].cast<bool>();
+        }
+
+        if (cfg_dict.contains("kv")) {
+            auto kv           = cfg_dict["kv"].cast<pybind11::dict>();
+            cfg.kv_layout.page_size = kv.contains("kv_page_size") ? kv["kv_page_size"].cast<int>() : cfg.kv_layout.page_size;
+            if (kv.contains("kv_capacity_bytes")) {
+                pybind11::object cap_obj = kv["kv_capacity_bytes"];
+                if (!cap_obj.is_none()) {
+                    cfg.kv_capacity_bytes = cap_obj.cast<size_t>();
+                }
+            }
+        }
+
+        cfg.kv_layout.kv_dtype        = parse_kv_dtype(cfg.dtype);
+        cfg.kv_layout.bytes_per_value = bytes_per_value_from_dtype(cfg.kv_layout.kv_dtype);
+        cfg.model_layout.max_seq_len  = cfg.session_len;
+        cfg.model_layout.kv_dtype     = cfg.kv_layout.kv_dtype;
+
+        cfg.prefer_high_throughput = cfg_dict.contains("prefer_high_throughput") ? cfg_dict["prefer_high_throughput"].cast<bool>() : cfg.prefer_high_throughput;
+        cfg.target_latency_ms_p50  = cfg_dict.contains("target_latency_ms_p50") ? cfg_dict["target_latency_ms_p50"].cast<int>() : cfg.target_latency_ms_p50;
+        cfg.target_latency_ms_p95  = cfg_dict.contains("target_latency_ms_p95") ? cfg_dict["target_latency_ms_p95"].cast<int>() : cfg.target_latency_ms_p95;
+        cfg.max_queued_requests    = cfg_dict.contains("max_queued_requests") ? cfg_dict["max_queued_requests"].cast<int>() : cfg.max_queued_requests;
+        cfg.abort_on_oom           = cfg_dict.contains("abort_on_oom") ? cfg_dict["abort_on_oom"].cast<bool>() : cfg.abort_on_oom;
+        cfg.scheduler_config.enable_speculative_decoding = false;
+
+        initialize_with_config(cfg, model_comm);
+    }
+
+    void initialize_with_config(const turbomind::DriftEngineConfig&                 cfg,
+                                const std::shared_ptr<turbomind::LlamaTritonModel>& model_comm)
+    {
+        const int groups      = std::max(1, cfg.tp);
+        const int group_size  = std::max(1, cfg.pp);
+        auto      ctx_factory = [] { return std::shared_ptr<void>(); };
+
+        gateway       = std::make_shared<turbomind::Gateway>(groups, group_size, ctx_factory);
+        kv_mgr        = nullptr;
+        prefix_cache  = nullptr;
+        engine        = std::make_unique<turbomind::DriftEngine>(cfg, gateway, kv_mgr, prefix_cache);
+
+        const char* stub_env  = std::getenv("DRIFT_USE_STUB_EXECUTOR");
+        const bool  force_stub = stub_env && stub_env[0] != '\0';
+        bool        use_stub   = false;
+
+        // When a LlamaTritonModel is available, build a LlamaBatch
+        // in executor mode and bind it to DriftEngine so scheduler-
+        // driven prefill/decode steps run real model compute.
+        if (!force_stub) {
+            if (!model_comm) {
+                throw std::runtime_error(
+                    "DriftEngine requires a LlamaTritonModel for real execution but none was provided.");
+            }
+            try {
+                auto batch = model_comm->createDriftEngine(/*device_id=*/0, /*rank=*/0, gateway);
+                if (!batch) {
+                    throw std::runtime_error(
+                        "LlamaTritonModel::createDriftEngine returned null for DriftEngine executor binding.");
+                }
+                llama_batch = batch;
+                engine->bind_llama_batch(llama_batch.get());
+            }
+            catch (const std::exception& e) {
+                // Propagate to Python; stub is not allowed without DRIFT_USE_STUB_EXECUTOR.
+                throw;
+            }
+            catch (...) {
+                throw;
+            }
+        }
+        else {
+            TM_LOG_WARNING("[DriftEngineWrapper] DRIFT_USE_STUB_EXECUTOR is set; using synthetic stub executor.");
+            use_stub = true;
+        }
+
+        if (use_stub) {
+            // Stub executor is only enabled when DRIFT_USE_STUB_EXECUTOR is set explicitly.
+            // It incrementally advances sequence_length and emits synthetic tokens for testing
+            // scheduler / KV / prefix paths without running the real model.
+            if (!force_stub) {
+                throw std::runtime_error(
+                    "DriftEngine stub executor reached unexpectedly with DRIFT_USE_STUB_EXECUTOR unset.");
+            }
+
+            engine->set_batch_executor(
+                [this](const std::vector<turbomind::PrefillChunk>& prefill,
+                       const std::vector<std::shared_ptr<turbomind::Request>>& decode) {
+                    auto step_decode = [](const std::shared_ptr<turbomind::Request>& req) {
+                        if (!req) {
+                            return;
+                        }
+
+                        int input_len = 0;
+                        try {
+                            auto it = req->inputs.find("input_ids");
+                            if (it != req->inputs.end()) {
+                                input_len = it->second.shape(0);
+                            }
+                        }
+                        catch (...) {
+                            input_len = 0;
+                        }
+
+                        const int out_cap = static_cast<int>(req->output_ids.shape(0));
+                        if (!req->output_ids.data() || out_cap <= input_len) {
+                            turbomind::UpdateState(*req, turbomind::Request::kFinish, input_len);
+                            return;
+                        }
+
+                        int cur_len = input_len;
+                        try {
+                            if (req->sequence_length.data()) {
+                                cur_len = std::max(cur_len, req->sequence_length.data()[0]);
+                            }
+                        }
+                        catch (...) {
+                            // Best-effort; fall back to input_len when sequence_length not readable.
+                        }
+
+                        const int max_new    = req->gen_cfg.max_new_tokens > 0 ? req->gen_cfg.max_new_tokens : 1;
+                        const int target_len = std::min(input_len + max_new, out_cap);
+
+                        if (cur_len >= target_len) {
+                            // Already finished for this request.
+                            turbomind::UpdateState(*req, turbomind::Request::kFinish, cur_len);
+                            return;
+                        }
+
+                        const int next_len = cur_len + 1;
+                        try {
+                            int* out = req->output_ids.data();
+                            if (out && next_len - 1 >= 0 && next_len - 1 < out_cap) {
+                                out[next_len - 1] = 2;  // EOS token placeholder
+                            }
+                            if (req->sequence_length.data()) {
+                                req->sequence_length.data()[0] = next_len;
+                            }
+                        }
+                        catch (...) {
+                        }
+
+                        const int status =
+                            (next_len >= target_len) ? turbomind::Request::kFinish : turbomind::Request::kOk;
+                        turbomind::UpdateState(*req, status, next_len);
+                    };
+
+                    for (const auto& chunk : prefill) {
+                        step_decode(chunk.req);
+                    }
+
+                    for (const auto& req : decode) {
+                        step_decode(req);
+                    }
+                },
+                []() {});
+        }
+
+        initialized = true;
+    }
+
+    void run(int rank = 0)
+    {
+        if (engine) {
+            running.store(true, std::memory_order_release);
+            // Establish a core context (stream + allocators) for the
+            // DriftEngine worker thread so that any Tensor allocations
+            // and kernel launches have a valid Context::stream() and
+            // allocators. This mirrors the pattern used in the main
+            // TurboMind engine path.
+            turbomind::CudaDeviceGuard      device_guard(0);
+            turbomind::core::Stream         core_stream = turbomind::core::Stream::create();
+            turbomind::core::Allocator      host_alloc{turbomind::kCPU};
+            turbomind::core::Allocator      device_alloc{turbomind::kDEVICE};
+            turbomind::core::ContextGuard   ctx_guard{core_stream, host_alloc, device_alloc};
+
+            engine->run(rank);
+            running.store(false, std::memory_order_release);
+        }
+    }
+
+    void start(int rank = 0)
+    {
+        if (!engine || running.load(std::memory_order_acquire)) {
+            return;
+        }
+        worker_thread = std::thread([this, rank] { this->run(rank); });
+    }
+
+    void shutdown()
+    {
+        if (engine) {
+            engine->shutdown();
+        }
+        if (worker_thread.joinable()) {
+            worker_thread.join();
+        }
+        engine.reset();
+        llama_batch.reset();
+        gateway.reset();
+        kv_mgr.reset();
+        prefix_cache.reset();
+        running.store(false, std::memory_order_release);
+        initialized = false;
+    }
+
+    bool is_initialized() const { return initialized; }
+    bool is_running() const { return running.load(std::memory_order_acquire); }
+
+    pybind11::tuple forward(std::shared_ptr<turbomind::core::TensorMap> input_tensors,
+                            const turbomind::SessionParam&              session,
+                            const turbomind::GenerationConfig&          gen_cfg,
+                            bool                                        stream_output,
+                            bool                                        enable_metrics,
+                            std::function<void()>                       cb)
+    {
+        if (!engine || !gateway) {
+            throw std::runtime_error("DriftEngineWrapper not initialized");
+        }
+
+        auto req       = std::make_shared<turbomind::Request>();
+        req->id        = session.id;
+        req->unique_id = 0;  // will be assigned by Gateway
+        req->session   = session;
+        req->gen_cfg   = gen_cfg;
+        req->stream_output = stream_output;
+
+        if (input_tensors) {
+            req->inputs = *input_tensors;
+        }
+
+        // Allocate simple CPU output buffers based on prompt length and max_new_tokens
+        int input_len = 0;
+        auto it       = req->inputs.find("input_ids");
+        if (it != req->inputs.end()) {
+            input_len = static_cast<int>(it->second.shape(0));
+        }
+        int max_new_tokens = gen_cfg.max_new_tokens > 0 ? gen_cfg.max_new_tokens : input_len ? input_len : 16;
+        int max_output_len = input_len + max_new_tokens;
+
+        using turbomind::core::Tensor_;
+        Tensor_<int> output_ids{{max_output_len}, turbomind::kCPU};
+        Tensor_<int> seq_len{{1}, turbomind::kCPU};
+
+        if (auto p = seq_len.data()) {
+            p[0] = input_len;
+        }
+
+        req->output_ids      = output_ids;
+        req->sequence_length = seq_len;
+
+        req->cancel_flag.store(0, std::memory_order_relaxed);
+        req->state       = std::make_shared<turbomind::AtomicRequestState>();
+        req->forward_cb  = std::move(cb);
+        req->metrics     = nullptr;
+        req->ec          = turbomind::Request::kOk;
+
+        // Submit request to DriftEngine via Gateway
+        gateway->push(req);
+
+        // Expose output tensors and shared state back to Python
+        auto output_tensors = std::make_shared<turbomind::core::TensorMap>();
+        (*output_tensors)["output_ids"]      = req->output_ids;
+        (*output_tensors)["sequence_length"] = req->sequence_length;
+
+        pybind11::object metrics_obj = pybind11::none();
+        // Drift MVP: metrics() exposure is available via get_metrics()
+        // on the wrapper, but per-request RequestMetrics are not yet
+        // wired through the async streaming path. Always return None
+        // here so Python treats metrics as disabled.
+
+        return pybind11::make_tuple(output_tensors, req->state, metrics_obj);
+    }
+
+    void cancel()
+    {
+        // No-op cancel stub for drift wrapper; real cancel is per-request
+        (void)gateway;
+    }
+
+    void end(std::function<void(int)> cb, uint64_t session_id)
+    {
+        // For DriftEngine, end is handled by request completion
+        // Just call the callback with success status
+        if (cb) {
+            cb(0);  // 0 = success
+        }
+    }
+
+    void set_grammar(const xgrammar::CompiledGrammar& grammar)
+    {
+        // TODO: Implement grammar support for DriftEngine requests
+        // For now, this is a no-op
+        (void)grammar;
+    }
+
+    pybind11::dict get_metrics() const
+    {
+        if (!engine) {
+            return pybind11::dict();
+        }
+        auto m = engine->metrics();
+        pybind11::dict out;
+        out["ema_tokens_per_second"] = m.ema_tokens_per_second;
+        out["ema_p50_latency_ms"]    = m.ema_p50_latency_ms;
+        out["ema_p95_latency_ms"]    = m.ema_p95_latency_ms;
+        out["step_prefill_tokens"]   = m.step_prefill_tokens;
+        out["step_decode_tokens"]    = m.step_decode_tokens;
+        out["queued_prefill"]        = m.queued_prefill;
+        out["queued_decode"]         = m.queued_decode;
+        out["active_requests"]       = m.active_requests;
+        out["kv_total_pages"]        = m.kv_total_pages;
+        out["kv_used_pages"]         = m.kv_used_pages;
+        out["kv_free_pages"]         = m.kv_free_pages;
+        out["kv_blocked"]            = m.kv_blocked;
+        out["kv_rejected"]           = m.kv_rejected;
+        out["prefix_hits"]           = m.prefix_hits;
+        out["prefix_misses"]         = m.prefix_misses;
+        out["prefix_evictions"]      = m.prefix_evictions;
+        out["prefix_bytes_evicted"]  = m.prefix_bytes_evicted;
+        return out;
+    }
+};
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -443,7 +1006,7 @@ static py::dict EagleForwardLogitsDebugImpl(const std::string& model_dir,
             /*attn_layer=*/nullptr,
             /*eagle3_attn_layer=*/&eagle3_attn_layer,
             &ffn_layer,
-            /*rmsnorm_eps=*/1e-5f);
+            /*rmsnorm_eps=*/1.0e-5f);
 
         // Allocate output hidden buffer and run the draft layer.
         hidden_out = Tensor(
@@ -631,6 +1194,35 @@ PYBIND11_MODULE(_turbomind, m)
                 .def_readonly("active_blocks", &ScheduleMetrics::active_blocks)
                 .def_readonly("cached_blocks", &ScheduleMetrics::cached_blocks)
                 .def_readonly("free_blocks", &ScheduleMetrics::free_blocks);
+        }
+    }
+
+    {
+        namespace detail = pybind11::detail;
+        py::handle existing = detail::get_type_handle(typeid(turbomind::DriftMetrics), /*throw_if_missing=*/false);
+        if (existing) {
+            m.attr("DriftMetrics") = existing;
+        }
+        else {
+            py::class_<turbomind::DriftMetrics>(m, "DriftMetrics")
+                .def(py::init())
+                .def_readwrite("ema_tokens_per_second", &turbomind::DriftMetrics::ema_tokens_per_second)
+                .def_readwrite("ema_p50_latency_ms", &turbomind::DriftMetrics::ema_p50_latency_ms)
+                .def_readwrite("ema_p95_latency_ms", &turbomind::DriftMetrics::ema_p95_latency_ms)
+                .def_readwrite("step_prefill_tokens", &turbomind::DriftMetrics::step_prefill_tokens)
+                .def_readwrite("step_decode_tokens", &turbomind::DriftMetrics::step_decode_tokens)
+                .def_readwrite("queued_prefill", &turbomind::DriftMetrics::queued_prefill)
+                .def_readwrite("queued_decode", &turbomind::DriftMetrics::queued_decode)
+                .def_readwrite("active_requests", &turbomind::DriftMetrics::active_requests)
+                .def_readwrite("kv_total_pages", &turbomind::DriftMetrics::kv_total_pages)
+                .def_readwrite("kv_used_pages", &turbomind::DriftMetrics::kv_used_pages)
+                .def_readwrite("kv_free_pages", &turbomind::DriftMetrics::kv_free_pages)
+                .def_readwrite("kv_blocked", &turbomind::DriftMetrics::kv_blocked)
+                .def_readwrite("kv_rejected", &turbomind::DriftMetrics::kv_rejected)
+                .def_readwrite("prefix_hits", &turbomind::DriftMetrics::prefix_hits)
+                .def_readwrite("prefix_misses", &turbomind::DriftMetrics::prefix_misses)
+                .def_readwrite("prefix_evictions", &turbomind::DriftMetrics::prefix_evictions)
+                .def_readwrite("prefix_bytes_evicted", &turbomind::DriftMetrics::prefix_bytes_evicted);
         }
     }
 
@@ -1447,7 +2039,7 @@ PYBIND11_MODULE(_turbomind, m)
                     /*attn_layer=*/nullptr,
                     /*eagle3_attn_layer=*/&eagle3_attn_layer,
                     &ffn_layer,
-                    /*rmsnorm_eps=*/1e-5f);
+/*rmsnorm_eps=*/1.0e-5f);
 
                 // Allocate output hidden buffer and run the draft layer.
                 hidden_out = Tensor(
@@ -1782,4 +2374,134 @@ PYBIND11_MODULE(_turbomind, m)
         .def("__repr__", &LlamaTritonModel::toString)
         .def("get_tensor_para_size", &LlamaTritonModel::getTensorParaSize)
         .def("get_pipeline_para_size", &LlamaTritonModel::getPipelineParaSize);
-}
+
+    // ------------------------------------------------------------------
+    // DriftEngine minimal bindings
+    // ------------------------------------------------------------------
+    m.def(
+        "create_drift_engine",
+        [](const std::string& model_path,
+           int tp,
+           int pp,
+           int session_len,
+           int max_batch_size,
+           const std::string& dtype,
+           int max_num_batched_tokens,
+           int max_num_seqs,
+           bool enable_chunked_prefill,
+           int max_num_partial_prefills,
+           int long_prefill_token_threshold,
+           bool prefer_decode_over_prefill,
+           int kv_page_size,
+           int kv_capacity_bytes,
+           bool enable_prefix_caching,
+           bool prefer_high_throughput,
+           int target_latency_ms_p50,
+           int target_latency_ms_p95,
+           int max_queued_requests,
+           bool abort_on_oom,
+           const std::string& log_level) {
+            auto wrapper = std::make_shared<DriftEngineWrapper>();
+            wrapper->initialize(model_path,
+                                tp,
+                                pp,
+                                session_len,
+                                max_batch_size,
+                                dtype,
+                                max_num_batched_tokens,
+                                max_num_seqs,
+                                enable_chunked_prefill,
+                                max_num_partial_prefills,
+                                long_prefill_token_threshold,
+                                prefer_decode_over_prefill,
+                                kv_page_size,
+                                kv_capacity_bytes,
+                                enable_prefix_caching,
+                                prefer_high_throughput,
+                                target_latency_ms_p50,
+                                target_latency_ms_p95,
+                                max_queued_requests,
+                                abort_on_oom,
+                                log_level);
+            wrapper->start();
+            return wrapper;
+        },
+        py::arg("model_path"),
+        py::arg("tp"),
+        py::arg("pp"),
+        py::arg("session_len"),
+        py::arg("max_batch_size"),
+        py::arg("dtype"),
+        py::arg("max_num_batched_tokens"),
+        py::arg("max_num_seqs"),
+        py::arg("enable_chunked_prefill"),
+        py::arg("max_num_partial_prefills"),
+        py::arg("long_prefill_token_threshold"),
+        py::arg("prefer_decode_over_prefill"),
+        py::arg("kv_page_size"),
+        py::arg("kv_capacity_bytes"),
+        py::arg("enable_prefix_caching"),
+        py::arg("prefer_high_throughput"),
+        py::arg("target_latency_ms_p50"),
+        py::arg("target_latency_ms_p95"),
+        py::arg("max_queued_requests"),
+        py::arg("abort_on_oom"),
+        py::arg("log_level"));
+
+    m.def(
+        "create_engine",
+        [](const std::string& model_path, const py::dict& engine_config, const std::string& backend) {
+            if (backend != "drift") {
+                throw std::runtime_error("Unsupported backend for drift binding: " + backend);
+            }
+            auto wrapper = std::make_shared<DriftEngineWrapper>();
+            wrapper->initialize_from_dict(model_path, engine_config);
+            wrapper->start();
+            return wrapper;
+        },
+        py::arg("model_path"),
+        py::arg("engine_config"),
+        py::arg("backend") = "drift");
+
+    // DriftEngine factory that reuses an existing LlamaTritonModel
+    // (created via AbstractTransformerModel.create_llama_model) to
+    // build a LlamaBatch executor with weights already loaded.
+    m.def(
+        "create_engine_with_model",
+        [](std::shared_ptr<LlamaTritonModel> model_comm,
+           const std::string&                model_path,
+           const py::dict&                   engine_config,
+           const std::string&                backend) {
+            if (backend != "drift") {
+                throw std::runtime_error("Unsupported backend for drift binding: " + backend);
+            }
+            auto wrapper = std::make_shared<DriftEngineWrapper>();
+            wrapper->initialize_from_dict_with_model(model_path, engine_config, model_comm);
+            wrapper->start();
+            return wrapper;
+        },
+        py::arg("model_comm"),
+        py::arg("model_path"),
+        py::arg("engine_config"),
+        py::arg("backend") = "drift");
+
+    py::class_<DriftEngineWrapper, std::shared_ptr<DriftEngineWrapper>>(m, "DriftEnginePyWrapper")
+        .def(py::init<>())
+        .def("run", &DriftEngineWrapper::run, py::arg("rank") = 0)
+        .def("start", &DriftEngineWrapper::start, py::arg("rank") = 0)
+        .def("shutdown", &DriftEngineWrapper::shutdown)
+        .def("is_initialized", &DriftEngineWrapper::is_initialized)
+        .def("is_running", &DriftEngineWrapper::is_running)
+        .def("forward",
+             &DriftEngineWrapper::forward,
+             "input_tensors"_a,
+             "session"_a,
+             "gen_cfg"_a,
+             "stream_output"_a,
+             "enable_metrics"_a,
+             "cb"_a)
+        .def("cancel", &DriftEngineWrapper::cancel)
+        .def("end", &DriftEngineWrapper::end, "cb"_a, "session_id"_a)
+        .def("set_grammar", &DriftEngineWrapper::set_grammar, "grammar"_a)
+        .def("get_metrics", &DriftEngineWrapper::get_metrics);
+ }

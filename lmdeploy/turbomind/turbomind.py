@@ -14,7 +14,7 @@ from dataclasses import asdict
 from functools import partial
 from multiprocessing.reduction import ForkingPickler
 from queue import Queue
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,6 +29,7 @@ from lmdeploy.messages import (
     ResponseType,
     ScheduleMetrics,
     TurbomindEngineConfig,
+    DriftEngineConfig,
 )
 from lmdeploy.serve.openai.protocol import UpdateParamsRequest
 from lmdeploy.tokenizer import Tokenizer
@@ -171,7 +172,7 @@ class TurboMind:
         model_path: str,
         model_name: str = None,
         chat_template_name: str = None,
-        engine_config: TurbomindEngineConfig = None,
+        engine_config: Union[TurbomindEngineConfig, DriftEngineConfig] = None,
         **kwargs,
     ):
         self.model_name = model_name
@@ -211,35 +212,200 @@ class TurboMind:
             f" greater than 0, but got {_engine_config.max_batch_size}"
         )
 
-        update_parallel_config(_engine_config)
+        # Handle DriftEngine config for new high-performance engine
+        if isinstance(_engine_config, DriftEngineConfig):
+            self._engine_type = "drift"
+            self._setup_drift_engine(_engine_config, model_path)
+            self.gpu_count = getattr(_engine_config, "device_num", 1) or 1
+            self.devices = getattr(_engine_config, "devices", None) or list(range(self.gpu_count))
+            self._engine_created = False
+            return
+        else:
+            self._engine_type = "turbomind"
+            update_parallel_config(_engine_config)
 
         self.gpu_count = _engine_config.device_num
         self.devices = _engine_config.devices
         self._engine_created = False
 
-        if not osp.exists(model_path):
-            model_path = get_model(
-                model_path, _engine_config.download_dir, _engine_config.revision
-            )
-        self.model_comm = self._from_hf(
-            model_path=model_path, engine_config=_engine_config
-        )
-        self.tokenizer = Tokenizer(model_path)
+    def _setup_drift_engine(self, engine_config: DriftEngineConfig, model_path: str):
+        """Setup DriftEngine-specific initialization.
 
-        # Initialize speculative decoding if configured
+        For HF-style GPT-OSS-120B paths (e.g. models/gpt-oss-120b), reuse the
+        same HF→TurboMind conversion path as the legacy TurboMind engine
+        (_from_hf + get_tm_model) so DriftEngine always binds a real
+        LlamaBatch backed by converted TurboMind weights. No pre-exported
+        \"-turbomind\" checkpoint is required.
+        """
+        from lmdeploy.messages import TurbomindEngineConfig
+
+        # Enforce drift v1 constraints.
+        engine_config.enable_speculative_decoding = False
+        engine_config.enable_metrics = False
+        if not engine_config.model_path:
+            engine_config.model_path = model_path
+
+        # Default drift dtype to BF16 for model weights/compute unless the
+        # user explicitly requested a different dtype.
+        if getattr(engine_config, "dtype", None) in (None, "", "auto", "float16", "fp16"):
+            engine_config.dtype = "bf16"
+
+        self._drift_config = engine_config
+
+        from lmdeploy.config.drift_config import to_cpp_drift_engine_config
+        cpp_args = to_cpp_drift_engine_config(engine_config)
+        self._drift_cpp_args = cpp_args
+
+        vocab_size = 0
+        try:
+            tok = Tokenizer(engine_config.model_path)
+            self.tokenizer = tok
+            vocab_size = getattr(tok, "vocab_size", 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Tokenizer init failed for drift backend: {exc}")
+            self.tokenizer = None
+
+        logger.info(f"DriftEngine backend requested: {engine_config}")
+        logger.info(f"Converted to C++ args: {list(cpp_args.keys())}")
+
+        # Build a TurboMindEngineConfig for HF conversion, mirroring the
+        # core session / batch / dtype / cache knobs from the drift
+        # config so that get_tm_model and _from_hf behave identically to
+        # the legacy TurboMind engine.
+        tm_engine = TurbomindEngineConfig()
+        tm_engine.tp = engine_config.tp
+        tm_engine.dp = 1
+        tm_engine.cp = 1
+        tm_engine.session_len = engine_config.session_len
+        tm_engine.max_batch_size = engine_config.max_batch_size
+
+        # Use BF16 weights/compute by default for GPT-OSS-120B; allow the
+        # converter to override dtype when the hardware or model config
+        # requires a fallback.
+        tm_engine.dtype = "bfloat16"
+
+        # Derive cache_max_entry_count from TM_CACHE_MAX_ENTRY_COUNT when
+        # provided, otherwise reuse the drift config or fall back to 0.75.
+        cache_frac_env = os.getenv("TM_CACHE_MAX_ENTRY_COUNT", "").strip()
+        cache_frac = None
+        if cache_frac_env:
+            try:
+                cache_frac = float(cache_frac_env)
+            except ValueError:
+                cache_frac = None
+        if cache_frac is None:
+            cache_frac = getattr(engine_config, "cache_max_entry_count", 0.75)
+        tm_engine.cache_max_entry_count = max(0.1, min(cache_frac, 0.95))
+
+        # Let the standard parallel config helper fill in device_num and
+        # devices for TP=1 drift.
+        update_parallel_config(tm_engine)
+        self.gpu_count = tm_engine.device_num
+        self.devices = tm_engine.devices
+
+        # Run the same HF→TM conversion path as TurboMind, which sets
+        # self._tm_model, self.config, self.engine_config (tm_engine),
+        # and self.config_dict, then create the LlamaTritonModel.
+        self.model_comm = self._from_hf(engine_config.model_path, tm_engine)
+
+        # Drift-specific config used on the Python side for generation.
+        # Reuse the TurboMind model config but override weight_type to
+        # reflect the drift dtype.
+        model_cfg = SimpleNamespace(vocab_size=vocab_size)
+        weight_type = getattr(self.config.model_config, "weight_type", "bfloat16")
+        self.config = SimpleNamespace(model_config=model_cfg, weight_type=weight_type)
+        self.engine_config = engine_config
+
+        self.node_id = 0
+        self.node_num = 1
+        self.session_len = engine_config.session_len
+        self._drift_engine = None
+
+    def _ensure_drift_engine(self):
+        if self._drift_engine is None:
+            self._create_drift_engine()
+
+    def _create_drift_engine(self):
+        """Create DriftEngine using C++ factory and start worker loop."""
+        args = self._drift_cpp_args
+        cfg = self._drift_config
+        # Apply log level early for TM logger if provided
+        try:
+            import os
+            if cfg and getattr(cfg, "log_level", None):
+                os.environ.setdefault("TM_LOG_LEVEL", str(cfg.log_level))
+        except Exception:
+            pass
+        try:
+            # Prefer the path that reuses an existing LlamaTritonModel so
+            # DriftEngine can bind a real LlamaBatch executor with GPU
+            # weights, falling back to the dict-only factory when no
+            # model_comm is available.
+            engine = None
+            if hasattr(_tm, "create_engine_with_model") and getattr(self, "model_comm", None) is not None:
+                engine = _tm.create_engine_with_model(
+                    self.model_comm,
+                    cfg.model_path,
+                    args,
+                    backend="drift",
+                )
+            elif hasattr(_tm, "create_engine"):
+                engine = _tm.create_engine(cfg.model_path, args, backend="drift")
+            elif hasattr(_tm, "create_drift_engine"):
+                # Fallback for builds exposing only create_drift_engine signature.
+                sched = cfg.scheduler
+                kv = cfg.kv
+                engine = _tm.create_drift_engine(
+                    cfg.model_path,
+                    cfg.tp,
+                    cfg.pp,
+                    cfg.session_len,
+                    cfg.max_batch_size,
+                    cfg.dtype,
+                    sched.max_num_batched_tokens,
+                    sched.max_num_seqs,
+                    sched.enable_chunked_prefill,
+                    sched.max_num_partial_prefills,
+                    sched.long_prefill_token_threshold,
+                    sched.prefer_decode_over_prefill,
+                    kv.kv_page_size,
+                    kv.kv_capacity_bytes or 0,
+                    kv.prefix_cache_enabled if hasattr(kv, "prefix_cache_enabled") else cfg.enable_prefix_caching,
+                    cfg.prefer_high_throughput,
+                    cfg.target_latency_ms_p50,
+                    cfg.target_latency_ms_p95,
+                    cfg.max_queued_requests,
+                    cfg.abort_on_oom,
+                    cfg.log_level,
+                )
+            else:
+                raise AttributeError("No drift engine factory available in _turbomind")
+
+            if engine is None:
+                raise RuntimeError("DriftEngine factory did not return an engine instance")
+
+            # Ensure the worker loop is running exactly once. The C++
+            # wrappers guard start() internally, so it is safe to call
+            # start() here even if the factory already started the
+            # worker thread.
+            should_start = True
+            try:
+                if hasattr(engine, "is_running") and engine.is_running():
+                    should_start = False
+            except Exception:
+                should_start = True
+            if should_start and hasattr(engine, "start"):
+                engine.start()
+
+            self._drift_engine = engine
+            self._engine_created = True
+            logger.info("DriftEngine created and worker started")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to create DriftEngine: {e}")
+            raise
+
+        self.session_len = self._drift_config.session_len
         self.speculative_manager = None
-        if _engine_config.speculative_config is not None:
-            logger.info(
-                "Speculative decoding is handled natively by C++ engine. "
-                "Python-side speculative decoding manager is deprecated."
-            )
-
-        if not _engine_config.empty_init:
-            self._load_weights()
-            self._process_weights()
-            self._create_engine()
-
-        self.session_len = self.config.session_len
 
     def _check_unloaded_tm_params(self):
         tm_params = self._tm_model.tm_params
@@ -512,14 +678,12 @@ class TurboMind:
         self._engine_created = False
 
     def create_instance(self, cuda_stream_id=0):
-        """Create a turbomind instance.
-
-        Args:
-            cuda_stream_id(int): identity of a cuda stream
-        Returns:
-            TurboMindInstance: an instance of turbomind
-        """
+        """Create a turbomind or drift instance."""
+        if getattr(self, "_engine_type", "turbomind") == "drift":
+            self._ensure_drift_engine()
+            return TurboMindInstance(self, self.config, cuda_stream_id)
         return TurboMindInstance(self, self.config, cuda_stream_id)
+
 
     def get_schedule_metrics(self):
         # TODO: support dp
@@ -786,14 +950,7 @@ class TurboMindInstance:
 
         self.session_len = tm_model.session_len
 
-        # create model instances
-        lazy_init = self.tm_model.config_dict["engine_config"].get("empty_init", False)
-        self._model_inst = None if lazy_init else self._create_model_instance(0)
-
-        self.config = config
-        self.lock = None
-        # error code map from csrc (refer to `struct Request` in src/turbomind/engine/request.h)
-        # to lmdeploy.messages.ResponseType
+        # Drift path: reuse shared DriftEngine wrapper as the model instance
         self.errcode_map = {
             0: ResponseType.SUCCESS,
             1: ResponseType.SESSION_NOT_EXIST,
@@ -807,6 +964,22 @@ class TurboMindInstance:
             9: ResponseType.PREFIX_CACHE_CONFLICT_INTERACTIVE_MODE,
             -1: ResponseType.INTERNAL_ENGINE_ERROR,
         }
+
+        if getattr(self.tm_model, "_engine_type", "turbomind") == "drift":
+            self._model_inst = self.tm_model._drift_engine
+            self.config = config
+            self.lock = None
+            return
+
+        # create model instances
+        lazy_init = self.tm_model.config_dict["engine_config"].get("empty_init", False)
+        self._model_inst = None if lazy_init else self._create_model_instance(0)
+
+        self.config = config
+        self.lock = None
+        # error code map from csrc (refer to `struct Request` in src/turbomind/engine/request.h)
+        # to lmdeploy.messages.ResponseType
+
 
     @property
     def model_inst(self):

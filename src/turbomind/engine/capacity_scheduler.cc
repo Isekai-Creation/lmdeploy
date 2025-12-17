@@ -25,27 +25,24 @@ bool CapacityScheduler::try_start_request(uint64_t seq_id,
         return false;
     }
 
+    if (est.pages_needed > kv_mgr_->total_pages()) {
+        rejected_never_schedulable_++;
+        TM_LOG_WARNING("[CapacityScheduler] Request %llu needs %zu pages > total %zu. Never schedulable.",
+                       seq_id, est.pages_needed, kv_mgr_->total_pages());
+        return false;
+    }
+
     KVReservation reservation{};
-    bool success = false;
+    bool success = kv_mgr_->reserve(seq_id, est, &reservation, pre_existing_page_ids);
 
-    // Try to reserve pages initially
-    success = kv_mgr_->reserve(seq_id, est, &reservation, pre_existing_page_ids);
-
-    if (!success && prefix_cache_) { // If initial reservation fails and prefix cache is available
+    if (!success && prefix_cache_) {
         TM_LOG_DEBUG("[CapacityScheduler] Initial KV reservation failed for seq %llu, attempting eviction.", seq_id);
-        // Attempt to evict LRU entries from prefix cache to free up KV pages
         for (int i = 0; i < MAX_EVICTION_ATTEMPTS; ++i) {
-            if (prefix_cache_->get_hit_count() == 0 && prefix_cache_->get_miss_count() == 0) {
-                 // If prefix cache is empty, no point in evicting. Break.
-                 break;
-            }
-            prefix_cache_->evict_lru_entry(); // Evict an entry
-
-            // Retry reservation after eviction
+            prefix_cache_->evict_lru_entry();
             success = kv_mgr_->reserve(seq_id, est, &reservation, pre_existing_page_ids);
             if (success) {
                 TM_LOG_DEBUG("[CapacityScheduler] KV reservation succeeded for seq %llu after %d evictions.", seq_id, i + 1);
-                break; // Reservation succeeded
+                break;
             }
         }
     }
@@ -56,8 +53,10 @@ bool CapacityScheduler::try_start_request(uint64_t seq_id,
             *out = reservation;
         }
         TM_LOG_DEBUG("[CapacityScheduler] Successfully started request %llu, reserved %d pages.", seq_id, reservation.num_pages);
-    } else {
-        TM_LOG_DEBUG("[CapacityScheduler] Failed to start request %llu after all attempts. Insufficient KV capacity or invalid pre-existing pages.", seq_id);
+    }
+    else {
+        blocked_due_to_capacity_++;
+        TM_LOG_DEBUG("[CapacityScheduler] Failed to start request %llu after attempts. Insufficient KV capacity or invalid pre-existing pages.", seq_id);
     }
     return success;
 }
@@ -67,9 +66,7 @@ void CapacityScheduler::finish_request(uint64_t seq_id)
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = active_reservations_.find(seq_id);
     if (it != active_reservations_.end()) {
-        kv_mgr_->release(seq_id); // Release the KV pages
-        // Erase prefix from cache if it belongs to this sequence to prevent stale entries.
-        // This is important if a sequence finishes and its prefix is no longer valid.
+        kv_mgr_->release(seq_id);
         if (prefix_cache_) {
             prefix_cache_->erase(seq_id);
         }
@@ -78,6 +75,24 @@ void CapacityScheduler::finish_request(uint64_t seq_id)
     } else {
         TM_LOG_WARNING("[CapacityScheduler] Attempted to finish non-existent or inactive request %llu.", seq_id);
     }
+}
+
+size_t CapacityScheduler::blocked_due_to_capacity() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return blocked_due_to_capacity_;
+}
+
+size_t CapacityScheduler::rejected_never_schedulable() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rejected_never_schedulable_;
+}
+
+size_t CapacityScheduler::active_reservation_count() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_reservations_.size();
 }
 
 } // namespace turbomind

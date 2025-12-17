@@ -1,13 +1,28 @@
 import os
 import subprocess
-from typing import Dict, List
+from typing import Dict, List, Any
 
 import fire
 import yaml
 
+# Try to import DriftEngineConfig
+try:
+    from lmdeploy import DriftEngineConfig
+except ImportError:
+    DriftEngineConfig = None
+    print("Warning: DriftEngineConfig not available")
 
-def get_cmd(model_path, backend, engine_config, data_config):
-    assert backend in ['turbomind', 'pytorch']
+
+    def get_cmd(model_path, backend, engine_config, data_config):
+    assert backend in ['turbomind', 'pytorch', 'drift']
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Handle config object vs dict
+    if hasattr(engine_config, '__dict__'):
+        engine_config = engine_config.__dict__.copy()
+    else:
+        engine_config = engine_config.copy()
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     dataset_path = data_config.pop('dataset_path')
@@ -60,19 +75,157 @@ def benchmark(model_path, backend, engine_config, data_config):
         print(f'exception happened, {e}')
 
 
-def main(model_path=None, backend=None, config_path=None):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-        engine_configs = config['engine']
-        data_config = config['data']
-        if isinstance(engine_configs, Dict):
-            engine_configs = [engine_configs]
-        assert isinstance(engine_configs, List) and all(isinstance(s, Dict) for s in engine_configs)
-        for engine_config in engine_configs:
-            # The model_path provided by the user will override the model_path in the config file.
-            model_path = model_path or engine_config.pop('model_path')
-            engine_config.pop('model_path', '')
-            benchmark(model_path, backend, engine_config, data_config)
+def main(model_path=None, backend=None, config_path=None, config_name=None, scenario=None, output_dir=None, warmup_runs=None, measurement_runs=None, csv=None):
+    # Handle case where config_path is provided (from run_engine_suite.sh)
+    if config_path and os.path.exists(config_path):
+        print(f"Loading config from: {config_path}")
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Extract engine and data configurations
+        if config_name:
+            config = config.get(config_name, {})
+        else:
+            # Fallback to first engine config if no config_name specified
+            engine_configs = config.get('engine', [{}])
+            config = engine_configs[0] if engine_configs else {}
+        
+        engine_config = config.get('engine_config', {})
+        data_config = config.get('data_config', {})
+        
+        # Override with command line arguments
+        if model_path:
+            if backend == 'drift' and hasattr(engine_config, 'model_path'):
+                engine_config.model_path = model_path
+            else:
+                engine_config['model_path'] = model_path
+        
+        if warmup_runs:
+            data_config['warmup_runs'] = warmup_runs
+        
+        if measurement_runs:
+            data_config['measurement_runs'] = measurement_runs
+        
+        if output_dir:
+            data_config['output_dir'] = output_dir
+        
+        # Handle csv parameter
+        if csv:
+            data_config['csv'] = csv
+        
+        print(f"Running benchmark: backend={backend}, config_name={config_name}, engine_config={engine_config}, data_config={data_config}")
+        benchmark(model_path or engine_config.get('model_path', ''), backend, engine_config, data_config)
+        return
+    
+    # Fallback to simple configuration for direct testing
+    engine_config = {}
+    data_config = {}
+    
+    # Create basic engine config based on backend
+    if backend == 'turbomind':
+        engine_config = {
+            'max_batch_size': 128,
+            'cache_max_entry_count': 0.8,
+            'session_len': 8192,
+            'tp': 1,
+            'dp': 1,
+        }
+    elif backend == 'drift':
+        # Use conservative DriftEngine config
+        try:
+            from lmdeploy import DriftEngineConfig
+            engine_config = DriftEngineConfig.conservative_baseline()
+            engine_config.max_batch_size = 128
+        except ImportError:
+            print("Warning: DriftEngineConfig not available, using basic config")
+            engine_config = {
+                'max_batch_size': 128,
+                'cache_max_entry_count': 0.8,
+                'session_len': 8192,
+                'tp': 1,
+                'dp': 1,
+            }
+    
+    # Set up data config for synthetic data since we don't have the real dataset
+    data_config = {
+        'dataset_name': 'random',
+        'random_input_len': 256,  # Smaller for testing
+        'random_output_len': 64,   # Smaller for testing
+        'num_prompts': 50,  # Reduced for testing
+        'csv': csv or 'benchmark_results.csv'
+    }
+    
+    # Override with command line arguments
+    if model_path:
+        engine_config['model_path'] = model_path
+    
+    # Run benchmark
+    print(f"Running benchmark: backend={backend}, engine_config={engine_config}, data_config={data_config}")
+    benchmark(model_path or engine_config.get('model_path', ''), backend, engine_config, data_config)
+
+def get_default_config(config_name: str, backend: str) -> Dict[str, Any]:
+    """Get default configuration based on config name and backend."""
+    
+    # Default data configuration
+    data_config = {
+        'dataset_path': '/nvme1/shared/ShareGPT_V3_unfiltered_cleaned_split.json',
+        'dataset_name': 'sharegpt',
+        'num_prompts': 1000,
+        'sharegpt_output_len': 2048,
+    }
+    
+    # Default engine configuration based on config_name
+    if backend == 'turbomind':
+        engine_config = {
+            'max_batch_size': 128,
+            'cache_max_entry_count': 0.8,
+            'max_prefill_token_num': 4096,
+            'tp': 1,
+            'dp': 1,
+            'session_len': 8192,
+        }
+    elif backend == 'drift':
+        if config_name == 'drift_baseline':
+            engine_config = {
+                'prefer_high_throughput': False,
+                'enable_cuda_graphs': False,
+                'decode_microbatch_size': None,
+                'prefill_microbatch_size': None,
+                'target_latency_ms_p50': 100,
+                'target_latency_ms_p95': 200,
+                'max_queued_requests': 4096,
+                'max_batch_size': 128,
+                'cache_max_entry_count': 0.8,
+                'max_prefill_token_num': 4096,
+                'tp': 1,
+                'dp': 1,
+                'session_len': 8192,
+            }
+        elif config_name == 'drift_optimized':
+            engine_config = {
+                'prefer_high_throughput': True,
+                'enable_cuda_graphs': True,
+                'decode_microbatch_size': 64,
+                'prefill_microbatch_size': 128,
+                'target_latency_ms_p50': 50,
+                'target_latency_ms_p95': 150,
+                'max_queued_requests': 8192,
+                'max_batch_size': 128,
+                'cache_max_entry_count': 0.8,
+                'max_prefill_token_num': 4096,
+                'tp': 1,
+                'dp': 1,
+                'session_len': 8192,
+            }
+        else:
+            engine_config = {}
+    else:
+        engine_config = {}
+    
+    return {
+        'engine_config': engine_config,
+        'data_config': data_config
+    }
 
 
 if __name__ == '__main__':

@@ -63,6 +63,14 @@ public:
 
     ScheduleMetrics getScheduleMetrics(int device_id, int rank);
 
+    // Create a LlamaBatch instance wired to an external Gateway for
+    // DriftEngine executor mode. This reuses the existing model
+    // parameters, communicators, and weights but does not start the
+    // internal TurboMind engine loop.
+    std::shared_ptr<Engine> createDriftEngine(int device_id,
+                                              int rank,
+                                              std::shared_ptr<Gateway> external_gateway);
+
 private:
     void handleMissingParams();
 

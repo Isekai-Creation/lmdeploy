@@ -8,9 +8,9 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
-#include "src/turbomind/utils/allocator.h"
+#include "src/turbomind/core/allocator.h"
 #include "src/turbomind/utils/memory_utils.h"
-#include "src/turbomind/utils/Tensor.h"
+#include "src/turbomind/core/tensor.h"
 #include "src/turbomind/utils/logger.h"
 
 namespace ft = turbomind;

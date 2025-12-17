@@ -112,6 +112,11 @@ struct AtomicRequestState {
     {
         return std::unique_ptr<RequestState>{data_.exchange(data, std::memory_order_acq_rel)};
     }
+
+    RequestState* load() const
+    {
+        return data_.load(std::memory_order_acquire);
+    }
 };
 
 struct Request {

@@ -408,9 +408,17 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
         engine_param_.eagle_debug                         = spec_reader["eagle_debug"].as<bool>(false);
         engine_param_.eagle_metrics_debug                 = spec_reader["eagle_metrics_debug"].as<bool>(false);
         // Target-tree decode is an optional, more advanced EAGLE3 path.
-        // When not specified, default to false so the engine continues
-        // to rely on the current single-step target logits path.
-        engine_param_.enable_eagle_target_tree            = spec_reader["enable_target_tree"].as<bool>(false);
+        // It is currently considered experimental and has known stability
+        // issues on the TurboMind integration path. To keep the core
+        // EAGLE3 speculative decode stable while we harden the target-tree
+        // kernels, we forcibly disable target-tree decode for this engine
+        // regardless of the config flag.
+        //
+        // This preserves the baseline EAGLE3 behaviour (single-step target
+        // logits + KV rewind / multi-token advance) and avoids crashes in
+        // the experimental target-tree branch.
+        (void)spec_reader["enable_target_tree"];  // consume but ignore
+        engine_param_.enable_eagle_target_tree = false;
 
         // SpecPV partial KV config (EAGLE3-only). These fields mirror the
         // SpeculativeConfig attributes and control when TurboMind is allowed
@@ -609,6 +617,19 @@ void LlamaTritonModel::createEngine(int device_id, int rank)
         ctx->comm = createCommSplits(rank);
     }
 
+    // For speculative engines, prefer a simple device allocator
+    // (plain cudaMalloc/cudaFree) instead of the mem-pool-backed
+    // allocator used by default. This avoids any interaction
+    // between large KV allocations and the custom mem pool when
+    // EAGLE3 buffers are present, and isolates speculative bugs
+    // from the baseline engine path. Apply this whenever a
+    // speculative engine is being created, even if the Context
+    // was originally instantiated for a non-speculative engine.
+    if (engine_param_.enable_speculative_decoding
+        && (engine_param_.spec_method == "eagle" || engine_param_.spec_method == "eagle3")) {
+        ctx->allocator = core::Allocator(kDEVICE);
+    }
+
     core::ContextGuard guard{ctx->core_stream, ctx->allocator, Allocator{kCPUpinned}};
 
     const auto& engine_param = engine_params_.at(rank);
@@ -676,6 +697,82 @@ ScheduleMetrics LlamaTritonModel::getScheduleMetrics(int device_id, int rank)
     auto& engine = *engines_[device_id];
 
     return engine.getScheduleMetrics();
+}
+
+std::shared_ptr<Engine> LlamaTritonModel::createDriftEngine(int                           device_id,
+                                                            int                           rank,
+                                                            std::shared_ptr<Gateway>      external_gateway)
+{
+    TM_LOG_INFO("[LlamaTritonModel] Creating DriftEngine LlamaBatch (device=%d, rank=%d)", device_id, rank);
+
+    CudaDeviceGuard dev_guard(engine_param_.devices[device_id]);
+
+    auto& ctx          = contexts_[device_id];
+    const bool first   = (ctx == nullptr);
+    if (first) {
+        ctx       = std::make_shared<Context>(engine_param_.devices[device_id]);
+        ctx->comm = createCommSplits(rank);
+    }
+
+    // For drift we enforce non-speculative configuration regardless of
+    // any speculative settings present in the YAML/config.
+    EngineParam engine_param = engine_params_.at(rank);
+    engine_param.enable_speculative_decoding    = false;
+    engine_param.spec_method                    = "";
+    engine_param.spec_max_draft_path_len        = 0;
+    engine_param.spec_max_decoding_draft_tokens = 0;
+    engine_param.spec_max_decoding_tokens       = 0;
+    engine_param.spec_max_non_leaf_nodes        = 0;
+    engine_param.spec_draft_model_path          = "";
+
+    // When speculative decoding is disabled this branch will be skipped,
+    // but we keep it for consistency with createEngine.
+    if (engine_param.enable_speculative_decoding
+        && (engine_param.spec_method == "eagle" || engine_param.spec_method == "eagle3")) {
+        ctx->allocator = core::Allocator(kDEVICE);
+    }
+
+    core::ContextGuard guard{ctx->core_stream, ctx->allocator, Allocator{kCPUpinned}};
+
+    const auto h_comm = ctx->comm.h_comm;
+    h_comm->Sync();
+
+    // Lazily create and process weights for this device if needed.
+    if (weights_.empty()) {
+        weights_.resize(engine_param_.devices.size());
+    }
+    if (!weights_[device_id]) {
+        createSharedWeights(device_id, rank);
+        processWeights(device_id, rank);
+    }
+
+    auto model = std::make_unique<LlamaV2>(dtype_,
+                                           model_param_,  //
+                                           engine_param,
+                                           attn_param_,
+                                           moe_param_,
+                                           lora_param_,
+                                           *ctx,
+                                           engine_param.max_batch_size,
+                                           weights_[device_id]);
+
+    h_comm->Sync();
+
+    const int dp_rank = engine_param.outer_dp_rank * engine_param.attn_dp_size + engine_param.attn_dp_rank;
+
+    // Wire the batch to the external Gateway used by DriftEngine so all
+    // request lifecycle events are driven by the new scheduler.
+    auto batch = std::make_shared<Engine>(dtype_,
+                                          engine_param,  //
+                                          std::move(model),
+                                          ctx,
+                                          external_gateway ? external_gateway : gateway_,
+                                          engine_param_.devices[device_id],
+                                          dp_rank);
+
+    // Do not call Warmup() or Start() here; DriftEngine will drive
+    // execution via LlamaBatch::ExecuteScheduled in executor mode.
+    return batch;
 }
 
 void LlamaTritonModel::sleep(int device_id, int level)
