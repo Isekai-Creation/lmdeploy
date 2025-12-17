@@ -292,11 +292,17 @@ void EngineScheduler::update_sequence_state(uint64_t seq_id, int prefilled_token
 
     if (state.phase == SequencePhase::kFinished) {
         TM_LOG_DEBUG("[EngineScheduler] Sequence %lu finished. Releasing resources.", seq_id);
-        if (kv_mgr_) {
-            kv_mgr_->release(seq_id);
-        }
+        // KV reservation ownership:
+        //  - When a CapacityScheduler is present, it is responsible for
+        //    calling kv_mgr_->release(seq_id) exactly once via
+        //    finish_request.
+        //  - When there is no CapacityScheduler, fall back to releasing
+        //    directly via KVCacheManager.
         if (capacity_scheduler_) {
             capacity_scheduler_->finish_request(seq_id);
+        }
+        else if (kv_mgr_) {
+            kv_mgr_->release(seq_id);
         }
         seq_states_.erase(seq_id);
         active_requests_.erase(seq_id);

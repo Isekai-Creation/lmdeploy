@@ -115,9 +115,6 @@ void PrefixCache::erase(uint64_t seq_id) {
     if (it_seq_key != seq_id_to_prefix_key_.end()) {
         const PrefixKey& key_to_erase = it_seq_key->second;
         cache_map_.erase(key_to_erase);
-        if (kv_cache_manager_) {
-            kv_cache_manager_->release(seq_id);
-        }
         seq_id_to_prefix_key_.erase(it_seq_key);
     }
 }
@@ -144,7 +141,9 @@ void PrefixCache::evict_lru_entry() {
         size_t   num_pages_evicted = lru_it->second.page_indices.size();
 
         if (kv_cache_manager_) {
-            kv_cache_manager_->release(seq_id_to_evict);
+            // Only track bytes evicted for metrics; KV page lifetime is
+            // owned by the scheduler / CapacityScheduler, not the
+            // PrefixCache.
             bytes_evicted_ += num_pages_evicted * kv_cache_manager_->page_bytes();
         }
 
