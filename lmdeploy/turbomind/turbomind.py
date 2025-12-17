@@ -239,6 +239,12 @@ class TurboMind:
         """
         from lmdeploy.messages import TurbomindEngineConfig
 
+        # For DriftEngine v1, KV storage is owned by the unified
+        # KVCacheManager, not the legacy BlockManager. Disable the
+        # BlockManager device KV pool so SequenceManager uses logical
+        # blocks only and we do not double-allocate KV in GPU memory.
+        os.environ.setdefault("TM_DRIFT_DISABLE_LEGACY_KV", "1")
+
         # Enforce drift v1 constraints.
         engine_config.enable_speculative_decoding = False
         engine_config.enable_metrics = False

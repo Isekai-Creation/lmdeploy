@@ -32,6 +32,18 @@ BlockManager::BlockManager(
     size_t block_size, double block_count, int chunk_size, core::Allocator allocator, GetFreeMemSize get_free_size):
     block_size_(block_size), allocator_(allocator)
 {
+    // In DriftEngine v1 the unified KVCacheManager owns KV storage. When
+    // TM_DRIFT_DISABLE_LEGACY_KV is set, treat BlockManager as a logical
+    // block indexer only and avoid allocating any device memory for KV
+    // blocks. This keeps the legacy SequenceManager machinery working
+    // without burning a second KV pool in GPU memory.
+    if (const char* env = std::getenv("TM_DRIFT_DISABLE_LEGACY_KV")) {
+        if (std::atoi(env) != 0) {
+            use_device_storage_ = false;
+            TM_LOG_WARNING("[BlockManager] Device KV storage disabled (DriftEngine); using logical blocks only.");
+        }
+    }
+
     if (block_count < 1.) {
         max_block_count_ = GetBlockCount(block_size, block_count, get_free_size);
     }
@@ -87,6 +99,24 @@ bool BlockManager::Malloc()
 
     if (!chunk_size) {
         return false;
+    }
+
+    // Drift logical-only path: create block ids without allocating device
+    // memory for their payloads. This is activated when
+    // TM_DRIFT_DISABLE_LEGACY_KV is set and allows DriftEngine to rely
+    // solely on KVCacheManager for KV storage while still reusing
+    // SequenceManager's block metadata.
+    if (!use_device_storage_) {
+        TM_LOG_WARNING("[BlockManager][Malloc] logical-only mode: creating %d blocks with null data pointers", chunk_size);
+        for (int i = 0; i < chunk_size; ++i) {
+            auto& block     = blocks_.emplace_back();
+            block.use_count = 0;
+            block.id        = static_cast<int>(blocks_.size()) - 1;
+            block.timestamp = 0;
+            block.data      = nullptr;
+            free_ids_.push_back(block.id);
+        }
+        return true;
     }
 
     size_t alloc_size = block_size_ * chunk_size;

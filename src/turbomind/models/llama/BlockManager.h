@@ -147,6 +147,7 @@ private:
 
 private:
     size_t block_size_;
+    bool   use_device_storage_{true};
     int    max_block_count_{};
     int    chunk_size_{};
 
