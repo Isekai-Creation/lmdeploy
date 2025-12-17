@@ -9,6 +9,7 @@
 #include <iterator>
 #include <memory>
 #include <ostream>
+#include <vector>
 
 #include <xgrammar/xgrammar.h>
 
@@ -144,6 +145,9 @@ struct Request {
     std::shared_ptr<AtomicRequestState> state;
 
     std::shared_ptr<RequestMetrics> metrics;
+
+    std::vector<int> kv_page_ids;
+    uint64_t        kv_cookie{0};
 
     int ec;  // set when disabling conflicting requests
 

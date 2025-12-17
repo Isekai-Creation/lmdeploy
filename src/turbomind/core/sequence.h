@@ -47,6 +47,7 @@ struct Sequence {
 
     // New member: KV page IDs allocated by KVCacheManager for this sequence
     std::vector<int> kv_page_ids;
+    uint64_t         kv_cookie{0};
     // The KVReservation for this sequence is managed by KVCacheManager.
 
     explicit Sequence(uint64_t _id): id(_id) {}
@@ -60,9 +61,10 @@ inline std::ostream& operator<<(std::ostream& os, const Sequence& seq)
 {
     os << "id=" << seq.id << ", status=" << static_cast<int>(seq.status) << ", token_count=" << seq.tokens.size()
        << ", block_count=" << seq.blocks.size() << ", cache_len=" << seq.cache_len
-       << ", random_state_size=" << seq.random_state.size() << ", input_length=" << seq.input_length
-       << ", kv_page_ids.size()=" << seq.kv_page_ids.size();
+        << ", random_state_size=" << seq.random_state.size() << ", input_length=" << seq.input_length
+        << ", kv_page_ids.size()=" << seq.kv_page_ids.size() << ", kv_cookie=" << seq.kv_cookie;
     return os;
 }
+
 
 }  // namespace turbomind

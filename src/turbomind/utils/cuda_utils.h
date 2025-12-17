@@ -35,6 +35,7 @@
 #include "src/turbomind/macro.h"
 #include "src/turbomind/utils/cuda_bf16_wrapper.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/progress_logger.h"
 
 namespace turbomind {
 
@@ -80,6 +81,65 @@ static const char* _cudaGetErrorEnum(cublasStatus_t error)
     return "<unknown>";
 }
 
+// Track the most recent cuda allocation size on the current thread so that
+// OOM diagnostics can report an approximate requested size.
+inline thread_local size_t g_last_cuda_alloc_bytes = 0;
+
+inline void set_last_cuda_alloc_bytes(size_t bytes)
+{
+    g_last_cuda_alloc_bytes = bytes;
+}
+
+inline size_t get_last_cuda_alloc_bytes()
+{
+    return g_last_cuda_alloc_bytes;
+}
+
+// Specialized check for cudaError_t so we can provide detailed OOM context.
+inline void check(cudaError_t result, char const* const func, const char* const file, int const line)
+{
+    if (result != cudaSuccess) {
+        if (result == cudaErrorMemoryAllocation) {
+            size_t free_bytes  = 0;
+            size_t total_bytes = 0;
+            auto   info_err    = cudaMemGetInfo(&free_bytes, &total_bytes);
+            size_t requested   = get_last_cuda_alloc_bytes();
+            if (info_err == cudaSuccess) {
+                TM_LOG_ERROR(
+                    "[TM][OOM] CUDA OOM in %s at %s:%d requested=%zu free=%zu total=%zu",
+                    func,
+                    file,
+                    line,
+                    requested,
+                    free_bytes,
+                    total_bytes);
+            }
+            else {
+                TM_LOG_ERROR(
+                    "[TM][OOM] CUDA OOM in %s at %s:%d requested=%zu (cudaMemGetInfo failed: %s)",
+                    func,
+                    file,
+                    line,
+                    requested,
+                    cudaGetErrorString(info_err));
+            }
+            // Emit a progress-style line even if the DriftEngine worker
+            // loop has not started yet so OOMs contribute to the unified
+            // [DRIFT][PROG] trace.
+            TM_LOG_ERROR("[DRIFT][PROG] stage=Error pct=100 requested=%zu free=%zu total=%zu msg=\"cuda_oom\"",
+                         requested,
+                         free_bytes,
+                         total_bytes);
+        }
+
+        TM_LOG_ERROR((std::string("CUDA runtime error: ") + (_cudaGetErrorEnum(result)) + " " + file + ":"
+                      + std::to_string(line))
+                         .c_str());
+        std::abort();
+    }
+}
+
+// Generic check for non-cudaError_t statuses (e.g., cuBLAS).
 template<typename T>
 void check(T result, char const* const func, const char* const file, int const line)
 {

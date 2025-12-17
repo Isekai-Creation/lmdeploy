@@ -18,7 +18,7 @@ public:
                                    const KVUsageEstimate& est,
                                    KVReservation* out,
                                    const std::vector<int>& pre_existing_page_ids = {});
-    virtual void finish_request(uint64_t seq_id);
+    virtual void finish_request(uint64_t seq_id, const char* reason = "unspecified");
 
     size_t blocked_due_to_capacity() const;
     size_t rejected_never_schedulable() const;

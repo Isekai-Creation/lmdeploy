@@ -90,6 +90,24 @@ bool BlockManager::Malloc()
     }
 
     size_t alloc_size = block_size_ * chunk_size;
+
+    // Emit a GPU memory snapshot before the first large KV chunk allocation so
+    // OOMs from this path can be attributed precisely in logs.
+    size_t     free_bytes  = 0;
+    size_t     total_bytes = 0;
+    auto       err         = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (err == cudaSuccess) {
+        TM_LOG_INFO(
+            "[BlockManager][Malloc] about_to_alloc bytes=%zu free=%zu total=%zu",
+            alloc_size,
+            free_bytes,
+            total_bytes);
+    }
+    else {
+        TM_LOG_WARNING("[BlockManager][Malloc] cudaMemGetInfo failed before alloc: %s",
+                       cudaGetErrorString(err));
+    }
+
     TM_LOG_WARNING("[BlockManager][Malloc] alloc_size = %lu * %d = %lu bytes (%.2f GB)", block_size_, chunk_size, alloc_size, alloc_size/1e9);
 
     auto ptr = (std::byte*)allocator_->allocate(alloc_size);

@@ -12,6 +12,7 @@
 #include "src/turbomind/engine/request_queue.h"
 #include "src/turbomind/engine/signal_buffer.h"
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/progress_logger.h"
 
 namespace turbomind {
 
@@ -67,6 +68,16 @@ public:
     void push(std::shared_ptr<Request> r)
     {
         int rank = -1;
+
+        if (ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kRequestEnqueue};
+            evt.pct        = 0;
+            evt.seq_id     = r->session.id;
+            evt.session_id = r->session.id;
+            evt.unique_id  = r->unique_id;
+            evt.msg        = r->session.start_flag ? "start" : "cont";
+            ProgressLogger::Log(evt);
+        }
 
         if (!r->session.start_flag) {
             // route to corresponding rank
@@ -126,6 +137,35 @@ public:
 
         // Assign a monotonic increasing id for each infer request
         queues_[rank]->assign_unique_ids(infer_reqs);
+
+        if (ProgressLogger::Enabled()) {
+            for (const auto& req : infer_reqs) {
+                if (!req) {
+                    continue;
+                }
+                ProgressEvent evt{ProgressStage::kGatewayPop};
+                evt.pct        = 5;
+                evt.seq_id     = req->session.id;
+                evt.session_id = req->session.id;
+                evt.unique_id  = req->unique_id;
+                evt.rank       = rank;
+                evt.msg        = "infer";
+                ProgressLogger::Log(evt);
+            }
+            for (const auto& req : kill_reqs) {
+                if (!req) {
+                    continue;
+                }
+                ProgressEvent evt{ProgressStage::kGatewayPop};
+                evt.pct        = 5;
+                evt.seq_id     = req->session.id;
+                evt.session_id = req->session.id;
+                evt.unique_id  = req->unique_id;
+                evt.rank       = rank;
+                evt.msg        = "kill";
+                ProgressLogger::Log(evt);
+            }
+        }
 
         // Bind for stateful inference
         std::vector<uint64_t> bind_ids;

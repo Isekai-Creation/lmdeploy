@@ -707,6 +707,18 @@ std::shared_ptr<Engine> LlamaTritonModel::createDriftEngine(int                 
 
     CudaDeviceGuard dev_guard(engine_param_.devices[device_id]);
 
+    // Drift engine startup allocation-order logs: capture GPU memory
+    // snapshots before and after major init stages so OOMs can be
+    // attributed precisely.
+    auto log_mem = [](const char* scope) {
+        size_t free_bytes  = 0;
+        size_t total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+            TM_LOG_INFO("[DriftEngine][MEM] %s free=%zu total=%zu", scope, free_bytes, total_bytes);
+        }
+    };
+    log_mem("before_context_and_weights");
+
     auto& ctx          = contexts_[device_id];
     const bool first   = (ctx == nullptr);
     if (first) {
@@ -742,10 +754,14 @@ std::shared_ptr<Engine> LlamaTritonModel::createDriftEngine(int                 
         weights_.resize(engine_param_.devices.size());
     }
     if (!weights_[device_id]) {
+        log_mem("before_createSharedWeights");
         createSharedWeights(device_id, rank);
+        log_mem("after_createSharedWeights");
         processWeights(device_id, rank);
+        log_mem("after_processWeights");
     }
 
+    log_mem("before_LlamaV2_ctor");
     auto model = std::make_unique<LlamaV2>(dtype_,
                                            model_param_,  //
                                            engine_param,
@@ -762,6 +778,7 @@ std::shared_ptr<Engine> LlamaTritonModel::createDriftEngine(int                 
 
     // Wire the batch to the external Gateway used by DriftEngine so all
     // request lifecycle events are driven by the new scheduler.
+    log_mem("before_drift_Engine_ctor");
     auto batch = std::make_shared<Engine>(dtype_,
                                           engine_param,  //
                                           std::move(model),
@@ -769,6 +786,7 @@ std::shared_ptr<Engine> LlamaTritonModel::createDriftEngine(int                 
                                           external_gateway ? external_gateway : gateway_,
                                           engine_param_.devices[device_id],
                                           dp_rank);
+    log_mem("after_drift_Engine_ctor");
 
     // Do not call Warmup() or Start() here; DriftEngine will drive
     // execution via LlamaBatch::ExecuteScheduled in executor mode.

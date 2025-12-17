@@ -1,12 +1,27 @@
 #include "src/turbomind/core/kv_cache_manager.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/cuda_utils.h"
-#include <numeric> // For std::iota
+#include "src/turbomind/utils/progress_logger.h"
 #include <cuda_runtime_api.h> // For cudaMalloc and cudaFree
 #include <cassert>
+#include <cstdint>
+#include <numeric> // For std::iota
 #include <unordered_set>
 
 namespace turbomind {
+namespace {
+
+uint64_t hash_page_ids(uint64_t seq_id, const std::vector<int>& page_ids)
+{
+    uint64_t hash = 1469598103934665603ull;
+    hash ^= seq_id + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    for (const int page_id : page_ids) {
+        hash ^= static_cast<uint64_t>(page_id) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    }
+    return hash;
+}
+
+}  // namespace
 
 // Helper functions for CUDA memory management
 static void* allocate_device_memory(size_t bytes) {
@@ -36,18 +51,32 @@ KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_byt
     FT_CHECK_WITH_INFO(layout_.head_dim > 0, "KVLayout.head_dim must be positive");
     FT_CHECK_WITH_INFO(layout_.page_size > 0, "KVLayout.page_size must be positive");
 
-    int effective_bpv      = layout_.bytes_per_value > 0 ? layout_.bytes_per_value : bytes_per_value_from_dtype(layout_.kv_dtype);
+    int effective_bpv       = layout_.bytes_per_value > 0 ? layout_.bytes_per_value : bytes_per_value_from_dtype(layout_.kv_dtype);
     layout_.bytes_per_value = effective_bpv;
-    page_bytes_             = static_cast<size_t>(layout_.num_layers) * layout_.num_kv_heads * layout_.head_dim * layout_.page_size * effective_bpv;
 
-    TM_LOG_INFO("[KVCacheManager] layout: layers=%d kv_heads=%d head_dim=%d page_size=%d dtype=%d bpv=%d page_bytes=%zu",
-                layout_.num_layers,
-                layout_.num_kv_heads,
-                layout_.head_dim,
-                layout_.page_size,
-                static_cast<int>(layout_.kv_dtype),
-                effective_bpv,
-                page_bytes_);
+    const int kv_factor = layout_.kv_factor > 0 ? layout_.kv_factor : 2;
+    layout_.kv_factor   = kv_factor;
+    kv_factor_          = kv_factor;
+
+    // Each logical "page" stores both K and V activations for all
+    // layers and KV heads at `page_size` token positions.
+    page_bytes_ = static_cast<size_t>(layout_.num_layers)
+                   * layout_.num_kv_heads
+                   * layout_.head_dim
+                   * layout_.page_size
+                   * effective_bpv
+                   * kv_factor;
+
+    TM_LOG_INFO(
+        "[KVCacheManager] layout: layers=%d kv_heads=%d head_dim=%d page_size=%d dtype=%d bpv=%d kv_factor=%d page_bytes=%zu",
+        layout_.num_layers,
+        layout_.num_kv_heads,
+        layout_.head_dim,
+        layout_.page_size,
+        static_cast<int>(layout_.kv_dtype),
+        effective_bpv,
+        kv_factor,
+        page_bytes_);
 
     if (page_bytes_ == 0) {
         TM_LOG_ERROR("KVCacheManager page_bytes computed as 0. Invalid layout.");
@@ -60,7 +89,25 @@ KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_byt
         return;
     }
 
-    // Allocate a single contiguous device buffer for all KV data
+    // Allocate a single contiguous device buffer for all KV data. Before
+    // doing so, capture a GPU memory snapshot so any OOM here can be
+    // attributed precisely in logs.
+    size_t     free_bytes  = 0;
+    size_t     total_bytes = 0;
+    auto       info_err    = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (info_err == cudaSuccess) {
+        TM_LOG_INFO(
+            "[KVCacheManager] about_to_alloc bytes=%zu free=%zu total=%zu",
+            num_pages * page_bytes_,
+            free_bytes,
+            total_bytes);
+    }
+    else {
+        TM_LOG_WARNING("[KVCacheManager] cudaMemGetInfo failed before alloc: %s",
+                       cudaGetErrorString(info_err));
+    }
+
+    // Real allocation
     void* all_kv_data_ptr = allocate_device_memory(num_pages * page_bytes_);
     if (!all_kv_data_ptr) {
         TM_LOG_ERROR("Failed to allocate contiguous device memory for KV cache.");
@@ -69,14 +116,16 @@ KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_byt
     }
 
     all_pages_.reserve(num_pages);
-    page_ref_counts_.assign(num_pages, 0); // Initialize ref counts
+    page_ref_counts_.assign(num_pages, 0);  // Initialize ref counts
+    base_ptr_      = all_kv_data_ptr;
+    storage_bytes_ = num_pages * page_bytes_;
+
     for (size_t i = 0; i < num_pages; ++i) {
         KVCachePage page;
-        page.id = i;
+        page.id   = static_cast<int>(i);
         page.data = static_cast<char*>(all_kv_data_ptr) + (i * page_bytes_);
-        page.is_free = true;
         all_pages_.push_back(page);
-        free_page_ids_.push(i); // Add all pages to the free list
+        free_page_ids_.push(static_cast<int>(i));  // Add all pages to the free list
     }
     TM_LOG_INFO("KVCacheManager initialized with %zu pages, total capacity %lu bytes.", num_pages, total_capacity_bytes_);
 }
@@ -84,9 +133,9 @@ KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_byt
 KVCacheManager::~KVCacheManager()
 {
     // Free the contiguous device buffer
-    if (!all_pages_.empty() && all_pages_[0].data) {
-        // Only free the base pointer once
-        free_device_memory(all_pages_[0].data);
+    if (base_ptr_) {
+        free_device_memory(base_ptr_);
+        base_ptr_ = nullptr;
     }
     TM_LOG_INFO("KVCacheManager destroyed, memory freed.");
 }
@@ -149,32 +198,61 @@ bool KVCacheManager::reserve(uint64_t seq_id,
     // First, incorporate pre-existing pages from the prefix cache
     std::unordered_set<int> seen_pages;
     for (int page_id : pre_existing_page_ids) {
-        if (page_id < 0 || page_id >= all_pages_.size()) {
+        if (page_id < 0 || page_id >= static_cast<int>(all_pages_.size())) {
             TM_LOG_ERROR("Pre-existing page ID %d for sequence %lu is invalid. Failing reservation.", page_id, seq_id);
             return false;
         }
-        if (all_pages_[page_id].is_free) {
-            TM_LOG_ERROR("Pre-existing page ID %d for sequence %lu is marked free. Failing reservation.", page_id, seq_id);
+        if (page_ref_counts_[page_id] <= 0) {
+            TM_LOG_ERROR("Pre-existing page ID %d for sequence %lu has non-positive refcount (%d). Failing reservation.",
+                         page_id,
+                         seq_id,
+                         page_ref_counts_[page_id]);
             return false;
         }
         if (!seen_pages.insert(page_id).second) {
             TM_LOG_ERROR("Duplicate pre-existing page ID %d for sequence %lu.", page_id, seq_id);
             return false;
         }
-        // Increment ref count for pre-existing pages
+        // Increment ref count for pre-existing pages (shared KV pages).
         page_ref_counts_[page_id]++;
         allocated_page_ids.push_back(page_id);
     }
 
+    if (!pre_existing_page_ids.empty()) {
+        TM_LOG_DEBUG("Reusing %zu prefix-cache pages for sequence ID: %lu", pre_existing_page_ids.size(), seq_id);
+        if (ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kKVReserve};
+            evt.pct           = 35;
+            evt.seq_id        = seq_id;
+            evt.session_id    = seq_id;
+            evt.kv_pages_seq  = static_cast<int>(pre_existing_page_ids.size());
+            evt.msg           = "use_prefix_pages";
+            ProgressLogger::Log(evt);
+        }
+    }
+
     // Calculate how many more pages are needed
     size_t remaining_pages_needed = est.pages_needed > allocated_page_ids.size() ? est.pages_needed - allocated_page_ids.size() : 0;
+
+    auto revert_shared_page = [&](int page_id) {
+        if (page_id < 0 || page_id >= static_cast<int>(page_ref_counts_.size())) {
+            return;
+        }
+        if (page_ref_counts_[page_id] <= 0) {
+            return;
+        }
+        page_ref_counts_[page_id]--;
+        if (page_ref_counts_[page_id] == 0) {
+            free_page_ids_.push(page_id);
+        }
+    };
 
     if (remaining_pages_needed > free_page_ids_.size()) {
         TM_LOG_DEBUG("Insufficient free pages to reserve for sequence ID: %lu. Needed: %zu, Available: %zu (after pre-existing: %zu)",
                   seq_id, est.pages_needed, free_page_ids_.size(), remaining_pages_needed);
         // If not enough pages are available, revert the ref count increments
         for (int page_id : pre_existing_page_ids) {
-            page_ref_counts_[page_id]--;
+            revert_shared_page(page_id);
         }
         return false;
     }
@@ -182,7 +260,7 @@ bool KVCacheManager::reserve(uint64_t seq_id,
         TM_LOG_ERROR("Pre-existing pages (%zu) exceed requested pages (%zu) for sequence %lu",
                      allocated_page_ids.size(), est.pages_needed, seq_id);
         for (int page_id : pre_existing_page_ids) {
-            page_ref_counts_[page_id]--;
+            revert_shared_page(page_id);
         }
         return false;
     }
@@ -191,18 +269,20 @@ bool KVCacheManager::reserve(uint64_t seq_id,
     for (size_t i = 0; i < remaining_pages_needed; ++i) {
         int page_id = free_page_ids_.front();
         free_page_ids_.pop();
-        all_pages_[page_id].is_free = false;
-        page_ref_counts_[page_id] = 1; // New page starts with ref count 1
+        page_ref_counts_[page_id] = 1;  // New page starts with ref count 1
         allocated_page_ids.push_back(page_id);
     }
 
     KVReservation reservation;
-    reservation.seq_id = seq_id;
+    reservation.seq_id    = seq_id;
     reservation.first_page = allocated_page_ids.empty() ? -1 : allocated_page_ids[0];
-    reservation.num_pages = allocated_page_ids.size();
-
+    reservation.num_pages  = allocated_page_ids.size();
+    reservation.page_ids   = allocated_page_ids;
+    reservation.kv_cookie  = hash_page_ids(seq_id, allocated_page_ids);
+ 
     seq_reservations_[seq_id] = reservation;
-    seq_page_map_[seq_id] = allocated_page_ids;
+    seq_page_map_[seq_id]     = allocated_page_ids;
+
 
     if (out) {
         *out = reservation;
@@ -217,9 +297,6 @@ void KVCacheManager::release(uint64_t seq_id)
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto res_it = seq_reservations_.find(seq_id);
-    
-    assert(res_it != seq_reservations_.end() && "Attempted to release non-existent reservation");
-
     if (res_it == seq_reservations_.end()) {
         TM_LOG_WARNING("Attempted to release non-existent reservation for sequence ID: %lu", seq_id);
         return;
@@ -233,7 +310,7 @@ void KVCacheManager::release(uint64_t seq_id)
 
     const std::vector<int>& allocated_page_ids = page_map_it->second;
     for (int page_id : allocated_page_ids) {
-        if (page_id < 0 || page_id >= all_pages_.size()) {
+        if (page_id < 0 || page_id >= static_cast<int>(all_pages_.size())) {
             TM_LOG_ERROR("Internal error: Invalid page ID %d in allocated_page_ids for sequence %lu", page_id, seq_id);
             continue;
         }
@@ -244,7 +321,6 @@ void KVCacheManager::release(uint64_t seq_id)
         page_ref_counts_[page_id]--;
 
         if (page_ref_counts_[page_id] == 0) {
-            all_pages_[page_id].is_free = true;
             free_page_ids_.push(page_id);
         }
     }
@@ -275,7 +351,7 @@ int KVCacheManager::page_for(uint64_t seq_id, int position) const
 void* KVCacheManager::get_page_data_ptr(int page_id) const
 {
     std::lock_guard<std::mutex> lock(mutex_); // Lock for read access
-    if (page_id < 0 || page_id >= all_pages_.size()) {
+    if (page_id < 0 || page_id >= static_cast<int>(all_pages_.size())) {
         TM_LOG_ERROR("Invalid page ID: %d", page_id);
         return nullptr;
     }
@@ -293,7 +369,7 @@ std::vector<int> KVCacheManager::get_sequence_page_ids(uint64_t seq_id) const {
 
 int KVCacheManager::get_page_ref_count(int page_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (page_id < 0 || page_id >= page_ref_counts_.size()) {
+    if (page_id < 0 || page_id >= static_cast<int>(page_ref_counts_.size())) {
         return -1; // Invalid page_id
     }
     return page_ref_counts_[page_id];
@@ -312,16 +388,50 @@ KVUsageEstimate KVCacheManager::estimate_usage(const ModelLayout& layout,
         pages = 1;
     }
 
-    int bytes_per_value_eff = bytes_per_value_from_dtype(layout.kv_dtype);
+    const int bytes_per_value_eff = bytes_per_value_from_dtype(layout.kv_dtype);
+    const int kv_factor           = 2;
 
     size_t bytes = static_cast<size_t>(pages)
                  * layout.num_layers
                  * layout.num_kv_heads
                  * layout.head_dim
                  * layout.page_size
-                 * bytes_per_value_eff;
+                 * bytes_per_value_eff
+                 * kv_factor;
 
     return {static_cast<size_t>(pages), bytes};
+}
+
+bool KVCacheManager::build_page_ptr_table(const std::vector<int>& page_ids,
+                                          std::vector<void*>&     out_ptrs) const
+
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    out_ptrs.clear();
+    out_ptrs.reserve(page_ids.size());
+    const uintptr_t base = reinterpret_cast<uintptr_t>(base_ptr_);
+    const uintptr_t end  = base + storage_bytes_;
+    for (size_t i = 0; i < page_ids.size(); ++i) {
+        int page_id = page_ids[i];
+        if (page_id < 0 || page_id >= static_cast<int>(all_pages_.size())) {
+            TM_LOG_ERROR("build_page_ptr_table: invalid page_id %d at index %zu", page_id, i);
+            return false;
+        }
+        void* page_ptr = all_pages_[page_id].data;
+        if (base_ptr_ && page_ptr) {
+            const uintptr_t val = reinterpret_cast<uintptr_t>(page_ptr);
+            if (val < base || val >= end) {
+                TM_LOG_ERROR("build_page_ptr_table: pointer %p out of range [base=%p, size=%zu] (page_id=%d)",
+                             page_ptr,
+                             base_ptr_,
+                             storage_bytes_,
+                             page_id);
+                return false;
+            }
+        }
+        out_ptrs.push_back(page_ptr);
+    }
+    return true;
 }
 
 }  // namespace turbomind

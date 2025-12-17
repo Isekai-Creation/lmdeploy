@@ -55,6 +55,7 @@ private:
      std::function<void(const std::vector<PrefillChunk>&,
                         const std::vector<std::shared_ptr<Request>>&)> batch_executor_;
      std::function<void()> batch_shutdown_;
+     std::atomic<bool>                  progress_ready_logged_{false};
  
      // Optional bound LlamaBatch executor for DriftEngine TP=1 path.
      LlamaBatch* llama_batch_{nullptr};

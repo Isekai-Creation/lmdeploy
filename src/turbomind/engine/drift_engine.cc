@@ -3,13 +3,17 @@
 #include "src/turbomind/models/common/model_layout.h"
 #include "src/turbomind/engine/request.h"
 #include "src/turbomind/models/llama/LlamaBatch.h"
+#include "src/turbomind/utils/progress_logger.h"
 #include <chrono>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <cstdlib>
+#include <string>
 #include <cuda_runtime_api.h>
+
 
 namespace {
 
@@ -47,10 +51,10 @@ inline std::function<void()> make_llama_batch_shutdown(turbomind::LlamaBatch* ba
 inline size_t auto_kv_capacity_bytes_from_env()
 {
     // Treat TM_CACHE_MAX_ENTRY_COUNT as an upper bound on the fraction of
-    // *free* device memory usable for KV. The caller is responsible for
-    // choosing a sane value; we avoid hidden clamps so that misconfigured
-    // ratios surface as explicit allocation errors instead of silently
-    // changing the effective KV budget.
+    // *free* device memory usable for KV. For DriftEngine v1 we apply a
+    // safety clamp and headroom reservation by default so that KV does not
+    // starve weights/workspaces, while still allowing power‑users to
+    // override the clamp via TM_DRIFT_KV_NO_CLAMP.
     double ratio = 0.75;
     if (const char* env = std::getenv("TM_CACHE_MAX_ENTRY_COUNT")) {
         char*  end = nullptr;
@@ -64,8 +68,8 @@ inline size_t auto_kv_capacity_bytes_from_env()
 
     // Optional environment override to tighten the KV budget without
     // changing engine configs. When set to a value in (0,1], this caps
-    // the internal ratio used for sizing KVCacheManager, but we no longer
-    // apply any default safety clamp.
+    // the internal ratio used for sizing KVCacheManager before the
+    // Drift‑specific clamp is applied.
     if (const char* env = std::getenv("TM_KV_EFFECTIVE_RATIO")) {
         char*  end = nullptr;
         double v   = std::strtod(env, &end);
@@ -91,14 +95,81 @@ inline size_t auto_kv_capacity_bytes_from_env()
         free_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     }
 
-    size_t capacity = static_cast<size_t>(static_cast<double>(free_bytes) * effective_ratio);
+    // By default clamp the effective ratio to 0.70 to leave room for
+    // model weights and workspaces unless the user explicitly disables
+    // the clamp via TM_DRIFT_KV_NO_CLAMP=1.
+    bool   clamp_enabled = true;
+    if (const char* env = std::getenv("TM_DRIFT_KV_NO_CLAMP")) {
+        if (std::atoi(env) != 0) {
+            clamp_enabled = false;
+        }
+    }
+    double clamped_ratio = effective_ratio;
+    if (clamp_enabled && clamped_ratio > 0.70) {
+        clamped_ratio = 0.70;
+    }
+
+    // Reserve headroom for runtime workspaces. Keep at least 10% of
+    // total memory or 8GB, whichever is larger.
+    const size_t reserve_bytes = std::max<size_t>(8ULL * 1024ULL * 1024ULL * 1024ULL,
+                                                  static_cast<size_t>(static_cast<double>(total_bytes) * 0.10));
+
+    size_t capacity_from_ratio = static_cast<size_t>(static_cast<double>(free_bytes) * clamped_ratio);
+    size_t capacity            = capacity_from_ratio;
+    if (free_bytes > reserve_bytes) {
+        size_t max_allowed = free_bytes - reserve_bytes;
+        if (capacity > max_allowed) {
+            capacity = max_allowed;
+        }
+    }
+    else {
+        // If we are already below the headroom threshold, be conservative.
+        capacity = static_cast<size_t>(static_cast<double>(free_bytes) * 0.5);
+    }
+
     TM_LOG_INFO(
-        "[DriftEngine] Auto KV capacity: free=%zu bytes, ratio=%.3f (effective=%.3f) -> kv_capacity_bytes=%zu",
+        "[DriftEngine] Auto KV capacity: free=%zu total=%zu bytes, "
+        "ratio=%.3f (effective=%.3f, clamped=%.3f) reserve_bytes=%zu -> kv_capacity_bytes=%zu",
         free_bytes,
+        total_bytes,
         ratio,
         effective_ratio,
+        clamped_ratio,
+        reserve_bytes,
         capacity);
     return capacity;
+}
+
+inline void log_progress_mem_snapshot(const char* scope, uint8_t pct)
+{
+    if (!turbomind::ProgressLogger::Enabled()) {
+        return;
+    }
+    if (!scope) {
+        scope = "drift_scope";
+    }
+    size_t free_bytes  = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        return;
+    }
+    turbomind::ProgressEvent evt{turbomind::ProgressStage::kKVReserve};
+    evt.pct = pct;
+    std::ostringstream oss;
+    oss << scope << " free=" << free_bytes << " total=" << total_bytes;
+    evt.msg = oss.str();
+    turbomind::ProgressLogger::Log(evt);
+}
+
+inline void log_progress_message(uint8_t pct, const std::string& msg)
+{
+    if (!turbomind::ProgressLogger::Enabled()) {
+        return;
+    }
+    turbomind::ProgressEvent evt{turbomind::ProgressStage::kKVReserve};
+    evt.pct = pct;
+    evt.msg = msg;
+    turbomind::ProgressLogger::Log(evt);
 }
 }
 
@@ -115,8 +186,14 @@ DriftEngine::DriftEngine(const DriftEngineConfig& cfg,
       capacity_sched_(nullptr),
       scheduler_(nullptr)
 {
+    // Always enable Drift progress trace and crash handler for DriftEngine.
+    ProgressLogger::ForceEnableForDrift(true);
+    ProgressLogger::InstallCrashHandler();
+    log_progress_mem_snapshot("drift_engine_ctor_entry", 2);
+
     cfg_.model_layout = resolve_model_layout(cfg_);
     cfg_.kv_layout    = derive_kv_layout(cfg_.model_layout, cfg_.kv_layout);
+    log_progress_message(3, "drift_engine_model_layout_ready");
 
     // Enforce v1 constraints: non-speculative, TP=1-only (checked in bindings), no CUDA graphs.
     if (cfg_.scheduler_config.enable_speculative_decoding) {
@@ -135,10 +212,14 @@ DriftEngine::DriftEngine(const DriftEngineConfig& cfg,
         cfg_.kv_capacity_bytes = auto_kv_capacity_bytes_from_env();
     }
 
+    log_progress_message(4, "kv_capacity_selected bytes=" + std::to_string(cfg_.kv_capacity_bytes));
+
     if (!kv_mgr_) {
         if (cfg_.kv_capacity_bytes > 0) {
+            log_progress_message(5, "kv_cache_manager_build_begin bytes=" + std::to_string(cfg_.kv_capacity_bytes));
             kv_mgr_ = std::make_shared<KVCacheManager>(cfg_.kv_layout, cfg_.kv_capacity_bytes);
             TM_LOG_INFO("[DriftEngine] Created KVCacheManager with %zu bytes", cfg_.kv_capacity_bytes);
+            log_progress_mem_snapshot("kv_cache_manager_ready", 7);
         }
         else {
             TM_LOG_WARNING("[DriftEngine] No KVCacheManager provided and kv_capacity_bytes is 0; KV will be unavailable.");
@@ -151,6 +232,8 @@ DriftEngine::DriftEngine(const DriftEngineConfig& cfg,
 
     capacity_sched_ = std::make_unique<CapacityScheduler>(kv_mgr_.get(), prefix_cache_.get());
     scheduler_      = std::make_unique<EngineScheduler>(cfg_.scheduler_config, kv_mgr_.get(), cfg_.model_layout, prefix_cache_.get(), capacity_sched_.get());
+
+    log_progress_message(9, "drift_scheduler_ready");
 
     // Guardrail: fail fast when configured capacity cannot hold a full batch at session_len.
     if (cfg_.kv_capacity_bytes > 0 && cfg_.session_len > 0 && cfg_.max_batch_size > 0) {
@@ -168,6 +251,8 @@ DriftEngine::DriftEngine(const DriftEngineConfig& cfg,
         }
     }
 
+    log_progress_mem_snapshot("drift_engine_ctor_done", 10);
+    log_progress_message(15, "drift_engine_ctor_complete");
     TM_LOG_INFO("DriftEngine created with new architecture");
 }
 
@@ -195,6 +280,13 @@ KVLayout DriftEngine::derive_kv_layout(const ModelLayout& model_layout, const KV
 
 void DriftEngine::run(int rank) {
     TM_LOG_INFO("DriftEngine worker running on rank %d", rank);
+    if (ProgressLogger::Enabled()) {
+        ProgressEvent evt{ProgressStage::kGatewayPop};
+        evt.pct  = 85;
+        evt.rank = rank;
+        evt.msg  = "worker_loop_launch";
+        ProgressLogger::Log(evt);
+    }
     worker_loop(rank);
 }
 
@@ -231,8 +323,20 @@ void DriftEngine::bind_llama_batch(LlamaBatch* batch)
         }
         llama_batch_->set_executor_mode();
         TM_LOG_INFO("[DriftEngine] LlamaBatch bound in executor mode (CUDA graphs disabled for v1).");
+        if (ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kGatewayPop};
+            evt.pct = 30;
+            evt.msg = "llama_batch_bound";
+            ProgressLogger::Log(evt);
+        }
     }
     set_batch_executor(make_llama_batch_executor(batch), make_llama_batch_shutdown(batch));
+    if (ProgressLogger::Enabled()) {
+        ProgressEvent evt{ProgressStage::kGatewayPop};
+        evt.pct = 40;
+        evt.msg = "batch_executor_ready";
+        ProgressLogger::Log(evt);
+    }
 }
 
 void DriftEngine::configure_speculative_decoding(bool enable, const std::string& method, int max_draft_tokens)
@@ -251,9 +355,27 @@ void DriftEngine::configure_speculative_decoding(bool enable, const std::string&
 void DriftEngine::worker_loop(int rank) {
     TM_LOG_INFO("DriftEngine internal worker_loop on rank %d. Abort flag: %d", rank, abort_.load());
 
-    while (!abort_.load()) {
-        std::vector<std::shared_ptr<Request>> infer_reqs;
-        std::vector<std::shared_ptr<Request>> kill_reqs;
+    bool logged_ready = false;
+ 
+     while (!abort_.load()) {
+         if (!logged_ready) {
+             if (ProgressLogger::Enabled() && !progress_ready_logged_.exchange(true)) {
+                 ProgressEvent evt_start{ProgressStage::kGatewayPop};
+                 evt_start.pct  = 90;
+                 evt_start.rank = rank;
+                 evt_start.msg  = "worker_loop_active";
+                 ProgressLogger::Log(evt_start);
+                 ProgressEvent evt_ready{ProgressStage::kRelease};
+                 evt_ready.pct  = 100;
+                 evt_ready.rank = rank;
+                 evt_ready.msg  = "drift_engine_ready_for_requests";
+                 ProgressLogger::Log(evt_ready);
+             }
+             logged_ready = true;
+         }
+         std::vector<std::shared_ptr<Request>> infer_reqs;
+         std::vector<std::shared_ptr<Request>> kill_reqs;
+
 
         // 1. Fetch new/kill requests from Gateway if available.
         if (gateway_) {
@@ -334,6 +456,40 @@ void DriftEngine::worker_loop(int rank) {
             capture_len(req);
         }
  
+        if (ProgressLogger::Enabled()) {
+            for (const auto& chunk : prefill_batch) {
+                if (!chunk.req) {
+                    continue;
+                }
+                ProgressEvent evt{ProgressStage::kPrefillSchedule};
+                evt.pct         = 45;
+                evt.seq_id      = chunk.req->session.id;
+                evt.session_id  = chunk.req->session.id;
+                evt.unique_id   = chunk.req->unique_id;
+                evt.chunk_start = chunk.start_pos;
+                evt.chunk_len   = chunk.len;
+                evt.rank        = rank;
+                evt.msg         = "scheduled";
+                ProgressLogger::Log(evt);
+            }
+            for (const auto& req : decode_batch) {
+                if (!req) {
+                    continue;
+                }
+                ProgressEvent evt{ProgressStage::kDecodeSchedule};
+                evt.pct        = 70;
+                evt.seq_id     = req->session.id;
+                evt.session_id = req->session.id;
+                evt.unique_id  = req->unique_id;
+                evt.rank       = rank;
+                if (auto it = pre_lengths.find(req->session.id); it != pre_lengths.end()) {
+                    evt.token_pos = it->second;
+                }
+                evt.msg = "scheduled";
+                ProgressLogger::Log(evt);
+            }
+        }
+ 
         TM_LOG_DEBUG("[DriftEngine] Scheduled prefill=%zu tokens (%zu seqs) decode=%zu tokens (%zu seqs)",
                      step_prefill_tokens,
                      prefill_batch.size(),
@@ -355,11 +511,22 @@ void DriftEngine::worker_loop(int rank) {
             TM_LOG_DEBUG("[DriftEngine] No batch executor bound; skipping model execution.");
         }
 
-// 5. After execution, update sequence states using actual
-        //    per-sequence token deltas derived from
-        //    Request.sequence_length where available.
+        // 5. After execution, update sequence states using actual
+        //    per-sequence token deltas reported by the executor.
         if (scheduler_) {
-            scheduler_->on_step_executed(prefill_batch, decode_batch, pre_lengths);
+            std::vector<ExecutionResult> exec_results;
+            if (llama_batch_) {
+                exec_results = llama_batch_->get_execution_results();
+            }
+            scheduler_->on_step_executed(prefill_batch, decode_batch, pre_lengths, exec_results);
+            if (ProgressLogger::Enabled()) {
+                ProgressEvent evt{ProgressStage::kCallbackNotify};
+                evt.pct   = 96;
+                evt.rank  = rank;
+                evt.msg   = "step_complete";
+                evt.batch_size = static_cast<int>(decode_batch.size() + prefill_batch.size());
+                ProgressLogger::Log(evt);
+            }
         }
 
         if (abort_.load()) {

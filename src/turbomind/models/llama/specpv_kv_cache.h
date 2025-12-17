@@ -159,7 +159,7 @@ public:
     Tensor buffer_v(int layer_idx);
 
     // Summary and retrieval helpers modelled after SpecPV. The initial
-    // implementation focuses on maintaining block counts and placeholders
+    // implementation focuses on maintaining block counts and scaffolding
     // for future CUDA kernels; they do not yet drive any change in the
     // attention layout.
     void summary_key_states(int layer_idx, const Tensor& key_states, int seq_len);

@@ -37,6 +37,9 @@ class BenchmarkRunner:
     """Run DriftEngine baseline benchmarks with simple metrics."""
 
     def __init__(self, model_path: str, output_dir: str = "results"):
+        if os.getenv("DRIFT_USE_STUB_EXECUTOR"):
+            raise RuntimeError("DRIFT_USE_STUB_EXECUTOR is not allowed when running DriftEngine benchmarks.")
+
         self.model_path = model_path
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -118,6 +121,14 @@ class BenchmarkRunner:
             return None
         return metrics if isinstance(metrics, dict) else None
 
+    def ensure_live_backend(self, pipe) -> None:
+        engine = getattr(pipe, "engine", None)
+        if engine is None:
+            raise RuntimeError("Pipeline missing engine handle; cannot verify DriftEngine state.")
+        drift_engine = getattr(engine, "_drift_engine", None)
+        if drift_engine is None:
+            raise RuntimeError("Drift pipeline did not expose a live DriftEngine backend.")
+
     def run_benchmark(
         self,
         pipe,
@@ -132,7 +143,10 @@ class BenchmarkRunner:
         except ValueError:
             pass
 
+        self.ensure_live_backend(pipe)
+ 
         print(f"  Warmup ({warmup_runs} runs)...")
+
         for _ in range(warmup_runs):
             _ = pipe(prompts, gen_config=gen_configs)
             if torch.cuda.is_available():
@@ -153,8 +167,19 @@ class BenchmarkRunner:
                 torch.cuda.synchronize()
             end_time = time.time()
 
+            if not responses:
+                raise RuntimeError("Benchmark run produced no responses; DriftEngine is not executing.")
+
+            total_tokens = sum(len(getattr(r, "token_ids", [])) for r in responses)
+            if total_tokens == 0:
+                raise RuntimeError("Benchmark run produced zero tokens; aborting.")
+            if any(len(getattr(r, "token_ids", [])) == 0 for r in responses):
+                raise RuntimeError("Benchmark run returned a response without generated tokens.")
+            if all(all(token == 0 for token in getattr(r, "token_ids", [])) for r in responses):
+                raise RuntimeError("Benchmark run produced only zero tokens; DriftEngine decode path is not live.")
+
             total_time = end_time - start_time
-            total_tokens = sum(len(r.token_ids) for r in responses)
+
             latency_per_token = (total_time / total_tokens) * 1000 if total_tokens else 0.0
             throughput = total_tokens / total_time if total_time > 0 else 0.0
 

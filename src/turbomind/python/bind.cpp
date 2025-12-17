@@ -314,121 +314,34 @@ public:
         prefix_cache  = nullptr;
         engine        = std::make_unique<turbomind::DriftEngine>(cfg, gateway, kv_mgr, prefix_cache);
 
-        const char* stub_env  = std::getenv("DRIFT_USE_STUB_EXECUTOR");
-        const bool  force_stub = stub_env && stub_env[0] != '\0';
-        bool        use_stub   = false;
+        if (const char* stub_env = std::getenv("DRIFT_USE_STUB_EXECUTOR"); stub_env && stub_env[0] != '\0') {
+            throw std::runtime_error(
+                "DRIFT_USE_STUB_EXECUTOR is no longer supported. DriftEngine always runs the real executor.");
+        }
 
         // When a LlamaTritonModel is available, build a LlamaBatch
         // in executor mode and bind it to DriftEngine so scheduler-
         // driven prefill/decode steps run real model compute.
-        if (!force_stub) {
-            if (!model_comm) {
+        if (!model_comm) {
+            throw std::runtime_error(
+                "DriftEngine requires a LlamaTritonModel for real execution but none was provided.");
+        }
+        try {
+            auto batch = model_comm->createDriftEngine(/*device_id=*/0, /*rank=*/0, gateway);
+            if (!batch) {
                 throw std::runtime_error(
-                    "DriftEngine requires a LlamaTritonModel for real execution but none was provided.");
+                    "LlamaTritonModel::createDriftEngine returned null for DriftEngine executor binding.");
             }
-            try {
-                auto batch = model_comm->createDriftEngine(/*device_id=*/0, /*rank=*/0, gateway);
-                if (!batch) {
-                    throw std::runtime_error(
-                        "LlamaTritonModel::createDriftEngine returned null for DriftEngine executor binding.");
-                }
-                llama_batch = batch;
-                engine->bind_llama_batch(llama_batch.get());
-            }
-            catch (const std::exception& e) {
-                // Propagate to Python; stub is not allowed without DRIFT_USE_STUB_EXECUTOR.
-                throw;
-            }
-            catch (...) {
-                throw;
-            }
+            llama_batch = batch;
+            engine->bind_llama_batch(llama_batch.get());
         }
-        else {
-            TM_LOG_WARNING("[DriftEngineWrapper] DRIFT_USE_STUB_EXECUTOR is set; using synthetic stub executor.");
-            use_stub = true;
+        catch (const std::exception&) {
+            throw;
+        }
+        catch (...) {
+            throw;
         }
 
-        if (use_stub) {
-            // Stub executor is only enabled when DRIFT_USE_STUB_EXECUTOR is set explicitly.
-            // It incrementally advances sequence_length and emits synthetic tokens for testing
-            // scheduler / KV / prefix paths without running the real model.
-            if (!force_stub) {
-                throw std::runtime_error(
-                    "DriftEngine stub executor reached unexpectedly with DRIFT_USE_STUB_EXECUTOR unset.");
-            }
-
-            engine->set_batch_executor(
-                [this](const std::vector<turbomind::PrefillChunk>& prefill,
-                       const std::vector<std::shared_ptr<turbomind::Request>>& decode) {
-                    auto step_decode = [](const std::shared_ptr<turbomind::Request>& req) {
-                        if (!req) {
-                            return;
-                        }
-
-                        int input_len = 0;
-                        try {
-                            auto it = req->inputs.find("input_ids");
-                            if (it != req->inputs.end()) {
-                                input_len = it->second.shape(0);
-                            }
-                        }
-                        catch (...) {
-                            input_len = 0;
-                        }
-
-                        const int out_cap = static_cast<int>(req->output_ids.shape(0));
-                        if (!req->output_ids.data() || out_cap <= input_len) {
-                            turbomind::UpdateState(*req, turbomind::Request::kFinish, input_len);
-                            return;
-                        }
-
-                        int cur_len = input_len;
-                        try {
-                            if (req->sequence_length.data()) {
-                                cur_len = std::max(cur_len, req->sequence_length.data()[0]);
-                            }
-                        }
-                        catch (...) {
-                            // Best-effort; fall back to input_len when sequence_length not readable.
-                        }
-
-                        const int max_new    = req->gen_cfg.max_new_tokens > 0 ? req->gen_cfg.max_new_tokens : 1;
-                        const int target_len = std::min(input_len + max_new, out_cap);
-
-                        if (cur_len >= target_len) {
-                            // Already finished for this request.
-                            turbomind::UpdateState(*req, turbomind::Request::kFinish, cur_len);
-                            return;
-                        }
-
-                        const int next_len = cur_len + 1;
-                        try {
-                            int* out = req->output_ids.data();
-                            if (out && next_len - 1 >= 0 && next_len - 1 < out_cap) {
-                                out[next_len - 1] = 2;  // EOS token placeholder
-                            }
-                            if (req->sequence_length.data()) {
-                                req->sequence_length.data()[0] = next_len;
-                            }
-                        }
-                        catch (...) {
-                        }
-
-                        const int status =
-                            (next_len >= target_len) ? turbomind::Request::kFinish : turbomind::Request::kOk;
-                        turbomind::UpdateState(*req, status, next_len);
-                    };
-
-                    for (const auto& chunk : prefill) {
-                        step_decode(chunk.req);
-                    }
-
-                    for (const auto& req : decode) {
-                        step_decode(req);
-                    }
-                },
-                []() {});
-        }
 
         initialized = true;
     }
@@ -1691,7 +1604,7 @@ PYBIND11_MODULE(_turbomind, m)
                 draft_ids_ptr,
                 target_ids_ptr,
                 paths_ptr,
-                nullptr,  // end_ids placeholder for parity
+                nullptr,  // end_ids buffer unused for this path
                 batch_slots_ptr,
                 static_cast<eagle_kernels::SizeType>(batch_size),
                 static_cast<eagle_kernels::SizeType>(max_batch_size),

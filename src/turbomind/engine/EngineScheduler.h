@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace turbomind {
@@ -24,14 +25,18 @@ enum class SequencePhase : uint8_t { kPrefill, kDecode, kFinished };
 enum class SequenceQueue : uint8_t { kNone, kPrefill, kDecode };
 
 struct SequenceState {
-    uint64_t      seq_id{0};
-    int           prompt_len{0};       // total prompt tokens
-    int           prefilled_len{0};    // how many prompt tokens already processed
-    int           generated_len{0};    // how many new tokens generated
-    int           max_new_tokens{0};
-    SequencePhase phase{SequencePhase::kPrefill};
-    SequenceQueue queue_tag{SequenceQueue::kNone};
-    int           kv_reservation_handle{-1};  // Placeholder for KVCacheManager integration
+    uint64_t             seq_id{0};
+    int                  prompt_len{0};       // total prompt tokens
+    int                  prefilled_len{0};    // how many prompt tokens already processed
+    int                  generated_len{0};    // how many new tokens generated
+    int                  max_new_tokens{0};
+    SequencePhase        phase{SequencePhase::kPrefill};
+    SequenceQueue        queue_tag{SequenceQueue::kNone};
+    int                  kv_reservation_handle{-1};  // Placeholder for KVCacheManager integration
+    std::vector<int>     kv_page_ids;
+    uint64_t             kv_cookie{0};
+    int                  decode_planned_fallbacks{0};
+    int                  prefill_planned_fallbacks{0};
 };
 
 struct PrefillChunk {
@@ -70,7 +75,8 @@ public:
     // per-sequence token deltas from Request.sequence_length.
     void on_step_executed(const std::vector<PrefillChunk>&             prefill_batch,
                            const std::vector<std::shared_ptr<Request>>& decode_batch,
-                           const std::unordered_map<uint64_t, int>&     pre_lengths);
+                           const std::unordered_map<uint64_t, int>&     pre_lengths,
+                           const std::vector<ExecutionResult>&          exec_results);
 
     // Step D: Speculative decoding execution result handling
     void on_speculative_execution(const std::vector<turbomind::ExecutionResult>& results);
@@ -84,13 +90,15 @@ public:
     // OOM detection
     bool   has_oom_detected() const;
     void   clear_oom_detected();
+ 
+ private:
+     // TODO: Implement policy hooks for FCFS and short-prompt-first
+     int tokens_for_decode_step(const SequenceState& state) const;
+     int tokens_for_prefill_chunk(const SequenceState& state) const;
+     bool extract_prompt_tokens(const std::shared_ptr<Request>& req, std::vector<int>& tokens_out, int max_tokens = -1) const;
+ 
+     SchedulerConfig   cfg_;
 
-private:
-    // TODO: Implement policy hooks for FCFS and short-prompt-first
-    int tokens_for_decode_step(const SequenceState& state) const;
-    int tokens_for_prefill_chunk(const SequenceState& state) const;
-
-    SchedulerConfig   cfg_;
     KVCacheManager*   kv_mgr_;
     ModelLayout       model_layout_;
     PrefixCache*      prefix_cache_;
@@ -107,9 +115,15 @@ private:
     double decode_token_ratio_; // For dynamic adjustment of decode token budget
     double prefill_token_ratio_; // For dynamic adjustment of prefill token budget
 
-    mutable std::mutex metrics_mutex_;
-    bool              oom_detected_ = false; // Flag to indicate if an OOM condition was detected (stub for future)
-    int               session_len_limit_{0};
+     mutable std::mutex             metrics_mutex_;
+     bool                           oom_detected_ = false; // Flag to indicate if an OOM condition was detected (stub for future)
+     int                            session_len_limit_{0};
+    std::unordered_set<uint64_t>   released_seq_ids_;
+    bool                           require_capacity_scheduler_{false};
+
+    void release_kv(uint64_t seq_id, const char* reason);
 };
+
+
 
 }  // namespace turbomind

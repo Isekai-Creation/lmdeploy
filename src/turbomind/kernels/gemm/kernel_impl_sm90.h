@@ -125,9 +125,16 @@ public:
 
         desc_.arch = Gemm::Arch::value;
 
-        auto func = gemm_kernel_name<Gemm>;
+        auto        func = gemm_kernel_name<Gemm>;
+        cudaError_t err  = cudaFuncGetAttributes(&info_.attr, func);
 
-        cudaFuncGetAttributes(&info_.attr, func);
+        if (err == cudaErrorNoKernelImageForDevice) {
+            // Kernel image is not available on this device (e.g. newer
+            // SM without matching binary). Leave desc_.arch at its
+            // default (0) so that Kernel::is_feasible treats this
+            // implementation as unusable.
+            return;
+        }
 
         if (info_.dynamic_smem_size > (48 << 10)) {
             cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, info_.dynamic_smem_size);

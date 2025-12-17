@@ -1,12 +1,35 @@
 
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <sstream>
 
 #include "src/turbomind/core/allocator.h"
 #include "src/turbomind/core/check.h"
 #include "src/turbomind/utils/eagle_debug.h"
+#include "src/turbomind/utils/progress_logger.h"
 
 namespace turbomind::core {
+namespace {
+
+void log_allocator_oom_event(const char* tag, ssize_t size)
+{
+    size_t     free_bytes  = 0;
+    size_t     total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        free_bytes  = 0;
+        total_bytes = 0;
+    }
+
+    ProgressEvent evt{ProgressStage::kError};
+    evt.pct = 100;
+    std::ostringstream oss;
+    oss << "cuda_oom tag=" << (tag ? tag : "unknown") << " bytes=" << size
+        << " free=" << free_bytes << " total=" << total_bytes;
+    evt.msg = oss.str();
+    ProgressLogger::Log(evt);
+}
+
+}  // namespace
 
 AllocatorImpl::~AllocatorImpl() = default;
 
@@ -20,27 +43,17 @@ public:
     CudaMemPoolAllocator(Stream stream, bool use_default_pool):
         pool_{}, stream_{stream}, device_{kDEVICE}, use_default_pool_{use_default_pool}
     {
+        // For DriftEngine v1 and the modern TurboMind path we no longer rely
+        // on device memory pools here. Instead, we fall back to the same
+        // plain cudaMalloc / cudaFree behaviour as CudaAllocator to avoid
+        // allocator‑pool fragmentation bugs. The stream is still tracked so
+        // callers can migrate back to async allocators in the future if
+        // desired.
         check_cuda_error(cudaGetDevice(&device_.id));
-        if (use_default_pool_) {
-            check_cuda_error(cudaDeviceGetDefaultMemPool(&pool_, device_.id));
-        }
-        else {
-            cudaMemPoolProps props{};
-            props.allocType     = cudaMemAllocationTypePinned;
-            props.handleTypes   = cudaMemHandleTypeNone;
-            props.location.type = cudaMemLocationTypeDevice;
-            props.location.id   = device_.id;
-            check_cuda_error(cudaMemPoolCreate(&pool_, &props));
-            cuuint64_t thres = (cuuint64_t)-1;
-            check_cuda_error(cudaMemPoolSetAttribute(pool_, cudaMemPoolAttrReleaseThreshold, &thres));
-        }
     }
 
     ~CudaMemPoolAllocator() override
     {
-        if (!use_default_pool_) {
-            check_cuda_error(cudaMemPoolDestroy(pool_));
-        }
         pool_ = {};
     }
 
@@ -58,8 +71,35 @@ public:
             abort();
         }
 
+        // Capture a lightweight memory snapshot before we touch the device
+        // allocator so OOMs are self‑describing in logs.
+        size_t     free_bytes  = 0;
+        size_t     total_bytes = 0;
+        cudaError_t info_err   = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (info_err == cudaSuccess) {
+            TM_LOG_INFO(
+                "[Allocator][CudaMemPool] about_to_alloc bytes=%zd free=%zu total=%zu",
+                static_cast<ssize_t>(size),
+                free_bytes,
+                total_bytes);
+        }
+        else {
+            TM_LOG_WARNING("[Allocator][CudaMemPool] cudaMemGetInfo failed before alloc: %s",
+                           cudaGetErrorString(info_err));
+        }
+
+        turbomind::set_last_cuda_alloc_bytes(static_cast<size_t>(size));
         void* ptr{};
-        check_cuda_error(cudaMallocFromPoolAsync(&ptr, size, pool_, stream_.handle()));
+        // Use plain cudaMalloc instead of cudaMallocFromPoolAsync to avoid
+        // interacting with device memory pools that can introduce hard‑to‑
+        // debug fragmentation or threshold issues.
+        cudaError_t alloc_err = cudaMalloc(&ptr, size);
+        if (alloc_err != cudaSuccess) {
+            if (alloc_err == cudaErrorMemoryAllocation) {
+                log_allocator_oom_event("CudaMemPool", size);
+            }
+            check_cuda_error(alloc_err);
+        }
 
         // Allocation debug logging is gated separately from general
         // EAGLE debug to avoid flooding logs during normal runs.
@@ -71,7 +111,7 @@ public:
 
     void deallocate(void* p, ssize_t) override
     {
-        check_cuda_error(cudaFreeAsync(p, stream_.handle()));
+        check_cuda_error(cudaFree(p));
     }
 
     Device device() const noexcept override
@@ -86,7 +126,8 @@ public:
 
     void trim(size_t bytes_to_keep)
     {
-        check_cuda_error(cudaMemPoolTrimTo(pool_, bytes_to_keep));
+        (void)bytes_to_keep;
+        // No-op for the plain cudaMalloc/cudaFree path.
     }
 
 private:
@@ -100,8 +141,15 @@ class CudaAllocator: public AllocatorImpl {
 public:
     void* allocate(ssize_t size) override
     {
+        turbomind::set_last_cuda_alloc_bytes(static_cast<size_t>(size));
         void* ptr{};
-        check_cuda_error(cudaMalloc(&ptr, size));
+        cudaError_t alloc_err = cudaMalloc(&ptr, size);
+        if (alloc_err != cudaSuccess) {
+            if (alloc_err == cudaErrorMemoryAllocation) {
+                log_allocator_oom_event("CudaAllocator", size);
+            }
+            check_cuda_error(alloc_err);
+        }
         if (turbomind::isEagleDebugEnabled() && turbomind::isEnvVarEnabled("LMDEPLOY_EAGLE_ALLOC_DEBUG")) {
             TM_LOG_WARNING("[EAGLE][AllocDBG:cuda] size=%zd ptr=%p", (ssize_t)size, ptr);
         }

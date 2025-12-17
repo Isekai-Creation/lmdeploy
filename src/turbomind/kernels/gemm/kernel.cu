@@ -44,6 +44,14 @@ bool Kernel::is_feasible(const GemmDesc& desc) const noexcept
 {
     constexpr bool debug = 0;
 
+    // Kernels with desc_.arch == 0 represent implementations that
+    // were compiled out or had no valid image for the current device
+    // (e.g. cudaFuncGetAttributes reported cudaErrorNoKernelImageForDevice).
+    // Treat them as universally infeasible.
+    if (desc_.arch == 0) {
+        return false;
+    }
+
     if constexpr (debug)
         printf("S\n");
 

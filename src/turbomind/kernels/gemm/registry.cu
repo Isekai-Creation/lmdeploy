@@ -2,12 +2,30 @@
 
 #include "src/turbomind/kernels/gemm/arch.h"
 #include "src/turbomind/kernels/gemm/registry.h"
+#include "src/turbomind/utils/logger.h"
 
 namespace turbomind::gemm {
 
 Registry::Registry(std::shared_ptr<cudaDeviceProp> device_prop):
     device_prop_{std::move(device_prop)}, arch_{device_prop_->major * 100 + device_prop_->minor * 10}
 {
+    TM_LOG_INFO("[GEMM][Registry] Initializing GEMM kernel registry for device CC %d.%d (arch=%d)",
+                device_prop_->major,
+                device_prop_->minor,
+                arch_);
+    // On GPUs with compute capability >= 12.0 (e.g. sm120), the CUDA
+    // 12.8 toolchain used in this environment cannot compile native
+    // kernel images. In that case, skip registration of architecture-
+    // specific kernels and fall back to cuBLAS-based GEMM only.
+    if (arch_ >= 1200) {
+        TM_LOG_WARNING(
+            "[GEMM][Registry] Device arch %d is newer than compiled kernels; "
+            "skipping custom GEMM registrations and using cuBLAS fallback only.",
+            arch_);
+        cublas_float();
+        return;
+    }
+
     sm90_16816_4();
     sm90_16816_8();
     sm90_16816_16();

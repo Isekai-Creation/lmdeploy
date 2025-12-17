@@ -1,11 +1,14 @@
 // Copyright (c) OpenMMLab. All rights reserved.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cctype>
 #include <functional>
 #include <iomanip>
 #include <memory>
@@ -14,6 +17,8 @@
 #include <optional>
 #include <random>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -31,9 +36,11 @@
 
 #include "src/turbomind/macro.h"
 
+#include "src/turbomind/engine/drift_guards.h"
 #include "src/turbomind/engine/gateway.h"
 #include "src/turbomind/engine/request.h"
 #include "src/turbomind/engine/EngineScheduler.h" // For PrefillChunk
+
 
 #include "src/turbomind/kernels/decoding_kernels.h"
 #include "src/turbomind/kernels/gemm/tuner/params.h"
@@ -53,6 +60,7 @@
 #include "src/turbomind/utils/debug_utils.h"
 #include "src/turbomind/utils/logger.h"
 #include "src/turbomind/utils/eagle_debug.h"
+#include "src/turbomind/utils/progress_logger.h"
 #include "lmdeploy/turbomind/kernels/speculative_decoding/kv_rewind_helper.h"
 
 namespace turbomind {
@@ -332,10 +340,17 @@ void LlamaBatch::ProcessInferRequests(const Requests& reqs, std::vector<Signal>&
 
         state.requests[idx]  = r;
         state.sequences[idx] = ptr;
-
+ 
+        // Update per-sequence KV metadata for executor-mode KV mapping.
         auto& seq = *state.sequences[idx];
-
+        if (r->session.start_flag && !r->kv_page_ids.empty()) {
+            auto* mutable_seq = const_cast<Sequence*>(state.sequences[idx]);
+            mutable_seq->kv_page_ids = r->kv_page_ids;
+            mutable_seq->kv_cookie   = r->kv_cookie;
+        }
+ 
         if (!param_.enable_prefix_caching && step < seq.tokens.size()) {
+
             // resize sequence tokens to match step
             seq.tokens.resize(step);
             seq.cache_len = std::min(seq.cache_len, step);
@@ -697,22 +712,138 @@ void LlamaBatch::Initialize(GenerationState& g)
         // Prepare intermediate buffers
         h_cu_block_counts_[0] = 0;
 
-        auto block_ptrs       = h_block_ptrs_.data();
-        auto scale_block_ptrs = h_scale_block_ptrs_.data();
+        auto       block_ptrs        = h_block_ptrs_.data();
+        auto       scale_block_ptrs  = h_scale_block_ptrs_.data();
+        const bool has_scale_blocks  = sequence_manager_->GetScaleBlockPtr(0);
+        const bool use_unified_kv    = (kv_cache_manager_ != nullptr) && (unified_kv_cache_ != nullptr);
+        const int  batch_size        = state_->active_size;
+        bool       kv_pointer_error  = false;
+        const bool progress_enabled  = ProgressLogger::Enabled();
+        static thread_local std::vector<void*>     page_ptr_buffer;
+        static thread_local std::vector<uintptr_t> drift_ptr_entries;
 
-        const int batch_size = state_->active_size;
-
+        auto resolve_stage_label = [&](const std::shared_ptr<Request>& req, uint64_t seq_id) -> std::string {
+            if (req) {
+                if (auto it = kv_install_stage_.find(seq_id); it != kv_install_stage_.end()) {
+                    return it->second;
+                }
+                // Without relying on internal fields, treat single-step
+                // installs as "decode" and others as generic installs.
+                return "kv_install";
+            }
+            return "executor_init";
+        };
+ 
+        auto append_scale_entries = [&](int count) {
+            if (!has_scale_blocks || count <= 0) {
+                return;
+            }
+            std::fill_n(scale_block_ptrs, count, uintptr_t{0});
+            scale_block_ptrs += count;
+        };
+ 
+        int drift_slots  = 0;
+        int legacy_slots = 0;
+ 
         for (int i = 0; i < batch_size; ++i) {
-            const auto& seq = *state_->sequences[i];
+            const auto& seq     = *state_->sequences[i];
+            const auto  seq_req = state_->requests[i];
+            if (!seq_req && !seq.kv_page_ids.empty()) {
+                TM_LOG_ERROR("[LlamaBatch] Sequence %lu missing request but has kv_page_ids", seq.id);
+                throw std::runtime_error("Sequence/request mismatch for KV install");
+            }
+            const bool has_kv_pages = use_unified_kv && seq_req && !seq.kv_page_ids.empty();
+ 
+            if (has_kv_pages) {
+                ++drift_slots;
+                const auto&   page_ids = seq.kv_page_ids;
+                const uint64_t seq_id  = seq_req->session.id;
+                const int      entry_cnt = static_cast<int>(page_ids.size() * kv_entries_per_page_);
+                h_cu_block_counts_[i + 1] = h_cu_block_counts_[i] + entry_cnt;
+                const std::string stage_label = resolve_stage_label(seq_req, seq_id);
+ 
+                if (progress_enabled) {
+                    ProgressEvent evt{ProgressStage::kKVReserve};
+                    evt.pct           = 55;
+                    evt.seq_id        = seq_id;
+                    evt.session_id    = seq_id;
+                    evt.kv_pages_seq  = static_cast<int>(page_ids.size());
+                    evt.kv_map_cookie = seq.kv_cookie;
+                    std::ostringstream oss;
+                    oss << "install_kv_table begin stage=" << stage_label
+                        << " format=" << kv_table_contract_label_
+                        << " pages=" << page_ids.size()
+                        << " ptrs=" << entry_cnt
+                        << " page_bytes=" << kv_cache_manager_->page_bytes();
+                    evt.msg = oss.str();
+                    ProgressLogger::Log(evt);
+                }
 
-            // cumulative num of blocks
-            h_cu_block_counts_[i + 1] = h_cu_block_counts_[i] + seq.blocks.size();
-
+ 
+                page_ptr_buffer.clear();
+                const bool table_ok = kv_cache_manager_->build_page_ptr_table(page_ids, page_ptr_buffer);
+                if (!table_ok || page_ptr_buffer.size() != page_ids.size()) {
+                    TM_LOG_ERROR("[LlamaBatch] Failed to build KV pointer table for seq %lu", seq_id);
+                    if (progress_enabled) {
+                        ProgressEvent evt{ProgressStage::kError};
+                        evt.pct           = 100;
+                        evt.seq_id        = seq_id;
+                        evt.session_id    = seq_id;
+                        evt.kv_map_cookie = seq.kv_cookie;
+                        evt.msg           = "kv_ptr_table_build_failed";
+                        ProgressLogger::Log(evt);
+                    }
+                    kv_pointer_error = true;
+                    for (int j = 0; j < entry_cnt; ++j) {
+                        *block_ptrs++ = uintptr_t{0};
+                    }
+                }
+                else {
+                    drift_ptr_entries.clear();
+                    const bool entries_ok =
+                        build_drift_pointer_entries(seq_id, page_ptr_buffer, drift_ptr_entries, stage_label.c_str());
+                    if (!entries_ok) {
+                        kv_pointer_error = true;
+                        for (int j = 0; j < entry_cnt; ++j) {
+                            *block_ptrs++ = uintptr_t{0};
+                        }
+                    }
+                    else {
+                        for (uintptr_t value : drift_ptr_entries) {
+                            *block_ptrs++ = value;
+                        }
+                    }
+                }
+ 
+                if (progress_enabled) {
+                    ProgressEvent evt{ProgressStage::kKVReserve};
+                    evt.pct           = 60;
+                    evt.seq_id        = seq_id;
+                    evt.session_id    = seq_id;
+                    evt.kv_pages_seq  = static_cast<int>(page_ids.size());
+                    evt.kv_map_cookie = seq.kv_cookie;
+                    std::ostringstream oss;
+                    oss << "install_kv_table done stage=" << stage_label
+                        << " format=" << kv_table_contract_label_
+                        << " pages=" << page_ids.size()
+                        << " ptrs=" << entry_cnt;
+                    evt.msg = oss.str();
+                    ProgressLogger::Log(evt);
+                }
+ 
+                append_scale_entries(entry_cnt);
+                continue;
+            }
+ 
+            ++legacy_slots;
+            const int legacy_entries = static_cast<int>(seq.blocks.size());
+            h_cu_block_counts_[i + 1] = h_cu_block_counts_[i] + legacy_entries;
+ 
             block_ptrs = std::transform(seq.blocks.cbegin(), seq.blocks.cend(), block_ptrs, [&](int block_id) {
                 return reinterpret_cast<uintptr_t>(sequence_manager_->GetBlockPtr(block_id));
             });
-
-            if (sequence_manager_->GetScaleBlockPtr(0)) {
+ 
+            if (has_scale_blocks) {
                 scale_block_ptrs =
                     std::transform(seq.blocks.cbegin(), seq.blocks.cend(), scale_block_ptrs, [&](int block_id) {
                         return reinterpret_cast<uintptr_t>(sequence_manager_->GetScaleBlockPtr(block_id));
@@ -720,11 +851,26 @@ void LlamaBatch::Initialize(GenerationState& g)
             }
         }
 
+        if (progress_enabled) {
+            ProgressEvent evt{ProgressStage::kKVReserve};
+            evt.pct = 62;
+            std::ostringstream oss;
+            oss << "kv_source_summary drift=" << drift_slots << " legacy=" << legacy_slots
+                << " format=" << kv_table_contract_label_
+                << " entries_per_page=" << kv_entries_per_page_;
+            evt.msg = oss.str();
+            ProgressLogger::Log(evt);
+        }
+
+        if (kv_pointer_error) {
+            throw std::runtime_error("Invalid DriftEngine KV pointer mapping");
+        }
+
         static_assert(sizeof(uintptr_t) == sizeof(void*));
 
         Copy(h_cu_block_counts_, batch_size + 1, cu_block_counts_);
         Copy(h_block_ptrs_, h_cu_block_counts_[batch_size], block_ptrs_);
-        if (sequence_manager_->GetScaleBlockPtr(0)) {
+        if (has_scale_blocks) {
             Copy(h_scale_block_ptrs_, h_cu_block_counts_[batch_size], scale_block_ptrs_);
         }
     }
@@ -1128,14 +1274,37 @@ LlamaBatch::LlamaBatch(DataType                 data_type,
     symm_alloc_ = core::SimpleAllocator::Create([this](ssize_t size) { return SymmAlloc(size, true); },
                                                 [this](void* p, ssize_t size) { return SymmFree(p, size, true); },
                                                 kDEVICE);
-
+ 
     InitializeBufferAndKVCache();
-
+ 
+    if (const char* env = std::getenv("TM_DRIFT_KV_CANARY")) {
+        kv_canary_enabled_ = env[0] != '\0' && env[0] != '0';
+    }
+    if (kv_canary_enabled_) {
+        if (const char* env = std::getenv("TM_DRIFT_KV_CANARY_BYTES")) {
+            char* end = nullptr;
+            long  val = std::strtol(env, &end, 10);
+            if (end != env && val > 0) {
+                kv_canary_sample_bytes_ = static_cast<size_t>(val);
+            }
+        }
+        if (const char* env = std::getenv("TM_DRIFT_KV_CANARY_PAGES")) {
+            char* end = nullptr;
+            long  val = std::strtol(env, &end, 10);
+            if (end != env && val > 0) {
+                kv_canary_sample_pages_ = static_cast<int>(val);
+            }
+        }
+        TM_LOG_WARNING(
+            "[LlamaBatch] TM_DRIFT_KV_CANARY enabled; pointer installs and post-step samples may impact performance");
+    }
+ 
     // Wait for allocations
     check_cuda_error(cudaStreamSynchronize(stream_));
-
+ 
     UpdateMetrics();
 }
+
 
 void LlamaBatch::disableEagleMultitokenForSlot(int slot, const char* reason)
 {
@@ -2075,8 +2244,11 @@ void LlamaBatch::Finish(GenerationState& g, std::vector<Signal>& signals)
             }
         }
     }
-
+ 
+    flush_sequence_length_outputs();
+ 
     // Cache computed blocks to block trie
+
     sequence_manager_->CachePrompt(state_->sequences, batch_size);
 
     if (debug_ && tp_rank_ == 0) {
@@ -2227,6 +2399,16 @@ auto LlamaBatch::Interrupt(int index, bool force_stop) -> Signal
 
 namespace {
 
+uint64_t HashKvPageIds(uint64_t seq_id, const std::vector<int>& page_ids)
+{
+    uint64_t hash = 1469598103934665603ull;
+    hash ^= seq_id + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    for (const int page_id : page_ids) {
+        hash ^= static_cast<uint64_t>(page_id) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    }
+    return hash;
+}
+
 struct RequestData {
     std::vector<std::shared_ptr<Request>> infer;  // incoming inference request
     std::vector<std::shared_ptr<Request>> kill;   // incoming kill request
@@ -2309,9 +2491,12 @@ void LlamaBatch::InternalThreadEntry()
         }
 
         Initialize(g);
-
-        // update the schedule metrics and request metrics in every forward iter
+        kv_install_stage_.clear();
+ 
+        // update the schedule metrics and request metrics in every
+        // forward iter to keep parity with the legacy engine loop.
         UpdateMetrics();
+
 
         const int n_active = AllReduce(comm_.h_dp_group, state_->active_size, comm::RedOp::kSum);
 
@@ -2456,13 +2641,25 @@ void LlamaBatch::ExecuteScheduled(const std::vector<PrefillChunk>& prefill,
             } else {
                 Forward(g);
             }
-            
+
+            if (!decode.empty() && ProgressLogger::Enabled()) {
+                ProgressEvent evt{ProgressStage::kDecodeExec};
+                evt.pct        = 80;
+                evt.batch_size = static_cast<int>(decode.size());
+                evt.msg        = "decode_forward_done logits_ready=1";
+                ProgressLogger::Log(evt);
+            }
+
             EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::post_Forward");
- 
-             Finish(g, signals);
-             build_execution_results(prefill, decode, pre_lengths);
+
+            Finish(g, signals);
+            log_sequence_length_progress(prefill, decode);
+            build_execution_results(prefill, decode, pre_lengths);
+
+
  
              // Step C: Unified KV cache cleanup for finished sequences
+
              if (unified_kv_cache_ && g.finished_count > 0) {
 
                 // Go through execution results and cleanup finished sequences
@@ -2491,110 +2688,15 @@ void LlamaBatch::ExecuteScheduled(const std::vector<PrefillChunk>& prefill,
         return;
     }
 
-    // Legacy stub path (non-executor mode): preserve previous
-    // placeholder semantics for any callers that still rely on it.
-    std::vector<Signal> signals;
-    signals.reserve(prefill.size() + decode.size());
-
-    auto write_progress = [](const std::shared_ptr<Request>& req, int seq_len) {
-        if (!req) {
-            return;
-        }
-        try {
-            if (req->sequence_length.data()) {
-                seq_len = std::max(seq_len, req->sequence_length.data()[0]);
-            }
-        }
-        catch (...) {
-            // Best-effort stub write
-        }
-        UpdateState(*req, Request::kOk, seq_len);
-    };
-
-    for (const auto& chunk : prefill) {
-        const auto& req = chunk.req;
-        if (!req) {
-            continue;
-        }
-
-        const int start_pos = chunk.start_pos;
-        const int len       = chunk.len;
-        const int seq_len   = start_pos + len;
-
-        try {
-            auto it = req->inputs.find("input_ids");
-            if (it != req->inputs.end() && req->output_ids.data()) {
-                const auto& input     = it->second;
-                const int*  src       = input.data<int>();
-                int*        dst       = req->output_ids.data();
-                const int   input_len = input.shape(0);
-                const int   out_len   = req->output_ids.shape(0);
-
-                const int copy_start = std::max(0, start_pos);
-                const int copy_end   = std::min(seq_len, std::min(input_len, out_len));
-
-                if (copy_end > copy_start) {
-                    std::copy_n(src + copy_start, copy_end - copy_start, dst + copy_start);
-                }
-            }
-        }
-        catch (...) {
-            // Best-effort prompt copy; fall back to sequence_length only.
-        }
-
-        signals.push_back([req, seq_len, write_progress] {
-            write_progress(req, seq_len);
-        });
-    }
-
-    for (const auto& req : decode) {
-        if (!req) {
-            continue;
-        }
-
-        int prompt_len = 0;
-        try {
-            auto it = req->inputs.find("input_ids");
-            if (it != req->inputs.end()) {
-                prompt_len = it->second.shape(0);
-            }
-        }
-        catch (...) {
-            prompt_len = 0;
-        }
-
-        int seq_len = prompt_len;
-        try {
-            if (req->sequence_length.data()) {
-                seq_len = std::max(seq_len, req->sequence_length.data()[0]);
-            }
-        }
-        catch (...) {
-        }
-
-        const int next_len = seq_len + 1;
-
-        try {
-            if (req->output_ids.data() && next_len - 1 >= 0 && next_len - 1 < req->output_ids.shape(0)) {
-                req->output_ids.data()[next_len - 1] = 0;
-            }
-        }
-        catch (...) {
-        }
-
-        signals.push_back([req, next_len, write_progress] {
-            write_progress(req, next_len);
-        });
-    }
-
-    if (tp_rank_ == 0 && !signals.empty()) {
-        gateway_->notify(std::move(signals));
-    }
+    DRIFT_NO_STUB_FAIL("Legacy LlamaBatch stub execution path has been removed; executor mode is required");
 }
 
 
 bool LlamaBatch::Forward(GenerationState& g)
 {
+    if (!executor_initialized_ && mode_ == Mode::kExecutor) {
+        DRIFT_NO_STUB_FAIL("Forward called before executor initialization");
+    }
     NvtxScope _("Forward");
 
     FT_CHECK(max_context_token_num_ >= max_batch_size_);
@@ -3720,6 +3822,24 @@ void LlamaBatch::InitializeBufferAndKVCache()
 
     const auto cache_block_seq_len = model_->attn_param_.cache_block_seq_len;
 
+    auto log_mem_snapshot = [&](const char* scope, uint8_t pct) {
+        if (!ProgressLogger::Enabled()) {
+            return;
+        }
+        size_t free_bytes  = 0;
+        size_t total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+            return;
+        }
+        ProgressEvent evt{ProgressStage::kKVReserve};
+        evt.pct = pct;
+        std::ostringstream oss;
+        oss << scope << " free=" << free_bytes << " total=" << total_bytes;
+        evt.msg = oss.str();
+        ProgressLogger::Log(evt);
+    };
+    log_mem_snapshot("llama_init_buffers_entry", 12);
+
     const int dbits = byte_size(data_type_, 8);
 
     const auto quant_policy = model_->param_.quant_policy;
@@ -3864,6 +3984,7 @@ void LlamaBatch::InitializeBufferAndKVCache()
 
     TM_LOG_WARNING("[LlamaBatch] Creating SequenceManager. block_size(from layout)=?, scale_block_size=%lu", scale_block_size);
 
+    log_mem_snapshot("sequence_manager_alloc_begin", 14);
     sequence_manager_.reset(new SequenceManager{model_->layer_num_,
                                                 block_config,
                                                 cache_block_budget,
@@ -3874,8 +3995,17 @@ void LlamaBatch::InitializeBufferAndKVCache()
                                                 core::Context::alloc(kDEVICE),
                                                 get_free_size,
                                                 scale_block_size});
+    if (ProgressLogger::Enabled()) {
+        ProgressEvent evt{ProgressStage::kKVReserve};
+        evt.pct = 15;
+        evt.msg = "sequence_manager_build_done blocks="
+            + std::to_string(sequence_manager_->max_block_count());
+        ProgressLogger::Log(evt);
+    }
+    log_mem_snapshot("sequence_manager_alloc_done", 16);
+ 
+     // Cache basic KV layout parameters for EAGLE KV rewind integration.
 
-    // Cache basic KV layout parameters for EAGLE KV rewind integration.
     kv_block_size_         = cache_block_seq_len;
     kv_max_blocks_per_seq_ = sequence_manager_->max_block_count();
 
@@ -3903,16 +4033,18 @@ void LlamaBatch::InitializeBufferAndKVCache()
     back_     = &states_[1];
     incoming_ = &states_[2];
 
+    log_mem_snapshot("llama_allocate_buffer_begin", 20);
     AllocSymmBuffers();
-
-
     AllocateBuffer(max_batch_size_, session_len_, model_->attn_param_.cache_block_seq_len);
+    log_mem_snapshot("llama_allocate_buffer_done", 22);
 
     // Allow the model to observe the live SequenceManager so that
     // specialized decode paths (e.g. EAGLE target-tree decode) can
     // reuse prefix KV block pointers as read-only when building
     // scratch decode passes.
     model_->sequence_manager_ = sequence_manager_.get();
+
+    log_mem_snapshot("llama_init_buffers_complete", 100);
 }
 
 void LlamaBatch::FreeBufferAndKVCache()
@@ -4014,7 +4146,7 @@ void LlamaBatch::process_scheduled_prefill(const std::vector<PrefillChunk>& pref
 {
     // Reserve KV space and touch prefix cache entries for the scheduled
     // chunks. Actual output tensors and sequence lengths will be updated
-    // by Forward/Finish so we avoid writing placeholders here.
+    // by Forward/Finish, so we do not mutate them here.
     for (const auto& chunk : prefill) {
         const auto& req = chunk.req;
         if (!req) {
@@ -4121,11 +4253,198 @@ void LlamaBatch::capture_executor_pre_lengths(const std::vector<PrefillChunk>& p
         capture(req);
     }
 }
+ 
+bool LlamaBatch::build_drift_pointer_entries(uint64_t                   seq_id,
+                                             const std::vector<void*>& page_ptrs,
+                                             std::vector<uintptr_t>&   entries,
+                                             const char*               stage_label)
+{
+    entries.clear();
+    if (page_ptrs.empty()) {
+        return true;
+    }
 
+    const size_t entries_per_page = kv_entries_per_page_;
+    entries.reserve(page_ptrs.size() * entries_per_page);
+
+    auto stage_with_region = [&](const char* region) {
+        std::string label;
+        if (stage_label && stage_label[0] != '\0') {
+            label = stage_label;
+        }
+        else {
+            label = "kv_install";
+        }
+        label += "|fmt=";
+        label += kv_table_contract_label_;
+        if (region && region[0] != '\0') {
+            label += "|region=";
+            label += region;
+        }
+        return label;
+    };
+
+    switch (kv_table_format_) {
+    case DriftKVTableFormat::kPerPage: {
+        const size_t v_offset = kv_value_offset_bytes_;
+        const std::string stage_k = stage_with_region("K");
+        bool ok_k = run_kv_canary_check(seq_id, page_ptrs, 0, stage_k.c_str());
+        bool ok_v = true;
+        if (v_offset > 0) {
+            const std::string stage_v = stage_with_region("V");
+            ok_v = run_kv_canary_check(seq_id, page_ptrs, v_offset, stage_v.c_str());
+        }
+        for (void* ptr : page_ptrs) {
+            entries.push_back(reinterpret_cast<uintptr_t>(ptr));
+        }
+        return ok_k && ok_v;
+    }
+    case DriftKVTableFormat::kSplitKV: {
+        if (kv_value_offset_bytes_ == 0) {
+            TM_LOG_ERROR("[LlamaBatch] kv_split format requires non-zero value offset; seq=%lu", seq_id);
+            return false;
+        }
+        const std::string stage_k = stage_with_region("K");
+        const std::string stage_v = stage_with_region("V");
+        bool ok_k = run_kv_canary_check(seq_id, page_ptrs, 0, stage_k.c_str());
+        bool ok_v = run_kv_canary_check(seq_id, page_ptrs, kv_value_offset_bytes_, stage_v.c_str());
+        for (void* ptr : page_ptrs) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+            entries.push_back(base);
+            entries.push_back(base + kv_value_offset_bytes_);
+        }
+        return ok_k && ok_v;
+    }
+    }
+    return false;
+}
+
+bool LlamaBatch::run_kv_canary_check(uint64_t seq_id,
+                                      const std::vector<void*>& page_ptrs,
+                                      size_t                    byte_offset,
+                                      const char*               stage)
+{
+    if (!kv_canary_enabled_ || !kv_cache_manager_ || page_ptrs.empty()) {
+        return true;
+    }
+
+    const std::string stage_label = stage ? stage : "kv_canary";
+
+    const size_t page_bytes = kv_cache_manager_->page_bytes();
+    if (byte_offset >= page_bytes || kv_canary_sample_bytes_ == 0) {
+        return true;
+    }
+
+    const size_t sample_bytes = std::min(kv_canary_sample_bytes_, page_bytes - byte_offset);
+    if (sample_bytes == 0) {
+        return true;
+    }
+
+    const int pages_to_sample = std::min<int>(kv_canary_sample_pages_, static_cast<int>(page_ptrs.size()));
+    std::vector<uint8_t>      host(sample_bytes);
+
+    for (int i = 0; i < pages_to_sample; ++i) {
+        void* ptr = page_ptrs[i];
+        if (!ptr) {
+            TM_LOG_ERROR("[LlamaBatch] KV canary (%s): null page pointer for seq %lu (page_idx=%d)",
+                         stage_label.c_str(),
+                         seq_id,
+                         i);
+            if (ProgressLogger::Enabled()) {
+                ProgressEvent evt{ProgressStage::kError};
+                evt.pct        = 100;
+                evt.seq_id     = seq_id;
+                evt.session_id = seq_id;
+                evt.msg        = "kv_canary_failed_null_ptr stage=" + stage_label;
+                ProgressLogger::Log(evt);
+            }
+            return false;
+        }
+        auto* src = static_cast<const uint8_t*>(ptr) + byte_offset;
+        check_cuda_error(cudaMemcpyAsync(host.data(), src, sample_bytes, cudaMemcpyDeviceToHost, stream_));
+        check_cuda_error(cudaStreamSynchronize(stream_));
+        const bool non_zero = std::any_of(host.begin(), host.end(), [](uint8_t b) { return b != 0; });
+        if (!non_zero) {
+            TM_LOG_ERROR("[LlamaBatch] KV canary (%s): zero sample for seq %lu (page_idx=%d offset=%zu)",
+                         stage_label.c_str(),
+                         seq_id,
+                         i,
+                         byte_offset);
+            if (ProgressLogger::Enabled()) {
+                ProgressEvent evt{ProgressStage::kError};
+                evt.pct        = 100;
+                evt.seq_id     = seq_id;
+                evt.session_id = seq_id;
+                evt.msg        = "kv_canary_failed_zero_sample stage=" + stage_label;
+                ProgressLogger::Log(evt);
+            }
+            return false;
+        }
+    }
+
+    if (ProgressLogger::Enabled()) {
+        ProgressEvent evt{ProgressStage::kKVWrite};
+        evt.pct        = 66;
+        evt.seq_id     = seq_id;
+        evt.session_id = seq_id;
+        evt.msg        = "kv_canary_check_ok stage=" + stage_label;
+        ProgressLogger::Log(evt);
+    }
+    return true;
+}
+ 
+void LlamaBatch::flush_sequence_length_outputs()
+{
+    if (tp_rank_ != 0) {
+        return;
+    }
+    const int active = state_->active_size;
+    for (int i = 0; i < active; ++i) {
+        auto& req = state_->requests[i];
+        if (!req) {
+            continue;
+        }
+        try {
+            if (auto* out = req->sequence_length.data()) {
+                const int len = std::max(0, state_->h_context_length[i]);
+                *out         = len;
+            }
+        }
+        catch (...) {
+        }
+    }
+}
+ 
+void LlamaBatch::log_sequence_length_progress(const std::vector<PrefillChunk>& prefill,
+                                              const std::vector<std::shared_ptr<Request>>& decode) const
+{
+    if (!ProgressLogger::Enabled() || tp_rank_ != 0) {
+        return;
+    }
+    auto log_req = [&](const std::shared_ptr<Request>& req, ProgressStage stage, int pct) {
+        if (!req) {
+            return;
+        }
+        ProgressEvent evt{stage};
+        evt.pct        = pct;
+        evt.seq_id     = req->session.id;
+        evt.session_id = req->session.id;
+        evt.msg        = "sequence_length_updated post_len=" + std::to_string(read_sequence_length(req));
+        ProgressLogger::Log(evt);
+    };
+    for (const auto& chunk : prefill) {
+        log_req(chunk.req, ProgressStage::kPrefillExec, 65);
+    }
+    for (const auto& req : decode) {
+        log_req(req, ProgressStage::kDecodeExec, 85);
+    }
+}
+ 
 void LlamaBatch::build_execution_results(const std::vector<PrefillChunk>& prefill,
                                          const std::vector<std::shared_ptr<Request>>& decode,
                                          const std::unordered_map<uint64_t, int>& pre_lengths)
 {
+
     execution_results_.clear();
 
     auto lookup_pre_len = [&](uint64_t seq_id, int fallback) {
@@ -4141,15 +4460,16 @@ void LlamaBatch::build_execution_results(const std::vector<PrefillChunk>& prefil
         const int before = lookup_pre_len(req->session.id, chunk.start_pos);
         const int after  = read_sequence_length(req);
         const int processed = std::max(0, after - before);
-
+ 
         ExecutionResult result{};
-        result.sequence_id      = req->session.id;
-        result.tokens_processed = processed > 0 ? processed : chunk.len;
-        result.tokens_generated = 0;
-        result.is_finished      = request_finished(req);
+        result.sequence_id           = req->session.id;
+        result.tokens_processed      = processed > 0 ? processed : chunk.len;
+        result.tokens_generated      = 0;
+        result.is_finished           = request_finished(req);
+        result.final_sequence_length = after;
         execution_results_.push_back(std::move(result));
     }
-
+ 
     for (const auto& req : decode) {
         if (!req) {
             continue;
@@ -4157,25 +4477,48 @@ void LlamaBatch::build_execution_results(const std::vector<PrefillChunk>& prefil
         const int before    = lookup_pre_len(req->session.id, read_sequence_length(req));
         const int after     = read_sequence_length(req);
         const int generated = std::max(0, after - before);
-
+ 
         ExecutionResult result{};
-        result.sequence_id      = req->session.id;
-        result.tokens_processed = generated;
-        result.tokens_generated = generated;
-        result.is_finished      = request_finished(req);
+        result.sequence_id           = req->session.id;
+        result.tokens_processed      = generated;
+        result.tokens_generated      = generated;
+        result.is_finished           = request_finished(req);
+        result.final_sequence_length = after;
+
 
         if (generated > 0 && req->output_ids.data()) {
             const int start = std::max(0, after - generated);
             const int end   = std::min(after, static_cast<int>(req->output_ids.shape(0)));
             int*       out  = req->output_ids.data();
             for (int i = start; i < end; ++i) {
-                result.generated_token_ids.push_back(out[i]);
+                const int token = out[i];
+                result.generated_token_ids.push_back(token);
+                if (ProgressLogger::Enabled()) {
+                    ProgressEvent evt{ProgressStage::kSampling};
+                    evt.pct        = 88;
+                    evt.seq_id     = req->session.id;
+                    evt.session_id = req->session.id;
+                    evt.token_pos  = i;
+                    evt.msg        = "sampled token_id=" + std::to_string(token);
+                    ProgressLogger::Log(evt);
+                }
             }
         }
 
+        if (generated > 0 && ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kOutputAppend};
+            evt.pct            = 95;
+            evt.seq_id         = req->session.id;
+            evt.session_id     = req->session.id;
+            evt.generated_len  = generated;
+            evt.msg            = "append_done seq_len=" + std::to_string(after) + " gen_len=" + std::to_string(generated);
+            ProgressLogger::Log(evt);
+        }
+ 
         execution_results_.push_back(std::move(result));
     }
 }
+
 
 int LlamaBatch::read_sequence_length(const std::shared_ptr<Request>& req) const
 {
@@ -4327,6 +4670,13 @@ void LlamaBatch::bridge_kv_cache_manager(KVCacheManager* kv_mgr, PrefixCache* pr
     kv_cache_manager_ = kv_mgr;
     prefix_cache_ = prefix_cache;
     
+    if (ProgressLogger::Enabled()) {
+        ProgressEvent evt{ProgressStage::kKVReserve};
+        evt.pct = 18;
+        evt.msg = "bridge_kv_cache_manager_begin";
+        ProgressLogger::Log(evt);
+    }
+    
     // Step C: Create unified KV cache interface
     if (kv_mgr && sequence_manager_) {
         // Create KV layout for unified cache
@@ -4339,127 +4689,180 @@ void LlamaBatch::bridge_kv_cache_manager(KVCacheManager* kv_mgr, PrefixCache* pr
                     layout.num_layers, layout.page_size);
     }
     
+    initialize_kv_table_format();
+    
     TM_LOG_DEBUG("[LlamaBatch] KV cache bridge established: KVManager=%p, PrefixCache=%p", 
                  static_cast<void*>(kv_mgr), static_cast<void*>(prefix_cache));
 }
 
-void LlamaBatch::InitializeFromScheduler(GenerationState& g, 
-                                       const std::vector<PrefillChunk>& prefill,
-                                       const std::vector<std::shared_ptr<Request>>& decode)
+void LlamaBatch::initialize_kv_table_format()
 {
-    NvtxScope scope("initialize_from_scheduler");
-    
-    // Step B: Build batch directly from scheduler decisions instead of internal Materialize()
-    std::vector<const Sequence*>             sequences;
-    std::vector<std::shared_ptr<Request>>    batch_requests;
-    std::vector<uint64_t>                    priorities;
-    std::vector<int>                         context_lengths;
-    
-    // Helper to get sequence for a request (requests are already attached via attach_new_requests)
-    auto get_sequence = [&](const std::shared_ptr<Request>& req) -> const Sequence* {
-        if (!req) return nullptr;
-        
-        // Get existing sequence that should have been created in attach_new_requests()
-        const Sequence* seq = sequence_manager_->Get(req->session.id);
-        if (!seq) {
-            TM_LOG_ERROR("[LlamaBatch] Sequence not found for attached request %lu", req->session.id);
-            return nullptr;
-        }
-        
-        return seq;
+    // Default: one pointer per page (combined K/V layout).
+    kv_table_format_         = DriftKVTableFormat::kPerPage;
+    kv_entries_per_page_     = 1;
+    kv_value_offset_bytes_   = 0;
+    kv_table_contract_label_ = "per_page";
+
+    if (!kv_cache_manager_) {
+        return;
+    }
+
+    const size_t page_bytes = kv_cache_manager_->page_bytes();
+    const int    kv_factor  = std::max(1, kv_cache_manager_->kv_factor());
+    if (kv_factor > 0 && page_bytes >= static_cast<size_t>(kv_factor)) {
+        kv_value_offset_bytes_ = page_bytes / static_cast<size_t>(kv_factor);
+    }
+
+    const char* env = std::getenv("TM_DRIFT_KV_TABLE_FORMAT");
+
+    if (!env || env[0] == '\0') {
+        TM_LOG_INFO("[LlamaBatch] Drift KV table contract=%s (default)", kv_table_contract_label_.c_str());
+        return;
+    }
+
+    std::string fmt(env);
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    auto log_fallback = [&]() {
+        TM_LOG_WARNING("[LlamaBatch] TM_DRIFT_KV_TABLE_FORMAT=%s unsupported, falling back to per_page", fmt.c_str());
+        TM_LOG_INFO("[LlamaBatch] Drift KV table contract=%s", kv_table_contract_label_.c_str());
     };
-    
-    // Collect sequences for scheduler's prefill chunks
-    for (const auto& chunk : prefill) {
-        const Sequence* seq = get_sequence(chunk.req);
-        if (!seq) continue;
-        
-        sequences.push_back(seq);
-        batch_requests.push_back(chunk.req);
-        priorities.push_back(chunk.req->unique_id);
-        context_lengths.push_back(chunk.start_pos + chunk.len); // context length after this chunk
-    }
-    
-    // Collect sequences for scheduler's decode requests
-    for (const auto& req : decode) {
-        const Sequence* seq = get_sequence(req);
-        if (!seq) continue;
-        
-        sequences.push_back(seq);
-        batch_requests.push_back(req);
-        priorities.push_back(req->unique_id);
-        
-        // For decode, context length comes from request's current sequence_length
-        int context_len = 0;
-        try {
-            if (req->sequence_length.data()) {
-                context_len = req->sequence_length.data()[0];
-            } else {
-                auto it = req->inputs.find("input_ids");
-                if (it != req->inputs.end()) {
-                    context_len = it->second.shape(0);
-                }
-            }
-        } catch (...) {
-            context_len = 0;
-        }
-        
-        context_lengths.push_back(context_len);
-    }
-    
-    // Update BatchState with scheduler-driven composition
-    if (!sequences.empty()) {
-        const size_t batch_size = sequences.size();
 
-        // Reset previous batch state before installing the scheduler-
-        // selected sequences. ClearState will zero out the old size and
-        // pointers; we then repopulate size/active_size and the first
-        // `batch_size` entries below.
-        ClearState(*state_);
-
-        // Ensure we have capacity for this batch. In executor mode the
-        // BatchState size is driven by the scheduler rather than the
-        // internal gateway loop, so use max_batch_size_ as the capacity
-        // guard and update state_->size accordingly.
-        if (max_batch_size_ < static_cast<int>(batch_size)) {
-            TM_LOG_ERROR("[LlamaBatch] Batch capacity exceeded: have %d, need %zu",
-                        max_batch_size_, batch_size);
+    if (fmt == "kv_split" || fmt == "split_kv" || fmt == "split" || fmt == "kvsplit") {
+        if (kv_factor < 2 || page_bytes == 0 || page_bytes % static_cast<size_t>(kv_factor) != 0) {
+            TM_LOG_ERROR("[LlamaBatch] kv_split format invalid (kv_factor=%d page_bytes=%zu); using per_page",
+                         kv_factor,
+                         page_bytes);
+            log_fallback();
             return;
         }
+        kv_table_format_         = DriftKVTableFormat::kSplitKV;
+        kv_entries_per_page_     = 2;
+        kv_value_offset_bytes_   = page_bytes / static_cast<size_t>(kv_factor);
+        kv_table_contract_label_ = "kv_split";
+        TM_LOG_INFO("[LlamaBatch] Drift KV table contract=kv_split offset_bytes=%zu", kv_value_offset_bytes_);
+        return;
+    }
 
-        // Update BatchState with scheduler's selected sequences
-        state_->size        = static_cast<int>(batch_size);
-        state_->active_size = static_cast<int>(batch_size);
-        
-        for (size_t i = 0; i < batch_size; ++i) {
-            state_->sequences[i]       = sequences[i];
-            state_->requests[i]        = batch_requests[i];
-            state_->h_context_length[i] = context_lengths[i];
-        }
-        
-        // Skip Materialize() since scheduler has already decided the batch composition
-        // Just ensure sequences are properly materialized for this step
-        // Use minimal materialization - just ensure sequences are ready
-        auto outcome = sequence_manager_->Materialize(
-            {sequences}, context_lengths, priorities, 1,
-            [](const Sequences& seqs, const std::vector<int>& lengths) { 
-                return seqs.size(); // Accept all scheduler-selected sequences
-            });
-            
-        if (outcome.allocation || outcome.swap_in || outcome.swap_out) {
-            dbg(outcome);
-        }
-        
-        TM_LOG_DEBUG("[LlamaBatch] Scheduler-driven batch: %zu seqs (%zu prefill, %zu decode)", 
-                    sequences.size(), prefill.size(), decode.size());
+    if (fmt != "per_page" && fmt != "perpage") {
+        log_fallback();
+    }
+    else {
+        TM_LOG_INFO("[LlamaBatch] Drift KV table contract=%s", kv_table_contract_label_.c_str());
     }
 }
 
+void LlamaBatch::InitializeFromScheduler(GenerationState& g,
+                                         const std::vector<PrefillChunk>& prefill,
+                                         const std::vector<std::shared_ptr<Request>>& decode)
+{
+    NvtxScope scope("initialize_from_scheduler");
+    const bool progress_enabled = ProgressLogger::Enabled();
+ 
+    std::vector<const Sequence*>          sequences;
+    std::vector<std::shared_ptr<Request>> batch_requests;
+    std::vector<int>                      context_lengths;
+ 
+    kv_install_stage_.clear();
+    auto record_stage = [&](const std::shared_ptr<Request>& req, const char* label) {
+        if (req && label) {
+            kv_install_stage_[req->session.id] = label;
+        }
+    };
+ 
+    auto get_sequence = [&](const std::shared_ptr<Request>& req) -> const Sequence* {
+        if (!req) {
+            return nullptr;
+        }
+        const Sequence* seq = sequence_manager_ ? sequence_manager_->Get(req->session.id) : nullptr;
+        if (!seq) {
+            TM_LOG_ERROR("[LlamaBatch] Sequence not found for attached request %lu", req->session.id);
+        }
+        return seq;
+    };
+ 
+    for (const auto& chunk : prefill) {
+        record_stage(chunk.req, "prefill_install");
+        if (const Sequence* seq = get_sequence(chunk.req)) {
+            sequences.push_back(seq);
+            batch_requests.push_back(chunk.req);
+            context_lengths.push_back(chunk.start_pos + chunk.len);
+        }
+    }
+    for (const auto& req : decode) {
+        record_stage(req, "decode_install");
+        if (const Sequence* seq = get_sequence(req)) {
+            sequences.push_back(seq);
+            batch_requests.push_back(req);
+            int context_len = 0;
+            try {
+                if (req->sequence_length.data()) {
+                    context_len = req->sequence_length.data()[0];
+                }
+                else if (auto it = req->inputs.find("input_ids"); it != req->inputs.end()) {
+                    context_len = it->second.shape(0);
+                }
+            }
+            catch (...) {
+                context_len = 0;
+            }
+            context_lengths.push_back(context_len);
+        }
+    }
+ 
+    if (sequences.empty()) {
+        ClearState(*state_);
+        g.finished_count = 0;
+        return;
+    }
+ 
+    const size_t batch_size = sequences.size();
+ 
+    ClearState(*state_);
+    ClearState(*incoming_);
+ 
+    if (max_batch_size_ < static_cast<int>(batch_size)) {
+        TM_LOG_ERROR("[LlamaBatch] Batch capacity exceeded: have %d, need %zu", max_batch_size_, batch_size);
+        if (progress_enabled) {
+            ProgressEvent evt{ProgressStage::kError};
+            evt.pct = 100;
+            evt.msg = "init_from_scheduler_failed capacity";
+            ProgressLogger::Log(evt);
+        }
+        throw std::runtime_error("DriftEngine executor batch exceeds capacity");
+    }
+ 
+    state_->size        = static_cast<int>(batch_size);
+    state_->active_size = static_cast<int>(batch_size);
+ 
+    for (size_t i = 0; i < batch_size; ++i) {
+        state_->sequences[i]        = sequences[i];
+        state_->requests[i]         = batch_requests[i];
+        state_->h_context_length[i] = context_lengths[i];
+        state_->h_prompt_length[i]  = context_lengths[i];
+        state_->h_finished[i]       = false;
+    }
+ 
+    try {
+        Initialize(g);
+    }
+    catch (const std::exception& e) {
+        if (progress_enabled) {
+            ProgressEvent evt{ProgressStage::kError};
+            evt.pct = 100;
+            evt.msg = std::string("init_from_scheduler_failed: ") + e.what();
+            ProgressLogger::Log(evt);
+        }
+        throw;
+    }
+}
+
+
 // Step C: UnifiedKVCache implementation for DriftEngine integration
 DriftEngineKVCache::DriftEngineKVCache(KVCacheManager* kv_mgr,
-                                     PrefixCache* prefix_cache,
-                                     SequenceManager* seq_manager,
-                                     const KVLayout& layout)
+                                      PrefixCache* prefix_cache,
+                                      SequenceManager* seq_manager,
+                                      const KVLayout& layout)
     : kv_cache_manager_(kv_mgr)
     , prefix_cache_(prefix_cache)
     , sequence_manager_(seq_manager)
@@ -4468,23 +4871,50 @@ DriftEngineKVCache::DriftEngineKVCache(KVCacheManager* kv_mgr,
     TM_LOG_DEBUG("[DriftEngineKVCache] Created unified KV cache bridge");
 }
 
-bool DriftEngineKVCache::allocate_kv_space(uint64_t seq_id, int tokens_needed, int max_tokens)
+void DriftEngineKVCache::update_sequence_page_ids(uint64_t seq_id,
+                                                   const std::vector<int>& page_ids,
+                                                   uint64_t                kv_cookie)
 {
+    if (!sequence_manager_) {
+        return;
+    }
+    if (!sequence_manager_->Contains(seq_id)) {
+        return;
+    }
+    if (const Sequence* seq = sequence_manager_->Get(seq_id)) {
+        auto* mutable_seq     = const_cast<Sequence*>(seq);
+        mutable_seq->kv_page_ids.assign(page_ids.begin(), page_ids.end());
+        if (kv_cookie != 0) {
+            mutable_seq->kv_cookie = kv_cookie;
+        }
+    }
+}
+
+bool DriftEngineKVCache::allocate_kv_space(uint64_t seq_id, int tokens_needed, int max_tokens)
+
+{
+    (void)tokens_needed;
+    (void)max_tokens;
+
     if (!kv_cache_manager_) {
         return false;
     }
 
     // The DriftEngine scheduler and CapacityScheduler own KV page
-    // reservations. Here we simply mirror the existing mapping from
-    // KVCacheManager into SequenceManager blocks so that LlamaBatch
-    // can index into the correct pages for this sequence.
+    // reservations. Here we mirror the existing mapping from
+    // KVCacheManager into local state (and, optionally, Sequence) so
+    // that LlamaBatch can index into the correct pages for this
+    // sequence without using BlockManager.
     const auto page_ids = kv_cache_manager_->get_sequence_page_ids(seq_id);
     if (page_ids.empty()) {
         return false;
     }
 
-    std::vector<int> block_ids(page_ids.begin(), page_ids.end());
-    seq_to_blocks_[seq_id] = std::move(block_ids);
+    // Persist the mapping locally as page IDs. The executor will
+    // translate these to device pointers via KVCacheManager.
+    seq_to_blocks_[seq_id] = std::vector<int>(page_ids.begin(), page_ids.end());
+    const uint64_t kv_cookie = HashKvPageIds(seq_id, seq_to_blocks_[seq_id]);
+    update_sequence_page_ids(seq_id, seq_to_blocks_[seq_id], kv_cookie);
 
     TM_LOG_DEBUG("[DriftEngineKVCache] Mapped existing KV pages for seq %lu: %zu pages",
                 seq_id, page_ids.size());
@@ -4493,38 +4923,43 @@ bool DriftEngineKVCache::allocate_kv_space(uint64_t seq_id, int tokens_needed, i
 
 void* DriftEngineKVCache::get_kv_data(uint64_t seq_id, int position)
 {
-    // Get page for this position
-    if (!sequence_manager_->Contains(seq_id)) {
+    if (!kv_cache_manager_) {
         return nullptr;
     }
-    
-    const Sequence* seq = sequence_manager_->Get(seq_id);
-    if (!seq) {
-        return nullptr;
-    }
-    
-    // Calculate page index from position
+
+    // Translate token position into a KV page index using the shared
+    // KVLayout page_size. The seq_to_blocks_ mapping stores page IDs
+    // allocated by KVCacheManager for this sequence.
     const int page_size = kv_layout_.page_size;
+    if (page_size <= 0 || position < 0) {
+        return nullptr;
+    }
     const int page_idx = position / page_size;
-    
+
     auto it = seq_to_blocks_.find(seq_id);
     if (it == seq_to_blocks_.end() || page_idx >= static_cast<int>(it->second.size())) {
         return nullptr;
     }
-    
-    const int block_id = it->second[page_idx];
-    return sequence_manager_->GetBlockPtr(block_id);
+
+    const int page_id = it->second[page_idx];
+    return kv_cache_manager_->get_page_data_ptr(page_id);
 }
 
 void DriftEngineKVCache::release_kv_space(uint64_t seq_id)
 {
-    // 1. Remove block mapping local to the unified cache bridge
+    // 1. Remove page mapping local to the unified cache bridge. The
+    // KVCacheManager lifetime and page release are owned by the
+    // DriftEngine scheduler / CapacityScheduler.
     seq_to_blocks_.erase(seq_id);
 
-    // 2. Remove from SequenceManager. KVCacheManager lifetime and page
-    // release are owned by the DriftEngine scheduler / CapacityScheduler.
-    if (sequence_manager_) {
-        (void)sequence_manager_->Erase(seq_id);
+    // 2. Clear the Sequence's KV metadata without erasing the record
+    // entirely; ownership of the Sequence lifecycle remains with
+    // LlamaBatch / EngineScheduler.
+    if (sequence_manager_ && sequence_manager_->Contains(seq_id)) {
+        if (const Sequence* seq = sequence_manager_->Get(seq_id)) {
+            auto* mutable_seq = const_cast<Sequence*>(seq);
+            mutable_seq->kv_page_ids.clear();
+        }
     }
     
     TM_LOG_DEBUG("[DriftEngineKVCache] Released KV space for seq %lu", seq_id);
@@ -4550,6 +4985,7 @@ bool DriftEngineKVCache::lookup_prefix(uint64_t seq_id, const std::vector<int>& 
     // Map prefix cache pages to sequence blocks
     if (!match.page_indices.empty()) {
         seq_to_blocks_[seq_id] = std::vector<int>(match.page_indices.begin(), match.page_indices.end());
+        update_sequence_page_ids(seq_id, seq_to_blocks_[seq_id], HashKvPageIds(seq_id, seq_to_blocks_[seq_id]));
     }
 
     return true;
@@ -4572,6 +5008,7 @@ void DriftEngineKVCache::store_prefix(uint64_t seq_id, const std::vector<int>& t
     key.namespace_id = 0;
 
     prefix_cache_->insert(key, it->second, /*priority*/ 0, seq_id);
+    update_sequence_page_ids(seq_id, it->second, HashKvPageIds(seq_id, it->second));
     
     TM_LOG_DEBUG("[DriftEngineKVCache] Stored prefix for seq %lu: %zu tokens", 
                 seq_id, tokens.size());

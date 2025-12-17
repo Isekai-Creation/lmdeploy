@@ -4,6 +4,7 @@
 
 #include <curand_kernel.h>
 #include <cuda_runtime.h>
+#include <string>
 #include <unordered_map>
 
 #include "src/turbomind/core/core.h"
@@ -34,9 +35,10 @@ struct MropeRope {
 struct ExecutionResult {
     uint64_t               sequence_id;
     int                    tokens_processed;    // actual tokens processed (may differ from scheduled)
-    int                    tokens_generated;   // actual tokens generated  
+    int                    tokens_generated;   // actual tokens generated
     bool                   is_finished;
-    std::vector<int>       generated_token_ids; // for real model forward (placeholder for now)
+    std::vector<int>       generated_token_ids; // tokens generated in this step (generated-only)
+    int                    final_sequence_length{0};
     
     // Step D: Speculative decoding tracking
     int                    draft_tokens_generated{0};  // Number of draft tokens produced
@@ -81,16 +83,19 @@ public:
     size_t get_used_capacity() const override;
     size_t get_total_capacity() const override;
     bool has_sequence(uint64_t seq_id) const override;
+ 
+ private:
+     void update_sequence_page_ids(uint64_t seq_id, const std::vector<int>& page_ids, uint64_t kv_cookie = 0);
+ 
+     KVCacheManager*  kv_cache_manager_;
+     PrefixCache*      prefix_cache_;
+     SequenceManager*   sequence_manager_;
+     KVLayout          kv_layout_;
+     
+     // Mapping between DriftEngine reservations and SequenceManager blocks
+     std::unordered_map<uint64_t, std::vector<int>> seq_to_blocks_;
+ };
 
-private:
-    KVCacheManager*  kv_cache_manager_;
-    PrefixCache*      prefix_cache_;
-    SequenceManager*   sequence_manager_;
-    KVLayout          kv_layout_;
-    
-    // Mapping between DriftEngine reservations and SequenceManager blocks
-    std::unordered_map<uint64_t, std::vector<int>> seq_to_blocks_;
-};
 
 struct BatchState {
 
@@ -259,22 +264,31 @@ private:
      // Helper methods for executor mode
      void process_scheduled_prefill(const std::vector<PrefillChunk>& prefill);
      void process_scheduled_decode(const std::vector<std::shared_ptr<Request>>& decode);
-     void capture_executor_pre_lengths(const std::vector<PrefillChunk>& prefill,
-                                       const std::vector<std::shared_ptr<Request>>& decode,
-                                       std::unordered_map<uint64_t, int>& lengths) const;
-     void build_execution_results(const std::vector<PrefillChunk>& prefill,
-                                  const std::vector<std::shared_ptr<Request>>& decode,
-                                  const std::unordered_map<uint64_t, int>& pre_lengths);
-     int  read_sequence_length(const std::shared_ptr<Request>& req) const;
-     bool request_finished(const std::shared_ptr<Request>& req) const;
+      void capture_executor_pre_lengths(const std::vector<PrefillChunk>& prefill,
+                                         const std::vector<std::shared_ptr<Request>>& decode,
+                                         std::unordered_map<uint64_t, int>& lengths) const;
+      void build_execution_results(const std::vector<PrefillChunk>& prefill,
+                                   const std::vector<std::shared_ptr<Request>>& decode,
+                                   const std::unordered_map<uint64_t, int>& pre_lengths);
+      int  read_sequence_length(const std::shared_ptr<Request>& req) const;
+      bool request_finished(const std::shared_ptr<Request>& req) const;
+      void initialize_kv_table_format();
+      bool build_drift_pointer_entries(uint64_t                      seq_id,
+                                       const std::vector<void*>&    page_ptrs,
+                                       std::vector<uintptr_t>&      entries,
+                                       const char*                  stage_label);
     
-     // Step B: Initialize method that uses scheduler-driven batch composition
-     void InitializeFromScheduler(GenerationState& g, 
-                                const std::vector<PrefillChunk>& prefill,
-                                const std::vector<std::shared_ptr<Request>>& decode);
+      // Step B: Initialize method that uses scheduler-driven batch composition
+ 
+       void InitializeFromScheduler(GenerationState& g, 
+                                  const std::vector<PrefillChunk>& prefill,
+ 
+                                 const std::vector<std::shared_ptr<Request>>& decode);
+
 
 
     void InternalThreadEntry();
+
 
     void OutputThreadEntry();
 
@@ -431,9 +445,19 @@ private:
          kExecutor,
      };
  
-     Mode            mode_{Mode::kEngine};
-     GenerationState exec_state_{};
-     bool            executor_initialized_{false};
+     enum class DriftKVTableFormat {
+         kPerPage,
+         kSplitKV,
+     };
+ 
+     Mode                mode_{Mode::kEngine};
+     GenerationState     exec_state_{};
+     bool                executor_initialized_{false};
+     DriftKVTableFormat  kv_table_format_{DriftKVTableFormat::kPerPage};
+     size_t              kv_entries_per_page_{1};
+     size_t              kv_value_offset_bytes_{0};
+     std::string         kv_table_contract_label_{"per_page"};
+     std::unordered_map<uint64_t, std::string> kv_install_stage_;
      
      // Store execution results for feedback to EngineScheduler
      std::vector<ExecutionResult> execution_results_;
@@ -443,9 +467,14 @@ private:
      PrefixCache*    prefix_cache_{nullptr};
      
      // Step C: Unified KV cache interface
-     std::unique_ptr<UnifiedKVCache> unified_kv_cache_;
-     
-     // Step E: Performance optimization - CUDA graph support
+      std::unique_ptr<UnifiedKVCache> unified_kv_cache_;
+ 
+      bool   kv_canary_enabled_{false};
+      size_t kv_canary_sample_bytes_{128};
+      int    kv_canary_sample_pages_{1};
+      
+      // Step E: Performance optimization - CUDA graph support
+
      bool                enable_cuda_graphs_{false};
      cudaGraph_t         prefill_graph_{nullptr};
      cudaGraphExec_t     prefill_graph_exec_{nullptr};
@@ -525,27 +554,36 @@ private:
     Buffer_<uint64_t> h_random_seed_;
     Buffer_<uint64_t> d_random_seed_;
 
-    Tensor_<uint8_t> h_curand_state_;  // [n, sizeof(curandState_t)]
-    Tensor_<uint8_t> d_curand_state_;
+     Tensor_<uint8_t> h_curand_state_;  // [n, sizeof(curandState_t)]
+     Tensor_<uint8_t> d_curand_state_;
+ 
+     std::array<BatchState, 3> states_{};
+ 
+     BatchState* state_{};
+     BatchState* back_{};
+     BatchState* incoming_{};
+ 
+     // hard limits for persistent buffers
+     static constexpr int kMaxStopBadWordsLen = 32;
+     static constexpr int kMaxEndIdsSize      = 32;
+ 
+     std::thread internal_thread_;
+ 
+     bool            enable_metrics_;
+     ScheduleMetrics schedule_metrics_;
+     std::mutex      metrics_mutex_;
+ 
+     bool run_kv_canary_check(uint64_t seq_id,
+                              const std::vector<void*>& page_ptrs,
+                              size_t                    byte_offset = 0,
+                              const char*               stage        = nullptr);
+     void flush_sequence_length_outputs();
+     void log_sequence_length_progress(const std::vector<PrefillChunk>& prefill,
+                                       const std::vector<std::shared_ptr<Request>>& decode) const;
+ };
 
-    std::array<BatchState, 3> states_{};
 
-    BatchState* state_{};
-    BatchState* back_{};
-    BatchState* incoming_{};
-
-    // hard limits for persistent buffers
-    static constexpr int kMaxStopBadWordsLen = 32;
-    static constexpr int kMaxEndIdsSize      = 32;
-
-    std::thread internal_thread_;
-
-    bool            enable_metrics_;
-    ScheduleMetrics schedule_metrics_;
-    std::mutex      metrics_mutex_;
-};
 
 using Engine = LlamaBatch;
 
 }  // namespace turbomind
-

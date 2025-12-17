@@ -86,9 +86,17 @@ public:
 
         desc_.cluster_shape = {1, 1};
 
-        auto func = gemm_kernel<Gemm, GemmParam, EpilogueParam, Sched>;
+        auto        func = gemm_kernel<Gemm, GemmParam, EpilogueParam, Sched>;
+        cudaError_t err  = cudaFuncGetAttributes(&info_.attr, func);
 
-        cudaFuncGetAttributes(&info_.attr, func);
+        if (err == cudaErrorNoKernelImageForDevice) {
+            // This kernel image is not available for the current
+            // device architecture. Leave desc_.arch at its default
+            // (0) so that Kernel::is_feasible will never select it,
+            // and avoid any further occupancy / launch configuration
+            // work that assumes a valid image.
+            return;
+        }
 
         info_.dynamic_smem_size = sizeof(typename Gemm::SharedStorage);
 

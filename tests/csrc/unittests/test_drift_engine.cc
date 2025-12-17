@@ -59,7 +59,7 @@ public:
     bool try_start_request(uint64_t seq_id, const turbomind::KVUsageEstimate& est, turbomind::KVReservation* out, const std::vector<int>& pre_existing_page_ids) override {
         return true; // Always succeed for mock
     }
-    void finish_request(uint64_t seq_id) override {
+    void finish_request(uint64_t seq_id, const char* /*reason*/ = "unspecified") override {
         // Do nothing for mock
     }
 };

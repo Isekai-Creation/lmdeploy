@@ -3,10 +3,14 @@
 #include "src/turbomind/engine/drift_metrics.h"
 #include "src/turbomind/engine/drift_engine_config.h" // Added for from_engine_config implementation
 #include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/progress_logger.h"
 #include "src/turbomind/core/allocator.h"
 #include "src/turbomind/models/llama/LlamaBatch.h"  // For ExecutionResult
 #include <algorithm> // For std::min, std::max
 #include <cstring>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 
 namespace turbomind {
 
@@ -29,7 +33,8 @@ EngineScheduler::EngineScheduler(const SchedulerConfig& cfg,
     decode_token_ratio_(0.5),
     prefill_token_ratio_(0.5)
 {
-    session_len_limit_ = model_layout_.max_seq_len;
+    session_len_limit_            = model_layout_.max_seq_len;
+    require_capacity_scheduler_   = (capacity_scheduler_ != nullptr);
 }
 
 EngineScheduler::EngineScheduler(const SchedulerConfig& cfg, KVCacheManager* kv_mgr):
@@ -42,34 +47,27 @@ EngineScheduler::EngineScheduler(const SchedulerConfig& cfg, KVCacheManager* kv_
     decode_token_ratio_(0.5),
     prefill_token_ratio_(0.5)
 {
-    session_len_limit_ = 0;
+    session_len_limit_          = 0;
+    require_capacity_scheduler_ = false;
 }
 
 void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>>& infer_reqs,
                                       const std::vector<std::shared_ptr<Request>>& kill_reqs)
 {
-    auto extract_prompt_tokens = [&](const std::shared_ptr<Request>& req, std::vector<int>& tokens_out) -> bool {
-        auto it = req->inputs.find("input_ids");
-        if (it == req->inputs.end()) {
-            return false;
-        }
-        const auto& tensor = it->second;
-        if (tensor.device().type != DeviceType::kCPU && tensor.device().type != DeviceType::kCPUpinned) {
-            return false; // skip prefix cache if not host-accessible
-        }
-        const int prompt_len = tensor.shape(0);
-        if (prompt_len <= 0) {
-            return false;
-        }
-        tokens_out.resize(prompt_len);
-        std::memcpy(tokens_out.data(), tensor.data<int>(), sizeof(int) * prompt_len);
-        return true;
-    };
-
-    // Admit new requests and perform basic KV capacity checks.
     for (const auto& r : infer_reqs) {
         if (!r) {
             continue;
+        }
+
+        if (ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kSchedulerAdmit};
+            evt.pct        = 10;
+            evt.seq_id     = r->session.id;
+            evt.session_id = r->session.id;
+            evt.unique_id  = r->unique_id;
+            evt.rank       = -1;
+            evt.msg        = r->session.start_flag ? "start" : "cont";
+            ProgressLogger::Log(evt);
         }
 
         // Enforce SessionParam legal state transitions
@@ -107,8 +105,8 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
                 decode_request_queue_.remove_if([&](const std::shared_ptr<Request>& req){ return req->session.id == r->session.id; });
                 seq_states_.erase(r->session.id);
                 active_requests_.erase(r->session.id);
-                if (kv_mgr_) kv_mgr_->release(r->session.id);
-                if (capacity_scheduler_) capacity_scheduler_->finish_request(r->session.id);
+                release_kv(r->session.id, "kill_continuation");
+
                 r->ec = Request::kCancel;
                 continue;
             }
@@ -120,90 +118,126 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
             }
         }
 
-        if (kv_mgr_ && r->session.start_flag) {
+        if (r->session.start_flag) {
+            released_seq_ids_.erase(r->session.id);
             const int prompt_len = r->inputs.at("input_ids").shape(0);
-            std::vector<int> prompt_tokens;
-            std::vector<int> pre_existing_page_ids;
-            int matched_tokens = 0;
 
-            if (prefix_cache_ && cfg_.enable_prefix_caching && extract_prompt_tokens(r, prompt_tokens)) {
-                PrefixKey key{prompt_tokens, 0};
-                PrefixMatchResult result = prefix_cache_->match(key);
-                if (result.matched_tokens > 0) {
-                    matched_tokens        = result.matched_tokens;
-                    pre_existing_page_ids = result.page_indices;
-                    TM_LOG_DEBUG("[EngineScheduler] PrefixCache matched %d tokens for sequence %llu.", matched_tokens, r->session.id);
+            if (kv_mgr_) {
+                std::vector<int> prompt_tokens;
+                std::vector<int> pre_existing_page_ids;
+                int              matched_tokens = 0;
+
+                if (prefix_cache_ && cfg_.enable_prefix_caching && extract_prompt_tokens(r, prompt_tokens)) {
+                    PrefixKey          key{prompt_tokens, 0};
+                    PrefixMatchResult  result = prefix_cache_->match(key);
+                    if (result.matched_tokens > 0) {
+                        matched_tokens        = result.matched_tokens;
+                        pre_existing_page_ids = result.page_indices;
+                        TM_LOG_DEBUG("[EngineScheduler] PrefixCache matched %d tokens for sequence %llu.",
+                                     matched_tokens,
+                                     r->session.id);
+                    }
                 }
-            }
 
-            const KVUsageEstimate est = KVCacheManager::estimate_usage(model_layout_, prompt_len, r->gen_cfg.max_new_tokens);
+                const KVUsageEstimate est = KVCacheManager::estimate_usage(model_layout_, prompt_len, r->gen_cfg.max_new_tokens);
 
-            KVReservation reservation{};
-            bool          reservation_success = false;
+                KVReservation reservation{};
+                bool          reservation_success = false;
 
-            if (capacity_scheduler_) {
-                reservation_success = capacity_scheduler_->try_start_request(r->session.id, est, &reservation, pre_existing_page_ids);
-                if (!reservation_success) {
-                    TM_LOG_WARNING(
-                        "[EngineScheduler] Rejecting request %llu due to insufficient KV capacity (needed %zu pages) via CapacityScheduler.",
-                        r->session.id,
-                        est.pages_needed);
-                    r->ec = Request::kTooLong;
+                if (capacity_scheduler_) {
+                    reservation_success =
+                        capacity_scheduler_->try_start_request(r->session.id, est, &reservation, pre_existing_page_ids);
+                    if (!reservation_success) {
+                        TM_LOG_WARNING(
+                            "[EngineScheduler] Rejecting request %llu due to insufficient KV capacity (needed %zu pages) via CapacityScheduler.",
+                            r->session.id,
+                            est.pages_needed);
+                        r->ec = Request::kTooLong;
+                        continue;
+                    }
+                }
+                else {
+                    reservation_success = kv_mgr_->reserve(r->session.id, est, &reservation, pre_existing_page_ids);
+                    if (!reservation_success) {
+                        TM_LOG_WARNING(
+                            "[EngineScheduler] Rejecting request %llu due to insufficient KV capacity (needed %zu pages) via KVCacheManager.",
+                            r->session.id,
+                            est.pages_needed);
+                        r->ec = Request::kTooLong;
+                        continue;
+                    }
+                }
+
+                if (reservation.page_ids.empty()) {
+                    TM_LOG_ERROR("[EngineScheduler] Reservation for %llu succeeded but returned no pages; rejecting.",
+                                 r->session.id);
+                    if (ProgressLogger::Enabled()) {
+                        ProgressEvent evt{ProgressStage::kError};
+                        evt.pct        = 100;
+                        evt.seq_id     = r->session.id;
+                        evt.session_id = r->session.id;
+                        evt.msg        = "reserve_ok_but_no_pages";
+                        ProgressLogger::Log(evt);
+                    }
+                    release_kv(r->session.id, "reservation_no_pages");
+                    r->ec = Request::kFail;
                     continue;
                 }
-            }
-            else if (kv_mgr_) {
-                reservation_success = kv_mgr_->reserve(r->session.id, est, &reservation, pre_existing_page_ids);
-                if (!reservation_success) {
-                    TM_LOG_WARNING(
-                        "[EngineScheduler] Rejecting request %llu due to insufficient KV capacity (needed %zu pages) via KVCacheManager.",
-                        r->session.id,
-                        est.pages_needed);
-                    r->ec = Request::kTooLong;
-                    continue;
-                }
-            }
-            else {
-                reservation_success = true;
-                TM_LOG_WARNING("[EngineScheduler] No KV manager or capacity scheduler. Request %llu admitted without KV checks.", r->session.id);
-            }
 
-            if (reservation_success) {
                 FT_CHECK_WITH_INFO(seq_states_.find(r->session.id) == seq_states_.end(),
                                    "Attempting to add new sequence that already exists in seq_states_.");
-                SequenceState state{};
-                state.seq_id          = r->session.id;
-                state.prompt_len      = prompt_len;
-                state.prefilled_len   = matched_tokens;
-                state.generated_len   = 0;
-                state.max_new_tokens  = r->gen_cfg.max_new_tokens;
-                state.phase           = (matched_tokens == prompt_len) ? SequencePhase::kDecode : SequencePhase::kPrefill;
-                state.queue_tag       = (state.phase == SequencePhase::kPrefill) ? SequenceQueue::kPrefill : SequenceQueue::kDecode;
-                state.kv_reservation_handle = reservation.first_page;
 
-                seq_states_[state.seq_id] = state;
-                if (state.phase == SequencePhase::kPrefill) {
+                SequenceState state{};
+                state.seq_id                = r->session.id;
+                state.prompt_len            = prompt_len;
+                state.prefilled_len         = matched_tokens;
+                state.generated_len         = 0;
+                state.max_new_tokens        = r->gen_cfg.max_new_tokens;
+                state.phase                 = (matched_tokens == prompt_len) ? SequencePhase::kDecode : SequencePhase::kPrefill;
+                state.queue_tag             = (state.phase == SequencePhase::kPrefill) ? SequenceQueue::kPrefill : SequenceQueue::kDecode;
+                state.kv_reservation_handle = reservation.first_page;
+                state.kv_page_ids           = reservation.page_ids;
+                state.kv_cookie             = reservation.kv_cookie;
+
+                r->kv_page_ids = reservation.page_ids;
+                r->kv_cookie   = reservation.kv_cookie;
+
+                if (ProgressLogger::Enabled()) {
+                    ProgressEvent evt{ProgressStage::kSchedulerAdmit};
+                    evt.pct           = 45;
+                    evt.seq_id        = state.seq_id;
+                    evt.session_id    = state.seq_id;
+                    evt.kv_pages_seq  = static_cast<int>(state.kv_page_ids.size());
+                    evt.kv_map_cookie = state.kv_cookie;
+                    evt.msg           = "kv_meta_attached";
+                    ProgressLogger::Log(evt);
+                }
+
+                released_seq_ids_.erase(state.seq_id);
+                seq_states_[state.seq_id] = std::move(state);
+                if (seq_states_[r->session.id].phase == SequencePhase::kPrefill) {
                     prefill_request_queue_.push_back(r);
                 }
                 else {
                     decode_request_queue_.push_back(r);
                 }
             }
-        }
-        else if (r->session.start_flag) {
-            const int prompt_len = r->inputs.at("input_ids").shape(0);
-            FT_CHECK_WITH_INFO(seq_states_.find(r->session.id) == seq_states_.end(),
-                               "Attempting to add new sequence that already exists in seq_states_ (no KV manager).");
-            SequenceState state{};
-            state.seq_id          = r->session.id;
-            state.prompt_len      = prompt_len;
-            state.prefilled_len   = 0;
-            state.generated_len   = 0;
-            state.max_new_tokens  = r->gen_cfg.max_new_tokens;
-            state.phase           = SequencePhase::kPrefill;
-            state.queue_tag       = SequenceQueue::kPrefill;
-            seq_states_[state.seq_id] = state;
-            prefill_request_queue_.push_back(r);
+            else {
+                // No KV manager configured; admit the sequence without KV tracking.
+                FT_CHECK_WITH_INFO(seq_states_.find(r->session.id) == seq_states_.end(),
+                                   "Attempting to add new sequence that already exists in seq_states_ (no KV manager).");
+                SequenceState state{};
+                state.seq_id         = r->session.id;
+                state.prompt_len     = prompt_len;
+                state.prefilled_len  = 0;
+                state.generated_len  = 0;
+                state.max_new_tokens = r->gen_cfg.max_new_tokens;
+                state.phase          = SequencePhase::kPrefill;
+                state.queue_tag      = SequenceQueue::kPrefill;
+                released_seq_ids_.erase(state.seq_id);
+                seq_states_[state.seq_id] = state;
+                prefill_request_queue_.push_back(r);
+            }
         }
 
         if (!r->ec) {
@@ -215,6 +249,16 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
     for (const auto& r : kill_reqs) {
         if (!r) {
             continue;
+        }
+
+        if (ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kSchedulerAdmit};
+            evt.pct        = 10;
+            evt.seq_id     = r->session.id;
+            evt.session_id = r->session.id;
+            evt.unique_id  = r->unique_id;
+            evt.msg        = "kill";
+            ProgressLogger::Log(evt);
         }
 
         // Erase from queues
@@ -234,12 +278,7 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
         FT_CHECK_WITH_INFO(seq_states_.find(r->session.id) == seq_states_.end(),
                            "Killed request still in seq_states_ after erase.");
         active_requests_.erase(r->session.id);
-        if (kv_mgr_) {
-            kv_mgr_->release(r->session.id);
-        }
-        if (capacity_scheduler_) {
-            capacity_scheduler_->finish_request(r->session.id);
-        }
+        release_kv(r->session.id, "kill_queue");
     }
 }
 
@@ -267,22 +306,70 @@ void EngineScheduler::update_sequence_state(uint64_t seq_id, int prefilled_token
             auto req_it = active_requests_.find(seq_id);
             if (req_it != active_requests_.end()) {
                 const auto& req = req_it->second;
-                PrefixKey key;
-                key.tokens.assign(req->inputs.at("input_ids").data<int>(), req->inputs.at("input_ids").data<int>() + state.prompt_len);
-                key.namespace_id = 0; // Default namespace
-
-                // Get allocated KV page indices for this sequence
-                std::vector<int> page_indices = kv_mgr_->get_sequence_page_ids(seq_id);
-                if (!page_indices.empty()) {
-                    prefix_cache_->insert(key, page_indices, 0, seq_id); // priority 0, pass seq_id for internal mapping
-                    TM_LOG_DEBUG("[EngineScheduler] Inserted prefix for sequence %lu into PrefixCache.", seq_id);
-                } else {
-                    TM_LOG_WARNING("[EngineScheduler] Sequence %lu completed prefill but has no allocated KV pages. Not inserting to PrefixCache.", seq_id);
+                const int   page_size = kv_mgr_->get_layout().page_size;
+                if (page_size <= 0) {
+                    TM_LOG_WARNING("[EngineScheduler] Cannot insert prefix for seq %lu: invalid page_size %d.", seq_id, page_size);
+                }
+                else {
+                    const int aligned_tokens = (state.prompt_len / page_size) * page_size;
+                    if (aligned_tokens <= 0) {
+                        TM_LOG_DEBUG("[EngineScheduler] Skipping prefix insert for seq %lu: prompt too small for alignment.", seq_id);
+                    }
+                    else {
+                        std::vector<int> prompt_tokens;
+                        if (!extract_prompt_tokens(req, prompt_tokens, aligned_tokens)) {
+                            TM_LOG_WARNING("[EngineScheduler] Unable to extract prompt tokens for seq %lu; skipping prefix insert.", seq_id);
+                        }
+                        else {
+                            prompt_tokens.resize(aligned_tokens);
+                            std::vector<int> live_page_ids = kv_mgr_->get_sequence_page_ids(seq_id);
+                            if (live_page_ids != state.kv_page_ids) {
+                                TM_LOG_WARNING("[EngineScheduler] KV page mismatch for seq %lu during prefix insert (cached=%zu live=%zu). Skipping.",
+                                               seq_id,
+                                               state.kv_page_ids.size(),
+                                               live_page_ids.size());
+                                if (ProgressLogger::Enabled()) {
+                                    ProgressEvent evt{ProgressStage::kError};
+                                    evt.pct           = 100;
+                                    evt.seq_id        = seq_id;
+                                    evt.session_id    = seq_id;
+                                    evt.kv_pages_seq  = static_cast<int>(live_page_ids.size());
+                                    evt.kv_map_cookie = state.kv_cookie;
+                                    evt.msg           = "prefix_insert_kv_page_mismatch";
+                                    ProgressLogger::Log(evt);
+                                }
+                            }
+                            else if (live_page_ids.empty()) {
+                                TM_LOG_WARNING("[EngineScheduler] Sequence %lu completed prefill but has no allocated KV pages. Not inserting to PrefixCache.", seq_id);
+                            }
+                            else {
+                                PrefixKey key;
+                                key.tokens       = prompt_tokens;
+                                key.namespace_id = 0;
+                                prefix_cache_->insert(key, live_page_ids, 0, seq_id);
+                                TM_LOG_DEBUG("[EngineScheduler] Inserted prefix for sequence %lu into PrefixCache (aligned_tokens=%d).",
+                                             seq_id,
+                                             aligned_tokens);
+                                if (ProgressLogger::Enabled()) {
+                                    ProgressEvent evt{ProgressStage::kPrefixMatch};
+                                    evt.pct           = 60;
+                                    evt.seq_id        = seq_id;
+                                    evt.session_id    = seq_id;
+                                    evt.kv_pages_seq  = static_cast<int>(live_page_ids.size());
+                                    evt.kv_map_cookie = state.kv_cookie;
+                                    evt.chunk_len     = aligned_tokens;
+                                    evt.msg           = "prefix_insert";
+                                    ProgressLogger::Log(evt);
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 TM_LOG_WARNING("[EngineScheduler] Sequence %lu completed prefill, but request not found in active_requests_. Cannot insert to PrefixCache.", seq_id);
             }
         }
+
     }
 
     if (state.generated_len >= state.max_new_tokens) {
@@ -298,12 +385,7 @@ void EngineScheduler::update_sequence_state(uint64_t seq_id, int prefilled_token
         //    finish_request.
         //  - When there is no CapacityScheduler, fall back to releasing
         //    directly via KVCacheManager.
-        if (capacity_scheduler_) {
-            capacity_scheduler_->finish_request(seq_id);
-        }
-        else if (kv_mgr_) {
-            kv_mgr_->release(seq_id);
-        }
+        release_kv(seq_id, "finished");
         seq_states_.erase(seq_id);
         active_requests_.erase(seq_id);
 
@@ -419,6 +501,63 @@ int EngineScheduler::tokens_for_prefill_chunk(const SequenceState& state) const 
     chunk_size = std::max(1, chunk_size); // Minimum 1 token per chunk if possible
 
     return std::min(remaining_prompt_tokens, chunk_size);
+}
+
+bool EngineScheduler::extract_prompt_tokens(const std::shared_ptr<Request>& req,
+                                            std::vector<int>&              tokens_out,
+                                            int                            max_tokens) const
+{
+    if (!req) {
+        return false;
+    }
+    auto it = req->inputs.find("input_ids");
+    if (it == req->inputs.end()) {
+        return false;
+    }
+    const auto& tensor = it->second;
+    const auto  device = tensor.device().type;
+    if (device != DeviceType::kCPU && device != DeviceType::kCPUpinned) {
+        TM_LOG_DEBUG("[EngineScheduler] input_ids for seq %llu not on host-accessible memory; skipping token extraction.", req->session.id);
+        return false;
+    }
+
+    int prompt_len = 0;
+    if (tensor.ndim() == 1) {
+        prompt_len = tensor.shape(0);
+    }
+    else if (tensor.ndim() == 2) {
+        if (tensor.shape(0) != 1) {
+            TM_LOG_WARNING("[EngineScheduler] input_ids tensor for seq %llu has unsupported batch dimension %lld.",
+                           req->session.id,
+                           static_cast<long long>(tensor.shape(0)));
+            return false;
+        }
+        prompt_len = tensor.shape(1);
+    }
+    else {
+        TM_LOG_WARNING("[EngineScheduler] input_ids tensor for seq %llu has unsupported rank %d.", req->session.id, tensor.ndim());
+        return false;
+    }
+
+    if (prompt_len <= 0) {
+        return false;
+    }
+
+    const int copy_len = (max_tokens > 0) ? std::min(prompt_len, max_tokens) : prompt_len;
+    if (copy_len <= 0) {
+        return false;
+    }
+
+    tokens_out.resize(copy_len);
+    try {
+        std::memcpy(tokens_out.data(), tensor.data<int>(), sizeof(int) * copy_len);
+    }
+    catch (...) {
+        TM_LOG_ERROR("[EngineScheduler] Failed to read input_ids for seq %llu.", req->session.id);
+        tokens_out.clear();
+        return false;
+    }
+    return true;
 }
 
 
@@ -567,98 +706,181 @@ void EngineScheduler::schedule_step(std::vector<PrefillChunk>&             prefi
 
 void EngineScheduler::on_step_executed(const std::vector<PrefillChunk>&             prefill_batch,
                                        const std::vector<std::shared_ptr<Request>>& decode_batch,
-                                       const std::unordered_map<uint64_t, int>&     pre_lengths)
+                                       const std::unordered_map<uint64_t, int>&     pre_lengths,
+                                       const std::vector<ExecutionResult>&          exec_results)
 {
     auto get_pre_len = [&](uint64_t seq_id) -> int {
-        auto it = pre_lengths.find(seq_id);
-        if (it != pre_lengths.end()) {
+        if (auto it = pre_lengths.find(seq_id); it != pre_lengths.end()) {
             return it->second;
         }
         auto st_it = seq_states_.find(seq_id);
-        if (st_it != seq_states_.end()) {
-            return st_it->second.prefilled_len + st_it->second.generated_len;
-        }
-        return 0;
-    };
-
-    auto compute_delta = [&](const std::shared_ptr<Request>& req, bool is_decode) -> int {
-        if (!req) {
+        if (st_it == seq_states_.end()) {
+            TM_LOG_ERROR("[EngineScheduler] Missing seq_state for seq %lu during on_step_executed", seq_id);
             return 0;
         }
-        const uint64_t seq_id   = req->session.id;
-        const int      pre_len  = get_pre_len(seq_id);
-        int            post_len = pre_len;
- 
-         try {
-             if (req->sequence_length.data()) {
-                 post_len = req->sequence_length.data()[0];
-             }
-             else {
-                 auto it = req->inputs.find("input_ids");
-                 if (it != req->inputs.end()) {
-                     post_len = it->second.shape(0);
-                 }
-             }
-         }
-         catch (...) {
-             // Fall back to scheduler state when sequence_length is not readable.
-         }
- 
-         int delta = post_len - pre_len;
-         if (delta <= 0) {
-             auto st_it = seq_states_.find(seq_id);
-             if (st_it != seq_states_.end()) {
-                 const int planned = is_decode ? tokens_for_decode_step(st_it->second) : tokens_for_prefill_chunk(st_it->second);
-                 TM_LOG_DEBUG("[EngineScheduler] Backend reported non-positive delta for seq %lu (pre=%d post=%d). Using planned budget %d",
-                              seq_id,
-                              pre_len,
-                              post_len,
-                              planned);
-                 delta = planned;
-             }
-         }
-
-
-        return std::max(delta, 0);
+        return st_it->second.prefilled_len + st_it->second.generated_len;
     };
 
-    // Update states for scheduled requests using actual per-sequence deltas
-    // derived from Request.sequence_length where available.
+
+    auto remove_from_queues = [&](uint64_t seq_id) {
+        prefill_request_queue_.remove_if([&](const auto& r_ptr) { return r_ptr->session.id == seq_id; });
+        decode_request_queue_.remove_if([&](const auto& r_ptr) { return r_ptr->session.id == seq_id; });
+    };
+
+    auto fail_sequence = [&](uint64_t seq_id, const char* reason, const std::shared_ptr<Request>& req) {
+        const char* reason_text = reason ? reason : "delta_failure";
+        uint64_t    kv_cookie   = 0;
+        int         kv_pages    = 0;
+        if (auto st_it = seq_states_.find(seq_id); st_it != seq_states_.end()) {
+            kv_cookie = st_it->second.kv_cookie;
+            kv_pages  = static_cast<int>(st_it->second.kv_page_ids.size());
+        }
+        if (ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kError};
+            evt.pct           = 100;
+            evt.seq_id        = seq_id;
+            evt.session_id    = seq_id;
+            evt.kv_pages_seq  = kv_pages;
+            evt.kv_map_cookie = kv_cookie;
+            evt.msg           = reason_text;
+            ProgressLogger::Log(evt);
+        }
+        if (auto it_req = active_requests_.find(seq_id); it_req != active_requests_.end() && it_req->second) {
+            UpdateState(*it_req->second, Request::kFail, get_pre_len(seq_id));
+        }
+        else if (req) {
+            UpdateState(*req, Request::kFail, get_pre_len(seq_id));
+        }
+        release_kv(seq_id, reason_text);
+        seq_states_.erase(seq_id);
+        active_requests_.erase(seq_id);
+        remove_from_queues(seq_id);
+    };
+
+    std::unordered_map<uint64_t, int> post_lengths;
+    post_lengths.reserve(exec_results.size());
+    for (const auto& result : exec_results) {
+        if (result.final_sequence_length >= 0) {
+            post_lengths[result.sequence_id] = result.final_sequence_length;
+        }
+    }
+
+    auto log_post_len = [&](uint64_t seq_id, bool is_decode, int pre_len, int post_len, int delta) {
+        if (!ProgressLogger::Enabled()) {
+            return;
+        }
+        ProgressEvent evt{is_decode ? ProgressStage::kDecodeExec : ProgressStage::kPrefillExec};
+        evt.pct        = is_decode ? 86 : 66;
+        evt.seq_id     = seq_id;
+        evt.session_id = seq_id;
+        std::ostringstream oss;
+        oss << "post_len_reported pre=" << pre_len << " post=" << post_len << " delta=" << delta;
+        evt.msg = oss.str();
+        ProgressLogger::Log(evt);
+    };
+
+    auto get_post_len = [&](uint64_t seq_id) -> std::optional<int> {
+        if (auto it = post_lengths.find(seq_id); it != post_lengths.end()) {
+            return it->second;
+        }
+        return std::nullopt;
+    };
+
+    auto compute_delta = [&](const std::shared_ptr<Request>& req, bool is_decode) -> std::pair<int, bool> {
+        if (!req) {
+            return {0, false};
+        }
+        const uint64_t seq_id  = req->session.id;
+        const int      pre_len = get_pre_len(seq_id);
+        auto           post    = get_post_len(seq_id);
+        if (!post.has_value()) {
+            TM_LOG_ERROR("[EngineScheduler] Missing post length for seq %lu", seq_id);
+            fail_sequence(seq_id, is_decode ? "missing_decode_post_length" : "missing_prefill_post_length", req);
+            return {0, false};
+        }
+        int post_len = post.value();
+        int delta    = post_len - pre_len;
+        log_post_len(seq_id, is_decode, pre_len, post_len, delta);
+ 
+        bool used_planned = false;
+        if (delta <= 0) {
+            TM_LOG_ERROR("[EngineScheduler] Non-positive delta for seq %lu (pre=%d post=%d)", seq_id, pre_len, post_len);
+            fail_sequence(seq_id,
+                          is_decode ? "decode_delta_nonpositive" : "prefill_delta_nonpositive",
+                          req);
+            return {0, false};
+        }
+ 
+        return {delta, used_planned};
+    };
+
+
+    constexpr int kMaxDecodeFallbacks  = 2;
+    constexpr int kMaxPrefillFallbacks = 3;
+
+    auto handle_fallback = [&](uint64_t seq_id,
+                               SequenceState& state,
+                               bool           is_decode,
+                               bool           used_planned,
+                               const std::shared_ptr<Request>& req) -> bool {
+        (void)state;
+        (void)seq_id;
+        (void)is_decode;
+        (void)used_planned;
+        (void)req;
+        return true;
+    };
+
     for (const auto& req : decode_batch) {
-        const int delta = compute_delta(req, /*is_decode=*/true);
+        auto [delta, used_planned] = compute_delta(req, /*is_decode=*/true);
         if (!req || delta == 0) {
             continue;
         }
-        update_sequence_state(req->session.id, 0, delta);
-        if (auto st_it = seq_states_.find(req->session.id); st_it != seq_states_.end()) {
+        const uint64_t seq_id = req->session.id;
+        auto           st_it  = seq_states_.find(seq_id);
+        if (st_it == seq_states_.end()) {
+            continue;
+        }
+        if (!handle_fallback(seq_id, st_it->second, /*is_decode=*/true, used_planned, req)) {
+            continue;
+        }
+        update_sequence_state(seq_id, 0, delta);
+        if (auto fresh_it = seq_states_.find(seq_id); fresh_it != seq_states_.end()) {
             TM_LOG_DEBUG("[EngineScheduler] seq %lu decode advanced by %d tokens (prefilled=%d generated=%d phase=%d)",
-                         req->session.id,
+                         seq_id,
                          delta,
-                         st_it->second.prefilled_len,
-                         st_it->second.generated_len,
-                         static_cast<int>(st_it->second.phase));
+                         fresh_it->second.prefilled_len,
+                         fresh_it->second.generated_len,
+                         static_cast<int>(fresh_it->second.phase));
         }
     }
     for (const auto& chunk : prefill_batch) {
         if (!chunk.req) {
             continue;
         }
-        const int delta = compute_delta(chunk.req, /*is_decode=*/false);
+        auto [delta, used_planned] = compute_delta(chunk.req, /*is_decode=*/false);
         if (delta == 0) {
             continue;
         }
-        update_sequence_state(chunk.req->session.id, delta, 0);
-        if (auto st_it = seq_states_.find(chunk.req->session.id); st_it != seq_states_.end()) {
+        const uint64_t seq_id = chunk.req->session.id;
+        auto           st_it  = seq_states_.find(seq_id);
+        if (st_it == seq_states_.end()) {
+            continue;
+        }
+        if (!handle_fallback(seq_id, st_it->second, /*is_decode=*/false, used_planned, chunk.req)) {
+            continue;
+        }
+        update_sequence_state(seq_id, delta, 0);
+        if (auto fresh_it = seq_states_.find(seq_id); fresh_it != seq_states_.end()) {
             TM_LOG_DEBUG("[EngineScheduler] seq %lu prefill advanced by %d tokens (prefilled=%d/%d phase=%d)",
                          chunk.req->session.id,
                          delta,
-                         st_it->second.prefilled_len,
-                         st_it->second.prompt_len,
-                         static_cast<int>(st_it->second.phase));
+                         fresh_it->second.prefilled_len,
+                         fresh_it->second.prompt_len,
+                         static_cast<int>(fresh_it->second.phase));
         }
     }
 
-    // Requeue active sequences based on updated phases
     for (const auto& req : decode_batch) {
         auto st_it = seq_states_.find(req->session.id);
         if (st_it != seq_states_.end() && st_it->second.phase == SequencePhase::kDecode) {
@@ -689,6 +911,46 @@ void EngineScheduler::on_speculative_execution(const std::vector<turbomind::Exec
 {
     // Speculative decoding disabled in v1.
     (void)results;
+}
+
+void EngineScheduler::release_kv(uint64_t seq_id, const char* reason)
+{
+    const char* reason_text = reason ? reason : "unspecified";
+    if (!released_seq_ids_.insert(seq_id).second) {
+        TM_LOG_WARNING("[EngineScheduler] Duplicate KV release attempt for seq %llu (reason=%s).", seq_id, reason_text);
+        return;
+    }
+
+    if (capacity_scheduler_) {
+        TM_LOG_DEBUG("[EngineScheduler] KV release owned by CapacityScheduler: seq=%llu reason=%s", seq_id, reason_text);
+        capacity_scheduler_->finish_request(seq_id, reason_text);
+        return;
+    }
+
+    if (require_capacity_scheduler_) {
+        TM_LOG_ERROR("[EngineScheduler] CapacityScheduler missing during release for seq %llu (reason=%s).",
+                     seq_id,
+                     reason_text);
+        throw std::runtime_error("CapacityScheduler required for DriftEngine KV lifecycle");
+    }
+
+    if (kv_mgr_) {
+        TM_LOG_DEBUG("[EngineScheduler] KV release owned directly by EngineScheduler: seq=%llu reason=%s", seq_id, reason_text);
+        kv_mgr_->release(seq_id);
+        if (ProgressLogger::Enabled()) {
+            ProgressEvent evt{ProgressStage::kRelease};
+            evt.pct        = 100;
+            evt.seq_id     = seq_id;
+            evt.session_id = seq_id;
+            evt.msg        = std::string("direct_release:") + reason_text;
+            ProgressLogger::Log(evt);
+        }
+        return;
+    }
+
+    TM_LOG_DEBUG("[EngineScheduler] KV release requested for seq %llu but no KV manager configured (reason=%s).",
+                 seq_id,
+                 reason_text);
 }
 
 }  // namespace turbomind
