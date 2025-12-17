@@ -122,18 +122,6 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
 
         if (kv_mgr_ && r->session.start_flag) {
             const int prompt_len = r->inputs.at("input_ids").shape(0);
-            if (session_len_limit_ > 0) {
-                const int total_required = prompt_len + r->gen_cfg.max_new_tokens;
-                if (total_required > session_len_limit_) {
-                    TM_LOG_WARNING("[EngineScheduler] Rejecting request %llu: prompt(%d) + max_new_tokens(%d) exceeds session_len limit %d",
-                                   r->session.id,
-                                   prompt_len,
-                                   r->gen_cfg.max_new_tokens,
-                                   session_len_limit_);
-                    r->ec = Request::kTooLong;
-                    continue;
-                }
-            }
             std::vector<int> prompt_tokens;
             std::vector<int> pre_existing_page_ids;
             int matched_tokens = 0;
@@ -204,15 +192,6 @@ void EngineScheduler::on_new_requests(const std::vector<std::shared_ptr<Request>
         }
         else if (r->session.start_flag) {
             const int prompt_len = r->inputs.at("input_ids").shape(0);
-            if (session_len_limit_ > 0 && prompt_len + r->gen_cfg.max_new_tokens > session_len_limit_) {
-                TM_LOG_WARNING("[EngineScheduler] Rejecting request %llu: prompt(%d) + max_new_tokens(%d) exceeds session_len limit %d",
-                               r->session.id,
-                               prompt_len,
-                               r->gen_cfg.max_new_tokens,
-                               session_len_limit_);
-                r->ec = Request::kTooLong;
-                continue;
-            }
             FT_CHECK_WITH_INFO(seq_states_.find(r->session.id) == seq_states_.end(),
                                "Attempting to add new sequence that already exists in seq_states_ (no KV manager).");
             SequenceState state{};
