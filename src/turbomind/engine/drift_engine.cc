@@ -46,10 +46,11 @@ inline std::function<void()> make_llama_batch_shutdown(turbomind::LlamaBatch* ba
 
 inline size_t auto_kv_capacity_bytes_from_env()
 {
-    // Mirror TurboMind BlockManager semantics: treat TM_CACHE_MAX_ENTRY_COUNT
-    // as an upper bound on the fraction of *free* device memory usable for
-    // KV, then apply an internal safety cap (or TM_KV_EFFECTIVE_RATIO) to
-    // avoid over-allocation on large models such as 120B.
+    // Treat TM_CACHE_MAX_ENTRY_COUNT as an upper bound on the fraction of
+    // *free* device memory usable for KV. The caller is responsible for
+    // choosing a sane value; we avoid hidden clamps so that misconfigured
+    // ratios surface as explicit allocation errors instead of silently
+    // changing the effective KV budget.
     double ratio = 0.75;
     if (const char* env = std::getenv("TM_CACHE_MAX_ENTRY_COUNT")) {
         char*  end = nullptr;
@@ -60,6 +61,11 @@ inline size_t auto_kv_capacity_bytes_from_env()
     }
 
     double effective_ratio = ratio;
+
+    // Optional environment override to tighten the KV budget without
+    // changing engine configs. When set to a value in (0,1], this caps
+    // the internal ratio used for sizing KVCacheManager, but we no longer
+    // apply any default safety clamp.
     if (const char* env = std::getenv("TM_KV_EFFECTIVE_RATIO")) {
         char*  end = nullptr;
         double v   = std::strtod(env, &end);
@@ -67,21 +73,11 @@ inline size_t auto_kv_capacity_bytes_from_env()
             if (v < effective_ratio) {
                 effective_ratio = v;
                 TM_LOG_WARNING(
-                    "[DriftEngine] TM_KV_EFFECTIVE_RATIO=%s clamping cache_max_entry_count from %.3f to %.3f",
+                    "[DriftEngine] TM_KV_EFFECTIVE_RATIO=%s overrides cache_max_entry_count from %.3f to %.3f",
                     env,
                     ratio,
                     effective_ratio);
             }
-        }
-    }
-    else {
-        constexpr double kMaxSafeRatio = 0.70;
-        if (effective_ratio > kMaxSafeRatio) {
-            TM_LOG_WARNING(
-                "[DriftEngine] Clamping cache_max_entry_count from %.3f to %.3f to avoid KV overallocation.",
-                ratio,
-                kMaxSafeRatio);
-            effective_ratio = kMaxSafeRatio;
         }
     }
 
@@ -96,7 +92,7 @@ inline size_t auto_kv_capacity_bytes_from_env()
     }
 
     size_t capacity = static_cast<size_t>(static_cast<double>(free_bytes) * effective_ratio);
-    TM_LOG_WARNING(
+    TM_LOG_INFO(
         "[DriftEngine] Auto KV capacity: free=%zu bytes, ratio=%.3f (effective=%.3f) -> kv_capacity_bytes=%zu",
         free_bytes,
         ratio,

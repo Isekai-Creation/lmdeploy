@@ -61,7 +61,15 @@ BlockManager::BlockManager(
 
     // pre-allocate first chunk
     if (!Malloc()) {
-        TM_LOG_ERROR("[BlockManager] Failed to allocate first chunk! size=%lu, chunk_size=%d", block_size_ * chunk_size_, chunk_size_);
+        TM_LOG_ERROR(
+            "[BlockManager] Failed to allocate first KV chunk: block_size=%.3f MB, "
+            "chunk_size=%d, requested_bytes=%lu. Likely insufficient free GPU memory "
+            "for the configured cache_max_entry_count. Reduce TM_CACHE_MAX_ENTRY_COUNT "
+            "or session_len / max_batch_size and retry.",
+            static_cast<float>(block_size_) / (1 << 20),
+            chunk_size_,
+            block_size_ * static_cast<size_t>(chunk_size_));
+        throw std::runtime_error("BlockManager: unable to allocate initial KV chunk");
     }
     dbg(free_ids_);
 }
@@ -127,12 +135,9 @@ size_t BlockManager::GetBlockCount(size_t block_size, double ratio, GetFreeMemSi
     size_t free = get_free_size();
 
     // Treat `ratio` as an upper bound on the fraction of free device
-    // memory that can be reserved for KV blocks. On very large models
-    // (e.g. 120B with long contexts) an aggressive ratio such as 0.75
-    // can lead to allocator failures on the first chunk allocation even
-    // though the theoretical "free * ratio" budget exists. To make the
-    // BlockManager more robust, apply an internal safety cap while
-    // keeping the user-visible knob unchanged.
+    // memory that can be reserved for KV blocks. We avoid hard-coded
+    // safety clamps so that overly aggressive settings surface as
+    // explicit allocation failures instead of being silently reduced.
     double effective_ratio = ratio;
 
     // Optional environment override to tighten the KV budget without
@@ -145,25 +150,11 @@ size_t BlockManager::GetBlockCount(size_t block_size, double ratio, GetFreeMemSi
             if (v < effective_ratio) {
                 effective_ratio = v;
                 TM_LOG_WARNING(
-                    "[BlockManager] TM_KV_EFFECTIVE_RATIO=%s clamping cache_max_entry_count from %.3f to %.3f",
+                    "[BlockManager] TM_KV_EFFECTIVE_RATIO=%s overrides cache_max_entry_count from %.3f to %.3f",
                     env,
                     ratio,
                     effective_ratio);
             }
-        }
-    }
-    else {
-        // Default safety cap when no explicit override is provided.
-        // This leaves headroom for model weights, activations, and
-        // additional runtime buffers even when cache_max_entry_count
-        // is configured to aggressive values like 0.75.
-        constexpr double kMaxSafeRatio = 0.70;
-        if (effective_ratio > kMaxSafeRatio) {
-            TM_LOG_WARNING(
-                "[BlockManager] Clamping cache_max_entry_count from %.3f to %.3f to avoid KV overallocation.",
-                ratio,
-                kMaxSafeRatio);
-            effective_ratio = kMaxSafeRatio;
         }
     }
 
