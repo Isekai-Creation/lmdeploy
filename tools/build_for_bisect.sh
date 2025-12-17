@@ -17,7 +17,10 @@ INSTALL_PREFIX="lmdeploy/lib"
 rm -rf "$BUILD_DIR"
 
 # Configure TurboMind
-# Note: Using SM120 (Blackwell) as user has SM 120.
+# Prefer Ada/Hopper (sm89/sm90a) for broad compatibility. Blackwell
+# (sm120) is only available when the CUDA toolkit supports it; using
+# 120 unconditionally causes "Unsupported gpu architecture 'compute_120'"
+# on CUDA 12.x toolchains.
 echo "Configuring TurboMind build..."
 cmake -S . -B "$BUILD_DIR" -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -29,8 +32,7 @@ cmake -S . -B "$BUILD_DIR" -G Ninja \
   -DBUILD_PY_FFI=ON \
   -DBUILD_MULTI_GPU=ON \
   -DUSE_NVTX=ON \
-  -DCMAKE_CUDA_COMPILER="${CUDA_HOME}/bin/nvcc" \
-  -DCMAKE_CUDA_ARCHITECTURES="120"
+  -DCMAKE_CUDA_COMPILER="${CUDA_HOME}/bin/nvcc"
 
 # Build
 echo "Building TurboMind..."

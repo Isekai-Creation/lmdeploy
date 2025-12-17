@@ -226,9 +226,15 @@ endif()
 
 
 if(ARCH STREQUAL "x86_64")
-  # Build for Ada/Hopper and Blackwell GPUs. This enables BF16/FP4 paths
-  # on 8.9/9.0a while also generating native kernels for sm_120.
-  set(CMAKE_CUDA_ARCHITECTURES "89-real;90a-real;120-real")
+  # Build for Ada/Hopper by default; enable Blackwell (sm_120) only when
+  # the CUDA toolkit is new enough to recognize compute_120. CUDA 12.8
+  # (as used on Kaggle H100) does not support compute_120, so we must
+  # skip 120 there to avoid: "nvcc fatal : Unsupported gpu architecture 'compute_120'".
+  if(DEFINED CUDAToolkit_VERSION AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+    set(CMAKE_CUDA_ARCHITECTURES "89-real;90a-real;120-real")
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES "89-real;90a-real")
+  endif()
 elseif(ARCH STREQUAL "aarch64")
   if (NOT CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 72-real 87-real)  # Jetson
