@@ -376,13 +376,28 @@ int KVCacheManager::get_page_ref_count(int page_id) const {
 }
 
 KVUsageEstimate KVCacheManager::estimate_usage(const ModelLayout& layout,
-                                              int prompt_len,
-                                              int max_new_tokens)
+                                               int                prompt_len,
+                                               int                max_new_tokens)
 {
+    // Total logical tokens scheduled for this sequence.
     int total_tokens = prompt_len + max_new_tokens;
-    int pages        = (total_tokens > 0 && layout.page_size > 0)
-                           ? (total_tokens + layout.page_size - 1) / layout.page_size
-                           : 0;
+
+    // Clamp to the engine's configured max sequence length when provided.
+    // This keeps KV reservations and page counts consistent with the
+    // runtime `session_len` / `max_seq_len` limits used by LlamaBatch
+    // and the block-pointer buffers. Without this clamp, a large
+    // `max_new_tokens` can cause `pages_needed` to exceed the number of
+    // blocks that the model buffers were sized for (e.g. more pages than
+    // ceil(session_len / page_size)), which in turn would overflow the
+    // block_ptrs_ / h_block_ptrs_ arrays and lead to illegal memory
+    // accesses in the attention kernels.
+    if (layout.max_seq_len > 0 && total_tokens > layout.max_seq_len) {
+        total_tokens = layout.max_seq_len;
+    }
+
+    int pages = (total_tokens > 0 && layout.page_size > 0)
+                    ? (total_tokens + layout.page_size - 1) / layout.page_size
+                    : 0;
 
     if (pages == 0 && total_tokens > 0 && layout.page_size > 0) {
         pages = 1;
