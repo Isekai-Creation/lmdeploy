@@ -47,6 +47,7 @@
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/metrics.h"
 #include "src/turbomind/utils/eagle_debug.h"
+#include "src/turbomind/utils/progress_logger.h"
 
 // Minimal DriftEngine wrapper class for Python binding
 class DriftEngineWrapper {
@@ -348,22 +349,48 @@ public:
 
     void run(int rank = 0)
     {
-        if (engine) {
-            running.store(true, std::memory_order_release);
+        if (!engine) {
+            return;
+        }
+
+        running.store(true, std::memory_order_release);
+
+        try {
             // Establish a core context (stream + allocators) for the
             // DriftEngine worker thread so that any Tensor allocations
             // and kernel launches have a valid Context::stream() and
             // allocators. This mirrors the pattern used in the main
             // TurboMind engine path.
-            turbomind::CudaDeviceGuard      device_guard(0);
-            turbomind::core::Stream         core_stream = turbomind::core::Stream::create();
-            turbomind::core::Allocator      host_alloc{turbomind::kCPU};
-            turbomind::core::Allocator      device_alloc{turbomind::kDEVICE};
-            turbomind::core::ContextGuard   ctx_guard{core_stream, host_alloc, device_alloc};
+            turbomind::CudaDeviceGuard    device_guard(0);
+            turbomind::core::Stream       core_stream = turbomind::core::Stream::create();
+            turbomind::core::Allocator    host_alloc{turbomind::kCPU};
+            turbomind::core::Allocator    device_alloc{turbomind::kDEVICE};
+            turbomind::core::ContextGuard ctx_guard{core_stream, host_alloc, device_alloc};
 
             engine->run(rank);
-            running.store(false, std::memory_order_release);
         }
+        catch (const std::exception& e) {
+            TM_LOG_ERROR("[DriftEngineWrapper] DriftEngine worker_thread caught exception: %s", e.what());
+            if (turbomind::ProgressLogger::Enabled()) {
+                turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+                evt.pct  = 100;
+                evt.rank = rank;
+                evt.msg  = std::string("drift_worker_exception:") + e.what();
+                turbomind::ProgressLogger::Log(evt);
+            }
+        }
+        catch (...) {
+            TM_LOG_ERROR("[DriftEngineWrapper] DriftEngine worker_thread caught unknown exception");
+            if (turbomind::ProgressLogger::Enabled()) {
+                turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+                evt.pct  = 100;
+                evt.rank = rank;
+                evt.msg  = "drift_worker_exception:unknown";
+                turbomind::ProgressLogger::Log(evt);
+            }
+        }
+
+        running.store(false, std::memory_order_release);
     }
 
     void start(int rank = 0)
@@ -442,6 +469,19 @@ public:
         req->metrics     = nullptr;
         req->ec          = turbomind::Request::kOk;
 
+        // Submit request to DriftEngine via Gateway. Emit an explicit
+        // Drift progress event at the Python/pybind boundary so that
+        // we can trace request submission even if Gateway logging is
+        // filtered or the worker crashes early.
+        if (turbomind::ProgressLogger::Enabled()) {
+            turbomind::ProgressEvent evt{turbomind::ProgressStage::kRequestEnqueue};
+            evt.pct        = 0;
+            evt.seq_id     = req->session.id;
+            evt.session_id = req->session.id;
+            evt.unique_id  = req->unique_id;
+            evt.msg        = "pybind_submit";
+            turbomind::ProgressLogger::Log(evt);
+        }
         // Submit request to DriftEngine via Gateway
         gateway->push(req);
 
