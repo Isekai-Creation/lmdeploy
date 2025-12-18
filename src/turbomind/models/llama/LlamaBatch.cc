@@ -2568,12 +2568,28 @@ void LlamaBatch::InternalThreadEntry()
 void LlamaBatch::Start()
 {
     TM_LOG_INFO("LlamaBatch<T>::Start()");
+    if (mode_ == Mode::kExecutor) {
+        TM_LOG_ERROR("[LlamaBatch] Start() called in executor mode; this is illegal for DriftEngine");
+        if (turbomind::ProgressLogger::Enabled()) {
+            turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+            evt.pct = 100;
+            evt.msg = "legacy_internal_thread_start_in_executor_mode";
+            turbomind::ProgressLogger::Log(evt);
+        }
+        std::abort();
+    }
     internal_thread_ = std::thread([this] {
         try {
             InternalThreadEntry();
         }
         catch (const std::exception& e) {
             TM_LOG_ERROR("[Engine] %s", e.what());
+            if (turbomind::ProgressLogger::Enabled()) {
+                turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+                evt.pct = 100;
+                evt.msg = std::string("legacy_internal_thread_exception:") + e.what();
+                turbomind::ProgressLogger::Log(evt);
+            }
             std::abort();
         }
     });

@@ -4,6 +4,8 @@
 
 #include "src/turbomind/engine/gateway.h"
 #include "src/turbomind/engine/request_queue.h"
+#include "src/turbomind/utils/logger.h"
+#include "src/turbomind/utils/progress_logger.h"
 
 namespace turbomind {
 
@@ -39,17 +41,38 @@ void Gateway::shutdown()
 
 void Gateway::signal_thread_entry() noexcept
 {
-    while (true) {
-        bool                abort{};
-        std::vector<Signal> signals = signal_buffer_.take_all(abort);
-        if (abort) {
-            break;
-        }
-        else {
-            auto ctx = ctx_factory_();
-            for (const auto& s : signals) {
-                s();
+    try {
+        while (true) {
+            bool                abort{};
+            std::vector<Signal> signals = signal_buffer_.take_all(abort);
+            if (abort) {
+                break;
             }
+            else {
+                auto ctx = ctx_factory_();
+                (void)ctx;
+                for (const auto& s : signals) {
+                    s();
+                }
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        TM_LOG_ERROR("[Gateway] signal_thread exception: %s", e.what());
+        if (turbomind::ProgressLogger::Enabled()) {
+            turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+            evt.pct = 100;
+            evt.msg = std::string("gateway_signal_exception:") + e.what();
+            turbomind::ProgressLogger::Log(evt);
+        }
+    }
+    catch (...) {
+        TM_LOG_ERROR("[Gateway] signal_thread unknown exception");
+        if (turbomind::ProgressLogger::Enabled()) {
+            turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+            evt.pct = 100;
+            evt.msg = "gateway_signal_exception:unknown";
+            turbomind::ProgressLogger::Log(evt);
         }
     }
 }

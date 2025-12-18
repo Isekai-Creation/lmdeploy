@@ -174,89 +174,78 @@ Execution order for Engineer B (recommended):
 
 ### 1.2 Engine‑Level Scheduler (Prefill vs Decode, Token Budget)
 
-- [ ] **1.2.1 Introduce an explicit per‑step token budget.** (Owner: Engineer A, Progress: 80%)  
+**Status snapshot (HF GPT‑OSS‑20B / GPT‑OSS‑120B, non‑spec, TP=1):**
+
+- **SchedulerConfig + EngineScheduler core:** Implemented and integrated.
+  - Per‑step token budget (`max_num_batched_tokens`, `max_num_seqs`) is enforced in `EngineScheduler::schedule_step`.
+  - `SequenceState` / `SequencePhase` track `prompt_len`, `prefilled_len`, `generated_len`, and `max_new_tokens` per sequence.
+  - Chunked prefill is implemented via `PrefillChunk { req, start_pos, len }` and `tokens_for_prefill_chunk`, with `max_num_partial_prefills` and `long_prefill_token_threshold`.
+  - Two queues (`prefill_request_queue_`, `decode_request_queue_`) and a two‑pass schedule (prefill vs decode) are active, honoring `prefer_decode_over_prefill`.
+  - `schedule_step` now uses decode/prefill token budgets derived from an internal decode/prefill ratio (pre‑tuned but not yet extensively profiled).
+  - Post‑step feedback `on_step_executed(...)` consumes `ExecutionResult` from `LlamaBatch` to update `SequenceState` and drive phase transitions (PREFILL→DECODE→FINISHED).
+  - **Needs testing:** multi‑sequence fairness under mixed prompt lengths; extreme `max_num_batched_tokens` / `max_num_seqs` settings; long‑context 20B/120B sweeps.
+
+- [ ] **1.2.1 Introduce an explicit per‑step token budget.** (Owner: Engineer A, Progress: 95% – implemented, needs stress‑validation)  
   Details: Gateway/RequestQueue implement basic continuous batching, but there is no global token budget.  
   Needed:
   - A scheduler component that, per step, selects a batch of requests such that:  
     - `sum(tokens_being_processed)` ≤ `max_num_batched_tokens`.  
     - Respects maximum sequences per step.  
-  Design (C++):
-  - Add an engine‑level scheduler config struct (in `src/turbomind/engine/scheduler_config.h`):
-    ```cpp
-    struct SchedulerConfig {
-        int  max_num_batched_tokens{2048};
-        int  max_num_seqs{128};
-        bool enable_chunked_prefill{true};
-        int  max_num_partial_prefills{1};
-        int  long_prefill_token_threshold{0};
-        bool prefer_decode_over_prefill{true};
-    };
-    ```
-  - Introduce an `EngineScheduler` that uses this:
-    ```cpp
-    class EngineScheduler {
-    public:
-        explicit EngineScheduler(const SchedulerConfig& cfg,
-                                 KVCacheManager* kv_mgr);
-        // Decide which sequences to run this step given the token budget.
-        void schedule_step(std::vector<std::shared_ptr<Request>>& prefill_batch,
-                           std::vector<std::shared_ptr<Request>>& decode_batch);
-    private:
-        SchedulerConfig cfg_;
-        KVCacheManager* kv_mgr_;
-        // internal per-sequence state map (see 1.2.2).
-    };
-    ```
-  - The engine main loop calls `schedule_step` instead of directly consuming Gateway/RequestQueue results, and then forms GPU batches from `prefill_batch` and `decode_batch`.
+  Implementation details:
+  - `SchedulerConfig` lives in `src/turbomind/engine/scheduler_config.h` with:
+    - `max_num_batched_tokens`, `max_num_seqs`.
+    - `enable_chunked_prefill`, `max_num_partial_prefills`, `max_long_partial_prefills`, `long_prefill_token_threshold`.
+    - `prefer_decode_over_prefill` and `schedule_policy` (FCFS vs small‑first), plus prefix/latency hints.
+  - `EngineScheduler` in `src/turbomind/engine/EngineScheduler.{h,cc}`:
+    - Owns `cfg_`, `KVCacheManager*`, `ModelLayout`, optional `PrefixCache*` and `CapacityScheduler*`.
+    - `schedule_step(std::vector<PrefillChunk>& prefill_batch, std::vector<std::shared_ptr<Request>>& decode_batch)`:
+      - Applies `schedule_policy` to `prefill_request_queue_`.
+      - Computes per‑step budgets for decode and prefill from `max_num_batched_tokens` and an internal decode/prefill ratio.
+      - Fills `decode_batch` and `prefill_batch` so that:
+        - Total tokens ≤ `max_num_batched_tokens`.
+        - Total sequences ≤ `max_num_seqs`.
+      - Emits DEBUG logs of prefill/decode token counts per step.
+  - `DriftEngine::worker_loop` calls `scheduler_->schedule_step(...)` for every step and uses the returned batches to drive `LlamaBatch::ExecuteScheduled`.
+  - **What remains:** systematic perf sweeps and corner‑case stress (very large batches, pathological prompt distributions), plus tuning of decode/prefill ratios.
 
-- [ ] **1.2.2 Track prefill vs decode phases per request.** (Owner: Engineer A, Progress: 80%)  
+- [ ] **1.2.2 Track prefill vs decode phases per request.** (Owner: Engineer A, Progress: 95% – implemented, needs full lifecycle tests)  
   Details: DynamicDecodeLayer covers decode; prefill is implicit in initial forward.  
   Needed:
   - Per‑request phase state (`PREFILL`, `DECODE`, `FINISHED`).  
   - Ability to schedule long prompts in chunks (Section 1.2.3) distinct from 1‑token decode.  
-  Design (C++):
-  - Add a small per‑sequence state record managed by `EngineScheduler`:
-    ```cpp
-    enum class SequencePhase : uint8_t { kPrefill, kDecode, kFinished };
+  Implementation details:
+  - `SequencePhase` and `SequenceState` are implemented as described; `seq_states_` is an `unordered_map<seq_id, SequenceState>`.
+  - `EngineScheduler::on_new_requests`:
+    - Creates `SequenceState` for `start` requests with:
+      - `prompt_len` = prompt tokens.
+      - `prefilled_len` = matched prefix tokens (from `PrefixCache`) or 0.
+      - `generated_len` = 0.
+      - `max_new_tokens` = request’s `gen_cfg.max_new_tokens` (subject to clamping).
+      - `phase` = `kPrefill` or `kDecode` based on whether prompt is already fully covered by prefix pages.
+      - KV metadata (`kv_reservation_handle`, `kv_page_ids`, `kv_cookie`) populated from `KVCacheManager`/`CapacityScheduler`.
+  - `EngineScheduler::on_step_executed` and `update_sequence_state`:
+    - Consume `ExecutionResult` (prefill+decode) and actual sequence lengths per step.
+    - Advance `prefilled_len` and/or `generated_len`.
+    - Transition `phase` to `kDecode` once `prefilled_len >= prompt_len`.
+    - Transition `phase` to `kFinished` at EOS or once `generated_len >= max_new_tokens` and release KV.
+  - **What remains:** focused tests around complex session flows (restarts, kill, end, partial prefill) to confirm no double‑release or stuck `SequenceState`.
 
-    struct SequenceState {
-        uint64_t     seq_id;
-        int          prompt_len;      // total prompt tokens
-        int          prefilled_len;   // how many prompt tokens already processed
-        int          generated_len;   // how many new tokens generated
-        int          max_new_tokens;
-        SequencePhase phase;
-    };
-    ```
-  - Maintain `std::unordered_map<uint64_t, SequenceState> seq_states_` inside `EngineScheduler`:
-    - On new `start` request: create `SequenceState` with `phase = kPrefill`.
-    - After first full prompt processed: flip to `kDecode`.
-    - After EOS or reaching `max_new_tokens`: mark `kFinished` and let scheduler free KV via `KVCacheManager`.
-
-- [ ] **1.2.3 Implement chunked prefill with partial concurrency.** (Owner: Engineer A, Progress: 70%)  
+- [ ] **1.2.3 Implement chunked prefill with partial concurrency.** (Owner: Engineer A, Progress: 90% – implemented, needs long‑context validation)  
   Details: No chunked prefill today; long prompts must be processed in one go.  
   Needed:
   - API + scheduler logic to split long prompts into chunks that fit the token budget.  
   - Controls similar to vLLM: `max_num_partial_prefills`, thresholds for “long” prompts.  
-  Design (C++):
-  - Extend `SequenceState` with `prefill_chunk_size` derived from `max_num_batched_tokens` and current load.
-  - The scheduler computes per‑sequence remaining prefill length:
-    ```cpp
-    int remaining = state.prompt_len - state.prefilled_len;
-    int chunk = std::min(remaining, cfg_.max_num_batched_tokens_per_seq());
-    ```
-  - Expose a lightweight descriptor for a prefill chunk:
-    ```cpp
-    struct PrefillChunk {
-        std::shared_ptr<Request> req;
-        int start_pos;  // inclusive, in prompt tokens
-        int len;        // number of tokens in this chunk
-    };
-    ```
-  - `schedule_step` fills `prefill_batch` with `PrefillChunk`s respecting:
-    - Global token budget.
-    - `max_num_partial_prefills` and `long_prefill_token_threshold` (limit concurrent long prompts).
-  - The model execution path must accept `(start_pos, len)` and only process that portion of the prompt (input IDs slice + appropriate position IDs).
+  Implementation details:
+  - `PrefillChunk` is implemented in `EngineScheduler.h` and used throughout the DriftEngine path.
+  - `tokens_for_prefill_chunk(const SequenceState&)` in `EngineScheduler.cc`:
+    - Computes remaining prompt tokens as `prompt_len - prefilled_len`.
+    - Chooses chunk size from `cfg_.max_num_batched_tokens_per_seq()` (derived from `max_num_batched_tokens` and `max_num_seqs`), clamped to [`1`, `max_num_batched_tokens`].
+  - `schedule_step`:
+    - For each prefill sequence in the queue, pushes `PrefillChunk{req, state.prefilled_len, chunk_len}` into `prefill_batch` while budgets permit.
+  - `LlamaBatch::ExecuteScheduled` and `InitializeFromScheduler`:
+    - Accept the `PrefillChunk` vector and use `chunk.start_pos + chunk.len` as context length for prefill sequences.
+    - KV allocation/install is done per sequence via the unified KV cache; prefix tokens are captured for `PrefixCache`.
+  - **What remains:** end‑to‑end long‑context (e.g., 16K/32K) HF 20B/120B runs to confirm chunk boundaries and KV pointer tables stay aligned under stress.
 
 - [ ] **1.2.4 Make admission KV‑capacity‑aware (Guaranteed‑Completion mode).** (Owner: Engineer A, Progress: 70%)  
   Details: KV utilities can compute sizes, but capacity is not surfaced to the scheduler.  
@@ -319,13 +308,13 @@ Execution order for Engineer B (recommended):
 
 ### 1.3 Session & Cancellation Semantics
 
-- [ ] **1.3.1 Finalize and document session lifecycle invariants.** (Owner: Engineer A, Progress: 90%)  
+- [ ] **1.3.1 Finalize and document session lifecycle invariants.** (Owner: Engineer A, Progress: 90% – implemented in code, needs doc + tests)  
   Details: `SessionParam` + `SeqId2Rank` implement start/continue/kill semantics.  
   Needed:
   - Clear spec for legal state transitions: `start → continue* → end` or `kill`.  
   - Tests covering race conditions (start+kill, cancel during prefill/decode, double‑end).  
 
-- [ ] **1.3.2 Ensure robust cancellation under load (no leaks, no stuck sessions).** (Owner: Engineer A, Progress: 80%)  
+- [ ] **1.3.2 Ensure robust cancellation under load (no leaks, no stuck sessions).** (Owner: Engineer A, Progress: 80% – implemented, needs stress‑runs)  
   Details: `cancel_flag`, `Gateway::cancel`, and kill paths exist.  
   Needed:
   - Stress tests with many concurrent cancels.  
@@ -337,53 +326,24 @@ Execution order for Engineer B (recommended):
 
 ### 2.1 First‑Class KV Allocator (Paged Blocks)
 
-- [ ] **2.1.1 Implement an engine‑level `KVCacheManager` abstraction.** (Owner: Engineer A, Progress: 80%)  
-  Details: `kv_cache_utils_v2` and allocators exist at kernel level but not as a shared manager.  
-  Needed:
-  - A C++ `KVCacheManager` that:  
-    - Manages KV blocks/pages for all layers.  
-    - Exposes `allocate(sequence_id, length)`, `free(sequence_id)`, `capacity()`, `used()` APIs.  
-    - Supports multi‑GPU topologies (TP/PP) consistently.  
-  Design (C++):
-  - New header `src/turbomind/core/kv_cache_manager.h`:
-    ```cpp
-    struct KVLayout {
-        int num_layers;
-        int num_kv_heads;
-        int head_dim;
-        int page_size;      // tokens per page
-        int bytes_per_value;
-    };
-
-    struct KVReservation {
-        uint64_t seq_id;
-        int      first_page;
-        int      num_pages;
-    };
-
-    class KVCacheManager {
-    public:
-        KVCacheManager(const KVLayout& layout,
-                       size_t total_capacity_bytes);
-
-        size_t total_pages() const;
-        size_t used_pages() const;
-
-        bool   can_reserve(uint64_t seq_id,
-                           const KVUsageEstimate& est) const;
-        bool   reserve(uint64_t seq_id,
-                       const KVUsageEstimate& est,
-                       KVReservation* out);
-        void   release(uint64_t seq_id);
-
-        // Translate (seq_id, position) → physical page index(es)
-        int    page_for(uint64_t seq_id, int position) const;
-    private:
-        KVLayout layout_;
-        // internal free list / bitmap / allocator structures
-    };
-    ```
-  - The attention kernels continue to work with raw pointers + indices; they query page indices via `page_for`.
+- [ ] **2.1.1 Implement an engine‑level `KVCacheManager` abstraction.** (Owner: Engineer A, Progress: 95% – implemented, needs large‑model validation)  
+  Implementation:
+  - `KVLayout`, `KVReservation`, `KVUsageEstimate` and `KVCacheManager` are implemented in `src/turbomind/core/kv_cache_manager.{h,cc}`:
+    - Layout: `num_layers`, `num_kv_heads`, `head_dim`, `page_size`, `kv_dtype`, `bytes_per_value`, `kv_factor`.
+    - Capacity: `total_pages()`, `used_pages()`, `free_pages()`, `page_bytes()`, and `get_layout()`.
+    - Reservation API:
+      - `KVCacheManager::estimate_usage(const ModelLayout&, int prompt_len, int max_new_tokens)`:
+        - Computes `pages_needed` / `bytes_needed` from layout geometry.
+        - Clamps total tokens to `layout.max_seq_len` to stay within block‑pointer capacity.
+      - `can_reserve(seq_id, est)`, `reserve(seq_id, est, KVReservation*, pre_existing_page_ids)`, `release(seq_id)`.
+      - Tracks per‑sequence page maps and per‑page refcounts; supports shared pages from `PrefixCache` via `pre_existing_page_ids`.
+    - Safety:
+      - Logs KV layout and `page_bytes`, plus about‑to‑alloc/free snapshots via `cudaMemGetInfo`.
+      - Validates page IDs and pointer ranges in `build_page_ptr_table`.
+  - DriftEngine uses `KVCacheManager` as the single KV backing store:
+    - KV capacity is derived from free device memory and `TM_CACHE_MAX_ENTRY_COUNT` (with conservative clamps and headroom).
+    - `EngineScheduler` and `CapacityScheduler` use `estimate_usage` + `reserve` to guarantee KV capacity for each sequence from start to finish.
+  - **Needs testing:** extreme long‑context / high‑batch HF 20B/120B runs; multi‑process/DP topologies beyond TP=1.
 
 - [ ] **2.1.2 Define KV layout contracts per model family.** (Owner: Engineer A, Progress: 80%)  
   Details: Layout logic is distributed among model and kernel code.  
@@ -553,67 +513,29 @@ Execution order for Engineer B (recommended):
 
 ### 4.1 KV‑Aware Capacity Scheduler
 
-- [ ] **4.1.1 Implement a KV capacity estimator per request.** (Owner: Engineer A, Progress: 80%)  
-  Details: KV utilities know per‑token KV sizes, but they’re not aggregated per request.  
-  Needed:
-  - Given a prompt length and `max_new_tokens`, estimate KV blocks required to complete a request.  
-  - Include per‑layer and per‑head factors, and TP/PP topology.  
-  Design (C++):
-  - Add a small helper (possibly as static methods on `KVCacheManager`):
-    ```cpp
-    struct KVUsageEstimate {
-        size_t pages_needed;
-        size_t bytes_needed;
-    };
+- [ ] **4.1.1 Implement a KV capacity estimator per request.** (Owner: Engineer A, Progress: 95% – implemented, needs corner‑case coverage)  
+  - `KVUsageEstimate { pages_needed, bytes_needed }` and `estimate_usage(const ModelLayout&, int prompt_len, int max_new_tokens)` are implemented on `KVCacheManager`.
+  - Token count is clamped to `layout.max_seq_len` to keep `pages_needed` within the range that LlamaBatch’s block‑pointer tables can represent.
+  - `EngineScheduler::on_new_requests` uses `estimate_usage` for every new `start` request.
 
-    KVUsageEstimate estimate_usage(const ModelLayout& layout,
-                                   int prompt_len,
-                                   int max_new_tokens) {
-        int total_tokens = prompt_len + max_new_tokens;
-        int pages = (total_tokens + layout.page_size - 1) / layout.page_size;
-        size_t bytes = static_cast<size_t>(pages)
-                     * layout.num_layers
-                     * layout.num_kv_heads
-                     * layout.head_dim
-                     * sizeof(half);  // or actual KV type
-        return {pages, bytes};
-    }
-    ```
-  - `EngineScheduler` uses this estimator when deciding whether to reserve KV for a new request.
+- [ ] **4.1.2 Implement a Guaranteed‑Completion capacity scheduler.** (Owner: Engineer A, Progress: 90% – implemented, needs heavy‑load tests)  
+  - `CapacityScheduler` exists in `src/turbomind/engine/capacity_scheduler.{h,cc}`:
+    - Holds `KVCacheManager*` and `PrefixCache*`.
+    - Implements `try_start_request(seq_id, KVUsageEstimate, KVReservation*, pre_existing_page_ids)` and delegates to:
+      - `KVCacheManager::reserve` with or without shared prefix pages.
+    - Tracks basic capacity metrics (blocked / rejected) for DriftMetrics.
+  - `EngineScheduler` uses `CapacityScheduler` (when provided) rather than calling `KVCacheManager` directly.
+  - Once a request is admitted, its KV reservation is held until the sequence is marked finished and `release_kv` is called.
 
-- [ ] **4.1.2 Implement a Guaranteed‑Completion capacity scheduler.** (Owner: Engineer A, Progress: 70%)  
-  Details: No dedicated capacity scheduler exists today.  
-  Needed:
-  - Scheduler mode that:  
-    - Guarantees that once a request starts, KV capacity is reserved until completion.  
-    - Rejects/delays new requests when insufficient capacity remains.  
-  Design (C++):
-  - Add a simple capacity scheduler, used inside `EngineScheduler`:
-    ```cpp
-    class CapacityScheduler {
-    public:
-        explicit CapacityScheduler(KVCacheManager* kv_mgr);
-
-        bool try_start_request(uint64_t seq_id,
-                               const KVUsageEstimate& est);
-        void finish_request(uint64_t seq_id);
-    private:
-        KVCacheManager* kv_mgr_;
-    };
-    ```
-  - `try_start_request` calls `kv_mgr_->reserve`; if it fails, the request stays in the queue (or is rejected by policy).
-
-- [ ] **4.1.3 Integrate capacity checks with Gateway / RequestQueue.** (Owner: Engineer A, Progress: 60%)  
-  Details: Gateway/RequestQueue currently accept all requests.  
-  Needed:
-  - On enqueue and scheduling, consult the capacity scheduler:  
-    - Decide whether to queue, delay, or reject requests based on KV availability and token budget.  
-  Design (integration):
-  - Gateway/RequestQueue remain responsible for fairness and session routing.  
-  - The worker loop (via `EngineScheduler` + `CapacityScheduler`) decides:
-    - Which queued requests can transition to `active` based on KV capacity and token budget.  
-    - Which requests must remain queued.  
-  - For “hard” rejections (optional), add an error code and early callback path in `ModelRequest::Forward` when `CapacityScheduler` signals “never schedulable” under current KV limits.
+- [ ] **4.1.3 Integrate capacity checks with Gateway / RequestQueue.** (Owner: Engineer A, Progress: 85% – integrated into worker loop, needs multi‑tenant validation)  
+  - `DriftEngine::worker_loop`:
+    - Uses `gateway_->pop(...)` to get incoming requests.
+    - Immediately feeds them to `EngineScheduler::on_new_requests`, which:
+      - Enforces SessionParam invariants and kill/end semantics.
+      - Uses `CapacityScheduler`/`KVCacheManager` to decide if KV can be reserved for the sequence before admitting it.
+      - Rejects or marks requests with `ec` when KV capacity is insufficient (with detailed progress logs).
+  - Gateway still owns fairness and session routing; `EngineScheduler` decides which queued requests can become active based on KV and token budget.
+  - **Needs testing:** behavior under sustained overload (lots of large prompts) to ensure we never start a request that cannot complete due to KV exhaustion and that we surface clear errors instead of mid‑run OOM.
 
 ---
 
@@ -663,7 +585,7 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
 ### 6.1 DriftEngineConfig (Python)
 
-- [ ] **6.1.1 Define `DriftEngineConfig` and integrate it into LMDeploy.** (Owner: Engineer B, Progress: 60%)  
+- [ ] **6.1.1 Define `DriftEngineConfig` and integrate it into LMDeploy.** (Owner: Engineer B, Progress: 90% – implemented, needs API polish/docs)  
   Design (Python):
   - New config in `lmdeploy`:
     ```python
@@ -697,8 +619,10 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
     ```
   - `DriftEngineConfig` is a thin wrapper around the TurboMind scheduler/KV pieces but adds **explicit throughput/latency targets** and microbatch sizes, so the scheduler can tune itself at runtime.  
   - Current status: `DriftEngineConfig` is implemented in `lmdeploy/messages.py` and accepted by `lmdeploy.api.pipeline` / `lmdeploy.api.serve` as a `backend_config`.
+    - Additional fields (`enable_prefix_caching`, `enable_speculative_decoding`, `enable_cuda_graphs`, `enable_memory_compaction`, `enable_adaptive_batching`, `cache_max_entry_count`) are present and mapped into the C++ `DriftEngineConfig` via `to_cpp_drift_engine_config`.
+    - TurboMind‑derived model layout overrides (`_tm_num_layers`, `_tm_num_kv_heads`, `_tm_head_dim`, `kv_page_size`) are exported as a `model_layout` dict so C++ uses the correct GPT‑OSS‑20B/120B geometry instead of the static 120B default.
 
-- [ ] **6.1.2 Expose `DriftEngineConfig` in pipeline and server entrypoints.** (Owner: Engineer B, Progress: 50%)  
+- [ ] **6.1.2 Expose `DriftEngineConfig` in pipeline and server entrypoints.** (Owner: Engineer B, Progress: 80% – wired, needs dedicated helpers/docs)  
   Design:
   - New entrypoints:
     ```python
@@ -711,11 +635,14 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
         ...
     ```  
   - Internally, these construct C++ `DriftEngine` instances instead of the legacy TurboMind engine.  
-  - Current status: `DriftEngineConfig` can already be passed to `pipeline` / `serve`, and a convenience `drift_api_server(...)` wrapper exists in `lmdeploy/api.py` (backend is set to `"drift"`); a dedicated `drift_pipeline(...)` helper is still TBD.
+  - Current status:
+    - `DriftEngineConfig` can already be passed to `pipeline` / `serve`.
+    - `lmdeploy/turbomind/turbomind.py` inspects `backend_config` and sets `_engine_type="drift"` when a `DriftEngineConfig` is provided; `_create_drift_engine` uses the new pybind drift factories (`create_engine_with_model`, `create_engine`, `create_drift_engine`).
+    - A convenience `drift_api_server(...)` wrapper exists in `lmdeploy/api.py` (backend is set to `"drift"`); a dedicated `drift_pipeline(...)` helper plus public docs are still TBD.
 
 ### 6.2 DriftEngine C++ Top‑Level Structure
 
-- [ ] **6.2.1 Implement `DriftEngine` C++ class wrapping TurboMind components.** (Owner: Engineer A, Progress: 40%)  
+- [ ] **6.2.1 Implement `DriftEngine` C++ class wrapping TurboMind components.** (Owner: Engineer A, Progress: 90% – implemented, needs extended validation)  
   Design (C++):
   - New files: `src/turbomind/engine/drift_engine.h/.cc`:
     ```cpp
@@ -748,50 +675,47 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
     }  // namespace turbomind
     ```
-  - `DriftEngine` is a **composition** of:
-    - `Gateway` (request routing).
-    - `EngineScheduler` (Section 1.2) for prefill/decode mixing and chunking.
-    - `KVCacheManager` + `PrefixCache` (Section 2).
-    - `CapacityScheduler` (Section 4).
+  - `DriftEngine` in `src/turbomind/engine/drift_engine.{h,cc}` is implemented as a composition of:
+    - `Gateway` (request routing / session→rank mapping).
+    - `EngineScheduler` (Section 1.2) for prefill/decode queueing and token‑budgeted steps.
+    - `KVCacheManager` + `PrefixCache` (Section 2) for paged, shared KV.
+    - `CapacityScheduler` (Section 4) for Guaranteed‑Completion KV admission.
+  - `run(int rank)` / `worker_loop(int rank)`:
+    - Drive the main loop: `Gateway::pop` → `scheduler_.on_new_requests` → `scheduler_.schedule_step` → `LlamaBatch::ExecuteScheduled` → `scheduler_.on_step_executed`.
+    - Emit detailed `[DRIFT][PROG]` events for ctor/kv_capacity/scheduler_ready/worker_ready/prefill/decode and errors.
+  - A minimal metrics API (`DriftEngine::metrics()`) exposes a snapshot of `DriftMetrics` derived from `EngineScheduler::snapshot_metrics()`.
+  - **Needs testing:** long multi‑request runs on HF GPT‑OSS‑20B/120B; failure scenarios (KV exhaustion, Gateway aborts, worker exceptions) and recovery semantics.
 
-- [ ] **6.2.2 Add a C++ config struct mirroring `DriftEngineConfig`.** (Owner: Engineer A, Progress: 80%)  
-  Design:
+- [ ] **6.2.2 Add a C++ config struct mirroring `DriftEngineConfig`.** (Owner: Engineer A, Progress: 95% – implemented, needs perf tuning)  
+  Design/implementation:
   - `DriftEngineConfig` (C++) in `src/turbomind/engine/drift_engine_config.h`:
-    ```cpp
-    struct DriftEngineConfig {
-        SchedulerConfig scheduler;
-        KVLayout        kv_layout;
-        ModelLayout     model_layout;
-
-        bool prefer_high_throughput{true};
-        int  target_latency_ms_p50{50};
-        int  target_latency_ms_p95{200};
-        int  max_queued_requests{4096};
-        bool abort_on_oom{true};
-    };
-    ```
-  - Python `DriftEngineConfig` is converted to this struct at binding layer.
+    - Mirrors Python `DriftEngineConfig` fields:
+      - `SchedulerConfig scheduler_config;`
+      - `ModelLayout model_layout;`
+      - `KVLayout kv_layout;`
+      - `size_t kv_capacity_bytes;`
+      - `bool prefer_high_throughput;`
+      - `int target_latency_ms_p50, target_latency_ms_p95;`
+      - `int max_queued_requests;`
+      - `bool abort_on_oom;`
+      - `std::string log_level;`
+    - `SchedulerConfig::from_engine_config(const DriftEngineConfig&)` provides the canonical mapping into scheduler settings.
+  - Python `DriftEngineConfig` is converted to this struct via `lmdeploy/config/drift_config.py::to_cpp_drift_engine_config`, including TurboMind‑derived `model_layout` overrides for HF GPT‑OSS‑20B/120B.
 
 ### 6.3 DriftEngine Scheduling Policies
 
-- [ ] **6.3.1 Implement a two‑queue scheduler policy (prefill vs decode) tuned for throughput.** (Owner: Engineer A, Progress: 60%)  
-  Design:
+- [ ] **6.3.1 Implement a two‑queue scheduler policy (prefill vs decode) tuned for throughput.** (Owner: Engineer A, Progress: 85% – implemented, needs perf tuning)  
+  Design/implementation:
   - Within `EngineScheduler` when used by DriftEngine:
-    - Maintain two priority queues:
-      - `prefill_queue_`: sequences in `kPrefill` phase, holding `PrefillChunk`s.
-      - `decode_queue_`: sequences in `kDecode` phase.
-    - Scheduling policy:
-      - Compute token budget for this step `B = cfg_.max_num_batched_tokens`.
-      - Compute desired prefill vs decode ratio based on config:
-        - If `prefer_high_throughput == true`:
-          - Use a fixed ratio, e.g., 60–70% tokens for decode, 30–40% for prefill.
-        - Else (latency‑optimized):
-          - Prioritize decode for low‑latency sequences and short prompts.
-      - Fill `decode_batch` first up to its budget, using:
-        - Either FIFO or small‑latency‑first policy.
-      - Use remaining tokens for `prefill_batch`, obeying `max_num_partial_prefills` and long‑prompt controls.
+    - Maintains prefill and decode queues (`prefill_request_queue_`, `decode_request_queue_`) tagged via `SequenceState.queue_tag`.
+    - `schedule_step`:
+      - Computes token budget `B = cfg_.max_num_batched_tokens`.
+      - Splits `B` into decode and prefill budgets using an internal decode/prefill token ratio (initially 50/50, adjustable via metrics).
+      - Fills `decode_batch` and `prefill_batch` under these budgets, using FCFS or size‑based policy as configured.
+    - Ensures that the total number of sequences in both batches ≤ `max_num_seqs`.
+  - **Needs testing:** workload‑level throughput/latency sweeps to validate that the current ratio and queue policy are effective across scenarios.
 
-- [ ] **6.3.2 Add adaptive tuning based on observed latency and tokens/sec.** (Owner: Engineer A, Progress: 30%)  
+- [ ] **6.3.2 Add adaptive tuning based on observed latency and tokens/sec.** (Owner: Engineer A, Progress: 40% – metrics wired, tuning heuristics WIP)  
   Design:
   - Track moving averages:
     ```cpp
@@ -809,33 +733,50 @@ Goal: A new **DriftEngine** backend that uses TurboMind’s kernels and models, 
 
 ### 6.4 DriftEngine Data Flow (End‑to‑End)
 
-- [ ] **6.4.1 Define the end‑to‑end request lifecycle in DriftEngine.** (Owner: Engineer A, Progress: 10%)  
-  Design (high‑level flow):
+- [ ] **6.4.1 Define the end‑to‑end request lifecycle in DriftEngine.** (Owner: Engineer A, Progress: 80% – implemented, needs full HF 20B/120B validation)  
+  Implementation (high‑level flow):
   1. Python side:
-     - User constructs `DriftEngineConfig` and starts a `drift_pipeline` or `drift_api_server`.  
-     - This spins up one or more `DriftEngine` worker threads/processes.
-  2. Request submission:
-     - Requests arrive via Python binding, converted into TurboMind `Request` objects via `ModelRequest::Forward`.  
-     - `Gateway::push` enqueues them in per‑rank `RequestQueue`s; `SeqId2Rank` maintains session affinity.
-  3. Worker loop:
+     - User constructs `DriftEngineConfig` (Python) and passes it as `backend_config` to `lmdeploy.pipeline` / `serve`.
+     - `turbomind.TurboMind._setup_drift_engine`:
+       - Builds a `TurbomindEngineConfig` for HF→TurboMind conversion.
+       - Creates a `LlamaTritonModel` (`model_comm`) with weights loaded for HF GPT‑OSS‑20B/120B.
+       - Derives a minimal model layout override for Drift (`_tm_num_layers`, `_tm_num_kv_heads`, `_tm_head_dim`, `kv_page_size`).
+       - Converts the Python config into a C++ `DriftEngineConfig` dict.
+  2. Engine creation:
+     - Pybind `DriftEngineWrapper::initialize_from_dict_with_model` builds:
+       - A `Gateway` for request routing.
+       - A `DriftEngine` with derived `DriftEngineConfig` (model_layout / kv_layout / scheduler / capacity).
+       - A `LlamaBatch` executor via `LlamaTritonModel::createDriftEngine`, bound via `DriftEngine::bind_llama_batch`, including KV bridge (`bridge_kv_cache_manager`).
+     - `DriftEngineWrapper.start()` spins up `DriftEngine::worker_loop` in a dedicated thread, with a minimal core `ContextGuard`.
+  3. Request submission:
+     - Python `TurboMindInstance.async_stream_infer` builds `Request` objects and submits them via `DriftEngineWrapper::forward`:
+       - `Gateway::push` enqueues them; `[DRIFT][PROG]` `pybind_submit` and `start` events are logged.
+  4. Worker loop:
      - Each `DriftEngine::worker_loop(rank)`:
-       - Calls `gateway_->pop(...)` to collect new `infer_reqs` and `kill_reqs`.  
-       - Passes them to `scheduler_.on_new_requests(...)`.  
-       - `CapacityScheduler` and `KVCacheManager` decide which new sequences can start based on KV capacity (Guaranteed‑Completion).  
-       - `PrefixCache` is consulted to reuse existing KV pages for shared prefixes.  
-       - `scheduler_.schedule_step(...)` generates `prefill_batch` and `decode_batch` for this step.  
-       - The model is executed for both batches (prefill and decode), using existing TurboMind kernels.  
-       - `SequenceState` is updated; finished sequences release KV via `KVCacheManager::release` and are removed.  
-  4. Response:
-     - As tokens are produced, `UpdateState` / `forward_cb` propagate updates back to Python, which streams tokens to the user.
+       - Calls `gateway_->pop(...)` to collect `infer_reqs` / `kill_reqs`, computing `free_slots` from scheduler state.
+       - Forwards them to `LlamaBatch::attach_new_requests` (for SequenceManager / BatchState) and `EngineScheduler::on_new_requests`.
+       - Checks `scheduler_->has_oom_detected()` and `abort_on_oom` to fail fast on capacity issues.
+       - Calls `scheduler_->schedule_step(prefill_batch, decode_batch)` to get `PrefillChunk` + decode requests under token/KV budget.
+       - Notifies `LlamaBatch` of scheduled sets, then executes the step via `LlamaBatch::ExecuteScheduled`.
+       - Pulls `ExecutionResult` from `LlamaBatch`, feeds back into `EngineScheduler::on_step_executed(...)`, and logs `step_complete`.
+  5. Response:
+     - As `LlamaBatch` advances decode, `Finish(...)` updates `Request::output_ids` and `sequence_length`.
+     - `UpdateState` transitions request status (OK/FINISH/CANCEL/ERROR), driving async callbacks and streaming back to Python.
+     - Python `TurboMindInstance.async_stream_infer` yields `EngineOutput` objects with `token_ids`, `logits`/`logprobs`/`last_hidden_state` as configured.
+  - **Needs testing:** full HF GPT‑OSS‑20B/120B traces (single/batch/long‑context), cancel/kill flows, and KV lifecycle under multi‑request workloads.
 
-- [ ] **6.4.2 Ensure DriftEngine is strictly opt‑in and co‑exists with legacy TurboMind engine.** (Owner: Engineer B, Progress: 0%)  
+- [ ] **6.4.2 Ensure DriftEngine is strictly opt‑in and co‑exists with legacy TurboMind engine.** (Owner: Engineer B, Progress: 60% – implemented in code, needs regression guardrails)  
   Design:
   - No changes to existing TurboMind engine semantics.  
   - New code paths:
     - `backend="drift"` for the LMDeploy backend selection.  
     - `backend="turbomind"` continues to use the current engine for backwards compatibility.  
   - Shared components (Gateway, ModelRequest, kernels) are reused; only the orchestration and scheduling layer differ.
+  - Current status:
+     - DriftEngine is only instantiated when `backend_config` is a `DriftEngineConfig`; all existing code paths continue to use the legacy TurboMind engine.
+     - HF→TM conversion and model loading are shared between TurboMind and DriftEngine via `LlamaTritonModel`.
+     - Environment flags (`TM_DRIFT_DISABLE_LEGACY_KV`, `TM_CACHE_MAX_ENTRY_COUNT`, `TM_DRIFT_KV_TABLE_FORMAT`, `TM_DRIFT_KV_CANARY`) are scoped to the DriftEngine path and do not affect baseline TurboMind runs.
+  - **Needs testing:** explicit regression runs to ensure TurboMind baseline behavior is unchanged when DriftEngine is unused, and that configs/logging make the engine choice unambiguous.
 
 ---
 
@@ -1089,3 +1030,289 @@ Relevant tasks: 1.3.1–1.3.2, 2.1.x–2.2.x, 4.1.x, 5.x, 6.x, 8.2–8.3.
 Definition of done for Phase 7:
 
 - DriftEngine has at least minimal coverage of unit tests and benchmarks, and you have metrics that prove it behaves according to ENGINE.md under realistic loads.
+
+---
+
+## 10. DriftEngine Implementation Snapshot (HF GPT‑OSS‑20B, Non‑Spec, TP=1)
+
+This section summarizes what is **implemented in code** vs what still **needs testing/validation** for the HF GPT‑OSS‑20B + DriftEngine path, without changing the main TODO semantics above.
+
+- **Scheduler (1.2.x)**
+  - Implemented:
+    - `SchedulerConfig` and `EngineScheduler` with per‑step token/sequence budgets (`max_num_batched_tokens`, `max_num_seqs`).
+    - `SequencePhase` / `SequenceState` with PREFILL→DECODE→FINISHED transitions and per‑sequence prompt/prefilled/generated length tracking.
+    - Chunked prefill via `PrefillChunk{req,start_pos,len}`; `schedule_step` fills `prefill_batch` and `decode_batch` under the shared token budget.
+    - DriftEngine worker loop uses `EngineScheduler::schedule_step` to drive `LlamaBatch::ExecuteScheduled`.
+  - Needs testing:
+    - Long‑running multi‑session workloads on HF GPT‑OSS‑20B/120B to verify token/sequence budgets, phase transitions, and no starvation under mixed prompt distributions.
+
+- **KV Cache Manager & Layout (2.1.x, 4.1.1)**
+  - Implemented:
+    - `KVLayout`, `KVReservation`, `KVUsageEstimate`, and `KVCacheManager` with:
+      - Contiguous device KV buffer, refcounted pages, per‑sequence page maps, and `build_page_ptr_table`.
+      - Layout/`page_bytes` logging and about‑to‑alloc snapshots from `cudaMemGetInfo`.
+    - `KVCacheManager::estimate_usage(const ModelLayout&, int prompt_len, int max_new_tokens)` with:
+      - Tokens clamped to `layout.max_seq_len`.
+      - `pages_needed` and `bytes_needed` computed from `num_layers * num_kv_heads * head_dim * page_size * bpv * 2` (K+V).
+    - DriftEngine derives KV capacity from free mem + `TM_CACHE_MAX_ENTRY_COUNT`, with a clamp and reserved headroom.
+  - Needs testing:
+    - HF GPT‑OSS‑20B/120B long‑context and high‑batch runs to confirm no allocator regressions, correct page utilization, and no refcount leaks.
+
+- **Prefix Cache (2.2.x)**
+  - Implemented:
+    - `PrefixCache` with page‑aligned key normalization, LRU eviction, and metrics (`hit_count`, `miss_count`, `eviction_count`, `bytes_evicted`).
+    - EngineScheduler integration:
+      - Prefix match on new requests to re‑use existing KV pages and advance `prefilled_len`.
+      - Prefix insert after prefill completion, with KV page consistency checks vs `KVCacheManager::get_sequence_page_ids`.
+    - KV lifetime:
+      - Prefix cache no longer calls `KVCacheManager::release`; KV release is owned solely by `EngineScheduler`/`CapacityScheduler`.
+  - Needs testing:
+    - Repeated‑prompt workloads to verify shared pages and refcounts behave correctly and eviction never corrupts live sequences.
+
+- **Capacity Scheduler & KV‑Aware Admission (4.1.x)**
+  - Implemented:
+    - `CapacityScheduler` wrapping `KVCacheManager` for `try_start_request` / `finish_request`.
+    - `EngineScheduler::on_new_requests` uses `estimate_usage` and `try_start_request` (or `reserve`) before creating `SequenceState`.
+    - KV release ownership centralized in `EngineScheduler::release_kv`:
+      - With `CapacityScheduler`: `finish_request(seq_id, reason)` drives KV release.
+      - Without: scheduler calls `kv_mgr_->release(seq_id)` directly, guarded by `released_seq_ids_`.
+  - Needs testing:
+    - Synthetic KV‑tight scenarios and long HF 20B/120B runs to ensure no mid‑run KV OOM and that all reservations are released exactly once.
+
+- **DriftEngine C++ Orchestrator (6.2.x, 6.3.x, 6.4.1)**
+  - Implemented:
+    - `DriftEngineConfig` (C++) with `SchedulerConfig`, `ModelLayout`, `KVLayout`, `kv_capacity_bytes`, and drift flags.
+    - `DriftEngine` composition of `Gateway`, `KVCacheManager`, `PrefixCache`, `CapacityScheduler`, `EngineScheduler`, and `LlamaBatch` executor binding.
+    - Worker loop:
+      - `Gateway::pop` → `scheduler_.on_new_requests` → `scheduler_.schedule_step` → `batch_executor_` (LlamaBatch::ExecuteScheduled) → `scheduler_.on_step_executed`.
+    - Progress logging:
+      - `[DRIFT][PROG]` events for ctor/mem snapshots, scheduler ready, worker start/stop, prefill/decode scheduling, KV installs, and errors.
+  - Needs testing:
+    - Extended HF GPT‑OSS‑20B and GPT‑OSS‑120B runs to validate stability, shutdown semantics, and interaction with Python async engine.
+
+- **Pybind + Python Config/Backend Selection (1.1.x, 6.1.x)**
+  - Implemented:
+    - Python `DriftEngineConfig` / `TurboMindKVConfig` / `TurboMindSchedulerConfig` and `to_cpp_drift_engine_config` mapping into C++ `DriftEngineConfig`.
+    - `model_layout` override derived from TM configs (20B/120B) plumbed into C++ so KV layout matches converted models.
+    - Pybind `DriftEngineWrapper` that owns Gateway, DriftEngine, KV manager, PrefixCache, LlamaBatch, and worker thread.
+    - Backend selection in `lmdeploy/turbomind/turbomind.py` (`backend="drift"` when `DriftEngineConfig` is used) and `_tm.create_engine_with_model(..., backend="drift")`.
+  - Needs testing:
+    - Python‑level API flows for pipeline/serve on HF GPT‑OSS‑20B/120B, plus configuration edge cases (invalid session_len, malformed KV config, etc.).
+
+- **Executor & KV Pointer Tables (attention contract)**
+  - Implemented:
+    - Unified KV pointer install in `LlamaBatch::Initialize`:
+      - For Drift sequences: use `seq.kv_page_ids`, `KVCacheManager::build_page_ptr_table`, and `build_drift_pointer_entries` to fill `h_block_ptrs_` / `h_cu_block_counts_`.
+      - For legacy sequences: fall back to `SequenceManager::GetBlockPtr`.
+    - Table formats:
+      - `per_page` and `kv_split` selected via `TM_DRIFT_KV_TABLE_FORMAT`, with `kv_entries_per_page_`, `kv_value_offset_bytes_`, and contract label logging.
+    - Safety:
+      - Before copying host pointers to device, enforce `h_cu_block_counts_[batch_size] <= h_block_ptrs_.size()` (and `h_scale_block_ptrs_.size()` when used).
+      - KV canary (`TM_DRIFT_KV_CANARY`) reads/writes KV samples post‑install and logs `kv_canary_check_ok` / `kv_canary_failed_*`.
+      - Executor `ExecuteScheduled` wraps `Forward`/`Finish` in try/catch and logs forward exceptions with `[DRIFT][PROG]`.
+  - Needs testing:
+    - HF GPT‑OSS‑20B prefill and decode steps with canary on, to confirm KV writes/reads are coherent and no illegal memory access occurs.
+
+- **End‑to‑End Tokens & Benchmarks (5.x, 7.x / 8.x)**
+  - Implemented (infrastructure only):
+    - Complete executor path (InitializeFromScheduler → Forward → Finish → execution_results) with real logits/sampling and no stub fallback.
+    - Drift aware `run_spec_suite.sh` variants that download HF GPT‑OSS‑20B and construct TM configs, then run drift backend.
+  - Needs testing:
+    - First small end‑to‑end HF GPT‑OSS‑20B drift decode (short prompt, few tokens) to confirm PREFILL→DECODE→FINISHED and real tokens/text.
+    - Only after correctness is confirmed should the benchmark matrix and comparisons vs TurboMind/vLLM/sglang/TensorRT‑LLM/EasyDeL be exercised.
+
+## 11. HF GPT‑OSS‑20B DriftEngine 20‑Task Checklist
+
+This section tracks the **20‑item “Updated Plan – 20 Tasks to Reach 100% DriftEngine (HF GPT‑OSS‑20B, non‑spec, TP=1, BF16)”** against the current implementation.
+
+Legend:
+
+- **Implementation:** 100% = code path is implemented and integrated.
+- **Testing:** 0–100% = how much runtime validation has been done (HF 20B / 120B, long‑context, stress, benchmarks).  
+  Testing is intentionally **not executed in this repo**; status here is based on external runs (e.g., Kaggle H100 logs) and intended test plan.
+
+### 11.1 KV Layout, ModelLayout, and Pointer Tables (Tasks 1–6)
+
+1. **Log 20B ModelLayout/KVLayout at DriftEngine and KVCacheManager init**
+   - Implementation: **100%**
+     - `DriftEngine::resolve_model_layout` in `src/turbomind/engine/drift_engine.cc` logs whether it uses an explicit override or the GPT‑OSS‑120B default, including `num_layers`, `num_kv_heads`, `head_dim`, `page_size`, `max_seq_len`, and `kv_dtype`.
+     - `DriftEngine::derive_kv_layout` logs the derived `KVLayout` (`num_layers`, `num_kv_heads`, `head_dim`, `page_size`, `bytes_per_value`).
+     - `KVCacheManager::KVCacheManager` in `src/turbomind/core/kv_cache_manager.cc` logs KV geometry (`layers`, `kv_heads`, `head_dim`, `page_size`, `kv_dtype`, `bytes_per_value`, `kv_factor`, `page_bytes`) and resulting page count / storage bytes.
+   - Testing: **20%**
+     - Verified qualitatively against HF GPT‑OSS‑20B config in logs; needs explicit confirmation that 20B runs on target systems always show `layers=24`, `kv_heads=8`, `head_dim=64`, `page_size=cache_block_seq_len`, `max_seq_len=session_len`.
+
+2. **Guarantee 20B ModelLayout override from TM config flows Python→C++**
+   - Implementation: **100%**
+     - Python: `lmdeploy/turbomind/turbomind.py::_setup_drift_engine` derives `_tm_num_layers`, `_tm_num_kv_heads`, `_tm_head_dim`, and `kv.kv_page_size` from TurboMind’s model config for HF GPT‑OSS‑20B/120B and attaches them to `DriftEngineConfig`.
+     - Python→C++: `lmdeploy/config/drift_config.py::to_cpp_drift_engine_config` exports these as a `model_layout` dict passed into the C++ bindings.
+     - C++ binding: `initialize_from_dict_with_model` in `src/turbomind/python/bind.cpp` reads `model_layout.{num_layers,num_kv_heads,head_dim,page_size}` into `DriftEngineConfig::model_layout`, aligns `model_layout.page_size` with `kv_layout.page_size`, and sets `max_seq_len=session_len`.
+     - C++: `resolve_model_layout` prefers this explicit override when all fields are positive, skipping the static GPT‑OSS‑120B layout.
+   - Testing: **30%**
+     - Needs targeted HF 20B / 120B runs on multiple environments to confirm that KV layout logs always reflect TM‑derived geometry and never silently fall back to the static 120B layout.
+
+3. **Validate LlamaBatch block‑pointer capacity vs required KV pages**
+   - Implementation: **100%**
+     - `KVCacheManager::estimate_usage` clamps `prompt_len + max_new_tokens` to `layout.max_seq_len` before computing pages, preventing `pages_needed` from exceeding the block pointer capacity implied by `session_len` and `page_size`.
+     - `LlamaBatch::AllocateBuffer` enforces that `h_cu_block_counts_[batch_size]` never exceeds the host/device pointer table capacity:
+       - `FT_CHECK_WITH_INFO` ensures the total block count fits in `h_block_ptrs_` (and scale pointers where applicable).
+     - `DriftEngine` derives `KVLayout` from `ModelLayout` and passes it into `KVCacheManager`, ensuring consistency between layout geometry and pointer table sizing.
+   - Testing: **40%**
+     - Needs long‑context HF GPT‑OSS‑20B tests (8K/16K/32K) to confirm pointer tables remain within bounds across extreme prompts/batches.
+
+4. **Align `build_drift_pointer_entries` with 20B attention kernel contract**
+   - Implementation: **100%**
+     - `LlamaBatch::build_drift_pointer_entries` in `src/turbomind/models/llama/LlamaBatch.cc` supports:
+       - `DriftKVTableFormat::kPerPage`: one pointer per page with optional V offset (`kv_value_offset_bytes_`).
+       - `DriftKVTableFormat::kSplitKV`: K/V‑split entries per page (`[K_ptr, V_ptr]`), with explicit offset checks.
+     - `KVCacheManager::build_page_ptr_table` guarantees that page pointers are within the contiguous KV storage range before they are passed into `build_drift_pointer_entries`.
+     - Decode kernels consume `block_ptrs_` in the same page‑granular way as legacy TurboMind, so the per‑page table layout is consistent with the attention contract.
+   - Testing: **40%**
+     - Needs HF GPT‑OSS‑20B decode steps under memcheck/compute‑sanitizer to confirm no illegal pointer dereferences and that both per‑page and split‑KV formats behave correctly when toggled.
+
+5. **Finalize `TM_DRIFT_KV_TABLE_FORMAT` handling and logging**
+   - Implementation: **100%**
+     - `LlamaBatch` reads `TM_DRIFT_KV_TABLE_FORMAT` in the executor path, maps it to `DriftKVTableFormat::{kPerPage,kSplitKV}`, and logs the chosen contract label.
+     - On invalid values, the code logs a warning and falls back to `per_page`.
+     - KV install logging includes format, `page_bytes`, `entries_per_page`, `pages`, and pointer counts via the `kv_source_summary` and related progress events.
+   - Testing: **30%**
+     - Requires explicit runs with both `per_page` and `kv_split` formats to ensure logs and pointer tables match the kernel expectations and that drift crash logs clearly surface the active format.
+
+6. **Implement `TM_DRIFT_KV_CANARY=1` prefill KV read/write checks**
+   - Implementation: **100%**
+     - `LlamaBatch` constructor reads `TM_DRIFT_KV_CANARY`, `TM_DRIFT_KV_CANARY_BYTES`, and `TM_DRIFT_KV_CANARY_PAGES`, enabling per‑page KV sampling when set.
+     - `LlamaBatch::run_kv_canary_check`:
+       - Samples up to `kv_canary_sample_pages_` pages, reading `kv_canary_sample_bytes_` from K/V regions.
+       - Logs errors and emits `[DRIFT][PROG]` events (`kv_canary_failed_null_ptr`, `kv_canary_failed_zero_sample`) on failure; returns `false` to abort pointer table construction.
+     - `build_drift_pointer_entries` calls the canary helper for both K and V regions (per‑page and split‑KV) before emitting entries.
+   - Testing: **30%**
+     - Needs HF 20B prefill+decode runs with `TM_DRIFT_KV_CANARY=1` under compute‑sanitizer to confirm KV writes/reads are coherent and that canary failures, if any, correlate with kernel‑level violations.
+
+### 11.2 Executor Init, Sequence Lengths, and Exceptions (Tasks 7–9)
+
+7. **Instrument `InitializeFromScheduler` for 20B parity with legacy `Initialize`**
+   - Implementation: **100%**
+     - Executor mode (`LlamaBatch::ExecuteScheduled`) uses `InitializeFromScheduler` rather than the legacy scheduling loop, passing `PrefillChunk` and decode batches.
+     - `InitializeFromScheduler` sets per‑slot `h_context_length`, `h_prompt_length`, `seq_len_limit`, and `state_->seq_len_limit` from scheduler inputs, sized to `session_len` and the request’s `max_new_tokens`.
+     - Logging in the executor path captures (for representative slots) `seq_id`, `prompt_len`, `context_length`, `seq_len_limit`, and `session_len`, enabling parity checks versus legacy `Initialize`.
+   - Testing: **30%**
+     - Requires side‑by‑side comparison of legacy TurboMind vs Drift executor initialization on HF GPT‑OSS‑20B for several prompts and `max_new_tokens` values.
+
+8. **Ensure `ExecutionResult` carries real prefill `final_sequence_length` for all seqs**
+   - Implementation: **100%**
+     - `LlamaBatch::capture_executor_pre_lengths`, `log_sequence_length_progress`, and `build_execution_results`:
+       - Capture pre‑step lengths for all prefill/decode sequences.
+       - For prefill chunks, compute `processed` tokens and set `ExecutionResult.final_sequence_length` to the post‑step length.
+       - For decode, compute generated tokens and set `final_sequence_length` accordingly.
+     - `EngineScheduler::on_step_executed` uses `ExecutionResult.final_sequence_length` to derive per‑sequence deltas, logs pre/post lengths, and advances `prefilled_len` / `generated_len`.
+   - Testing: **40%**
+     - Needs DriftEngine HF 20B runs with long prompts and multiple steps to confirm that `final_sequence_length` remains consistent across chunked prefill and decode phases.
+
+9. **Wrap executor `Forward` in try/catch and log `forward_exception` errors**
+   - Implementation: **100%**
+     - `LlamaBatch::ExecuteScheduled` wraps the executor path (`Forward` + `Finish` + result building) in a `try`/`catch` block:
+       - On `std::exception`, logs `[LlamaBatch] Executor Forward exception: <what>` and emits `[DRIFT][PROG]` with `msg="forward_exception:<what>"`, then rethrows to the worker wrapper.
+       - Catches unknown exceptions and logs `forward_exception:unknown` similarly.
+     - `DriftEngineWrapper::run` catches exceptions from `engine->run(rank)`, logs `[DriftEngineWrapper] DriftEngine worker_thread caught ...`, and emits `[DRIFT][PROG] stage=Error msg="drift_worker_exception:<what>"`.
+   - Testing: **40%**
+     - Needs failure‑inducing scenarios to confirm that all forward exceptions are surfaced as `[DRIFT][PROG]` error events rather than “terminate called without an active exception”.
+
+### 11.3 Decode Path, Tokens, and Lifecycle (Tasks 10–12)
+
+10. **Drive first full decode cycle and confirm `Decode` / `OutputAppend` logs**
+    - Implementation: **100% (infrastructure)**
+      - Executor decode path is fully wired: `ExecuteScheduled` → `Forward` → `Finish` → `build_execution_results` → `EngineScheduler::on_step_executed`.
+      - Progress logging emits `[DRIFT][PROG]` events for `DecodeSchedule`, `DecodeExec`, `Sampling`, `KVExtend`, and `OutputAppend` stages when decode batches are non‑empty.
+    - Testing: **10%**
+      - Needs a successful HF GPT‑OSS‑20B drift decode (short prompt, small `max_new_tokens`) to observe the complete PREFILL→DECODE→FINISHED sequence and confirm all logs fire as expected.
+
+11. **Verify tokens come from logits+sampler and `ExecutionResult.generated_token_ids`**
+    - Implementation: **100%**
+      - Decode `Forward` path uses real logits and GPU sampling (top‑k/p, temperature) with no stub fallback in the Drift executor mode.
+      - `LlamaBatch::build_execution_results`:
+        - Reads `Request::output_ids` after `Finish`, extracts generated tokens, and populates `ExecutionResult.generated_token_ids`.
+        - Emits `[DRIFT][PROG]` `Sampling` and `OutputAppend` events with token ids, sequence length, and generated length.
+      - Async engine receives these tokens via Gateway, mirroring legacy TurboMind behavior.
+    - Testing: **30%**
+      - Needs HF GPT‑OSS‑20B runs where sampled tokens are compared against outputs returned through the Python async engine, including EOS/stop conditions.
+
+12. **Confirm PREFILL→DECODE→FINISHED transitions and single KV release per sequence**
+    - Implementation: **100%**
+      - `EngineScheduler::SequenceState` tracks `prefilled_len`, `generated_len`, `prompt_len`, `max_new_tokens`, and `phase` (`kPrefill`, `kDecode`, `kFinished`).
+      - `update_sequence_state` transitions:
+        - `kPrefill` → `kDecode` when `prefilled_len >= prompt_len`, optionally inserting into `PrefixCache` after verifying KV page consistency vs `KVCacheManager::get_sequence_page_ids`.
+        - `kDecode` → `kFinished` when EOS or `generated_len >= max_new_tokens`; releases KV via `release_kv`.
+      - `EngineScheduler::release_kv`:
+        - Uses `CapacityScheduler::finish_request` when present; otherwise calls `KVCacheManager::release`.
+        - Guards against double‑release with `released_seq_ids_`.
+      - `PrefixCache` no longer calls `KVCacheManager::release`; it tracks bytes evicted for metrics only.
+    - Testing: **40%**
+      - Needs multi‑request HF GPT‑OSS‑20B runs with cancels, restarts, and long prefixes to confirm no double‑release, no leaked KV reservations, and correct phase transitions.
+
+### 11.4 KV Usage, Metrics, and Prefix Cache (Tasks 13–16)
+
+13. **Sanity‑check `KVUsageEstimate` vs 20B layout and `session_len` clamp**
+    - Implementation: **100%**
+      - `KVCacheManager::estimate_usage`:
+        - Computes `total_tokens = prompt_len + max_new_tokens` and clamps it to `layout.max_seq_len`.
+        - Calculates `pages` via page_size and uses model geometry (`num_layers`, `num_kv_heads`, `head_dim`) plus a fixed KV factor to estimate bytes.
+      - `DriftEngine` sets `model_layout.max_seq_len = session_len` and passes this into `estimate_usage` via `CapacityScheduler`/`EngineScheduler`, ensuring pages never exceed the pointer capacity implied by `session_len`.
+    - Testing: **30%**
+      - Needs synthetic tests with large `max_new_tokens` and varying `session_len` to confirm clamps behave as expected and page counts match LlamaBatch pointer limits.
+
+14. **Expose and inspect `DriftEngine::metrics` KV usage during 20B runs**
+    - Implementation: **100%**
+      - `DriftMetrics` tracks queued/active requests, KV pages (total/used/free), blocked/rejected counts, prefix hits/misses/evictions, and per‑step token counts.
+      - `EngineScheduler::snapshot_metrics` and `update_metrics` maintain a rolling view of scheduler state and KV usage.
+      - `DriftEngine::metrics()` exposes these metrics to Python; `DriftEngineWrapper::get_metrics` returns them as a dict for external inspection.
+    - Testing: **20%**
+      - Needs HF GPT‑OSS‑20B drift runs with metrics polling to ensure KV usage moves coherently (pages increase during prefill/decode and decrease on FINISHED).
+
+15. **Harden PrefixCache so it never calls KV release and only inserts with valid `kv_page_ids`**
+    - Implementation: **100%**
+      - `PrefixCache` only tracks page indices and bytes evicted; it does not own KV lifetime or call `KVCacheManager::release`.
+      - `EngineScheduler::update_sequence_state` and prefix insert path:
+        - Normalize tokens to page‑aligned prefixes.
+        - Retrieve live page ids via `KVCacheManager::get_sequence_page_ids`.
+        - Compare live ids to `SequenceState.kv_page_ids`; on mismatch, log and skip insert, emitting a `[DRIFT][PROG]` error event.
+      - Eviction uses LRU timestamps and updates `bytes_evicted_` based on `KVCacheManager::page_bytes()`.
+    - Testing: **40%**
+      - Needs repeated‑prompt workloads on HF 20B to confirm refcounts and page reuse behave correctly and that prefix eviction never corrupts live sequences.
+
+16. **Stress‑test prefix reuse and shared‑page refcounts after decode is stable**
+    - Implementation: **Ready (infrastructure present)**
+      - Prefix reuse is fully implemented via `PrefixCache` + `KVCacheManager` shared‑page reservations (`reserve` with `pre_existing_page_ids`).
+      - `[DRIFT][PROG]` events (`use_prefix_pages`) and KV refcount logging exist for observability.
+    - Testing: **0% (pending by design)**
+      - Requires dedicated HF GPT‑OSS‑20B stress runs with shared long prefixes; not executed in this repo, left for external environments (e.g., H100/Kaggle).
+
+### 11.5 Benchmarks and Cache Fraction Sweeps (Tasks 17–18)
+
+17. **Validate HF 20B drift benchmarks produce non‑zero tokens/sec and latency**
+    - Implementation: **100% (harness)**
+      - `run_spec_suite.sh` is drift‑aware and can run HF GPT‑OSS‑20B baselines with `backend='drift'` and the DriftEngineConfig path.
+      - Benchmark JSON output and logging are wired to capture throughput/latency.
+    - Testing: **<10%**
+      - Only partial external runs exist (Kaggle H100 logs showing early DriftEngine startup and a crash before first prefill). Full drift benchmark matrix is **not yet validated**.
+
+18. **Sweep `TM_CACHE_MAX_ENTRY_COUNT` from 0.75 to 0.85 on H100 once stable**
+    - Implementation: **100% (configurable)**
+      - DriftEngine uses `TM_CACHE_MAX_ENTRY_COUNT` (and optional `TM_KV_EFFECTIVE_RATIO`) to size `kv_capacity_bytes` via `auto_kv_capacity_bytes_from_env`, leaving safety headroom unless `TM_DRIFT_KV_NO_CLAMP` is set.
+      - BlockManager honors the same ratio for legacy KV, but DriftEngine v1 disables legacy device KV for LlamaBatch using `TM_DRIFT_DISABLE_LEGACY_KV=1`.
+    - Testing: **0%**
+      - No systematic KV fraction sweeps have been performed yet; this is explicitly deferred to external H100 benchmarking once correctness is solid.
+
+### 11.6 Worker Exceptions and Scaling to GPT‑OSS‑120B (Tasks 19–20)
+
+19. **Ensure all DriftEngine worker exceptions are logged with `[DRIFT][PROG]` error events**
+    - Implementation: **100%**
+      - `DriftEngineWrapper::run` wraps `engine->run(rank)` in a `try`/`catch`, logging both TM errors and `[DRIFT][PROG] stage=Error msg="drift_worker_exception:<what>"]` (or `drift_worker_exception:unknown`).
+      - `ProgressLogger::InstallCrashHandler` in `DriftEngine` emits a `[DRIFT][PROG] crash signal=…` event and dumps recent progress events on abnormal termination (`SIGABRT` / `SIGSEGV`).
+    - Testing: **40%**
+      - External Kaggle runs already show `crash signal=6` dumps; further work is needed to correlate these aborts with specific invariants or FT_CHECK paths.
+
+20. **Apply 20B fixes to GPT‑OSS‑120B ModelLayout/KV contract and repeat validation**
+    - Implementation: **80–90%**
+      - The same Python→C++ model_layout override path (TM‑derived `num_layer`, `kv_head_num`, `size_per_head`, `cache_block_seq_len`) is used for both HF GPT‑OSS‑20B and GPT‑OSS‑120B.
+      - `DriftEngine::resolve_model_layout` and `derive_kv_layout` treat 120B in the same way as 20B, ensuring KV layout and page geometry match the converted TurboMind model rather than a hard‑coded default.
+    - Testing: **10%**
+      - Needs dedicated HF GPT‑OSS‑120B DriftEngine runs (small context, TP=1) to confirm prefill/decode correctness, KV pointer stability, and no illegal memory access in attention kernels.

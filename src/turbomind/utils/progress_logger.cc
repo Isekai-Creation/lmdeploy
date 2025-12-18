@@ -4,6 +4,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
+#include <exception>
 #include <sstream>
 #include <string_view>
 #include <string>
@@ -48,6 +49,7 @@ constexpr size_t                               kRingCapacity = 512;
 std::array<std::string, kRingCapacity>         g_ring;
 std::atomic<size_t>                            g_ring_index{0};
 std::atomic<bool>                              g_crash_handler_installed{false};
+std::terminate_handler                         g_prev_terminate{nullptr};
 
 constexpr std::array<std::string_view, 17> kStageNames = {
     "RequestEnqueue",
@@ -106,9 +108,8 @@ void append_to_ring(const std::string& line)
     g_ring[idx % kRingCapacity] = line;
 }
 
-void crash_dump_handler(int signo)
+void dump_ring_impl()
 {
-    TM_LOG_ERROR("[DRIFT][PROG] crash signal=%d, dumping recent progress events", signo);
     const size_t end   = g_ring_index.load(std::memory_order_relaxed);
     const size_t start = (end > kRingCapacity) ? end - kRingCapacity : 0;
     for (size_t i = start; i < end; ++i) {
@@ -117,7 +118,36 @@ void crash_dump_handler(int signo)
             TM_LOG_ERROR("%s", line.c_str());
         }
     }
+}
+
+void crash_dump_handler(int signo)
+{
+    TM_LOG_ERROR("[DRIFT][PROG] crash signal=%d, dumping recent progress events", signo);
+    dump_ring_impl();
     std::_Exit(signo);
+}
+
+void terminate_dump_handler()
+{
+    TM_LOG_ERROR("[DRIFT][PROG] std::terminate invoked, dumping recent progress events");
+    if (auto eptr = std::current_exception()) {
+        try {
+            std::rethrow_exception(eptr);
+        }
+        catch (const std::exception& e) {
+            TM_LOG_ERROR("[DRIFT][PROG] terminate exception: %s", e.what());
+        }
+        catch (...) {
+            TM_LOG_ERROR("[DRIFT][PROG] terminate exception: unknown");
+        }
+    }
+    dump_ring_impl();
+    if (g_prev_terminate) {
+        g_prev_terminate();
+    }
+    else {
+        std::_Exit(EXIT_FAILURE);
+    }
 }
 
 }  // namespace
@@ -137,6 +167,11 @@ void ProgressLogger::ForceEnableForDrift(bool enable)
     g_force_enabled_for_drift.store(enable, std::memory_order_relaxed);
 }
 
+void ProgressLogger::DumpRecent()
+{
+    dump_ring_impl();
+}
+
 void ProgressLogger::InstallCrashHandler()
 {
     bool expected = false;
@@ -145,6 +180,7 @@ void ProgressLogger::InstallCrashHandler()
     }
     std::signal(SIGABRT, crash_dump_handler);
     std::signal(SIGSEGV, crash_dump_handler);
+    g_prev_terminate = std::set_terminate(terminate_dump_handler);
 }
 
 void ProgressLogger::Log(const ProgressEvent& event)

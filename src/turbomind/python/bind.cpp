@@ -448,6 +448,13 @@ public:
         if (!engine || running.load(std::memory_order_acquire)) {
             return;
         }
+        if (turbomind::ProgressLogger::Enabled()) {
+            turbomind::ProgressEvent evt{turbomind::ProgressStage::kGatewayPop};
+            evt.pct  = 80;
+            evt.rank = rank;
+            evt.msg  = "drift_worker_spawned";
+            turbomind::ProgressLogger::Log(evt);
+        }
         worker_thread = std::thread([this, rank] { this->run(rank); });
     }
 
@@ -491,6 +498,22 @@ public:
 
         if (input_tensors) {
             req->inputs = *input_tensors;
+        }
+
+        if (turbomind::ProgressLogger::Enabled()) {
+            turbomind::ProgressEvent evt{turbomind::ProgressStage::kRequestEnqueue};
+            evt.pct        = 0;
+            evt.seq_id     = session.id;
+            evt.session_id = session.id;
+            evt.max_new_tokens = gen_cfg.max_new_tokens;
+            int input_len = 0;
+            auto it_len   = req->inputs.find("input_ids");
+            if (it_len != req->inputs.end()) {
+                input_len = static_cast<int>(it_len->second.shape(0));
+            }
+            evt.prompt_len = input_len;
+            evt.msg        = "pybind_submit";
+            turbomind::ProgressLogger::Log(evt);
         }
 
         // Allocate simple CPU output buffers based on prompt length and max_new_tokens

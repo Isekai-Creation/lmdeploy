@@ -56,6 +56,10 @@ public:
     static bool Verbose();
     static void Log(const ProgressEvent& event);
 
+    // Dump recent events without exiting the process (used from
+    // OOM paths and terminate handlers).
+    static void DumpRecent();
+
     // Force-enable progress logging for DriftEngine regardless of env.
     static void ForceEnableForDrift(bool enable);
 
