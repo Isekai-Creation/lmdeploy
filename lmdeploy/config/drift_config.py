@@ -62,7 +62,13 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
     num_layers = getattr(cfg, "_tm_num_layers", None)
     num_kv = getattr(cfg, "_tm_num_kv_heads", None)
     head_dim = getattr(cfg, "_tm_head_dim", None)
-    page_size = getattr(cfg.kv, "kv_page_size", None)
+    # Prefer an explicit TM-derived page_size override (cache_block_seq_len)
+    # when available so that DriftEngine KV pages always map 1:1 to the
+    # TurboMind attention block geometry, even if cfg.kv.kv_page_size is
+    # later mutated by other helpers.
+    page_size = getattr(cfg, "_tm_page_size", None)
+    if page_size is None:
+        page_size = getattr(cfg.kv, "kv_page_size", None)
     if num_layers and num_kv and head_dim:
         ml: Dict[str, Any] = {
             "num_layers": int(num_layers),

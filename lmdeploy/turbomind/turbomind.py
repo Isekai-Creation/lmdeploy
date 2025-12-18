@@ -324,9 +324,9 @@ class TurboMind:
             tm_model_cfg = getattr(self.config, "model_config", None)
             if tm_model_cfg is not None:
                 num_layers = getattr(tm_model_cfg, "num_layer", None)
-                num_kv     = getattr(tm_model_cfg, "kv_head_num", None)
-                head_dim   = getattr(tm_model_cfg, "size_per_head", None)
-                page_size  = getattr(tm_model_cfg, "cache_block_seq_len", None)
+                num_kv = getattr(tm_model_cfg, "kv_head_num", None)
+                head_dim = getattr(tm_model_cfg, "size_per_head", None)
+                page_size = getattr(tm_model_cfg, "cache_block_seq_len", None)
                 # Attach overrides onto the DriftEngineConfig instance
                 # so to_cpp_drift_engine_config can surface them into
                 # the C++ DriftEngineConfig when present.
@@ -337,10 +337,17 @@ class TurboMind:
                 if page_size:
                     # Align drift KV page size with TurboMind
                     # cache_block_seq_len so KV pages map 1:1 to
-                    # blocks expected by attention kernels.
-                    engine_config.kv.kv_page_size = int(page_size)
+                    # blocks expected by attention kernels. Store the
+                    # TM-derived value explicitly so the config→C++
+                    # bridge can prefer it even if kv_page_size is
+                    # later mutated.
+                    tm_page = int(page_size)
+                    setattr(engine_config, "_tm_page_size", tm_page)
+                    engine_config.kv.kv_page_size = tm_page
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Failed to derive drift model_layout overrides from TurboMind config: {exc}")
+            logger.warning(
+                f"Failed to derive drift model_layout overrides from TurboMind config: {exc}"
+            )
 
         # Convert the Python DriftEngineConfig into the flat C++ dict
         # consumed by _turbomind drift bindings.
