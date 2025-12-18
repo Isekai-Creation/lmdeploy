@@ -15,6 +15,7 @@
  */
 
 #include <cub/cub.cuh>
+#include <limits>
 
 #include "src/turbomind/kernels/core/array_ops.h"
 #include "src/turbomind/kernels/gpt_kernels.h"
@@ -52,45 +53,39 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
 
     int num, dim;
     std::tie(num, dim) = out.shapes(0, 1);
+    // Always perform a lightweight ID-range sanity check against the
+    // local embedding shard. This turns otherwise opaque illegal
+    // memory accesses into explicit logs showing the offending ID
+    // range and local vocab size. To keep overhead reasonable we only
+    // sample the first few hundred IDs.
+    const int local_vocab = embedding_table.shape(0);
+    const int sample      = std::min(num, 256);
+    if (local_vocab > 0 && sample > 0) {
+        std::vector<int> host_ids(static_cast<size_t>(sample));
+        check_cuda_error(cudaMemcpyAsync(
+            host_ids.data(), token_ids.data(), sizeof(int) * static_cast<size_t>(sample), cudaMemcpyDeviceToHost, st));
+        check_cuda_error(cudaStreamSynchronize(st));
 
-    // Optional debug guard for DriftEngine and other advanced backends:
-    // when TM_DRIFT_EMBED_GUARD is set, validate that token IDs are
-    // within the local embedding shard range before launching the
-    // kernel. This turns otherwise opaque illegal memory accesses into
-    // explicit logs showing the offending ID range and local vocab
-    // size. Overhead is acceptable for debug / sanitizer runs.
-    static bool kEnableEmbedGuard = []() {
-        const char* env = std::getenv("TM_DRIFT_EMBED_GUARD");
-        return env && env[0] != '\0' && env[0] != '0';
-    }();
-    if (kEnableEmbedGuard) {
-        const int local_vocab = embedding_table.shape(0);
-        if (local_vocab > 0 && num > 0) {
-            std::vector<int> host_ids(static_cast<size_t>(num));
-            check_cuda_error(cudaMemcpyAsync(
-                host_ids.data(), token_ids.data(), sizeof(int) * static_cast<size_t>(num), cudaMemcpyDeviceToHost, st));
-            check_cuda_error(cudaStreamSynchronize(st));
-
-            int min_id = std::numeric_limits<int>::max();
-            int max_id = std::numeric_limits<int>::min();
-            for (int i = 0; i < num; ++i) {
-                const int v = host_ids[i];
-                if (v < min_id) {
-                    min_id = v;
-                }
-                if (v > max_id) {
-                    max_id = v;
-                }
+        int min_id = std::numeric_limits<int>::max();
+        int max_id = std::numeric_limits<int>::min();
+        for (int i = 0; i < sample; ++i) {
+            const int v = host_ids[i];
+            if (v < min_id) {
+                min_id = v;
             }
-            if (max_id >= local_vocab || min_id < 0) {
-                TM_LOG_ERROR(
-                    "[EmbeddingLookup][DriftGuard] token id out of range: min=%d max=%d local_vocab=%d (rows in "
-                    "embedding_table), num_tokens=%d",
-                    min_id,
-                    max_id,
-                    local_vocab,
-                    num);
+            if (v > max_id) {
+                max_id = v;
             }
+        }
+        if (max_id >= local_vocab || min_id < 0) {
+            TM_LOG_ERROR(
+                "[EmbeddingLookup][DriftGuard] token id out of range: min=%d max=%d local_vocab=%d (rows in "
+                "embedding_table), num_tokens=%d sample=%d",
+                min_id,
+                max_id,
+                local_vocab,
+                num,
+                sample);
         }
     }
 
