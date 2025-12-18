@@ -12,7 +12,7 @@ add_library(core STATIC
         tensor.cc
         tensor.cu
         kv_cache_manager.cc
-        model_layout.cc
+        ../models/common/model_layout.cc
         prefix_cache.cc
         module.cc)
 

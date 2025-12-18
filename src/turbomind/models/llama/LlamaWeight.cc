@@ -185,18 +185,30 @@ void LlamaWeight::initialize()
 
     const auto expected_emb_elems = static_cast<size_t>(embedding_rows) * static_cast<size_t>(embedding_cols);
     const auto expected_emb_bytes = static_cast<size_t>(byte_size(data_type_, expected_emb_elems));
-    const auto actual_emb_bytes   = static_cast<size_t>(pre_decoder_embedding.weight.byte_size());
-    TM_LOG_WARNING(
-        "[LlamaWeight] pre_decoder_embedding_alloc: rows=%d cols=%d dtype=%d expected_bytes=%zu actual_bytes=%zu "
-        "bytes_per_val=%.4f",
-        embedding_rows,
-        embedding_cols,
-        static_cast<int>(data_type_),
-        expected_emb_bytes,
-        actual_emb_bytes,
-        bytes_per_val);
+    auto       log_pre_embedding  = [&](const char* tag, const Tensor& tensor) {
+        if (!tensor) {
+            TM_LOG_ERROR("[LlamaWeight][%s] embedding tensor empty", tag);
+            TM_CHECK(tensor);
+            return;
+        }
+        const size_t actual_emb_bytes = static_cast<size_t>(tensor.byte_size());
+        TM_LOG_WARNING(
+            "[LlamaWeight][%s] rows=%zd cols=%zd dtype=%d expected_bytes=%zu actual_bytes=%zu bytes_per_val=%.4f",
+            tag,
+            tensor.shape(0),
+            tensor.shape(1),
+            static_cast<int>(tensor.dtype()),
+            expected_emb_bytes,
+            actual_emb_bytes,
+            bytes_per_val);
+        TM_CHECK_EQ(tensor.shape(0), embedding_rows);
+        TM_CHECK_EQ(tensor.shape(1), embedding_cols);
+        TM_CHECK(actual_emb_bytes >= expected_emb_bytes)
+            << "[LlamaWeight][" << tag << "] embedding under-allocated: expected_bytes=" << expected_emb_bytes
+            << " actual_bytes=" << actual_emb_bytes;
+    };
 
-    log_tensor_footprint("pre_decoder_embedding_device_alloc", pre_decoder_embedding.weight);
+    log_pre_embedding("pre_decoder_embedding_device_alloc", pre_decoder_embedding.weight);
     log_tensor_footprint("post_decoder_embedding_device_alloc", post_decoder_embedding.weight);
 
     register_module("tok_embeddings", pre_decoder_embedding, tp_rank_);
@@ -207,7 +219,7 @@ void LlamaWeight::initialize()
     pre_decoder_embedding.weight  = empty_like(pre_decoder_embedding.weight, kCPU);
     post_decoder_embedding.weight = empty_like(post_decoder_embedding.weight, kCPU);
 
-    log_tensor_footprint("pre_decoder_embedding_host_alloc", pre_decoder_embedding.weight);
+    log_pre_embedding("pre_decoder_embedding_host_alloc", pre_decoder_embedding.weight);
     log_tensor_footprint("post_decoder_embedding_host_alloc", post_decoder_embedding.weight);
 
     decoder_layer_weights.reserve(num_layer_);
@@ -280,6 +292,34 @@ void LlamaWeight::prepare(const cudaDeviceProp& prop)
 {
     core::ContextGuard guard = context();
 
+    const int    embedding_rows   = vocab_size_padded_;
+    const int    embedding_cols   = hidden_units_ / tp_size_;
+    const auto   expected_elems   = static_cast<size_t>(embedding_rows) * static_cast<size_t>(embedding_cols);
+    const auto   expected_bytes   = static_cast<size_t>(byte_size(data_type_, expected_elems));
+    const double bytes_per_val    = static_cast<double>(byte_size(data_type_, 256)) / 256.0;
+    auto         log_pre_embedding = [&](const char* tag, const Tensor& tensor) {
+        if (!tensor) {
+            TM_LOG_ERROR("[LlamaWeight][%s] embedding tensor empty", tag);
+            TM_CHECK(tensor);
+            return;
+        }
+        const size_t actual_bytes = static_cast<size_t>(tensor.byte_size());
+        TM_LOG_WARNING(
+            "[LlamaWeight][%s] rows=%zd cols=%zd dtype=%d expected_bytes=%zu actual_bytes=%zu bytes_per_val=%.4f",
+            tag,
+            tensor.shape(0),
+            tensor.shape(1),
+            static_cast<int>(tensor.dtype()),
+            expected_bytes,
+            actual_bytes,
+            bytes_per_val);
+        TM_CHECK_EQ(tensor.shape(0), embedding_rows);
+        TM_CHECK_EQ(tensor.shape(1), embedding_cols);
+        TM_CHECK(actual_bytes >= expected_bytes)
+            << "[LlamaWeight][" << tag << "] embedding under-allocated: expected_bytes=" << expected_bytes
+            << " actual_bytes=" << actual_bytes;
+    };
+
     // Wait for the weights to be filled externally
     check_cuda_error(cudaDeviceSynchronize());
 
@@ -299,11 +339,10 @@ void LlamaWeight::prepare(const cudaDeviceProp& prop)
     auto tmp_token_embeds = to_device(pre_decoder_embedding.weight);
     auto tmp_lm_head      = to_device(post_decoder_embedding.weight);
 
-    log_tensor_footprint("pre_decoder_embedding_device_upload", pre_decoder_embedding.weight);
+    log_pre_embedding("pre_decoder_embedding_device_upload", pre_decoder_embedding.weight);
     log_tensor_footprint("post_decoder_embedding_device_upload", post_decoder_embedding.weight);
-    log_tensor_footprint("pre_decoder_embedding_host_staging", tmp_token_embeds);
+    log_pre_embedding("pre_decoder_embedding_host_staging", tmp_token_embeds);
     log_tensor_footprint("post_decoder_embedding_host_staging", tmp_lm_head);
-    check_tensor_capacity("pre_decoder_embedding_device", pre_decoder_embedding.weight);
     check_tensor_capacity("post_decoder_embedding_device", post_decoder_embedding.weight);
 
     post_decoder_embedding.prepare();

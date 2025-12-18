@@ -48,7 +48,9 @@ embeddingLookupKernel(T* dst, int dst_stride, const T* src, int src_stride, cons
 void invokeEmbeddingLookup(Ref<Tensor>         out_,
                            const Buffer_<int>& token_ids,
                            const Tensor&       embedding_table,
-                           cudaStream_t        st)
+                           cudaStream_t        st,
+                           int                 expected_vocab_rows,
+                           int                 expected_hidden_units)
 {
     auto& out = out_.get();
 
@@ -58,24 +60,26 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
     int num, dim;
     std::tie(num, dim) = out.shapes(0, 1);
 
-    const int     vocab_rows      = embedding_table.shape(0);
-    const int     hidden_units    = embedding_table.shape(1);
-    const double  bytes_per_val   = static_cast<double>(byte_size(embedding_table.dtype(), 256)) / 256.0;
-    const ssize_t expected_elems  = static_cast<ssize_t>(vocab_rows) * static_cast<ssize_t>(hidden_units);
-    const ssize_t expected_bytes  = expected_elems > 0 ? byte_size(embedding_table.dtype(), expected_elems) : 0;
-    const ssize_t actual_bytes    = embedding_table ? embedding_table.buffer().byte_size() : 0;
-    const void*   emb_ptr         = embedding_table ? embedding_table.buffer().raw_data() : nullptr;
-    const int     device_tp       = embedding_table ? static_cast<int>(embedding_table.device().type) : -1;
-    const int     stride0         = embedding_table.stride(0);
+    const int declared_vocab_rows   = embedding_table.shape(0);
+    const int declared_hidden_units = embedding_table.shape(1);
+    const int target_vocab_rows     = expected_vocab_rows > 0 ? expected_vocab_rows : declared_vocab_rows;
+    const int target_hidden_units   = expected_hidden_units > 0 ? expected_hidden_units : declared_hidden_units;
+    const int bytes_per_val         = static_cast<int>(byte_size(embedding_table.dtype(), 1));
+    const size_t expected_bytes     = static_cast<size_t>(target_vocab_rows)
+                                  * static_cast<size_t>(target_hidden_units)
+                                  * static_cast<size_t>(bytes_per_val);
+    const size_t actual_bytes = embedding_table ? static_cast<size_t>(embedding_table.buffer().byte_size()) : 0;
+    const void*  emb_ptr      = embedding_table ? embedding_table.buffer().raw_data() : nullptr;
+    const int    device_tp    = embedding_table ? static_cast<int>(embedding_table.device().type) : -1;
+    const int    stride0      = embedding_table.stride(0);
 
     static std::once_flag emb_once;
     std::call_once(emb_once, [&] {
         TM_LOG_WARNING(
-            "[EmbeddingLookup][Startup] emb_ptr=%p vocab_rows=%d hidden_units=%d bytes_per_val=%.4f alloc_bytes=%zd "
-            "stride0=%d",
+            "[EmbeddingLookup][Startup] emb_ptr=%p vocab_rows=%d hidden_units=%d bytes_per_val=%d alloc_bytes=%zu stride0=%d",
             emb_ptr,
-            vocab_rows,
-            hidden_units,
+            declared_vocab_rows,
+            declared_hidden_units,
             bytes_per_val,
             actual_bytes,
             stride0);
@@ -84,12 +88,15 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
     static int emb_trace_budget = 16;
     if (emb_trace_budget-- > 0 || (expected_bytes > 0 && actual_bytes < expected_bytes)) {
         TM_LOG_WARNING(
-            "[EmbeddingLookup][DriftTrace] rows=%d cols=%d stride0=%d dtype=%d expected_bytes=%zd actual_bytes=%zd "
-            "device=%d num_tokens=%d dim=%d",
-            vocab_rows,
-            hidden_units,
+            "[EmbeddingLookup][DriftTrace] ptr=%p rows=%d cols=%d stride0=%d dtype=%d expected_rows=%d expected_cols=%d bytes_per_val=%d expected_bytes=%zu actual_bytes=%zu device=%d num_tokens=%d dim=%d",
+            emb_ptr,
+            declared_vocab_rows,
+            declared_hidden_units,
             stride0,
             static_cast<int>(embedding_table.dtype()),
+            target_vocab_rows,
+            target_hidden_units,
+            bytes_per_val,
             expected_bytes,
             actual_bytes,
             device_tp,
@@ -97,28 +104,45 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
             dim);
     }
 
+    if (expected_vocab_rows > 0 && declared_vocab_rows != expected_vocab_rows) {
+        TM_LOG_ERROR("[EmbeddingLookup][DriftGuard] embedding rows mismatch: expected=%d actual=%d",
+                     expected_vocab_rows,
+                     declared_vocab_rows);
+        TM_CHECK_EQ(declared_vocab_rows, expected_vocab_rows);
+    }
+
+    if (expected_hidden_units > 0 && declared_hidden_units != expected_hidden_units) {
+        TM_LOG_ERROR("[EmbeddingLookup][DriftGuard] embedding cols mismatch: expected=%d actual=%d",
+                     expected_hidden_units,
+                     declared_hidden_units);
+        TM_CHECK_EQ(declared_hidden_units, expected_hidden_units);
+    }
+
     if (expected_bytes > 0 && actual_bytes < expected_bytes) {
         TM_LOG_ERROR(
-            "[EmbeddingLookup][DriftGuard] embedding tensor too small: expected_bytes=%zd actual_bytes=%zd rows=%d cols=%d",
+            "[EmbeddingLookup][DriftGuard] embedding tensor too small: expected_bytes=%zu actual_bytes=%zu rows=%d cols=%d expected_rows=%d expected_cols=%d",
             expected_bytes,
             actual_bytes,
-            vocab_rows,
-            hidden_units);
+            declared_vocab_rows,
+            declared_hidden_units,
+            target_vocab_rows,
+            target_hidden_units);
         TM_CHECK(actual_bytes >= expected_bytes)
             << "[EmbeddingLookup][DriftGuard] embedding tensor under-allocated: expected=" << expected_bytes
-            << " actual=" << actual_bytes << " rows=" << vocab_rows << " cols=" << hidden_units;
+            << " actual=" << actual_bytes << " rows=" << declared_vocab_rows << " cols=" << declared_hidden_units;
     }
 
-    if (vocab_rows > 0 && vocab_rows < 4096) {
+    if (declared_vocab_rows > 0 && declared_vocab_rows < 4096) {
         TM_LOG_WARNING(
-            "[EmbeddingLookup][DriftGuard] suspicious local_vocab=%d stride0=%d dim=%d num_tokens=%d",
-            vocab_rows,
+            "[EmbeddingLookup][DriftGuard] suspicious local_vocab=%d stride0=%d dim=%d num_tokens=%d expected_vocab=%d",
+            declared_vocab_rows,
             stride0,
             dim,
-            num);
+            num,
+            target_vocab_rows);
     }
 
-    if (vocab_rows > 0 && num > 0) {
+    if (declared_vocab_rows > 0 && num > 0) {
         std::vector<int> host_ids(static_cast<size_t>(num));
         check_cuda_error(cudaMemcpyAsync(host_ids.data(),
                                          token_ids.data(),
@@ -127,41 +151,24 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
                                          st));
         check_cuda_error(cudaStreamSynchronize(st));
 
-        int min_id = std::numeric_limits<int>::max();
-        int max_id = std::numeric_limits<int>::min();
-        for (int i = 0; i < num; ++i) {
-            const int v = host_ids[i];
-            if (v < min_id) {
-                min_id = v;
-            }
-            if (v > max_id) {
-                max_id = v;
-            }
-        }
+        auto [min_it, max_it] = std::minmax_element(host_ids.begin(), host_ids.end());
+        const int min_id      = *min_it;
+        const int max_id      = *max_it;
 
-        static int token_trace_budget = 32;
-        if (token_trace_budget-- > 0 || max_id >= vocab_rows || min_id < 0) {
-            TM_LOG_WARNING(
-                "[EmbeddingLookup][DriftTraceTokens] min=%d max=%d vocab_rows=%d num_tokens=%d",
-                min_id,
-                max_id,
-                vocab_rows,
-                num);
-        }
-
-        if (max_id >= vocab_rows || min_id < 0) {
+        if (max_id >= declared_vocab_rows || min_id < 0) {
             TM_LOG_ERROR(
-                "[EmbeddingLookup][DriftGuard] token id out of range: min=%d max=%d vocab_rows=%d num_tokens=%d",
+                "[EmbeddingLookup][DriftGuard] token id out of range: min=%d max=%d local_vocab=%d expected_vocab=%d num_tokens=%d",
                 min_id,
                 max_id,
-                vocab_rows,
+                declared_vocab_rows,
+                target_vocab_rows,
                 num);
-            TM_CHECK(max_id < vocab_rows && min_id >= 0)
+            TM_CHECK(max_id < declared_vocab_rows && min_id >= 0)
                 << "[EmbeddingLookup][DriftGuard] token id out of range: min=" << min_id << " max=" << max_id
-                << " vocab_rows=" << vocab_rows << " num_tokens=" << num;
+                << " local_vocab=" << declared_vocab_rows << " expected_vocab=" << target_vocab_rows
+                << " num_tokens=" << num;
         }
     }
-
     auto invoke = [&](auto t) {
         using T                = decltype(t);
         constexpr int vec_size = sizeof(uint4) / sizeof(T);

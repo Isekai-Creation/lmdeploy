@@ -4,7 +4,18 @@
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
 
-import shortuuid
+try:
+    import shortuuid
+except ModuleNotFoundError:  # pragma: no cover - optional dependency fallback
+    import uuid
+
+    class _ShortUUIDFallback:
+        @staticmethod
+        def random() -> str:
+            return uuid.uuid4().hex
+
+    shortuuid = _ShortUUIDFallback()
+
 from pydantic import BaseModel, ConfigDict, Field
 
 

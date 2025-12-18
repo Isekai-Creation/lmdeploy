@@ -1412,7 +1412,9 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
                                      stream_));
     check_cuda_error(cudaStreamSynchronize(stream_));
 
-    const int token_num = static_cast<int>(num_tree_tokens);
+    const int token_num             = static_cast<int>(num_tree_tokens);
+    const int expected_vocab_rows   = vocab_size_padded_;
+    const int expected_hidden_cols  = static_cast<int>(hidden_units_ / tp_size_);
 
     // Stage 2: embed compact tree token ids into a [num_tree_tokens,
     // hidden_units_] buffer which will be used as decoder_input for the
@@ -1425,7 +1427,8 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
         tree_input_embeds = Tensor{{token_num, static_cast<int>(hidden_units_)}, dtype_, kDEVICE};
 
         if (tp_size_ == 1) {
-            invokeEmbeddingLookup(tree_input_embeds, d_tree_ids, embedding_table, stream_);
+            invokeEmbeddingLookup(
+                tree_input_embeds, d_tree_ids, embedding_table, stream_, expected_vocab_rows, expected_hidden_cols);
             sync_check_cuda_error();
         }
         else if (use_allgather_2d_) {
@@ -1435,7 +1438,7 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
 
             auto local = temp.slice({0, tp_rank_, 0}, {-1, 1, -1}).squeeze(1);
 
-            invokeEmbeddingLookup(local, d_tree_ids, embedding_table, stream_);
+            invokeEmbeddingLookup(local, d_tree_ids, embedding_table, stream_, expected_vocab_rows, expected_hidden_cols);
             sync_check_cuda_error();
 
             comm_->d_comm->AllGather2D(local.raw_data(),
@@ -1459,7 +1462,7 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
 
             auto local = temp.slice(tp_rank_).squeeze(0);
 
-            invokeEmbeddingLookup(local, d_tree_ids, embedding_table, stream_);
+            invokeEmbeddingLookup(local, d_tree_ids, embedding_table, stream_, expected_vocab_rows, expected_hidden_cols);
             sync_check_cuda_error();
 
             comm_->d_comm->AllGather(
@@ -2459,7 +2462,9 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
 
     Tensor input_embeds;
 
-    const int token_num = input_ids.size();
+    const int token_num            = input_ids.size();
+    const int expected_vocab_rows  = vocab_size_padded_;
+    const int expected_hidden_cols = static_cast<int>(hidden_units_ / tp_size_);
 
     if (token_num) {
         const auto& embedding_table = weights_->pre_decoder_embedding.weight;
@@ -2475,7 +2480,8 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
         }
 
         if (tp_size_ == 1) {
-            invokeEmbeddingLookup(input_embeds, input_ids, embedding_table, stream_);
+            invokeEmbeddingLookup(
+                input_embeds, input_ids, embedding_table, stream_, expected_vocab_rows, expected_hidden_cols);
             sync_check_cuda_error();
         }
         else if (use_allgather_2d_) {
@@ -2484,7 +2490,7 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
 
             auto local = temp.slice({0, tp_rank_, 0}, {-1, 1, -1}).squeeze(1);
 
-            invokeEmbeddingLookup(local, input_ids, embedding_table, stream_);
+            invokeEmbeddingLookup(local, input_ids, embedding_table, stream_, expected_vocab_rows, expected_hidden_cols);
             sync_check_cuda_error();
 
             comm_->d_comm->AllGather2D(local.raw_data(),
@@ -2507,7 +2513,7 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
 
             auto local = temp.slice(tp_rank_).squeeze(0);
 
-            invokeEmbeddingLookup(local, input_ids, embedding_table, stream_);
+            invokeEmbeddingLookup(local, input_ids, embedding_table, stream_, expected_vocab_rows, expected_hidden_cols);
             sync_check_cuda_error();
 
             comm_->d_comm->AllGather(
