@@ -81,8 +81,26 @@ void LlamaWeight::initialize()
 {
     core::ContextGuard guard = context();
 
+    TM_LOG_INFO(
+        "[LlamaWeight] init: vocab_size=%d vocab_size_padded=%d embedding_size=%d hidden_units=%d tp_size=%d",
+        vocab_size_,
+        vocab_size_padded_,
+        embedding_size_,
+        hidden_units_,
+        tp_size_);
+
     pre_decoder_embedding.emplace(embedding_size_, hidden_units_ / tp_size_, data_type_, false, data_type_, 1);
     post_decoder_embedding.emplace(hidden_units_, vocab_size_padded_ / tp_size_, data_type_, false, data_type_, 1);
+
+    TM_LOG_INFO("[LlamaWeight] pre_decoder_embedding: rows=%d cols=%d dtype=%d",
+                embedding_size_,
+                hidden_units_ / tp_size_,
+                static_cast<int>(data_type_));
+    TM_LOG_INFO("[LlamaWeight] post_decoder_embedding: rows=%d cols=%d dtype=%d",
+                hidden_units_,
+                vocab_size_padded_ / tp_size_,
+                static_cast<int>(data_type_));
+
     register_module("tok_embeddings", pre_decoder_embedding, tp_rank_);
     register_module("output", post_decoder_embedding, tp_rank_);
 
