@@ -17,6 +17,7 @@
 #include <cub/cub.cuh>
 #include <limits>
 
+#include "src/turbomind/core/data_type.h"
 #include "src/turbomind/kernels/core/array_ops.h"
 #include "src/turbomind/kernels/gpt_kernels.h"
 #include "src/turbomind/utils/memory_utils.h"
@@ -53,21 +54,45 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
 
     int num, dim;
     std::tie(num, dim) = out.shapes(0, 1);
-    {
-        static std::once_flag log_once;
-        std::call_once(log_once, [&] {
-            TM_LOG_INFO("[EmbeddingLookup][DriftTrace] emb_rows=%d emb_cols=%d emb_bytes=%zd out_rows=%d out_cols=%d "
-                        "out_bytes=%zd token_num=%d dim=%d",
-                        embedding_table.shape(0),
-                        embedding_table.shape(1),
-                        embedding_table.byte_size(),
-                        out.shape(0),
-                        out.shape(1),
-                        out.byte_size(),
-                        num,
-                        dim);
-        });
+
+    const ssize_t emb_rows   = embedding_table.shape(0);
+    const ssize_t emb_cols   = embedding_table.shape(1);
+    const ssize_t emb_elems  = emb_rows * emb_cols;
+    const size_t expected_mb = emb_elems > 0
+                                   ? static_cast<size_t>(byte_size(embedding_table.dtype(), emb_elems))
+                                   : 0;
+    const size_t actual_mb = embedding_table ? static_cast<size_t>(embedding_table.buffer().byte_size()) : 0;
+    const void*  emb_ptr   = embedding_table ? embedding_table.buffer().raw_data() : nullptr;
+    const int    device_tp = embedding_table ? static_cast<int>(embedding_table.device().type) : -1;
+
+    static int emb_trace_budget = 16;
+    if (emb_trace_budget-- > 0 || (expected_mb > 0 && actual_mb < expected_mb)) {
+        TM_LOG_WARNING(
+            "[EmbeddingLookup][DriftTrace] ptr=%p rows=%zd cols=%zd stride0=%d dtype=%d expected_bytes=%zu actual_bytes=%zu "
+            "device=%d num_tokens=%d dim=%d",
+            emb_ptr,
+            emb_rows,
+            emb_cols,
+            embedding_table.stride(0),
+            static_cast<int>(embedding_table.dtype()),
+            expected_mb,
+            actual_mb,
+            device_tp,
+            num,
+            dim);
     }
+
+    if (expected_mb > 0 && actual_mb < expected_mb) {
+        TM_LOG_ERROR(
+            "[EmbeddingLookup][DriftGuard] embedding tensor too small: expected_bytes=%zu actual_bytes=%zu rows=%zd cols=%zd",
+            expected_mb,
+            actual_mb,
+            emb_rows,
+            emb_cols);
+        TM_CHECK(actual_mb >= expected_mb)
+            << "embedding tensor under-allocated: expected=" << expected_mb << " actual=" << actual_mb;
+    }
+
     const int local_vocab = embedding_table.shape(0);
     const int stride0     = embedding_table.stride(0);
 
@@ -81,6 +106,7 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
     }
 
     const int sample = std::min(num, 32768);
+
     if (local_vocab > 0 && sample > 0) {
         std::vector<int> host_ids(static_cast<size_t>(sample));
         check_cuda_error(cudaMemcpyAsync(host_ids.data(),
@@ -101,6 +127,18 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
                 max_id = v;
             }
         }
+
+        static int token_trace_budget = 32;
+        if (token_trace_budget-- > 0 || max_id >= local_vocab || min_id < 0) {
+            TM_LOG_WARNING(
+                "[EmbeddingLookup][DriftTraceTokens] min=%d max=%d local_vocab=%d num_tokens=%d sample=%d",
+                min_id,
+                max_id,
+                local_vocab,
+                num,
+                sample);
+        }
+
         if (max_id >= local_vocab || min_id < 0) {
             TM_LOG_ERROR(
                 "[EmbeddingLookup][DriftGuard] token id out of range: min=%d max=%d local_vocab=%d num_tokens=%d sample=%d",

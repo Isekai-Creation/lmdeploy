@@ -22,10 +22,80 @@
 
 #include "src/turbomind/core/allocator.h"
 #include "src/turbomind/core/context.h"
+#include "src/turbomind/core/data_type.h"
 #include "src/turbomind/models/llama/LlamaDenseWeight.h"
 #include "src/turbomind/models/llama/LlamaWeight.h"
 #include "src/turbomind/models/llama/llama_params.h"
 #include "src/turbomind/utils/cuda_utils.h"
+
+namespace {
+
+using turbomind::Tensor;
+
+size_t tensor_expected_bytes(const Tensor& tensor)
+{
+    if (!tensor) {
+        return 0;
+    }
+    const ssize_t rows    = tensor.shape(0);
+    const ssize_t cols    = tensor.shape(1);
+    const ssize_t numel   = rows * cols;
+    const auto    dtype   = tensor.dtype();
+    const size_t  bytes   = numel > 0 ? static_cast<size_t>(turbomind::byte_size(dtype, numel)) : 0;
+    return bytes;
+}
+
+void log_tensor_footprint(const char* tag, const Tensor& tensor)
+{
+    if (!tensor) {
+        TM_LOG_WARNING("[LlamaWeight][%s] tensor empty", tag);
+        return;
+    }
+    const ssize_t rows          = tensor.shape(0);
+    const ssize_t cols          = tensor.shape(1);
+    const size_t  expected      = tensor_expected_bytes(tensor);
+    const size_t  actual        = static_cast<size_t>(tensor.byte_size());
+    const auto    dtype_code    = static_cast<int>(tensor.dtype());
+    const int     device_type   = static_cast<int>(tensor.device().type);
+    const void*   ptr           = tensor.raw_data();
+    TM_LOG_WARNING("[LlamaWeight][%s] rows=%zd cols=%zd dtype=%d expected_bytes=%zu actual_bytes=%zu device=%d ptr=%p",
+                   tag,
+                   rows,
+                   cols,
+                   dtype_code,
+                   expected,
+                   actual,
+                   device_type,
+                   ptr);
+    if (expected > 0 && actual < expected) {
+        TM_LOG_ERROR(
+            "[LlamaWeight][%s] tensor under-allocated: expected_bytes=%zu actual_bytes=%zu rows=%zd cols=%zd dtype=%d",
+            tag,
+            expected,
+            actual,
+            rows,
+            cols,
+            dtype_code);
+    }
+}
+
+void check_tensor_capacity(const char* tag, const Tensor& tensor)
+{
+    if (!tensor) {
+        TM_LOG_ERROR("[LlamaWeight][%s] tensor is empty", tag);
+        TM_CHECK(tensor);
+        return;
+    }
+    const size_t expected = tensor_expected_bytes(tensor);
+    const size_t actual   = static_cast<size_t>(tensor.byte_size());
+    if (expected > 0) {
+        TM_CHECK(actual >= expected)
+            << "[LlamaWeight][" << tag << "] tensor under-allocated: expected_bytes=" << expected
+            << " actual_bytes=" << actual;
+    }
+}
+
+}  // namespace
 
 namespace turbomind {
 
@@ -101,6 +171,9 @@ void LlamaWeight::initialize()
                    vocab_size_padded_ / tp_size_,
                    static_cast<int>(data_type_));
 
+    log_tensor_footprint("pre_decoder_embedding_device_alloc", pre_decoder_embedding.weight);
+    log_tensor_footprint("post_decoder_embedding_device_alloc", post_decoder_embedding.weight);
+
     register_module("tok_embeddings", pre_decoder_embedding, tp_rank_);
     register_module("output", post_decoder_embedding, tp_rank_);
 
@@ -108,6 +181,9 @@ void LlamaWeight::initialize()
     /// TODO: Support token embeds on pinned host memory
     pre_decoder_embedding.weight  = empty_like(pre_decoder_embedding.weight, kCPU);
     post_decoder_embedding.weight = empty_like(post_decoder_embedding.weight, kCPU);
+
+    log_tensor_footprint("pre_decoder_embedding_host_alloc", pre_decoder_embedding.weight);
+    log_tensor_footprint("post_decoder_embedding_host_alloc", post_decoder_embedding.weight);
 
     decoder_layer_weights.reserve(num_layer_);
     for (int i = 0; i < num_layer_; ++i) {
@@ -197,6 +273,13 @@ void LlamaWeight::prepare(const cudaDeviceProp& prop)
     // Keep the host tensor until stream synchronization
     auto tmp_token_embeds = to_device(pre_decoder_embedding.weight);
     auto tmp_lm_head      = to_device(post_decoder_embedding.weight);
+
+    log_tensor_footprint("pre_decoder_embedding_device_upload", pre_decoder_embedding.weight);
+    log_tensor_footprint("post_decoder_embedding_device_upload", post_decoder_embedding.weight);
+    log_tensor_footprint("pre_decoder_embedding_host_staging", tmp_token_embeds);
+    log_tensor_footprint("post_decoder_embedding_host_staging", tmp_lm_head);
+    check_tensor_capacity("pre_decoder_embedding_device", pre_decoder_embedding.weight);
+    check_tensor_capacity("post_decoder_embedding_device", post_decoder_embedding.weight);
 
     post_decoder_embedding.prepare();
 

@@ -15,6 +15,27 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
     kv = cfg.kv
     sched = cfg.scheduler
 
+    schedule_policy = getattr(sched, "schedule_policy", None)
+    if schedule_policy is None and hasattr(sched, "scheduler_policy"):
+        schedule_policy = getattr(sched, "scheduler_policy")
+    if schedule_policy is not None and hasattr(schedule_policy, "name"):
+        schedule_policy = schedule_policy.name
+    schedule_policy = (str(schedule_policy).lower() if schedule_policy else "fcfs")
+    if schedule_policy == "priority":
+        schedule_policy = "small_first"
+    if schedule_policy not in ("fcfs", "small_first"):
+        schedule_policy = "fcfs"
+
+    scheduler_spec_enable = bool(getattr(sched, "enable_speculative_decoding", False))
+    scheduler_spec_method = getattr(sched, "spec_method", None)
+    spec_method_value = scheduler_spec_method or cfg.spec_method or "none"
+    spec_method = str(spec_method_value).lower()
+
+    scheduler_max_draft = getattr(sched, "max_draft_tokens_per_seq", None)
+    max_draft_tokens = cfg.spec_max_draft_tokens
+    if isinstance(scheduler_max_draft, (int, float)) and scheduler_max_draft >= 0:
+        max_draft_tokens = int(scheduler_max_draft)
+
     # Let the C++ DriftEngine derive KV capacity from TM_CACHE_MAX_ENTRY_COUNT
     # and current free device memory after weights are loaded. Python should
     # not guess KV capacity up front based on pre-weight free memory, as this
@@ -36,12 +57,10 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
             "max_long_partial_prefills": getattr(sched, "max_long_partial_prefills", sched.max_num_partial_prefills),
             "long_prefill_token_threshold": sched.long_prefill_token_threshold,
             "prefer_decode_over_prefill": sched.prefer_decode_over_prefill,
-            "schedule_policy": getattr(sched.schedule_policy, "name", str(sched.schedule_policy)).lower()
-            if hasattr(sched, "schedule_policy")
-            else "fcfs",
-            "enable_speculative_decoding": cfg.enable_speculative_decoding or getattr(sched, "enable_speculative_decoding", False),
-            "spec_method": cfg.spec_method,
-            "max_draft_tokens_per_seq": cfg.spec_max_draft_tokens or getattr(sched, "max_draft_tokens_per_seq", 0),
+            "schedule_policy": schedule_policy,
+            "enable_speculative_decoding": bool(cfg.enable_speculative_decoding) or scheduler_spec_enable,
+            "spec_method": spec_method,
+            "max_draft_tokens_per_seq": max_draft_tokens,
         },
         "kv": {
             "kv_page_size": kv.kv_page_size,
@@ -59,6 +78,22 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
         "enable_prefix_caching": getattr(kv, "prefix_cache_enabled", cfg.enable_prefix_caching),
         "enable_speculative_decoding": cfg.enable_speculative_decoding,
         "enable_cuda_graphs": cfg.enable_cuda_graphs,
+        "spec_method": spec_method,
+        "spec_max_draft_tokens": max_draft_tokens,
+        "enable_specpv": cfg.enable_specpv,
+        "specpv_block_size": cfg.specpv_block_size,
+        "specpv_n_sink_blocks": cfg.specpv_n_sink_blocks,
+        "specpv_n_retrieval_blocks": cfg.specpv_n_retrieval_blocks,
+        "specpv_n_window_blocks": cfg.specpv_n_window_blocks,
+        "specpv_n_spec_tokens_buf": cfg.specpv_n_spec_tokens_buf,
+        "specpv_partial_threshold": cfg.specpv_partial_threshold,
+        "specpv_full_refresh_steps": cfg.specpv_full_refresh_steps,
+        "enable_suffix_decoding": cfg.enable_suffix_decoding,
+        "suffix_cache_max_depth": cfg.suffix_cache_max_depth,
+        "suffix_cache_max_requests": cfg.suffix_cache_max_requests,
+        "suffix_max_spec_factor": cfg.suffix_max_spec_factor,
+        "suffix_max_spec_offset": cfg.suffix_max_spec_offset,
+        "suffix_min_token_prob": cfg.suffix_min_token_prob,
     }
 
     # Optional model layout overrides derived from the TurboMind model

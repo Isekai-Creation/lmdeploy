@@ -245,7 +245,24 @@ class TurboMind:
         # blocks only and we do not double-allocate KV in GPU memory.
         os.environ.setdefault("TM_DRIFT_DISABLE_LEGACY_KV", "1")
 
-        # Enforce drift v1 constraints.
+        # Enforce drift v1 constraints while preserving requested spec hints for future wiring.
+        requested_spec = bool(getattr(engine_config, "enable_speculative_decoding", False))
+        sched = getattr(engine_config, "scheduler", None)
+        if sched is not None:
+            try:
+                if hasattr(sched, "enable_speculative_decoding"):
+                    sched.enable_speculative_decoding = bool(getattr(sched, "enable_speculative_decoding", False)) or requested_spec
+                if hasattr(sched, "spec_method"):
+                    sched_method = (getattr(sched, "spec_method", "none") or "none").lower()
+                    if sched_method == "none" and getattr(engine_config, "spec_method", None):
+                        sched.spec_method = engine_config.spec_method
+                if hasattr(sched, "max_draft_tokens_per_seq"):
+                    sched_drafts = getattr(sched, "max_draft_tokens_per_seq", 0) or 0
+                    if sched_drafts <= 0 and getattr(engine_config, "spec_max_draft_tokens", 0) > 0:
+                        sched.max_draft_tokens_per_seq = engine_config.spec_max_draft_tokens
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Preserving speculative scheduler hints failed: {exc}")
+        setattr(engine_config, "_requested_enable_speculative_decoding", requested_spec)
         engine_config.enable_speculative_decoding = False
         engine_config.enable_metrics = False
         if not engine_config.model_path:

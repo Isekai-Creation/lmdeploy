@@ -79,12 +79,31 @@ class TurboMindSchedulerConfig:
     max_num_seqs: int = 128
     enable_chunked_prefill: bool = True
     max_num_partial_prefills: int = 1
-    max_long_partial_prefills: int = 1 # Added
+    max_long_partial_prefills: int = 1  # Added
     long_prefill_token_threshold: int = 0
-    scheduler_policy: Literal['fcfs', 'priority'] = 'fcfs'
     prefer_decode_over_prefill: bool = True  # when token budget tight
-    target_latency_ms_p50: int = 50 # Added
-    target_latency_ms_p95: int = 200 # Added
+    schedule_policy: Literal['fcfs', 'small_first'] = 'fcfs'
+    target_latency_ms_p50: int = 50  # Added
+    target_latency_ms_p95: int = 200  # Added
+    enable_speculative_decoding: bool = False
+    spec_method: str = 'none'
+    max_draft_tokens_per_seq: int = 0
+    scheduler_policy: Optional[str] = None  # Deprecated alias
+
+    def __post_init__(self):
+        """Normalize compatibility aliases and speculative parameters."""
+        policy_value = self.scheduler_policy or self.schedule_policy
+        policy = str(policy_value).lower() if policy_value else 'fcfs'
+        if policy == 'priority':
+            policy = 'small_first'
+        if policy not in ('fcfs', 'small_first'):
+            policy = 'fcfs'
+        self.schedule_policy = policy
+        self.scheduler_policy = policy
+
+        self.spec_method = (self.spec_method or 'none').lower()
+        if self.max_draft_tokens_per_seq < 0:
+            raise ValueError('max_draft_tokens_per_seq must be non-negative')
 
 
 @dataclass
