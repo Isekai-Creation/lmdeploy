@@ -851,6 +851,34 @@ void LlamaBatch::Initialize(GenerationState& g)
             }
         }
 
+        // After computing block counts for all slots, ensure we do not
+        // exceed the host pointer buffer capacity. This guards against
+        // KV reservations that would overflow the block_ptr tables and
+        // cause the attention kernels to read out of bounds.
+        const int    total_entries = h_cu_block_counts_[batch_size];
+        const size_t max_entries   = h_block_ptrs_.shape(0);
+        if (total_entries > static_cast<int>(max_entries)) {
+            kv_pointer_error = true;
+            TM_LOG_ERROR(
+                "[LlamaBatch] KV pointer table overflow: total_entries=%d max_entries=%zu "
+                "(batch_size=%d format=%s entries_per_page=%zu)",
+                total_entries,
+                max_entries,
+                batch_size,
+                kv_table_contract_label_.c_str(),
+                kv_entries_per_page_);
+            if (progress_enabled) {
+                ProgressEvent evt{ProgressStage::kError};
+                evt.pct = 100;
+                std::ostringstream oss;
+                oss << "kv_ptr_table_overflow total_entries=" << total_entries
+                    << " max_entries=" << max_entries
+                    << " fmt=" << kv_table_contract_label_;
+                evt.msg = oss.str();
+                ProgressLogger::Log(evt);
+            }
+        }
+
         if (progress_enabled) {
             ProgressEvent evt{ProgressStage::kKVReserve};
             evt.pct = 62;
@@ -867,6 +895,18 @@ void LlamaBatch::Initialize(GenerationState& g)
         }
 
         static_assert(sizeof(uintptr_t) == sizeof(void*));
+
+        const int total_entries = h_cu_block_counts_[batch_size];
+        FT_CHECK_WITH_INFO(total_entries <= h_block_ptrs_.size(),
+                           "[LlamaBatch] KV pointer entries (%d) exceed h_block_ptrs_ capacity (%zd)",
+                           total_entries,
+                           static_cast<ssize_t>(h_block_ptrs_.size()));
+        if (has_scale_blocks) {
+            FT_CHECK_WITH_INFO(total_entries <= h_scale_block_ptrs_.size(),
+                               "[LlamaBatch] KV scale-pointer entries (%d) exceed h_scale_block_ptrs_ capacity (%zd)",
+                               total_entries,
+                               static_cast<ssize_t>(h_scale_block_ptrs_.size()));
+        }
 
         Copy(h_cu_block_counts_, batch_size + 1, cu_block_counts_);
         Copy(h_block_ptrs_, h_cu_block_counts_[batch_size], block_ptrs_);
@@ -2633,28 +2673,51 @@ void LlamaBatch::ExecuteScheduled(const std::vector<PrefillChunk>& prefill,
         if (n_active) {
             std::vector<Signal> signals;
 
-            EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::pre_Forward");
-            
-            // Non-spec v1: avoid CUDA graphs; run regular forward.
-            if (enable_cuda_graphs_) {
-                execute_cuda_graph_forward(g);
-            } else {
-                Forward(g);
+            try {
+                EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::pre_Forward");
+
+                // Non-spec v1: avoid CUDA graphs; run regular forward.
+                if (enable_cuda_graphs_) {
+                    execute_cuda_graph_forward(g);
+                }
+                else {
+                    Forward(g);
+                }
+
+                if (!decode.empty() && ProgressLogger::Enabled()) {
+                    ProgressEvent evt{ProgressStage::kDecodeExec};
+                    evt.pct        = 80;
+                    evt.batch_size = static_cast<int>(decode.size());
+                    evt.msg        = "decode_forward_done logits_ready=1";
+                    ProgressLogger::Log(evt);
+                }
+
+                EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::post_Forward");
+
+                Finish(g, signals);
+                log_sequence_length_progress(prefill, decode);
+                build_execution_results(prefill, decode, pre_lengths);
             }
-
-            if (!decode.empty() && ProgressLogger::Enabled()) {
-                ProgressEvent evt{ProgressStage::kDecodeExec};
-                evt.pct        = 80;
-                evt.batch_size = static_cast<int>(decode.size());
-                evt.msg        = "decode_forward_done logits_ready=1";
-                ProgressLogger::Log(evt);
+            catch (const std::exception& e) {
+                TM_LOG_ERROR("[LlamaBatch] Executor Forward exception: %s", e.what());
+                if (ProgressLogger::Enabled()) {
+                    ProgressEvent evt{ProgressStage::kError};
+                    evt.pct        = 100;
+                    evt.msg        = std::string("forward_exception:") + e.what();
+                    ProgressLogger::Log(evt);
+                }
+                throw;
             }
-
-            EagleCudaCheckAtBatch("LlamaBatch::ExecutorStep::post_Forward");
-
-            Finish(g, signals);
-            log_sequence_length_progress(prefill, decode);
-            build_execution_results(prefill, decode, pre_lengths);
+            catch (...) {
+                TM_LOG_ERROR("[LlamaBatch] Executor Forward unknown exception");
+                if (ProgressLogger::Enabled()) {
+                    ProgressEvent evt{ProgressStage::kError};
+                    evt.pct        = 100;
+                    evt.msg        = "forward_exception:unknown";
+                    ProgressLogger::Log(evt);
+                }
+                throw;
+            }
 
 
  
@@ -4854,6 +4917,30 @@ void LlamaBatch::InitializeFromScheduler(GenerationState& g,
             ProgressLogger::Log(evt);
         }
         throw;
+    }
+
+    // Emit a lightweight parity trace so DriftEngine 20B runs can be
+    // compared against the legacy Initialize path. Log only a small
+    // subset of fields to avoid log spam.
+    if (tp_rank_ == 0) {
+        const int log_slots = std::min<int>(state_->active_size, 4);
+        for (int i = 0; i < log_slots; ++i) {
+            const auto* seq  = state_->sequences[i];
+            const auto& req  = state_->requests[i];
+            const int   ctx  = state_->h_context_length[i];
+            const int   plen = state_->h_prompt_length[i];
+            const int   lim  = state_->seq_len_limit[i];
+            TM_LOG_DEBUG(
+                "[LlamaBatch] Drift executor init slot=%d seq=%lu prompt_len=%d context_len=%d "
+                "seq_len_limit=%d session_len=%d max_new_tokens=%d",
+                i,
+                seq ? seq->id : 0UL,
+                plen,
+                ctx,
+                lim,
+                (int)session_len_,
+                req ? req->gen_cfg.max_new_tokens : 0);
+        }
     }
 }
 

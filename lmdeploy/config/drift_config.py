@@ -61,12 +61,16 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
     num_layers = getattr(cfg, "_tm_num_layers", None)
     num_kv = getattr(cfg, "_tm_num_kv_heads", None)
     head_dim = getattr(cfg, "_tm_head_dim", None)
+    page_size = getattr(cfg.kv, "kv_page_size", None)
     if num_layers and num_kv and head_dim:
-        args["model_layout"] = {
+        ml: Dict[str, Any] = {
             "num_layers": int(num_layers),
             "num_kv_heads": int(num_kv),
             "head_dim": int(head_dim),
         }
+        if page_size and page_size > 0:
+            ml["page_size"] = int(page_size)
+        args["model_layout"] = ml
 
     return args
 
