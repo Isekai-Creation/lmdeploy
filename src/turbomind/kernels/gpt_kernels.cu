@@ -53,17 +53,41 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
 
     int num, dim;
     std::tie(num, dim) = out.shapes(0, 1);
-    // Always perform a lightweight ID-range sanity check against the
-    // local embedding shard. This turns otherwise opaque illegal
-    // memory accesses into explicit logs showing the offending ID
-    // range and local vocab size. To keep overhead reasonable we only
-    // sample the first few hundred IDs.
+    {
+        static std::once_flag log_once;
+        std::call_once(log_once, [&] {
+            TM_LOG_INFO("[EmbeddingLookup][DriftTrace] emb_rows=%d emb_cols=%d emb_bytes=%zd out_rows=%d out_cols=%d "
+                        "out_bytes=%zd token_num=%d dim=%d",
+                        embedding_table.shape(0),
+                        embedding_table.shape(1),
+                        embedding_table.byte_size(),
+                        out.shape(0),
+                        out.shape(1),
+                        out.byte_size(),
+                        num,
+                        dim);
+        });
+    }
     const int local_vocab = embedding_table.shape(0);
-    const int sample      = std::min(num, 256);
+    const int stride0     = embedding_table.stride(0);
+
+    if (local_vocab > 0 && local_vocab < 4096) {
+        TM_LOG_WARNING(
+            "[EmbeddingLookup][DriftGuard] suspicious local_vocab=%d stride0=%d dim=%d num_tokens=%d",
+            local_vocab,
+            stride0,
+            dim,
+            num);
+    }
+
+    const int sample = std::min(num, 32768);
     if (local_vocab > 0 && sample > 0) {
         std::vector<int> host_ids(static_cast<size_t>(sample));
-        check_cuda_error(cudaMemcpyAsync(
-            host_ids.data(), token_ids.data(), sizeof(int) * static_cast<size_t>(sample), cudaMemcpyDeviceToHost, st));
+        check_cuda_error(cudaMemcpyAsync(host_ids.data(),
+                                         token_ids.data(),
+                                         sizeof(int) * static_cast<size_t>(sample),
+                                         cudaMemcpyDeviceToHost,
+                                         st));
         check_cuda_error(cudaStreamSynchronize(st));
 
         int min_id = std::numeric_limits<int>::max();
@@ -79,17 +103,12 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
         }
         if (max_id >= local_vocab || min_id < 0) {
             TM_LOG_ERROR(
-                "[EmbeddingLookup][DriftGuard] token id out of range: min=%d max=%d local_vocab=%d (rows in "
-                "embedding_table), num_tokens=%d sample=%d",
+                "[EmbeddingLookup][DriftGuard] token id out of range: min=%d max=%d local_vocab=%d num_tokens=%d sample=%d",
                 min_id,
                 max_id,
                 local_vocab,
                 num,
                 sample);
-            // DriftEngine must never proceed with an embedding table that
-            // cannot cover the incoming token ids. Turn this into a hard
-            // failure so we catch the root cause (wrong embedding buffer or
-            // truncated vocab) instead of crashing later inside the kernel.
             TM_CHECK(max_id < local_vocab && min_id >= 0)
                 << "[EmbeddingLookup][DriftGuard] token id out of range: min=" << min_id << " max=" << max_id
                 << " local_vocab=" << local_vocab << " num_tokens=" << num << " sample=" << sample;

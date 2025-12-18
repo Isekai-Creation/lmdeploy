@@ -33,8 +33,15 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
             "max_num_seqs": sched.max_num_seqs,
             "enable_chunked_prefill": sched.enable_chunked_prefill,
             "max_num_partial_prefills": sched.max_num_partial_prefills,
+            "max_long_partial_prefills": getattr(sched, "max_long_partial_prefills", sched.max_num_partial_prefills),
             "long_prefill_token_threshold": sched.long_prefill_token_threshold,
             "prefer_decode_over_prefill": sched.prefer_decode_over_prefill,
+            "schedule_policy": getattr(sched.schedule_policy, "name", str(sched.schedule_policy)).lower()
+            if hasattr(sched, "schedule_policy")
+            else "fcfs",
+            "enable_speculative_decoding": cfg.enable_speculative_decoding or getattr(sched, "enable_speculative_decoding", False),
+            "spec_method": cfg.spec_method,
+            "max_draft_tokens_per_seq": cfg.spec_max_draft_tokens or getattr(sched, "max_draft_tokens_per_seq", 0),
         },
         "kv": {
             "kv_page_size": kv.kv_page_size,

@@ -24,6 +24,49 @@ enum class SequencePhase : uint8_t { kPrefill, kDecode, kFinished };
 // Tracks which queue a sequence currently resides in to avoid duplicate membership.
 enum class SequenceQueue : uint8_t { kNone, kPrefill, kDecode };
 
+enum class DraftSource : uint8_t { kNone, kEagle3, kArctic, kSuffix };
+
+struct DrafterStats {
+    uint64_t draft_tokens{0};
+    uint64_t accepted_tokens{0};
+    uint64_t num_steps_used{0};
+    float    ema_acceptance_rate{0.0f};
+    float    ema_draft_len{0.0f};
+    int      last_draft_len{0};
+    int      last_accepted_len{0};
+
+    static void update_ema(float& ema, float value, float alpha)
+    {
+        ema = (1.0f - alpha) * ema + alpha * value;
+    }
+
+    void on_step(int draft_len, int accepted_len, float alpha = 0.1f)
+    {
+        last_draft_len    = draft_len;
+        last_accepted_len = accepted_len;
+        if (draft_len <= 0) {
+            return;
+        }
+        draft_tokens += static_cast<uint64_t>(draft_len);
+        accepted_tokens += static_cast<uint64_t>(accepted_len);
+        num_steps_used += 1;
+        float step_rate = draft_len > 0 ? static_cast<float>(accepted_len) / static_cast<float>(draft_len) : 0.0f;
+        update_ema(ema_acceptance_rate, step_rate, alpha);
+        update_ema(ema_draft_len, static_cast<float>(draft_len), alpha);
+    }
+};
+
+struct PerSequenceSpecState {
+    DraftSource current_source{DraftSource::kNone};
+    DrafterStats eagle_stats{};
+    DrafterStats arctic_stats{};
+    DrafterStats suffix_stats{};
+    int         steps_with_low_acceptance{0};
+    bool        drafter_disabled_eagle{false};
+    bool        drafter_disabled_arctic{false};
+    bool        drafter_disabled_suffix{false};
+};
+
 struct SequenceState {
     uint64_t             seq_id{0};
     int                  prompt_len{0};       // total prompt tokens
@@ -37,6 +80,7 @@ struct SequenceState {
     uint64_t             kv_cookie{0};
     int                  decode_planned_fallbacks{0};
     int                  prefill_planned_fallbacks{0};
+    PerSequenceSpecState spec_state{};
 };
 
 struct PrefillChunk {

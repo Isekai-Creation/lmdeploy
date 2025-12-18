@@ -4920,13 +4920,26 @@ void LlamaBatch::InitializeFromScheduler(GenerationState& g,
  
     state_->size        = static_cast<int>(batch_size);
     state_->active_size = static_cast<int>(batch_size);
- 
+
     for (size_t i = 0; i < batch_size; ++i) {
         state_->sequences[i]        = sequences[i];
         state_->requests[i]         = batch_requests[i];
         state_->h_context_length[i] = context_lengths[i];
         state_->h_prompt_length[i]  = context_lengths[i];
         state_->h_finished[i]       = false;
+
+        // Hard guard: do not allow any sequence to exceed session_len_.
+        // When this triggers we fail fast with a clear error instead of
+        // letting downstream kernels hit illegal memory access.
+        if (state_->h_context_length[i] > static_cast<int>(session_len_)) {
+            TM_LOG_ERROR(
+                "[LlamaBatch] request exceeds session_len: seq=%lu context_len=%d session_len=%d max_new_tokens=%d",
+                sequences[i] ? sequences[i]->id : 0UL,
+                state_->h_context_length[i],
+                (int)session_len_,
+                batch_requests[i] ? batch_requests[i]->gen_cfg.max_new_tokens : -1);
+            throw std::runtime_error("DriftEngine: context length exceeds session_len");
+        }
     }
  
     try {

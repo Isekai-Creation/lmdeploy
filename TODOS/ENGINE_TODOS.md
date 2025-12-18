@@ -72,6 +72,19 @@ running HF `openai/gpt‑oss‑20b` (and re‑usable for GPT‑OSS‑120B):
     produces the expected KV memory footprint and throughput gains
     without regressions vs. the TurboMind baseline (FP16/BF16 KV).
 
+- ✅ **Embedding visibility / fail‑fast guard – IMPLEMENTED**
+  - `LlamaWeight::initialize` now logs embedding/vocab geometry at WARN
+    level (always visible in external logs).
+  - `createDriftEngine` logs a Drift embedding/layout summary
+    (vocab/hidden/kv_heads/head_dim/cache_block_seq_len/quant_policy)
+    right after weights are processed.
+  - `invokeEmbeddingLookup` already checks token id ranges vs the local
+    vocab (`[EmbeddingLookup][DriftGuard]`); use these logs to detect any
+    truncated/incorrect embedding buffers on Drift runs.
+  - **Needs testing:** rerun HF GPT‑OSS‑20B drift on Kaggle/H100 and
+    confirm the new logs appear (ensures correct wheel/so is in use) and
+    that no embedding OOB occurs before attention.
+
 - ✅ **PrefixCache & prefix reuse – ~80% IMPLEMENTED**
   - `PrefixCache` stores page‑aligned token prefixes only, with LRU
     eviction and metrics (hits/misses/evictions/bytes_evicted).

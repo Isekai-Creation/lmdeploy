@@ -347,6 +347,8 @@ class DriftEngineConfig:
     # Non-spec MVP: disable speculative/cuda graphs; keep knobs for future
     enable_prefix_caching: bool = False
     enable_speculative_decoding: bool = False
+    spec_method: str = "none"
+    spec_max_draft_tokens: int = 0
     enable_cuda_graphs: bool = False
     enable_memory_compaction: bool = False
     enable_adaptive_batching: bool = False
@@ -354,6 +356,23 @@ class DriftEngineConfig:
     empty_init: bool = False
     decode_microbatch_size: int | None = None
     prefill_microbatch_size: int | None = None
+
+    # SpecPV + suffix scaffolding (no behavior until Phase 3)
+    enable_specpv: bool = False
+    specpv_block_size: int = 16
+    specpv_n_sink_blocks: int = 2
+    specpv_n_retrieval_blocks: int = 256
+    specpv_n_window_blocks: int = 8
+    specpv_n_spec_tokens_buf: int = 128
+    specpv_partial_threshold: int = 4096
+    specpv_full_refresh_steps: int = 32
+
+    enable_suffix_decoding: bool = False
+    suffix_cache_max_depth: int = 64
+    suffix_cache_max_requests: int = -1
+    suffix_max_spec_factor: float = 1.0
+    suffix_max_spec_offset: float = 0.0
+    suffix_min_token_prob: float = 0.1
 
     def __post_init__(self):
         """Validate and derive configuration after initialization."""
@@ -379,6 +398,15 @@ class DriftEngineConfig:
 
         if self.quant_policy not in (0, 4, 8, 16):
             raise ValueError("quant_policy must be one of {0, 4, 8, 16}")
+
+        if self.spec_max_draft_tokens < 0:
+            raise ValueError("spec_max_draft_tokens must be non-negative")
+
+        if self.suffix_cache_max_depth < 0:
+            raise ValueError("suffix_cache_max_depth must be non-negative")
+
+        if self.suffix_min_token_prob < 0.0:
+            raise ValueError("suffix_min_token_prob must be non-negative")
 
     def _set_derived_values(self):
         """Set derived values based on configuration."""
