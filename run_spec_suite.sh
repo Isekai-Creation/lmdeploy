@@ -45,9 +45,15 @@ choose_tm_cache_fraction() {
   elif (( used_gb <= 45 )); then
     TM_CACHE_MAX_ENTRY_COUNT="0.50"
   else
-    echo "[run_spec_suite] GPU memory appears occupied (used=${used_gb}GB > 45GB); refusing to auto-run GPT-OSS benchmarks." >&2
-    echo "[run_spec_suite] Free GPU memory or export TM_CACHE_MAX_ENTRY_COUNT manually to override this guard." >&2
-    exit 1
+    if [[ "${TM_DRIFT_IGNORE_GPU_OCCUPIED:-0}" != "1" ]]; then
+      echo "[run_spec_suite] GPU memory appears occupied (used=${used_gb}GB > 45GB); refusing to auto-run GPT-OSS benchmarks." >&2
+      echo "[run_spec_suite] Free GPU memory or export TM_CACHE_MAX_ENTRY_COUNT manually to override this guard," >&2
+      echo "[run_spec_suite] or set TM_DRIFT_IGNORE_GPU_OCCUPIED=1 to bypass this guard at your own risk." >&2
+      exit 1
+    fi
+    echo "[run_spec_suite] GPU memory appears occupied (used=${used_gb}GB > 45GB); proceeding due to TM_DRIFT_IGNORE_GPU_OCCUPIED=1 override." >&2
+    # When heavily occupied, fall back to a conservative cache fraction.
+    TM_CACHE_MAX_ENTRY_COUNT="0.50"
   fi
 
   export TM_CACHE_MAX_ENTRY_COUNT

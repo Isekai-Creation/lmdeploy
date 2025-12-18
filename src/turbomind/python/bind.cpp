@@ -59,6 +59,7 @@ public:
     std::shared_ptr<turbomind::LlamaBatch>        llama_batch;
     std::thread                                   worker_thread;
     std::atomic<bool>                             running{false};
+    std::atomic<bool>                             worker_started{false};
     bool                                          initialized{false};
 
     DriftEngineWrapper() = default;
@@ -451,7 +452,15 @@ public:
 
     void start(int rank = 0)
     {
-        if (!engine || running.load(std::memory_order_acquire)) {
+        if (!engine) {
+            return;
+        }
+        bool expected = false;
+        if (!worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            // Worker thread already started (e.g., factory + Python
+            // wrapper both calling start); avoid spawning a second
+            // thread which would later trigger std::terminate on
+            // destruction.
             return;
         }
         if (turbomind::ProgressLogger::Enabled()) {
@@ -490,6 +499,7 @@ public:
         kv_mgr.reset();
         prefix_cache.reset();
         running.store(false, std::memory_order_release);
+        worker_started.store(false, std::memory_order_release);
         initialized = false;
     }
 
