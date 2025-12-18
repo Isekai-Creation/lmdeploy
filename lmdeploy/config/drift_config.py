@@ -46,6 +46,7 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
         "target_latency_ms_p95": cfg.target_latency_ms_p95,
         "max_queued_requests": cfg.max_queued_requests,
         "abort_on_oom": cfg.abort_on_oom,
+        "quant_policy": cfg.quant_policy,
         "cache_max_entry_count": cfg.cache_max_entry_count,
         "log_level": cfg.log_level,
         "enable_prefix_caching": getattr(kv, "prefix_cache_enabled", cfg.enable_prefix_caching),

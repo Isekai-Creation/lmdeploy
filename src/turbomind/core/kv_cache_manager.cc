@@ -58,14 +58,23 @@ KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_byt
     layout_.kv_factor   = kv_factor;
     kv_factor_          = kv_factor;
 
-    // Each logical "page" stores both K and V activations for all
-    // layers and KV heads at `page_size` token positions.
-    page_bytes_ = static_cast<size_t>(layout_.num_layers)
-                   * layout_.num_kv_heads
-                   * layout_.head_dim
-                   * layout_.page_size
-                   * effective_bpv
-                   * kv_factor;
+    if (layout_.page_bytes_override > 0) {
+        // When DriftEngine has provided an explicit page size in bytes
+        // (e.g. derived from TurboMind's quantized KV block layout),
+        // respect it verbatim so that attention kernels see the exact
+        // same block geometry as the legacy engine.
+        page_bytes_ = layout_.page_bytes_override;
+    }
+    else {
+        // Each logical "page" stores both K and V activations for all
+        // layers and KV heads at `page_size` token positions.
+        page_bytes_ = static_cast<size_t>(layout_.num_layers)
+                       * layout_.num_kv_heads
+                       * layout_.head_dim
+                       * layout_.page_size
+                       * effective_bpv
+                       * kv_factor;
+    }
 
     TM_LOG_INFO(
         "[KVCacheManager] layout: layers=%d kv_heads=%d head_dim=%d page_size=%d dtype=%d bpv=%d kv_factor=%d page_bytes=%zu",

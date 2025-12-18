@@ -6,13 +6,63 @@ MICRO_DIR="${ROOT_DIR}/results_eagle3_micro"
 mkdir -p "${MICRO_DIR}"
 
 # Default to HF repo ID for GPT-OSS-20B. MODEL_PATH can be overridden
-# to an explicit local directory, in which case no HF download is run.
-MODEL_PATH="${MODEL_PATH:-https://huggingface.co/openai/gpt-oss-20b}"
+# either to another HF repo ID/URL or to an explicit local directory.
+HF_DEFAULT_REPO="openai/gpt-oss-20b"
+MODEL_PATH="${MODEL_PATH:-${HF_DEFAULT_REPO}}"
 
 # Pin HF cache/root to the models directory so that both the HF CLI and
 # Transformers resolve GPT-OSS artifacts consistently on this machine.
 HF_ROOT="/workspace/aimo/models"
 export HF_HOME="${HF_HOME:-${HF_ROOT}}"
+
+# Auto-select TM_CACHE_MAX_ENTRY_COUNT for GPT-OSS runs based on
+# current device memory usage when the user has not set it
+# explicitly. Policy:
+#   - If GPU memory used <= ~10GB (GPU mostly idle): use 0.75.
+#   - If GPU memory used is around or below ~45GB: use 0.50.
+#   - If GPU memory used > ~45GB: treat GPU as occupied and exit so
+#     we do not oversubscribe KV cache.
+choose_tm_cache_fraction() {
+  # Respect explicit user choice if already set.
+  if [[ -n "${TM_CACHE_MAX_ENTRY_COUNT:-}" ]]; then
+    return
+  fi
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    TM_CACHE_MAX_ENTRY_COUNT="0.75"
+    export TM_CACHE_MAX_ENTRY_COUNT
+    return
+  fi
+
+  local line total used used_gb
+  line="$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits | head -n1)"
+  total="$(echo "$line" | awk -F',' '{print $1}' | xargs)"
+  used="$(echo "$line" | awk -F',' '{print $2}' | xargs)"
+  used_gb=$(( used / 1024 ))
+
+  if (( used_gb <= 10 )); then
+    TM_CACHE_MAX_ENTRY_COUNT="0.75"
+  elif (( used_gb <= 45 )); then
+    TM_CACHE_MAX_ENTRY_COUNT="0.50"
+  else
+    echo "[run_spec_suite] GPU memory appears occupied (used=${used_gb}GB > 45GB); refusing to auto-run GPT-OSS benchmarks." >&2
+    echo "[run_spec_suite] Free GPU memory or export TM_CACHE_MAX_ENTRY_COUNT manually to override this guard." >&2
+    exit 1
+  fi
+
+  export TM_CACHE_MAX_ENTRY_COUNT
+}
+
+# Auto-select KV cache fraction if not explicitly set.
+choose_tm_cache_fraction
+
+# Enable DriftEngine KV canary checks by default for drift spec runs so
+# that any KV pointer/layout mismatch is caught before attention
+# kernels run. Users can override/disable by explicitly setting
+# TM_DRIFT_KV_CANARY.
+if [[ -z "${TM_DRIFT_KV_CANARY:-}" ]]; then
+  export TM_DRIFT_KV_CANARY=1
+fi
 
 resolve_hf_model_path() {
   local path="$1"
@@ -32,13 +82,19 @@ resolve_hf_model_path() {
 
   # Treat non-existent paths that contain '/' as HF repo IDs.
   if [[ "$path" == */* ]]; then
-    local name="${path##*/}"
+    local repo="$path"
+    local name="${repo##*/}"
     local local_dir="${HF_ROOT}/${name}"
 
     if [ ! -d "$local_dir" ] || [ ! -f "${local_dir}/config.json" ]; then
       mkdir -p "$local_dir"
-      HF_HOME="$HF_ROOT" hf download "$path" \
-        --local-dir "$local_dir"
+      if ! command -v huggingface-cli >/dev/null 2>&1; then
+        echo "[run_spec_suite] huggingface-cli not found; install via 'pip install --upgrade huggingface_hub'" >&2
+        exit 1
+      fi
+      HF_HOME="$HF_ROOT" huggingface-cli download "$repo" \
+        --local-dir "$local_dir" \
+        --local-dir-use-symlinks False
     fi
 
     printf '%s\n' "$local_dir"
@@ -48,6 +104,7 @@ resolve_hf_model_path() {
   # Fallback: treat as literal local path.
   printf '%s\n' "$path"
 }
+
 
 MODEL_PATH="$(resolve_hf_model_path "$MODEL_PATH")"
 

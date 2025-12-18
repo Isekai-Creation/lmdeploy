@@ -90,7 +90,7 @@ class TurboMindSchedulerConfig:
 @dataclass
 class TurboMindKVConfig:
     """TurboMind KV cache config."""
-    kv_page_size: int = 128
+    kv_page_size: int = 256
     kv_capacity_bytes: int | None = None  # auto if None
     prefix_cache_enabled: bool = True
     prefix_cache_eviction_policy: Literal['lru', 'priority'] = 'lru'

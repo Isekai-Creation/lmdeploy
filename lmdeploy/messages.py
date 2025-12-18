@@ -325,6 +325,9 @@ class DriftEngineConfig:
     max_batch_size: int = 256
     dtype: Literal["fp16", "bf16", "fp8"] = "bf16"
     cache_max_entry_count: float = 0.75
+    # KV cache quantization policy, mirroring TurbomindEngineConfig:
+    # 0 = disabled, 4 = INT4, 8 = INT8, 16 = FP4/NVFP4 family.
+    quant_policy: int = 0
 
     # Scheduler / KV
     scheduler: TurboMindSchedulerConfig = field(default_factory=TurboMindSchedulerConfig)
@@ -373,6 +376,9 @@ class DriftEngineConfig:
 
         if self.cache_max_entry_count <= 0:
             raise ValueError("cache_max_entry_count must be positive")
+
+        if self.quant_policy not in (0, 4, 8, 16):
+            raise ValueError("quant_policy must be one of {0, 4, 8, 16}")
 
     def _set_derived_values(self):
         """Set derived values based on configuration."""

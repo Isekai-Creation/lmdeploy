@@ -25,6 +25,14 @@ struct KVLayout {
     int        bytes_per_value{0}; // derived from kv_dtype
     int        kv_factor{2};       // default K + V
     KVDataType kv_dtype{KVDataType::kFP16};
+    // Optional override for the computed page size in bytes. When
+    // non-zero, KVCacheManager will use this value directly instead of
+    // deriving page_bytes from (num_layers, num_kv_heads, head_dim,
+    // page_size, bytes_per_value, kv_factor). This is used by
+    // DriftEngine to align KV pages with TurboMind's quantized KV
+    // block layout (INT8/INT4/FP4) so that attention kernels see the
+    // exact same block geometry.
+    size_t     page_bytes_override{0};
 };
 
 

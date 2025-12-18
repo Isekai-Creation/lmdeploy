@@ -742,8 +742,10 @@ void LlamaBatch::Initialize(GenerationState& g)
             scale_block_ptrs += count;
         };
  
-        int drift_slots  = 0;
-        int legacy_slots = 0;
+        int  drift_slots     = 0;
+        int  legacy_slots    = 0;
+        bool capacity_error  = false;
+        const int ptr_capacity = static_cast<int>(h_block_ptrs_.size());
  
         for (int i = 0; i < batch_size; ++i) {
             const auto& seq     = *state_->sequences[i];
@@ -759,7 +761,28 @@ void LlamaBatch::Initialize(GenerationState& g)
                 const auto&   page_ids = seq.kv_page_ids;
                 const uint64_t seq_id  = seq_req->session.id;
                 const int      entry_cnt = static_cast<int>(page_ids.size() * kv_entries_per_page_);
-                h_cu_block_counts_[i + 1] = h_cu_block_counts_[i] + entry_cnt;
+                const int      next_count = h_cu_block_counts_[i] + entry_cnt;
+
+                // Guard against buffer overflow: the total number of
+                // pointer entries for this batch must not exceed the
+                // capacity of h_block_ptrs_/block_ptrs_. When this
+                // happens, we fail fast instead of allowing the
+                // attention kernels to index past the end of the
+                // block_ptrs_ array.
+                if (next_count > ptr_capacity) {
+                    TM_LOG_ERROR(
+                        "[LlamaBatch] KV pointer table overflow for seq %lu: required_entries=%d capacity=%d "
+                        "(pages=%zu entries_per_page=%zu)",
+                        seq_id,
+                        next_count,
+                        ptr_capacity,
+                        page_ids.size(),
+                        static_cast<size_t>(kv_entries_per_page_));
+                    capacity_error = true;
+                    break;
+                }
+
+                h_cu_block_counts_[i + 1] = next_count;
                 const std::string stage_label = resolve_stage_label(seq_req, seq_id);
  
                 if (progress_enabled) {
@@ -837,7 +860,19 @@ void LlamaBatch::Initialize(GenerationState& g)
  
             ++legacy_slots;
             const int legacy_entries = static_cast<int>(seq.blocks.size());
-            h_cu_block_counts_[i + 1] = h_cu_block_counts_[i] + legacy_entries;
+            const int next_count = h_cu_block_counts_[i] + legacy_entries;
+
+            if (next_count > ptr_capacity) {
+                TM_LOG_ERROR(
+                    "[LlamaBatch] Legacy KV pointer table overflow for seq %lu: required_entries=%d capacity=%d",
+                    seq.id,
+                    next_count,
+                    ptr_capacity);
+                capacity_error = true;
+                break;
+            }
+
+            h_cu_block_counts_[i + 1] = next_count;
  
             block_ptrs = std::transform(seq.blocks.cbegin(), seq.blocks.cend(), block_ptrs, [&](int block_id) {
                 return reinterpret_cast<uintptr_t>(sequence_manager_->GetBlockPtr(block_id));
@@ -862,8 +897,12 @@ void LlamaBatch::Initialize(GenerationState& g)
             ProgressLogger::Log(evt);
         }
 
+        if (capacity_error) {
+            throw std::runtime_error("DriftEngine KV pointer table capacity exceeded");
+        }
+
         if (kv_pointer_error) {
-            throw std::runtime_error("Invalid DriftEngine KV pointer mapping");
+            throw std::runtime_error("DriftEngine KV pointer mapping / canary validation failed");
         }
 
         static_assert(sizeof(uintptr_t) == sizeof(void*));
@@ -4382,6 +4421,14 @@ bool LlamaBatch::run_kv_canary_check(uint64_t seq_id,
     const int pages_to_sample = std::min<int>(kv_canary_sample_pages_, static_cast<int>(page_ptrs.size()));
     std::vector<uint8_t>      host(sample_bytes);
 
+    // For initial prefill installs we primarily care about pointer
+    // validity and address range; KV contents may legitimately be all
+    // zeros before the first ProcessKV_v2 invocation. Require non‑zero
+    // samples only for decode‑time installs (stage labels that contain
+    // "decode"), where K/V should already have been written.
+    const bool require_non_zero =
+        stage_label.find("decode") != std::string::npos;
+
     for (int i = 0; i < pages_to_sample; ++i) {
         void* ptr = page_ptrs[i];
         if (!ptr) {
@@ -4403,7 +4450,7 @@ bool LlamaBatch::run_kv_canary_check(uint64_t seq_id,
         check_cuda_error(cudaMemcpyAsync(host.data(), src, sample_bytes, cudaMemcpyDeviceToHost, stream_));
         check_cuda_error(cudaStreamSynchronize(stream_));
         const bool non_zero = std::any_of(host.begin(), host.end(), [](uint8_t b) { return b != 0; });
-        if (!non_zero) {
+        if (require_non_zero && !non_zero) {
             TM_LOG_ERROR("[LlamaBatch] KV canary (%s): zero sample for seq %lu (page_idx=%d offset=%zu)",
                          stage_label.c_str(),
                          seq_id,

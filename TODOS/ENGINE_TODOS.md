@@ -43,9 +43,34 @@ running HF `openai/gpt‑oss‑20b` (and re‑usable for GPT‑OSS‑120B):
     `TM_CACHE_MAX_ENTRY_COUNT` and free device memory, with a clamp and
     reserved headroom, so users do **not** have to set
     `kv_capacity_bytes` explicitly.
+  - **KV cache quantization parity with TurboMind (INT4/INT8) is fully wired in code:**  
+    - Python `DriftEngineConfig.quant_policy` (0/4/8/16) is validated
+      and forwarded into the C++ `DriftEngineConfig` via
+      `to_cpp_drift_engine_config` and `initialize_from_dict*` in
+      `bind.cpp`.
+    - `_setup_drift_engine` mirrors `quant_policy` into the internal
+      `TurbomindEngineConfig` so the converted HF→TurboMind model and
+      attention kernels see the same quantization mode as DriftEngine.
+    - `KVLayout` now exposes `page_bytes_override`, and
+      `DriftEngine::derive_kv_layout` computes a quantization‑aware
+      `page_bytes_override` for `quant_policy=4` (INT4) and
+      `quant_policy=8` (INT8) using the same
+      `block::Layout`/`KvCacheMode` geometry as
+      `LlamaBatch::InitializeBufferAndKVCache` (q_bits/t_bits, block
+      length, KV heads, layers).
+    - `KVCacheManager` respects `page_bytes_override` verbatim when
+      allocating its unified KV buffer, so each DriftEngine KV page maps
+      1:1 onto a TurboMind KV block and inherits the same memory
+      savings for INT4/INT8 KV cache as the legacy engine.
+    - The DriftEngine KV capacity guardrail now uses the quantized
+      `page_bytes_override` when present so `session_len × max_batch`
+      feasibility checks reflect the reduced KV size instead of the
+      conservative BF16/FP16 layout.
   - **Needs testing:** stress runs on HF 20B/120B to validate that KV
     usage stays within capacity and that no OOM/deadlock appears under
-    tight budgets.
+    tight budgets, and that enabling `quant_policy=4`/`8` for DriftEngine
+    produces the expected KV memory footprint and throughput gains
+    without regressions vs. the TurboMind baseline (FP16/BF16 KV).
 
 - ✅ **PrefixCache & prefix reuse – ~80% IMPLEMENTED**
   - `PrefixCache` stores page‑aligned token prefixes only, with LRU
@@ -1284,21 +1309,21 @@ Legend:
 3. **Validate LlamaBatch block‑pointer capacity vs required KV pages**
    - Implementation: **100%**
      - `KVCacheManager::estimate_usage` clamps `prompt_len + max_new_tokens` to `layout.max_seq_len` before computing pages, preventing `pages_needed` from exceeding the block pointer capacity implied by `session_len` and `page_size`.
-     - `LlamaBatch::AllocateBuffer` enforces that `h_cu_block_counts_[batch_size]` never exceeds the host/device pointer table capacity:
-       - `FT_CHECK_WITH_INFO` ensures the total block count fits in `h_block_ptrs_` (and scale pointers where applicable).
-     - `DriftEngine` derives `KVLayout` from `ModelLayout` and passes it into `KVCacheManager`, ensuring consistency between layout geometry and pointer table sizing.
+     - `LlamaBatch::AllocateBuffer` sizes `block_ptrs_`/`h_block_ptrs_` using:
+       - `max_batch_block_count = batch_size * ceil(session_len / cache_block_seq_len) + 1`, which matches the maximum number of KV blocks per batch the attention kernels will ever index.
+     - `h_cu_block_counts_` is built as a prefix sum of per‑sequence block counts (`entry_cnt` for drift, `seq.blocks.size()` for legacy) and then copied into `cu_block_counts_`, so the total number of entries used never exceeds the pre‑allocated pointer table capacity.
    - Testing: **40%**
      - Needs long‑context HF GPT‑OSS‑20B tests (8K/16K/32K) to confirm pointer tables remain within bounds across extreme prompts/batches.
 
 4. **Align `build_drift_pointer_entries` with 20B attention kernel contract**
    - Implementation: **100%**
      - `LlamaBatch::build_drift_pointer_entries` in `src/turbomind/models/llama/LlamaBatch.cc` supports:
-       - `DriftKVTableFormat::kPerPage`: one pointer per page with optional V offset (`kv_value_offset_bytes_`).
-       - `DriftKVTableFormat::kSplitKV`: K/V‑split entries per page (`[K_ptr, V_ptr]`), with explicit offset checks.
-     - `KVCacheManager::build_page_ptr_table` guarantees that page pointers are within the contiguous KV storage range before they are passed into `build_drift_pointer_entries`.
-     - Decode kernels consume `block_ptrs_` in the same page‑granular way as legacy TurboMind, so the per‑page table layout is consistent with the attention contract.
+       - `DriftKVTableFormat::kPerPage`: one pointer per page with optional V offset (`kv_value_offset_bytes_`), matching the legacy “one block pointer per KV block” contract used by `BlockIterator`.
+       - `DriftKVTableFormat::kSplitKV`: K/V‑split entries per page (`[K_ptr, V_ptr]`), with explicit offset checks, for future INT4/INT8/FP4 KV modes.
+     - `KVCacheManager::build_page_ptr_table` guarantees that page pointers are within the contiguous KV storage range before they are passed into `build_drift_pointer_entries`, so the attention kernels always see valid base addresses.
+     - Combined with the new `get_cache_block_size`‑driven `KVLayout::page_bytes_override`, each drift KV page now has the same byte size as a TurboMind KV block, so the attention kernels’ internal indexing over layers/heads/positions aligns with the drift pointer table.
    - Testing: **40%**
-     - Needs HF GPT‑OSS‑20B decode steps under memcheck/compute‑sanitizer to confirm no illegal pointer dereferences and that both per‑page and split‑KV formats behave correctly when toggled.
+     - Needs HF GPT‑OSS‑20B prefill/decode steps under memcheck/compute‑sanitizer to confirm no illegal pointer dereferences and that both per‑page and split‑KV formats behave correctly when toggled.
 
 5. **Finalize `TM_DRIFT_KV_TABLE_FORMAT` handling and logging**
    - Implementation: **100%**

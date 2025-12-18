@@ -79,7 +79,7 @@ scheduler_cfg = TurboMindSchedulerConfig(
 )
 
 kv_cfg = TurboMindKVConfig(
-    kv_page_size=128,
+    kv_page_size=256,
     kv_capacity_bytes=None,          # derive from GPU memory and model layout
     prefix_cache_enabled=True,
     prefix_cache_eviction_policy='lru',

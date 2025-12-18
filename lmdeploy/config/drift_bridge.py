@@ -46,7 +46,7 @@ def drift_config_to_cpp_dict(cfg: PyDriftEngineConfig) -> Dict[str, Any]:
         args.update(sched_defaults)
 
     # KV config
-    kv_page_size = 128
+    kv_page_size = 256
     kv_capacity_bytes = None
     enable_prefix_caching = True
     if hasattr(cfg, "kv") and cfg.kv:

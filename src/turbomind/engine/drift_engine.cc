@@ -3,6 +3,8 @@
 #include "src/turbomind/models/common/model_layout.h"
 #include "src/turbomind/engine/request.h"
 #include "src/turbomind/models/llama/LlamaBatch.h"
+#include "src/turbomind/models/llama/llama_utils.h"
+#include "src/turbomind/core/data_type.h"
 #include "src/turbomind/utils/progress_logger.h"
 #include <chrono>
 #include <memory>
@@ -259,8 +261,17 @@ DriftEngine::DriftEngine(const DriftEngineConfig& cfg,
 
     // Guardrail: fail fast when configured capacity cannot hold a full batch at session_len.
     if (cfg_.kv_capacity_bytes > 0 && cfg_.session_len > 0 && cfg_.max_batch_size > 0) {
-        const auto est          = KVCacheManager::estimate_usage(cfg_.model_layout, cfg_.session_len, 0);
-        const size_t total_need = est.bytes_needed * static_cast<size_t>(cfg_.max_batch_size);
+        const auto  est = KVCacheManager::estimate_usage(cfg_.model_layout, cfg_.session_len, 0);
+
+        // Use the quantization-aware page_bytes override when present so
+        // that the capacity check reflects the actual per-page KV size
+        // (INT8/INT4) instead of the conservative FP16/BF16 layout.
+        size_t bytes_per_seq = est.bytes_needed;
+        if (cfg_.kv_layout.page_bytes_override > 0 && est.pages_needed > 0) {
+            bytes_per_seq = cfg_.kv_layout.page_bytes_override * est.pages_needed;
+        }
+
+        const size_t total_need = bytes_per_seq * static_cast<size_t>(cfg_.max_batch_size);
         if (total_need > cfg_.kv_capacity_bytes) {
             TM_LOG_ERROR("[DriftEngine] Configured KV capacity (%zu bytes) is insufficient for session_len=%d "
                          "and max_batch_size=%d (requires ~%zu bytes). Reduce session_len/max_batch_size or "
@@ -288,8 +299,127 @@ KVLayout DriftEngine::derive_kv_layout(const ModelLayout& model_layout, const KV
     kv.kv_dtype        = kv.kv_dtype != KVDataType::kFP16 ? kv.kv_dtype : model_layout.kv_dtype;
     kv.bytes_per_value = kv.bytes_per_value > 0 ? kv.bytes_per_value : bytes_per_value_from_dtype(kv.kv_dtype);
 
-    TM_LOG_INFO("Derived KVLayout: num_layers=%d, num_kv_heads=%d, head_dim=%d, page_size=%d, bytes_per_value=%d", 
-        kv.num_layers, kv.num_kv_heads, kv.head_dim, kv.page_size, kv.bytes_per_value);
+    // Align the KV page byte size with TurboMind's block-level KV
+    // layout so that each DriftEngine page maps 1:1 to a TurboMind KV
+    // block. For non-quantized KV (the v1 DriftEngine default), derive
+    // the block size via get_cache_block_size so that
+    // KVCacheManager::page_bytes() matches BlockManager's block_size for
+    // the same (layers, kv_heads, head_dim, page_size, dtype).
+    // get_cache_block_size is defined in kv_cache_utils_v2.cu; forward
+    // declare it here to avoid pulling heavy Cutlass headers into this
+    // translation unit.
+    extern size_t get_cache_block_size(DataType dtype,
+                                       DataType kvtype,
+                                       int      layer_num,
+                                       int      head_num,
+                                       int      head_dim,
+                                       int      block_seq_len);
+
+    auto kv_dtype_to_datatype = [](KVDataType dt) -> DataType {
+        switch (dt) {
+        case KVDataType::kFP16:
+            return DataType::kFloat16;
+        case KVDataType::kBF16:
+            return DataType::kBfloat16;
+        case KVDataType::kNVFP4:
+            // FP4 payload; block layout uses 4‑bit values with an
+            // external scale pool. Treat as kFloat4_e2m1 for sizing.
+            return DataType::kFloat4_e2m1;
+        }
+        return DataType::kFloat16;
+    };
+
+    if (cfg_.quant_policy == 0) {
+        const DataType dt = kv_dtype_to_datatype(kv.kv_dtype);
+        const size_t   block_bytes =
+            get_cache_block_size(dt, dt, kv.num_layers, kv.num_kv_heads, kv.head_dim, kv.page_size);
+        if (block_bytes > 0) {
+            kv.page_bytes_override = block_bytes;
+            TM_LOG_INFO(
+                "[DriftEngine] KV page_bytes_override (non‑quantized) via get_cache_block_size: %zu "
+                "(layers=%d kv_heads=%d head_dim=%d page_size=%d)",
+                kv.page_bytes_override,
+                kv.num_layers,
+                kv.num_kv_heads,
+                kv.head_dim,
+                kv.page_size);
+        }
+    }
+    else {
+        // Derive a quantization-aware page_bytes override when INT4/INT8
+        // KV cache is enabled via quant_policy. This mirrors the block
+        // layout used by SequenceManager + BlockManager so that each
+        // DriftEngine KV "page" maps 1:1 to a TurboMind KV block and the
+        // attention kernels see identical geometry.
+        int device_id = 0;
+        cudaGetDevice(&device_id);
+
+        int           sm_version = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess) {
+            sm_version = prop.major * 10 + prop.minor;
+        }
+
+        const KvCacheMode kv_mode = GetKvCacheMode(cfg_.quant_policy, sm_version);
+
+        // Only integer KV cache modes (INT8 / INT4) change the logical
+        // block size today. FP4/NVFP4 remains mapped to the unquantized
+        // layout until the dedicated FP4 scale pool is wired end-to-end.
+        if (kv_mode == KvCacheMode::kInt8 || kv_mode == KvCacheMode::kInt4) {
+            const int dbits = kv.bytes_per_value * 8;
+
+            int q_bits = dbits;
+            int t_bits = 0;
+
+            switch (kv_mode) {
+            case KvCacheMode::kInt8:
+                q_bits = 8;
+                t_bits = dbits;
+                break;
+            case KvCacheMode::kInt4:
+                q_bits = 4;
+                t_bits = dbits;
+                break;
+            default:
+                break;
+            }
+
+            const int    block_len        = kv.page_size;
+            const int    head_dim         = kv.head_dim;
+            const int    kv_heads         = kv.num_kv_heads;
+            const int    layers           = kv.num_layers;
+            const int    token_data_size  = q_bits * head_dim / 8;
+            const int    token_param_size = t_bits * 2 / 8;
+            const size_t head_data_size   = static_cast<size_t>(block_len) * static_cast<size_t>(token_data_size);
+            const size_t head_param_size  = static_cast<size_t>(block_len) * static_cast<size_t>(token_param_size);
+            const size_t layer_size       = static_cast<size_t>(kv_heads) * 2U * (head_data_size + head_param_size);
+            const size_t block_size       = layer_size * static_cast<size_t>(layers);
+
+            if (block_size > 0) {
+                kv.page_bytes_override = block_size;
+                TM_LOG_INFO(
+                    "[DriftEngine] KV quantization active: quant_policy=%d kv_mode=%d "
+                    "q_bits=%d t_bits=%d page_size=%d -> page_bytes_override=%zu",
+                    cfg_.quant_policy,
+                    static_cast<int>(kv_mode),
+                    q_bits,
+                    t_bits,
+                    kv.page_size,
+                    kv.page_bytes_override);
+            }
+        }
+    }
+
+    TM_LOG_INFO(
+        "Derived KVLayout: num_layers=%d, num_kv_heads=%d, head_dim=%d, page_size=%d, bytes_per_value=%d, "
+        "kv_factor=%d, page_bytes_override=%zu",
+        kv.num_layers,
+        kv.num_kv_heads,
+        kv.head_dim,
+        kv.page_size,
+        kv.bytes_per_value,
+        kv.kv_factor,
+        kv.page_bytes_override);
 
     assert(kv.num_layers > 0 && "num_layers must be positive");
     assert(kv.num_kv_heads > 0 && "num_kv_heads must be positive");

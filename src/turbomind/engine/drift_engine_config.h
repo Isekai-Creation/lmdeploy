@@ -14,6 +14,7 @@ struct DriftEngineConfig {
     int         pp{1};
     int         session_len{8192};
     int         max_batch_size{256};
+    int         quant_policy{0};
 
     SchedulerConfig scheduler_config{};
     ModelLayout     model_layout{};   // canonical layout for the model

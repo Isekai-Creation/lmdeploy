@@ -195,6 +195,9 @@ public:
         cfg.max_batch_size = cfg_dict.contains("max_batch_size") ? cfg_dict["max_batch_size"].cast<int>() : 256;
         cfg.dtype          = cfg_dict.contains("dtype") ? cfg_dict["dtype"].cast<std::string>() : "bf16";
         cfg.log_level      = cfg_dict.contains("log_level") ? cfg_dict["log_level"].cast<std::string>() : "INFO";
+        if (cfg_dict.contains("quant_policy")) {
+            cfg.quant_policy = cfg_dict["quant_policy"].cast<int>();
+        }
 
         if (cfg_dict.contains("scheduler")) {
             auto sched = cfg_dict["scheduler"].cast<pybind11::dict>();
@@ -284,6 +287,9 @@ public:
         cfg.max_batch_size = cfg_dict.contains("max_batch_size") ? cfg_dict["max_batch_size"].cast<int>() : 256;
         cfg.dtype          = cfg_dict.contains("dtype") ? cfg_dict["dtype"].cast<std::string>() : "bf16";
         cfg.log_level      = cfg_dict.contains("log_level") ? cfg_dict["log_level"].cast<std::string>() : "INFO";
+        if (cfg_dict.contains("quant_policy")) {
+            cfg.quant_policy = cfg_dict["quant_policy"].cast<int>();
+        }
 
         if (cfg_dict.contains("scheduler")) {
             auto sched = cfg_dict["scheduler"].cast<pybind11::dict>();

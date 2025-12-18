@@ -283,6 +283,12 @@ class TurboMind:
         # requires a fallback.
         tm_engine.dtype = "bfloat16"
 
+        # Mirror KV cache quantization policy into TurboMind so that the
+        # underlying LlamaV2 model and attention kernels see the same
+        # quant_policy as DriftEngine. This keeps DriftEngine's unified
+        # KV cache layout aligned with the legacy TurboMind engine.
+        tm_engine.quant_policy = getattr(engine_config, "quant_policy", 0)
+
         # Derive cache_max_entry_count from TM_CACHE_MAX_ENTRY_COUNT when
         # provided, otherwise reuse the drift config or fall back to 0.75.
         cache_frac_env = os.getenv("TM_CACHE_MAX_ENTRY_COUNT", "").strip()
