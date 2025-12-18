@@ -19,11 +19,33 @@ namespace {
 
 inline turbomind::ModelLayout resolve_model_layout(const turbomind::DriftEngineConfig& cfg)
 {
-    if (cfg.model_layout.num_layers > 0 && cfg.model_layout.num_kv_heads > 0 && cfg.model_layout.head_dim > 0 && cfg.model_layout.page_size > 0) {
+    // Prefer an explicit model_layout provided via bindings (derived
+    // from the TurboMind model config) when all key fields are set.
+    if (cfg.model_layout.num_layers > 0 && cfg.model_layout.num_kv_heads > 0 && cfg.model_layout.head_dim > 0
+        && cfg.model_layout.page_size > 0) {
+        TM_LOG_INFO(
+            "[DriftEngine] Using explicit ModelLayout override: layers=%d kv_heads=%d head_dim=%d page_size=%d "
+            "max_seq_len=%d kv_dtype=%d",
+            cfg.model_layout.num_layers,
+            cfg.model_layout.num_kv_heads,
+            cfg.model_layout.head_dim,
+            cfg.model_layout.page_size,
+            cfg.model_layout.max_seq_len,
+            static_cast<int>(cfg.model_layout.kv_dtype));
         return cfg.model_layout;
     }
-    auto layout          = turbomind::make_gpt_oss_120b_layout();
-    layout.max_seq_len   = cfg.session_len > 0 ? cfg.session_len : layout.max_seq_len;
+
+    auto layout        = turbomind::make_gpt_oss_120b_layout();
+    layout.max_seq_len = cfg.session_len > 0 ? cfg.session_len : layout.max_seq_len;
+    TM_LOG_INFO(
+        "[DriftEngine] Using default GPT-OSS-120B ModelLayout: layers=%d kv_heads=%d head_dim=%d page_size=%d "
+        "max_seq_len=%d kv_dtype=%d",
+        layout.num_layers,
+        layout.num_kv_heads,
+        layout.head_dim,
+        layout.page_size,
+        layout.max_seq_len,
+        static_cast<int>(layout.kv_dtype));
     return layout;
 }
 

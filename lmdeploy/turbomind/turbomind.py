@@ -256,12 +256,6 @@ class TurboMind:
         if getattr(engine_config, "dtype", None) in (None, "", "auto", "float16", "fp16"):
             engine_config.dtype = "bf16"
 
-        self._drift_config = engine_config
-
-        from lmdeploy.config.drift_config import to_cpp_drift_engine_config
-        cpp_args = to_cpp_drift_engine_config(engine_config)
-        self._drift_cpp_args = cpp_args
-
         vocab_size = 0
         try:
             tok = Tokenizer(engine_config.model_path)
@@ -272,7 +266,6 @@ class TurboMind:
             self.tokenizer = None
 
         logger.info(f"DriftEngine backend requested: {engine_config}")
-        logger.info(f"Converted to C++ args: {list(cpp_args.keys())}")
 
         # Build a TurboMindEngineConfig for HF conversion, mirroring the
         # core session / batch / dtype / cache knobs from the drift
@@ -315,8 +308,43 @@ class TurboMind:
         self.model_comm = self._from_hf(engine_config.model_path, tm_engine)
 
         # Drift-specific config used on the Python side for generation.
-        # Reuse the TurboMind model config but override weight_type to
-        # reflect the drift dtype.
+        # At this point `self.config` and `self.engine_config` refer to
+        # the TurboMind model/tm_engine configuration. Derive a
+        # lightweight model layout override from that config so the
+        # C++ DriftEngine KV layout (num_layers / num_kv_heads /
+        # head_dim / page_size) matches the converted TurboMind model
+        # rather than the static GPT-OSS-120B layout.
+        try:
+            tm_model_cfg = getattr(self.config, "model_config", None)
+            if tm_model_cfg is not None:
+                num_layers = getattr(tm_model_cfg, "num_layer", None)
+                num_kv     = getattr(tm_model_cfg, "kv_head_num", None)
+                head_dim   = getattr(tm_model_cfg, "size_per_head", None)
+                page_size  = getattr(tm_model_cfg, "cache_block_seq_len", None)
+                # Attach overrides onto the DriftEngineConfig instance
+                # so to_cpp_drift_engine_config can surface them into
+                # the C++ DriftEngineConfig when present.
+                if num_layers and num_kv and head_dim:
+                    setattr(engine_config, "_tm_num_layers", int(num_layers))
+                    setattr(engine_config, "_tm_num_kv_heads", int(num_kv))
+                    setattr(engine_config, "_tm_head_dim", int(head_dim))
+                if page_size:
+                    # Align drift KV page size with TurboMind
+                    # cache_block_seq_len so KV pages map 1:1 to
+                    # blocks expected by attention kernels.
+                    engine_config.kv.kv_page_size = int(page_size)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to derive drift model_layout overrides from TurboMind config: {exc}")
+
+        # Convert the Python DriftEngineConfig into the flat C++ dict
+        # consumed by _turbomind drift bindings.
+        from lmdeploy.config.drift_config import to_cpp_drift_engine_config
+        self._drift_config = engine_config
+        cpp_args = to_cpp_drift_engine_config(engine_config)
+        self._drift_cpp_args = cpp_args
+
+        # Reuse a minimal TurboMind-style model config (vocab size +
+        # weight type) on the Python side for tokenizer / generation.
         model_cfg = SimpleNamespace(vocab_size=vocab_size)
         weight_type = getattr(self.config.model_config, "weight_type", "bfloat16")
         self.config = SimpleNamespace(model_config=model_cfg, weight_type=weight_type)

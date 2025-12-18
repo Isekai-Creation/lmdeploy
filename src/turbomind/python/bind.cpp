@@ -232,6 +232,15 @@ public:
         cfg.kv_layout.bytes_per_value = bytes_per_value_from_dtype(cfg.kv_layout.kv_dtype);
         cfg.model_layout.max_seq_len  = cfg.session_len;
         cfg.model_layout.kv_dtype     = cfg.kv_layout.kv_dtype;
+        // Align model_layout page_size with KV layout so DriftEngine can
+        // treat layout-derived KV geometry (num_layers / num_kv_heads /
+        // head_dim / page_size) as a coherent whole. This is required
+        // for the override path (e.g., GPT-OSS-20B) to take effect in
+        // resolve_model_layout instead of always falling back to the
+        // static GPT-OSS-120B layout.
+        if (cfg.kv_layout.page_size > 0) {
+            cfg.model_layout.page_size = cfg.kv_layout.page_size;
+        }
 
         cfg.prefer_high_throughput = cfg_dict.contains("prefer_high_throughput") ? cfg_dict["prefer_high_throughput"].cast<bool>() : cfg.prefer_high_throughput;
         cfg.target_latency_ms_p50  = cfg_dict.contains("target_latency_ms_p50") ? cfg_dict["target_latency_ms_p50"].cast<int>() : cfg.target_latency_ms_p50;
@@ -239,6 +248,26 @@ public:
         cfg.max_queued_requests    = cfg_dict.contains("max_queued_requests") ? cfg_dict["max_queued_requests"].cast<int>() : cfg.max_queued_requests;
         cfg.abort_on_oom           = cfg_dict.contains("abort_on_oom") ? cfg_dict["abort_on_oom"].cast<bool>() : cfg.abort_on_oom;
         cfg.scheduler_config.enable_speculative_decoding = false;
+
+        // Optional model_layout override from Python side. When present,
+        // this allows DriftEngine to align its KV layout (num_layers,
+        // num_kv_heads, head_dim) with the converted TurboMind model
+        // instead of always falling back to the static 120B layout.
+        if (cfg_dict.contains("model_layout")) {
+            auto ml = cfg_dict["model_layout"].cast<pybind11::dict>();
+            if (ml.contains("num_layers")) {
+                cfg.model_layout.num_layers = ml["num_layers"].cast<int>();
+            }
+            if (ml.contains("num_kv_heads")) {
+                cfg.model_layout.num_kv_heads = ml["num_kv_heads"].cast<int>();
+            }
+            if (ml.contains("head_dim")) {
+                cfg.model_layout.head_dim = ml["head_dim"].cast<int>();
+            }
+            if (ml.contains("page_size")) {
+                cfg.model_layout.page_size = ml["page_size"].cast<int>();
+            }
+        }
 
         initialize_with_config(cfg, nullptr);
     }
@@ -292,6 +321,9 @@ public:
         cfg.kv_layout.bytes_per_value = bytes_per_value_from_dtype(cfg.kv_layout.kv_dtype);
         cfg.model_layout.max_seq_len  = cfg.session_len;
         cfg.model_layout.kv_dtype     = cfg.kv_layout.kv_dtype;
+        if (cfg.kv_layout.page_size > 0) {
+            cfg.model_layout.page_size = cfg.kv_layout.page_size;
+        }
 
         cfg.prefer_high_throughput = cfg_dict.contains("prefer_high_throughput") ? cfg_dict["prefer_high_throughput"].cast<bool>() : cfg.prefer_high_throughput;
         cfg.target_latency_ms_p50  = cfg_dict.contains("target_latency_ms_p50") ? cfg_dict["target_latency_ms_p50"].cast<int>() : cfg.target_latency_ms_p50;
@@ -299,6 +331,24 @@ public:
         cfg.max_queued_requests    = cfg_dict.contains("max_queued_requests") ? cfg_dict["max_queued_requests"].cast<int>() : cfg.max_queued_requests;
         cfg.abort_on_oom           = cfg_dict.contains("abort_on_oom") ? cfg_dict["abort_on_oom"].cast<bool>() : cfg.abort_on_oom;
         cfg.scheduler_config.enable_speculative_decoding = false;
+
+        // Optional model_layout override from Python side (see comment
+        // above in initialize_from_dict).
+        if (cfg_dict.contains("model_layout")) {
+            auto ml = cfg_dict["model_layout"].cast<pybind11::dict>();
+            if (ml.contains("num_layers")) {
+                cfg.model_layout.num_layers = ml["num_layers"].cast<int>();
+            }
+            if (ml.contains("num_kv_heads")) {
+                cfg.model_layout.num_kv_heads = ml["num_kv_heads"].cast<int>();
+            }
+            if (ml.contains("head_dim")) {
+                cfg.model_layout.head_dim = ml["head_dim"].cast<int>();
+            }
+            if (ml.contains("page_size")) {
+                cfg.model_layout.page_size = ml["page_size"].cast<int>();
+            }
+        }
 
         initialize_with_config(cfg, model_comm);
     }
@@ -2408,8 +2458,30 @@ PYBIND11_MODULE(_turbomind, m)
                 throw std::runtime_error("Unsupported backend for drift binding: " + backend);
             }
             auto wrapper = std::make_shared<DriftEngineWrapper>();
-            wrapper->initialize_from_dict(model_path, engine_config);
-            wrapper->start();
+            try {
+                wrapper->initialize_from_dict(model_path, engine_config);
+                wrapper->start();
+            }
+            catch (const std::exception& e) {
+                TM_LOG_ERROR("[DriftEnginePy] create_engine (dict) threw exception: %s", e.what());
+                if (turbomind::ProgressLogger::Enabled()) {
+                    turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+                    evt.pct = 100;
+                    evt.msg = std::string("create_engine_exception:") + e.what();
+                    turbomind::ProgressLogger::Log(evt);
+                }
+                throw;
+            }
+            catch (...) {
+                TM_LOG_ERROR("[DriftEnginePy] create_engine (dict) threw unknown exception");
+                if (turbomind::ProgressLogger::Enabled()) {
+                    turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+                    evt.pct = 100;
+                    evt.msg = "create_engine_exception:unknown";
+                    turbomind::ProgressLogger::Log(evt);
+                }
+                throw;
+            }
             return wrapper;
         },
         py::arg("model_path"),
@@ -2429,8 +2501,30 @@ PYBIND11_MODULE(_turbomind, m)
                 throw std::runtime_error("Unsupported backend for drift binding: " + backend);
             }
             auto wrapper = std::make_shared<DriftEngineWrapper>();
-            wrapper->initialize_from_dict_with_model(model_path, engine_config, model_comm);
-            wrapper->start();
+            try {
+                wrapper->initialize_from_dict_with_model(model_path, engine_config, model_comm);
+                wrapper->start();
+            }
+            catch (const std::exception& e) {
+                TM_LOG_ERROR("[DriftEnginePy] create_engine_with_model threw exception: %s", e.what());
+                if (turbomind::ProgressLogger::Enabled()) {
+                    turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+                    evt.pct = 100;
+                    evt.msg = std::string("create_engine_with_model_exception:") + e.what();
+                    turbomind::ProgressLogger::Log(evt);
+                }
+                throw;
+            }
+            catch (...) {
+                TM_LOG_ERROR("[DriftEnginePy] create_engine_with_model threw unknown exception");
+                if (turbomind::ProgressLogger::Enabled()) {
+                    turbomind::ProgressEvent evt{turbomind::ProgressStage::kError};
+                    evt.pct = 100;
+                    evt.msg = "create_engine_with_model_exception:unknown";
+                    turbomind::ProgressLogger::Log(evt);
+                }
+                throw;
+            }
             return wrapper;
         },
         py::arg("model_comm"),

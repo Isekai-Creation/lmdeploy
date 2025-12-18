@@ -85,7 +85,10 @@ KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_byt
 
     size_t num_pages = total_capacity_bytes_ / page_bytes_;
     if (num_pages == 0) {
-        TM_LOG_WARNING("KVCacheManager initialized with 0 pages. total_capacity_bytes: %lu, page_bytes: %lu", total_capacity_bytes_, page_bytes_);
+        TM_LOG_WARNING(
+            "KVCacheManager initialized with 0 pages. total_capacity_bytes: %lu, page_bytes: %zu",
+            total_capacity_bytes_,
+            page_bytes_);
         return;
     }
 
@@ -127,7 +130,12 @@ KVCacheManager::KVCacheManager(const KVLayout& layout, size_t total_capacity_byt
         all_pages_.push_back(page);
         free_page_ids_.push(static_cast<int>(i));  // Add all pages to the free list
     }
-    TM_LOG_INFO("KVCacheManager initialized with %zu pages, total capacity %lu bytes.", num_pages, total_capacity_bytes_);
+    TM_LOG_INFO(
+        "KVCacheManager initialized with %zu pages, total_capacity_bytes=%lu page_bytes=%zu storage_bytes=%zu",
+        num_pages,
+        total_capacity_bytes_,
+        page_bytes_,
+        storage_bytes_);
 }
 
 KVCacheManager::~KVCacheManager()

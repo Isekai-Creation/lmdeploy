@@ -181,7 +181,16 @@ def get_model_arch(model_path: str):
                 'auto_map', None) and 'AutoModelForCausalLM' in _cfg['language_config']['auto_map']:
             arch = _cfg['language_config']['auto_map']['AutoModelForCausalLM'].split('.')[-1]
         else:
-            raise RuntimeError(f'Could not find model architecture from config: {_cfg}')
+            # Some repos (e.g., certain GPT-OSS checkpoints) may expose a
+            # GenerationConfig or a minimal config without explicit
+            # `architectures`/`auto_map`. In that case, treat the model as a
+            # generic causal LM instead of failing hard. This keeps pipeline
+            # creation working for DriftEngine while still allowing VL models
+            # to be detected via check_vl_llm on the same config.
+            arch = _cfg.get('model_type') or 'AutoModelForCausalLM'
+            logger.warning(
+                'Could not find explicit model architecture from config keys; '
+                'falling back to %s for model_path=%s', arch, model_path)
         return arch, cfg
 
 

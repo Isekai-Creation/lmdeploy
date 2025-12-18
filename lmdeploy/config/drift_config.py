@@ -21,7 +21,7 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
     # can easily over-allocate on large models (e.g. 120B) and cause OOM.
     kv_capacity = getattr(kv, "kv_capacity_bytes", 0) or 0
 
-    return {
+    args: Dict[str, Any] = {
         "model_path": cfg.model_path,
         "tp": cfg.tp,
         "pp": cfg.pp,
@@ -52,6 +52,23 @@ def to_cpp_drift_engine_config(cfg: DriftEngineConfig) -> Dict[str, Any]:
         "enable_speculative_decoding": cfg.enable_speculative_decoding,
         "enable_cuda_graphs": cfg.enable_cuda_graphs,
     }
+
+    # Optional model layout overrides derived from the TurboMind model
+    # config in turbomind._setup_drift_engine. When present, these
+    # allow the C++ DriftEngine to derive a KV layout that matches
+    # the converted model (e.g., GPT-OSS-20B vs GPT-OSS-120B) instead
+    # of always falling back to the static 120B layout.
+    num_layers = getattr(cfg, "_tm_num_layers", None)
+    num_kv = getattr(cfg, "_tm_num_kv_heads", None)
+    head_dim = getattr(cfg, "_tm_head_dim", None)
+    if num_layers and num_kv and head_dim:
+        args["model_layout"] = {
+            "num_layers": int(num_layers),
+            "num_kv_heads": int(num_kv),
+            "head_dim": int(head_dim),
+        }
+
+    return args
 
 
 __all__ = ["DriftEngineConfig", "TurboMindKVConfig", "TurboMindSchedulerConfig", "to_cpp_drift_engine_config"]
