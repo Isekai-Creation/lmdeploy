@@ -242,6 +242,8 @@ void invokeTranspose2D(T* dst, const T* src, int rows, int cols, cudaStream_t st
 void invokeEmbeddingLookup(Ref<Tensor>         out_,
                            const Buffer_<int>& token_ids,
                            const Tensor&       embedding_table,
-                           cudaStream_t        st);
+                           cudaStream_t        st,
+                           int                 expected_vocab_rows    = -1,
+                           int                 expected_hidden_units  = -1);
 
 }  // namespace turbomind

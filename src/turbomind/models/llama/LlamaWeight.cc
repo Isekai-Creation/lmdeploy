@@ -123,6 +123,14 @@ LlamaWeight::LlamaWeight(DataType           data_type,
         vocab_size_padded_ = (vocab_size_ + tp_size_ - 1) / tp_size_ * tp_size_;
         TM_LOG_WARNING("pad vocab size from %d to %d", vocab_size_, vocab_size_padded_);
     }
+    const int configured_embedding_size = embedding_size_ == 0 ? vocab_size_ : embedding_size_;
+    if (configured_embedding_size != vocab_size_) {
+        TM_LOG_WARNING(
+            "[LlamaWeight] embedding_size (%d) differs from vocab_size (%d); using padded vocab for embeddings",
+            configured_embedding_size,
+            vocab_size_);
+    }
+    embedding_size_ = vocab_size_padded_;
     if (embedding_size_ % tp_size_ != 0) {
         embedding_size_ = (embedding_size_ + tp_size_ - 1) / tp_size_ * tp_size_;
         TM_LOG_WARNING("pad embed size from %d to %d", embedding_size_, embedding_size_);
@@ -159,17 +167,34 @@ void LlamaWeight::initialize()
         hidden_units_,
         tp_size_);
 
-    pre_decoder_embedding.emplace(embedding_size_, hidden_units_ / tp_size_, data_type_, false, data_type_, 1);
+    const int    embedding_rows = vocab_size_padded_;
+    const int    embedding_cols = hidden_units_ / tp_size_;
+    const double bytes_per_val  = static_cast<double>(byte_size(data_type_, 256)) / 256.0;
+
+    pre_decoder_embedding.emplace(embedding_rows, embedding_cols, data_type_, false, data_type_, 1);
     post_decoder_embedding.emplace(hidden_units_, vocab_size_padded_ / tp_size_, data_type_, false, data_type_, 1);
 
     TM_LOG_WARNING("[LlamaWeight] pre_decoder_embedding: rows=%d cols=%d dtype=%d",
-                   embedding_size_,
-                   hidden_units_ / tp_size_,
+                   embedding_rows,
+                   embedding_cols,
                    static_cast<int>(data_type_));
     TM_LOG_WARNING("[LlamaWeight] post_decoder_embedding: rows=%d cols=%d dtype=%d",
                    hidden_units_,
                    vocab_size_padded_ / tp_size_,
                    static_cast<int>(data_type_));
+
+    const auto expected_emb_elems = static_cast<size_t>(embedding_rows) * static_cast<size_t>(embedding_cols);
+    const auto expected_emb_bytes = static_cast<size_t>(byte_size(data_type_, expected_emb_elems));
+    const auto actual_emb_bytes   = static_cast<size_t>(pre_decoder_embedding.weight.byte_size());
+    TM_LOG_WARNING(
+        "[LlamaWeight] pre_decoder_embedding_alloc: rows=%d cols=%d dtype=%d expected_bytes=%zu actual_bytes=%zu "
+        "bytes_per_val=%.4f",
+        embedding_rows,
+        embedding_cols,
+        static_cast<int>(data_type_),
+        expected_emb_bytes,
+        actual_emb_bytes,
+        bytes_per_val);
 
     log_tensor_footprint("pre_decoder_embedding_device_alloc", pre_decoder_embedding.weight);
     log_tensor_footprint("post_decoder_embedding_device_alloc", post_decoder_embedding.weight);
@@ -282,6 +307,16 @@ void LlamaWeight::prepare(const cudaDeviceProp& prop)
     check_tensor_capacity("post_decoder_embedding_device", post_decoder_embedding.weight);
 
     post_decoder_embedding.prepare();
+
+    const auto emb_bytes     = static_cast<size_t>(pre_decoder_embedding.weight.byte_size());
+    const double bytes_per_row =
+        vocab_size_padded_ > 0 ? static_cast<double>(emb_bytes) / static_cast<double>(vocab_size_padded_) : 0.0;
+    TM_LOG_WARNING("[EmbeddingSanity] vocab=%d hidden=%d dtype=%d alloc_bytes=%zu bytes_per_row=%.2f",
+                   vocab_size_padded_,
+                   hidden_units_,
+                   static_cast<int>(data_type_),
+                   emb_bytes,
+                   bytes_per_row);
 
     // Block until processing is done
     check_cuda_error(cudaStreamSynchronize(stream));
