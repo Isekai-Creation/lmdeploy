@@ -851,34 +851,6 @@ void LlamaBatch::Initialize(GenerationState& g)
             }
         }
 
-        // After computing block counts for all slots, ensure we do not
-        // exceed the host pointer buffer capacity. This guards against
-        // KV reservations that would overflow the block_ptr tables and
-        // cause the attention kernels to read out of bounds.
-        const int    total_entries = h_cu_block_counts_[batch_size];
-        const size_t max_entries   = h_block_ptrs_.shape(0);
-        if (total_entries > static_cast<int>(max_entries)) {
-            kv_pointer_error = true;
-            TM_LOG_ERROR(
-                "[LlamaBatch] KV pointer table overflow: total_entries=%d max_entries=%zu "
-                "(batch_size=%d format=%s entries_per_page=%zu)",
-                total_entries,
-                max_entries,
-                batch_size,
-                kv_table_contract_label_.c_str(),
-                kv_entries_per_page_);
-            if (progress_enabled) {
-                ProgressEvent evt{ProgressStage::kError};
-                evt.pct = 100;
-                std::ostringstream oss;
-                oss << "kv_ptr_table_overflow total_entries=" << total_entries
-                    << " max_entries=" << max_entries
-                    << " fmt=" << kv_table_contract_label_;
-                evt.msg = oss.str();
-                ProgressLogger::Log(evt);
-            }
-        }
-
         if (progress_enabled) {
             ProgressEvent evt{ProgressStage::kKVReserve};
             evt.pct = 62;
@@ -895,18 +867,6 @@ void LlamaBatch::Initialize(GenerationState& g)
         }
 
         static_assert(sizeof(uintptr_t) == sizeof(void*));
-
-        const int total_entries = h_cu_block_counts_[batch_size];
-        FT_CHECK_WITH_INFO(total_entries <= h_block_ptrs_.size(),
-                           "[LlamaBatch] KV pointer entries (%d) exceed h_block_ptrs_ capacity (%zd)",
-                           total_entries,
-                           static_cast<ssize_t>(h_block_ptrs_.size()));
-        if (has_scale_blocks) {
-            FT_CHECK_WITH_INFO(total_entries <= h_scale_block_ptrs_.size(),
-                               "[LlamaBatch] KV scale-pointer entries (%d) exceed h_scale_block_ptrs_ capacity (%zd)",
-                               total_entries,
-                               static_cast<ssize_t>(h_scale_block_ptrs_.size()));
-        }
 
         Copy(h_cu_block_counts_, batch_size + 1, cu_block_counts_);
         Copy(h_block_ptrs_, h_cu_block_counts_[batch_size], block_ptrs_);

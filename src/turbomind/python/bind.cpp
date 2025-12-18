@@ -460,11 +460,23 @@ public:
 
     void shutdown()
     {
+        // First, request a clean engine shutdown so the worker loop
+        // and any in-flight requests can drain.
         if (engine) {
             engine->shutdown();
         }
+        // Ensure the worker thread is joined before any resources
+        // (especially the Gateway and its internal signal thread) are
+        // destroyed to avoid std::terminate due to joinable threads.
         if (worker_thread.joinable()) {
             worker_thread.join();
+        }
+        // Explicitly shut down the Gateway so its internal signal
+        // thread is joined before the shared pointer goes out of
+        // scope. Relying on the Gateway destructor alone would cause
+        // std::terminate if the thread is still joinable.
+        if (gateway) {
+            gateway->shutdown();
         }
         engine.reset();
         llama_batch.reset();

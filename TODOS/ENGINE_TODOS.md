@@ -1,17 +1,148 @@
 # LMDeploy / TurboMind Engine TODOs (GPT‑OSS‑120B, Non‑Speculative)
 
-Progress values are approximate and based on current code + docs:
+> Progress values are approximate and based on current code + docs:
+>
+> - `0–30%` – mostly design / scaffolding only.  
+> - `30–70%` – partially implemented, needs correctness/perf work.  
+> - `70–100%` – functionally present, needs polishing/validation at the upper end.  
+>
+> Scope of this file:
+>
+> - Focuses on **pure GPT‑OSS‑120B decoding** (no speculative decoding / no EAGLE3).  
+> - EAGLE/EAGLE3/SpecPV‑specific work is tracked in `EAGLE_TODOS.md` and `SPECPV_TODO.md`.  
+>
+> Every task below is a **numbered checkbox** with a progress estimate.
 
-- `0–30%` – mostly design / scaffolding only.  
-- `30–70%` – partially implemented, needs correctness/perf work.  
-- `70–100%` – functionally present, needs polishing/validation at the upper end.  
+---
 
-Scope of this file:
+## 0.0 DriftEngine HF GPT‑OSS‑20B Status Snapshot (2025‑12‑18)
 
-- Focuses on **pure GPT‑OSS‑120B decoding** (no speculative decoding / no EAGLE3).  
-- EAGLE/EAGLE3/SpecPV‑specific work is tracked in `EAGLE_TODOS.md` and `SPECPV_TODO.md`.  
+Concrete implementation status for the non‑spec, TP=1 DriftEngine path
+running HF `openai/gpt‑oss‑20b` (and re‑usable for GPT‑OSS‑120B):
 
-Every task below is a **numbered checkbox** with a progress estimate.
+- ✅ **DriftEngine C++ core (ctor, worker loop, bindings) – ~95% IMPLEMENTED**
+  - `DriftEngine` composes `Gateway`, `KVCacheManager`, `PrefixCache`,
+    `CapacityScheduler`, and `EngineScheduler`.
+  - Worker loop uses `scheduler_->on_new_requests`, `schedule_step`,
+    `batch_executor_` (LlamaBatch executor mode), and
+    `on_step_executed` for feedback.
+  - Progress tracing is always enabled for Drift (`ForceEnableForDrift`)
+    and a crash handler dumps recent `[DRIFT][PROG]` events on
+    `SIGABRT`/`SIGSEGV`/`std::terminate`.
+  - **Needs testing:** full PREFILL→DECODE→FINISHED lifecycle on HF
+    20B/120B under long‑context + batched workloads.
+
+- ✅ **KV cache manager, layout, and capacity guardrails – ~90% IMPLEMENTED**
+  - `KVCacheManager` manages a single contiguous device KV buffer with
+    correct `page_bytes_` sizing (layers × KV heads × head_dim ×
+    page_size × bytes_per_value × 2 for K+V).
+  - Per‑page refcounts, per‑sequence page lists, and
+    `reserve`/`release`/`estimate_usage` are implemented together with
+    `KVUsageEstimate::bytes_needed`.
+  - `DriftEngine` auto‑derives `kv_capacity_bytes` from
+    `TM_CACHE_MAX_ENTRY_COUNT` and free device memory, with a clamp and
+    reserved headroom, so users do **not** have to set
+    `kv_capacity_bytes` explicitly.
+  - **Needs testing:** stress runs on HF 20B/120B to validate that KV
+    usage stays within capacity and that no OOM/deadlock appears under
+    tight budgets.
+
+- ✅ **PrefixCache & prefix reuse – ~80% IMPLEMENTED**
+  - `PrefixCache` stores page‑aligned token prefixes only, with LRU
+    eviction and metrics (hits/misses/evictions/bytes_evicted).
+  - Integration with `EngineScheduler` is in place: prefix matches seed
+    `prefilled_len` and pre‑existing KV pages, inserts happen after
+    prefill completes.
+  - Prefix cache never calls `KVCacheManager::release`; KV ownership is
+    centralized in `CapacityScheduler` / `EngineScheduler`.
+  - **Needs testing:** synthetic workloads with shared prefixes and
+    eviction to validate shared‑page refcounts and reuse.
+
+- ✅ **Scheduler, CapacityScheduler, and sequence lifecycle – ~85% IMPLEMENTED**
+  - `SchedulerConfig` (token/seq budgets, chunked prefill knobs,
+    `prefer_decode_over_prefill`) and `EngineScheduler` implement
+    chunked prefill (`PrefillChunk`), decode scheduling, and phase
+    transitions (`kPrefill`→`kDecode`→`kFinished`).
+  - `CapacityScheduler` uses `KVUsageEstimate` + `KVCacheManager` to
+    admit/finish requests and tracks blocked/rejected metrics.
+  - `on_step_executed` consumes `ExecutionResult` deltas; missing or
+    non‑positive deltas are treated as hard errors (no synthetic
+    progress).
+  - **Needs testing:** mixed prompt/batch workloads on HF 20B/120B to
+    verify PREFILL/DECODE balance, capacity rejections, and single KV
+    release per sequence.
+
+- ✅ **LlamaBatch executor mode + Drift KV bridge – ~85% IMPLEMENTED**
+  - `LlamaBatch::bridge_kv_cache_manager` attaches `KVCacheManager` and
+    `PrefixCache` into a `DriftEngineKVCache` and switches to executor
+    mode (no internal `Start()` thread, no CUDA graphs).
+  - KV pointer tables are built from Drift KV pages using
+    `build_page_ptr_table`, and `install_kv_table` logs pages/ptrs and
+    format (`TM_DRIFT_KV_TABLE_FORMAT=per_page|kv_split`).
+  - `ExecuteScheduled` goes through `InitializeFromScheduler` →
+    `Forward` (wrapped in try/catch with `forward_exception` logs) →
+    `Finish` → `build_execution_results`.
+  - KV canary hooks (`TM_DRIFT_KV_CANARY`) are present for K/V regions
+    but need runtime validation on HF 20B/120B.
+
+- ✅ **ProgressLogger + crash ring buffer – ~95% IMPLEMENTED**
+  - Unified `[DRIFT][PROG]` events for enqueue, KV reserve, prefill,
+    decode, sampling, callbacks, finish, and release.
+  - Ring buffer of last 512 events and crash handlers for signals and
+    `std::terminate` dump progress on abnormal exits.
+  - New C++ paths (DriftEngine, Gateway, LlamaBatch executor, pybind
+    wrappers) all emit stage‑specific events.
+  - **Needs testing:** sampling a full 0→100% trace for a single HF 20B
+    request and verifying it is sufficient for post‑mortem debugging.
+
+- ✅ **Pybind DriftEngineWrapper & Gateway lifetime – ~90% IMPLEMENTED**
+  - DriftEngineWrapper parses dict configs, constructs `DriftEngine`,
+    binds a real `LlamaBatch`, and starts the worker thread.
+  - `run(rank)` installs a proper CUDA context/Stream/Allocator and
+    catches/logs any `std::exception` from `engine->run`.
+  - **Newly implemented:** `shutdown()` now:
+    - calls `engine->shutdown()`, joins `worker_thread` if joinable,  
+    - calls `gateway->shutdown()` **before** resetting the shared
+      pointer, ensuring the Gateway’s internal `signal_thread_` is
+      joined,  
+    - then resets `engine`, `llama_batch`, `gateway`, `kv_mgr`,
+      `prefix_cache`.
+    - This removes the `std::terminate` risk from destructing a
+      joinable `std::thread` (the source of the earlier
+      “terminate called without an active exception” on Kaggle).
+  - `forward(...)` allocates CPU output buffers, logs a
+    `[DRIFT][PROG] stage=RequestEnqueue msg="pybind_submit"`, and
+    pushes the request into `Gateway`.
+  - **Needs testing:** repeated pipeline create/destroy cycles to
+    confirm no terminate() from Gateway/worker threads.
+
+- ✅ **AsyncEngine backend_config wiring for drift – ~90% IMPLEMENTED**
+  - AsyncEngine now sets:
+    ```python
+    engine_cfg = getattr(self.engine, "engine_config", None)
+    self.backend_config = engine_cfg or backend_config
+    ```
+    so drift/TurboMind always have a valid `backend_config` (and avoid
+    `NoneType.max_batch_size` errors) even if `engine.engine_config` is
+    not populated in some error paths.
+  - Drift backend selection in `lmdeploy/api.py` uses
+    `backend_config is DriftEngineConfig` ⇒ `backend="drift"`.
+  - **Needs testing:** HF 20B drift pipeline creation via
+    `lmdeploy.api.pipeline` and `AsyncEngine` with various configs.
+
+- ✅ **Benchmark harness (HF GPT‑OSS‑20B drift mode) – ~85% IMPLEMENTED**
+  - `LM/lmdeploy_drift/benchmark_speculative.py` now constructs a
+    `DriftEngineConfig` (non‑spec, TP=1, BF16, session_len from
+    scenario) and calls `lmdeploy.pipeline(..., backend_config=cfg)`,
+    thereby selecting the drift backend.
+  - `run_spec_suite.sh` in `lmdeploy_drift` has drift baseline
+    scenarios wired for HF 20B (and 120B later).
+  - **Needs testing:** actual drift runs producing non‑zero tokens/sec
+    and latencies (user‑driven on RTX PRO 6000 / Kaggle H100).
+
+The rest of this file keeps the original per‑task TODO structure, but
+the above snapshot clarifies which major DriftEngine components are
+implemented vs. waiting on validation.
 
 ---
 
