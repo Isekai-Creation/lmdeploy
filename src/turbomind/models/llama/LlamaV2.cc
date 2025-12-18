@@ -2467,6 +2467,13 @@ void LlamaV2::Forward(Buffer_<int>     input_ids,
 
         input_embeds = Tensor{{token_num, (int)hidden_units_}, dtype_, kDEVICE};
 
+        if (tp_rank_ == 0) {
+            TM_LOG_INFO("[LlamaV2][Drift] embedding_lookup: rows=%d cols=%d token_num=%d",
+                        embedding_table.shape(0),
+                        embedding_table.shape(1),
+                        token_num);
+        }
+
         if (tp_size_ == 1) {
             invokeEmbeddingLookup(input_embeds, input_ids, embedding_table, stream_);
             sync_check_cuda_error();

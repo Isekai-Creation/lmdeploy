@@ -772,6 +772,18 @@ std::shared_ptr<Engine> LlamaTritonModel::createDriftEngine(int                 
                                            engine_param.max_batch_size,
                                            weights_[device_id]);
 
+    TM_LOG_WARNING(
+        "[DriftEngine] embedding/layout summary: vocab=%d embed=%d hidden=%d kv_heads=%d head_dim=%d "
+        "cache_block_seq_len=%d kv_page_size_cfg=%d quant_policy=%d",
+        model_param_.vocab_size,
+        model_param_.embedding_size,
+        model_param_.hidden_units,
+        model_param_.kv_head_num,
+        model_param_.head_dim,
+        attn_param_.cache_block_seq_len,
+        engine_param.kv_block_len,
+        model_param_.quant_policy);
+
     h_comm->Sync();
 
     const int dp_rank = engine_param.outer_dp_rank * engine_param.attn_dp_size + engine_param.attn_dp_rank;

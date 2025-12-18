@@ -327,6 +327,15 @@ class TurboMind:
                 num_kv = getattr(tm_model_cfg, "kv_head_num", None)
                 head_dim = getattr(tm_model_cfg, "size_per_head", None)
                 page_size = getattr(tm_model_cfg, "cache_block_seq_len", None)
+                if page_size is None:
+                    attn_cfg = getattr(self.config, "attention_config", None)
+                    if attn_cfg is not None:
+                        page_size = getattr(attn_cfg, "cache_block_seq_len", None)
+                if page_size is None:
+                    try:
+                        page_size = (self.config_dict or {}).get("attention_config", {}).get("cache_block_seq_len")
+                    except Exception:
+                        page_size = None
                 # Attach overrides onto the DriftEngineConfig instance
                 # so to_cpp_drift_engine_config can surface them into
                 # the C++ DriftEngineConfig when present.

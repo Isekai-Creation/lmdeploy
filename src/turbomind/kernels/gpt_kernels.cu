@@ -86,6 +86,13 @@ void invokeEmbeddingLookup(Ref<Tensor>         out_,
                 local_vocab,
                 num,
                 sample);
+            // DriftEngine must never proceed with an embedding table that
+            // cannot cover the incoming token ids. Turn this into a hard
+            // failure so we catch the root cause (wrong embedding buffer or
+            // truncated vocab) instead of crashing later inside the kernel.
+            TM_CHECK(max_id < local_vocab && min_id >= 0)
+                << "[EmbeddingLookup][DriftGuard] token id out of range: min=" << min_id << " max=" << max_id
+                << " local_vocab=" << local_vocab << " num_tokens=" << num << " sample=" << sample;
         }
     }
 
