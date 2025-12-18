@@ -295,7 +295,27 @@ KVLayout DriftEngine::derive_kv_layout(const ModelLayout& model_layout, const KV
     kv.num_layers      = kv.num_layers > 0 ? kv.num_layers : model_layout.num_layers;
     kv.num_kv_heads    = kv.num_kv_heads > 0 ? kv.num_kv_heads : model_layout.num_kv_heads;
     kv.head_dim        = kv.head_dim > 0 ? kv.head_dim : model_layout.head_dim;
-    kv.page_size       = kv.page_size > 0 ? kv.page_size : model_layout.page_size;
+
+    // For DriftEngine v1, treat the ModelLayout page_size (derived
+    // from TurboMind's cache_block_seq_len) as the canonical KV block
+    // length. If Python passed a conflicting kv.page_size (e.g. legacy
+    // defaults such as 256), override it here so that Drift KV pages
+    // map 1:1 to the attention block geometry expected by the
+    // kernels.
+    if (model_layout.page_size > 0) {
+        if (kv.page_size > 0 && kv.page_size != model_layout.page_size) {
+            TM_LOG_WARNING(
+                "[DriftEngine] Overriding KVLayout.page_size=%d with ModelLayout.page_size=%d to match "
+                "TurboMind cache_block_seq_len.",
+                kv.page_size,
+                model_layout.page_size);
+        }
+        kv.page_size = model_layout.page_size;
+    }
+    else {
+        kv.page_size = kv.page_size > 0 ? kv.page_size : model_layout.page_size;
+    }
+
     kv.kv_dtype        = kv.kv_dtype != KVDataType::kFP16 ? kv.kv_dtype : model_layout.kv_dtype;
     kv.bytes_per_value = kv.bytes_per_value > 0 ? kv.bytes_per_value : bytes_per_value_from_dtype(kv.kv_dtype);
 
