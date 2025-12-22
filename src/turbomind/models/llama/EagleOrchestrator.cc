@@ -117,9 +117,18 @@ void EagleOrchestrator::setChoices(const std::vector<std::vector<int>>& choices)
     total_successors_ = static_cast<int>(h_succ_counts.size());
     
     // Free existing buffers if they were previously allocated
-    if (d_path_indices_) cudaFree(d_path_indices_);
-    if (d_successor_offsets_) cudaFree(d_successor_offsets_);
-    if (d_successor_counts_) cudaFree(d_successor_counts_);
+    if (d_path_indices_) {
+        cudaFree(d_path_indices_);
+        d_path_indices_ = nullptr;
+    }
+    if (d_successor_offsets_) {
+        cudaFree(d_successor_offsets_);
+        d_successor_offsets_ = nullptr;
+    }
+    if (d_successor_counts_) {
+        cudaFree(d_successor_counts_);
+        d_successor_counts_ = nullptr;
+    }
 
     cudaMalloc(&d_path_indices_, h_path_indices.size() * sizeof(int));
     cudaMemcpy(d_path_indices_, h_path_indices.data(), h_path_indices.size() * sizeof(int), cudaMemcpyHostToDevice);
