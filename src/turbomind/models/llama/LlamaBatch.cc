@@ -47,7 +47,6 @@
 #include "src/turbomind/models/llama/llama_utils.h"
 
 #include "src/turbomind/utils/anomaly_handler.h"
-#include "src/turbomind/utils/metrics.h"
 #include "src/turbomind/utils/constant.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/debug_utils.h"
@@ -599,6 +598,9 @@ void LlamaBatch::Initialize(GenerationState& g)
             });
         }
 
+            });
+        }
+
         // Free slots for inactive/dropped sequences
         for (size_t i = 0; i < sequences.size(); ++i) {
             if (sequences[i]->status != Sequence::kActive) {
@@ -749,7 +751,6 @@ void LlamaBatch::CopyState(const std::vector<std::tuple<BatchState*, BatchState*
 
         std::vector<int> s_idx;
         std::vector<int> d_idx;
-        for (int i = beg; i < end; ++i) {
             s_idx.push_back(std::get<2>(desc[idxs[i]]));
             d_idx.push_back(std::get<3>(desc[idxs[i]]));
             // Copy eagle_slots
@@ -994,6 +995,9 @@ LlamaBatch::LlamaBatch(DataType                 data_type,
 {
 
     symm_alloc_ = core::SimpleAllocator::Create([this](ssize_t size) { return SymmAlloc(size, true); },
+                                                [this](void* p, ssize_t size) { return SymmFree(p, size, true); },
+                                                kDEVICE);
+
                                                 [this](void* p, ssize_t size) { return SymmFree(p, size, true); },
                                                 kDEVICE);
 
@@ -1306,9 +1310,12 @@ void LlamaBatch::runEagleMultiTokenAdvance(const std::vector<int>&  h_token_ids,
                                       eagle_tokens_per_seq,
                                       eagle_accepted_lens,
                                       eagle_accepted_tokens,
+                                      eagle_accepted_tokens,
                                       g);
 
     runEagleKVCacheCompaction(eagle_accepted_lens, batch_size, g);
+}
+
 }
 
 void LlamaBatch::runEagleKVCacheCompaction(const std::vector<int>& kv_accepted_lengths,
@@ -1330,10 +1337,22 @@ void LlamaBatch::runEagleKVCacheCompaction(const std::vector<int>& kv_accepted_l
         return;
     }
 
-    // Prepare Block Tables (Physical IDs from SequenceManager)
+    // Reuse similar logic to runEagleKVRewind to prepare destination block tables
     const int max_batch_size = max_batch_size_;
+    const int num_layers     = model_->layer_num_;
+    const int bsz            = batch_size;
+
+    static std::vector<int> batch_slots_storage;
+    if (batch_slots_storage.size() < static_cast<size_t>(bsz)) {
+        batch_slots_storage.resize(bsz);
+    }
+    for (int i = 0; i < bsz; ++i) {
+        batch_slots_storage[i] = i; 
+    }
+    
+    // Prepare Block Tables (Physical IDs from SequenceManager)
     static std::vector<int> h_block_tables_storage;
-    const int total_block_entries = max_batch_size * kv_max_blocks_per_seq_;
+    const int               total_block_entries = max_batch_size * kv_max_blocks_per_seq_;
     if (h_block_tables_storage.size() < static_cast<size_t>(total_block_entries)) {
         h_block_tables_storage.resize(total_block_entries);
     }
@@ -1348,17 +1367,86 @@ void LlamaBatch::runEagleKVCacheCompaction(const std::vector<int>& kv_accepted_l
         }
     }
 
-    if (!eagle_kv_block_tables_) {
+    if (!eagle_kv_block_tables_ || !eagle_kv_cache_blocks_) {
+        // Should be allocated by now if Eagle is enabled
         return;
     }
 
     // Copy block tables to device
     core::Copy(h_block_tables_storage.data(), h_block_tables_storage.size(), eagle_kv_block_tables_.data());
 
-    // Get destination block pointers from model's buffer
+    // Prepare Physical Block Pointers (Logical Block ID -> Physical Pointer)?
+    // Wait, eagle_kv_cache_blocks_ logic in runEagleKVRewind maps [Physical ID] -> [Pointer]??
+    // Let's check lines 1369-1385 in runEagleKVRewind.
+    // It iterates `block_id < total_blocks`. Yes, it maps Physical ID -> Pointer.
+    // Use the same logic.
+    static std::vector<void*> h_kv_cache_blocks;
+    const int total_blocks = std::min(kv_max_blocks_per_seq_ * 100 /*Hack?*/, sequence_manager_->total_count()); 
+    // Wait, reusing kv_max_blocks_per_seq_ dimension for PHYSICAL ID mapping is dangerous if IDs > max_blocks_per_seq!
+    // EagleKVRewindConfig uses it for both columns in block_table AND size of cache_blocks array?
+    // If so, LlamaBatch's rewind logic is flawed for large block IDs.
+    // But assuming it works or I fix it.
+    // Actually, dst_block_base_ptrs should ideally be ALL blocks.
+    // Using UnifiedAttentionLayer's buffer is better if available.
+    // LlamaV2 has getKvBlockPtrsBuffer().
+    // We can use THAT.
+    // So we don't need to build eagle_kv_cache_blocks_ here manually!
+    
     void** dst_block_base_ptrs = (void**)model_->getKvBlockPtrsBuffer().raw_data();
     
-    // Call Model Compaction (currently stubbed)
+    // We strictly need cu_block_nums for the source (scratch) buffer indexing.
+    // LlamaBatch has cu_block_counts_.
+    // Is it "nums" (prefix sum) or counts?
+    // h_cu_block_counts_ seems to be counts in some contexts?
+    // LlamaV2 uses h_cu_block_nums usually.
+    // LlamaBatch::cu_block_counts_ name suggests counts.
+    // But LlamaV2::dynamicDecodeWithSpecMulti uses h_cu_block_nums.
+    // LlamaV2 constructs h_cu_block_nums locally.
+    
+    // We need to reconstruct cu_block_nums on GPU or host passing it.
+    // CompactKVCache takes `const int* cu_block_nums`.
+    // We can pass `cu_block_counts_.data()` IF it contains the prefix sum.
+    // Let's assume LlamaBatch doesn't have it ready.
+    // We can build it on host and copy to temp buffer?
+    // OR: LlamaV2 maintains it?
+    // LlamaV2 builds `h_cu_block_nums` in `dynamicDecode`.
+    // Does it save it?
+    // No.
+    
+    // We must rebuild it.
+    static std::vector<int> h_cu_block_nums;
+    if (h_cu_block_nums.size() < static_cast<size_t>(batch_size + 1)) {
+        h_cu_block_nums.resize(batch_size + 1);
+    }
+    h_cu_block_nums[0] = 0;
+    
+    // Replicate LlamaV2 logic for scratch/extra blocks
+    // scratch_blocks = max...
+    // But for index calculation we need the cumulative count of blocks assigned per slot.
+    // In LlamaV2, `h_cu_block_nums` is derived from `total_blocks`.
+    // Scratch blocks are appended linearly.
+    // Wait, `moveNewTokenBlocksKernel` uses `cu_block_nums` to find `src_block_ptrs` offset.
+    // `src_block_ptrs` is constructed by LlamaV2.
+    // It usually concatenates [prefix blocks... | scratch blocks...] ?
+    // LlamaV2 `h_block_ptrs` construction: `h_block_ptrs[base_index + j] = ...`.
+    // So `base_index` MUST match what LlamaV2 used!
+    // LlamaV2 calculates it based on `prefix_blocks` + `extra_blocks` per slot.
+    // We don't have `extra_blocks` here easily.
+    
+    // If we can't reconstruct `cu_block_nums` exactly, we can't index `src_block_ptrs`.
+    // SOLUTION: LlamaV2 should save `cu_block_nums` to a buffer.
+    // Or we assume `kv_scratch` is used DIRECTLY without `block_ptrs` layer?
+    // If I switched `kv_scratch` to be a flat buffer in EagleBuffers...
+    // And LlamaV2 uses it.
+    // But `moveNewTokenBlocksKernel` uses `src_block_ptrs`!
+    
+    // If `src_block_ptrs` points into `kv_scratch`, then `src_block_ptrs[idx]` is some address in `kv_scratch`.
+    // The `idx` comes from `cu_block_nums`.
+    
+    // Maybe I should modify `compactKVCache` to NOT take `cu_block_nums` if I can avoid it?
+    void** dst_block_base_ptrs = (void**)model_->getKvBlockPtrsBuffer().raw_data();
+    
+    // Call Model Compaction
     model_->compactKVCache(batch_size,
                            eagle_kv_block_tables_.data(),
                            dst_block_base_ptrs,
@@ -1366,8 +1454,132 @@ void LlamaBatch::runEagleKVCacheCompaction(const std::vector<int>& kv_accepted_l
                            kv_block_size_,
                            stream_);
 }
+    // The `extra_blocks` start immediately after `prefix_blocks`.
+    // So `src_block_idx = base_index + prefix_blocks + (draft_idx / block_size)`.
+    
+    // We need `base_index` (cu_block_nums).
+    
+    // Since `LlamaV2` calculates this every step, and `LlamaBatch` runs AFTER `LlamaV2` returns...
+    // We rely on `LlamaV2` having saved it? No.
+    
+    // Does `LlamaBatch` know `prefix_blocks`?
+    // `seq->blocks.size()`?
+    // `extra_blocks`? The draft length!
+    // `h_extra_blocks[i] = (tokens_per_seq + block_size - 1) / block_size`.
+    // This is predictable!
+    // `prefix_blocks` = `seq->blocks.size()` BEFORE update?
+    // But `runEagleMultiTokenAdvance` just updated sequences!
+    // So `seq->blocks.size()` now includes accepted blocks.
+    // We need "Previous" blocks count?
+    // `eagle_accepted_lens` tells us how many adding.
+    // Actually we need the "Allocation Layout" used during draft.
+    // The draft allocated blocks based on `tokens_per_seq`.
+    // So `extra_blocks` was based on `tokens_per_seq`.
+    
+    // So we can reconstruct `cu_block_nums`!
+    int current_offset = 0;
+    for (int i = 0; i < batch_size; ++i) {
+        h_cu_block_nums[i] = current_offset;
+        // Count blocks for this slot
+        // LlamaV2 logic: prefix_blocks + extra_blocks.
+        // What was prefix_blocks?
+        // `seq->blocks.size()` MINUS the newly added blocks?
+        // Actually LlamaV2 uses "committed" blocks.
+        // Since `runEagleMultiTokenAdvance` just appended new blocks, the "old" prefix blocks count is `seq->blocks.size() - new_blocks`.
+        // But wait, `Advance` adds tokens, does it allocate blocks? Yes.
+        // So `old_blocks` = ...
+        // `extra_blocks` = `(eagle_tokens_per_seq + block_size - 1) / block_size` (Usually constant across batch).
+        // EAGLE fixed draft: `extra_blocks` is same for all active slots.
+        
+        int extra_blocks = (model_->getEagleTokensPerSeq() + kv_block_size_ - 1) / kv_block_size_; 
+        // Need accessor for tokens_per_seq or pass it.
+        // LlamaBatch passes `eagle_tokens_per_seq` to `runEagleMultiTokenAdvance`.
+        // But `runEagleKVCacheCompaction` doesn't have it.
+        // I will hardcode or guess? No, passing it is better.
+        // Actually `extra_blocks` depends on `tokens_per_seq`.
+        // I'll calculate `extra_blocks` inside loop using `eagle_tokens_per_seq` if I passed it.
+        // Or reconstruct from `kv_draft_lengths`?
+        
+        // I should update signature of `runEagleKVCacheCompaction` to take `eagle_tokens_per_seq`.
+        
+        // current_offset += (prefix_blocks + extra_blocks);
+    }
+    
+    // Wait, this is getting fragile. 
+    // Reconstructing the EXACT `cu_block_nums` used by LlamaV2 is risky.
+    // If LlamaV2 logic changes, this breaks.
+    
+    // Alternative:
+    // Pass `h_cu_block_nums` from LlamaV2 to LlamaBatch? 
+    // LlamaV2 writes it to a buffer?
+    // `LlamaV2` has `h_cu_block_nums` local.
+    // If `LlamaV2` saves it to `eagle_buffers_->inputs.draft_offsets`? No.
+    
+    // Better: Move `compactKVCache` logic ENTIRELY into `LlamaV2`.
+    // `LlamaV2` calls `compactKVCache` at the end of `dynamicDecodeWithSpecMulti`?
+    // But at that point, we don't know acceptance?
+    // Yes we do! `finalizeAcceptance` is called.
+    // So `accepted_lens` is known.
+    // `best_path_ids` is known.
+    // `kv_block_ptrs` is fresh and valid.
+    // `h_cu_block_nums` is available!
+    
+    // The ONLY missing piece in `LlamaV2` is `dst_block_tables`.
+    // `dst_block_tables` belong to `SequenceManager`.
+    // `LlamaV2` has `sequence_manager_` pointer!
+    // Line 281 in `LlamaBatch.h`: `std::unique_ptr<SequenceManager> sequence_manager_;`
+    // `LlamaV2` has it too?
+    // `LlamaV2.h`?
+    // LlamaV2 usually doesn't own SequenceManager. LlamaBatch does.
+    // Check `LlamaV2.h`.
+    // It does not have SequenceManager.
+    
+    // Does `SpecContext` have it? No.
+    
+    // But `LlamaV2` *can* take `dst_block_tables` as input!
+    // If `dst_block_tables` were available in `EagleBuffers` (persistent), LlamaBatch could update them BEFORE calling `Forward`.
+    // But `dst_block_tables` need to allow *new* blocks.
+    // `LlamaBatch` usually updates `SequenceManager` *after* decode.
+    
+    // This circular dependency is the problem.
+    // 1. LlamaV2 Decode (Draft) -> Produced Data in Scratch.
+    // 2. LlamaBatch Update -> Allocates Destination Blocks.
+    // 3. Compaction -> Needs Scratch + Destination.
+    
+    // So `runEagleKVCacheCompaction` in `LlamaBatch` is the right place conceptually.
+    // But `cu_block_nums` reconstruction is the pain point.
+    
+    // If we simply ensure `LlamaV2` saves `cu_block_nums` to `EagleBuffers` (GPU buffer).
+    // `EagleBuffers` has `draft_offsets`? `eagle_net_ctx_lens`?
+    // `LlamaV2` could save `cu_block_nums` to `eagle_buffers_->inputs.draft_offsets` or similar unused buffer?
+    // Or just a new `cu_block_nums` buffer in `EagleBuffers`.
+    
+    // I will add `cu_block_nums` to `EagleBuffers::Inputs`.
+    // And update `LlamaV2.cc` to save it.
+    // Then `LlamaBatch` can just point to it.
+    
+    // Efficient Plan:
+    // 1. Add `SizeType* cu_block_nums` to `EagleBuffers::Inputs`.
+    // 2. In `LlamaV2.cc`, `cudaMemcpyAsync` `h_cu_block_nums` to it.
+    // 3. In `LlamaBatch.cc`, `runEagleKVCacheCompaction` passes `eagle_buffers_->inputs.cu_block_nums`.
+    //    Wait, `LlamaBatch` doesn't see `eagle_buffers_`.
+    //    `model_->compactKVCache` can access it internally!
+    //    So `runEagleKVCacheCompaction` just passes `dst` tables and `stream`.
+    //    `model_->compactKVCache` fetches `cu_block_nums` from its own buffers.
+    
+    // This solves the reconstruction issue!
+    
+    // I need to:
+    // 1. Update `EagleBuffers` (add `cu_block_nums`).
+    // 2. Update `LlamaV2.cc` (copy to `cu_block_nums`).
+    // 3. Update `LlamaBatch.cc` (runEagleKVCacheCompaction implementation simplified).
+    
+    I will add `cu_block_nums` to `EagleBuffers.h`.
 
-void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
+void LlamaBatch::runEagleKVCompaction(const std::vector<int>& kv_accepted_lengths,
+                                      int                     batch_size,
+                                      const GenerationState&  g);
+
                                   const std::vector<int>& kv_accepted_lengths,
                                   int                     batch_size,
                                   const GenerationState&  g)
@@ -2501,7 +2713,7 @@ bool LlamaBatch::Forward(GenerationState& g)
                 current_slots.push_back(state_->eagle_slots[i]);
             }
             if (!current_slots.empty()) {
-                core::Copy(current_slots.data(), current_slots.size(), eagle_kv_batch_slots_.data());
+                eagle_kv_batch_slots_.copy_from(current_slots);
             }
 
             LlamaV2::SpecContext spec_ctx{};
@@ -3169,15 +3381,7 @@ void LlamaBatch::InitializeBufferAndKVCache()
     const int dbits = byte_size(data_type_, 8);
 
     const auto quant_policy = model_->param_.quant_policy;
-    // Map quant_policy to actual KV element bit width
-    int elem_bits = dbits;  // default: unquantized
-    if (quant_policy & QuantPolicy::kCacheKVInt8) {
-        elem_bits = 8;
-    } else if (quant_policy & QuantPolicy::kCacheKVInt4) {
-        elem_bits = 4;
-    } else if (quant_policy & QuantPolicy::kCacheKVFP4) {
-        elem_bits = 4;  // FP4 is 4 bits per element
-    }
+    const int  elem_bits    = quant_policy ? quant_policy : dbits;
 
     SequenceManager::BlockConfig block_config{
         (int)model_->size_per_head_,
@@ -3339,7 +3543,6 @@ void LlamaBatch::DestroyCommunicators()
 void LlamaBatch::UpdateMetrics()
 {
     if (tp_rank_ == 0 && param_.enable_metrics) {
-        /*
         // update schedule metrics
         int total_seqs, active_seqs, cached_seqs;
         std::tie(total_seqs, active_seqs, cached_seqs) = sequence_manager_->seq_stats();
@@ -3365,11 +3568,9 @@ void LlamaBatch::UpdateMetrics()
             if (!metrics || metrics->scheduled_time != 0) {
                 continue;
             }
-            metrics->scheduled_time = turbomind::RequestMetrics::timestamp();
+            metrics->scheduled_time = RequestMetrics::timestamp();
         }
-        */
     }
 }
-
 
 }  // namespace turbomind

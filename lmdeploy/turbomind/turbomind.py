@@ -82,7 +82,9 @@ def _require_int_range(name: str, value: Any, min_val: int, max_val: int) -> int
     return int_val
 
 
-def _require_int_list(name: str, values: Any, min_val: int, max_val: int) -> list[int] | None:
+def _require_int_list(
+    name: str, values: Any, min_val: int, max_val: int
+) -> list[int] | None:
     if values is None:
         return None
     if not isinstance(values, list):
@@ -243,6 +245,74 @@ class TurboMind:
 
         update_parallel_config(_engine_config)
 
+        # EAGLE HF -> TurboMind conversion (before C++ engine creation)
+        # If speculative_config uses EAGLE/EAGLE3 and the draft model is in
+        # HuggingFace format, convert it to TurboMind format first.
+        if _engine_config.speculative_config is not None:
+            spec_cfg = _engine_config.speculative_config
+            method = getattr(spec_cfg, "method", None)
+            draft_path = getattr(spec_cfg, "model", None)
+
+            if method in ("eagle", "eagle3") and draft_path and osp.exists(draft_path):
+                # Check if HuggingFace format (has config.json or safetensors)
+                is_hf_format = (
+                    osp.exists(osp.join(draft_path, "config.json"))
+                    or osp.exists(osp.join(draft_path, "model.safetensors"))
+                    or any(
+                        f.endswith(".safetensors")
+                        for f in os.listdir(draft_path)
+                        if osp.isfile(osp.join(draft_path, f))
+                    )
+                )
+                # Check if TurboMind format (has norm.weight binary file)
+                is_tm_format = osp.exists(osp.join(draft_path, "norm.weight"))
+
+                if is_hf_format and not is_tm_format:
+                    logger.info(
+                        f"[EAGLE] Draft model at {draft_path} is HuggingFace format, converting to TurboMind..."
+                    )
+                    try:
+                        from lmdeploy.turbomind.eagle_draft_converter import (
+                            prepare_eagle_draft_from_hf,
+                        )
+
+                        # Convert to a subdirectory within the draft model path
+                        tm_dir = osp.join(draft_path, "turbomind_eagle")
+                        os.makedirs(tm_dir, exist_ok=True)
+
+                        # Find base model path (try parent directory as common layout)
+                        base_model_dir = None
+                        parent = osp.dirname(draft_path)
+                        if osp.exists(osp.join(parent, "config.json")):
+                            base_model_dir = parent
+                        # Also try the main model_path being loaded
+                        if base_model_dir is None and osp.exists(
+                            osp.join(model_path, "config.json")
+                        ):
+                            base_model_dir = model_path
+
+                        # Run conversion
+                        converted_path = prepare_eagle_draft_from_hf(
+                            hf_model_dir=draft_path,
+                            out_dir=tm_dir,
+                            base_model_dir=base_model_dir,
+                            logger=logger,
+                        )
+
+                        logger.info(
+                            f"[EAGLE] Draft model converted to TurboMind format: {converted_path}"
+                        )
+                        # Update the config to point to converted path
+                        spec_cfg.model = converted_path
+                    except Exception as e:
+                        logger.error(f"[EAGLE] HF->TM conversion failed: {e}")
+                        import traceback
+
+                        logger.error(traceback.format_exc())
+                        logger.warning(
+                            "[EAGLE] Continuing with original path; C++ may fail to load weights"
+                        )
+
         self.gpu_count = _engine_config.device_num
         self.devices = _engine_config.devices
         self._engine_created = False
@@ -251,54 +321,18 @@ class TurboMind:
             model_path = get_model(
                 model_path, _engine_config.download_dir, _engine_config.revision
             )
-        
-        # Auto-convert HuggingFace EAGLE model BEFORE _from_hf builds config_dict
-        # This ensures the converted model path is included in the YAML passed to C++
-        if _engine_config.speculative_config is not None:
-            spec_cfg = _engine_config.speculative_config
-            eagle_model_path = getattr(spec_cfg, 'model', None)
-            
-            # Auto-convert HuggingFace EAGLE model to TurboMind format if needed
-            if eagle_model_path and osp.exists(eagle_model_path):
-                has_yaml = osp.exists(osp.join(eagle_model_path, 'config.yaml'))
-                has_json = osp.exists(osp.join(eagle_model_path, 'config.json'))
-                has_safetensors = osp.exists(osp.join(eagle_model_path, 'model.safetensors'))
-                
-                # HuggingFace format: config.json exists but config.yaml doesn't
-                if not has_yaml and has_json and has_safetensors:
-                    logger.info(f"Detected HuggingFace EAGLE model at {eagle_model_path}, auto-converting to TurboMind format...")
-                    try:
-                        from lmdeploy.turbomind.eagle_draft_converter import prepare_eagle_draft_from_hf
-                        # Create output directory in same location with -turbomind suffix
-                        out_dir = eagle_model_path.rstrip('/') + '-turbomind-auto'
-                        if not osp.exists(out_dir) or not osp.exists(osp.join(out_dir, 'config.yaml')):
-                            prepare_eagle_draft_from_hf(
-                                hf_model_dir=eagle_model_path,
-                                out_dir=out_dir,
-                                base_model_dir=model_path,  # Use the main model as base
-                                logger=logger
-                            )
-                            logger.info(f"EAGLE model converted to: {out_dir}")
-                        else:
-                            logger.info(f"Using previously converted EAGLE model: {out_dir}")
-                        # Update speculative config to point to converted model
-                        spec_cfg.model = out_dir
-                    except Exception as e:
-                        logger.warning(f"Failed to auto-convert HuggingFace EAGLE model: {e}. "
-                                       "Please manually convert using prepare_eagle_draft_from_hf().")
-            
-            logger.info(
-                "Speculative decoding is handled natively by C++ engine. "
-                "Python-side speculative decoding manager is deprecated."
-            )
-
         self.model_comm = self._from_hf(
             model_path=model_path, engine_config=_engine_config
         )
         self.tokenizer = Tokenizer(model_path)
 
-        # Speculative manager init (deprecated, kept for compatibility)
+        # Initialize speculative decoding if configured
         self.speculative_manager = None
+        if _engine_config.speculative_config is not None:
+            logger.info(
+                "Speculative decoding is handled natively by C++ engine. "
+                "Python-side speculative decoding manager is deprecated."
+            )
 
         if not _engine_config.empty_init:
             self._load_weights()
@@ -700,9 +734,7 @@ def _get_metrics(metrics, eagle_metrics_debug: bool = False):
         else:
             events = [
                 EngineEvent(EventType.QUEUED, metrics.enque_time / 1000000),
-                EngineEvent(
-                    EventType.SCHEDULED, metrics.scheduled_time / 1000000
-                ),
+                EngineEvent(EventType.SCHEDULED, metrics.scheduled_time / 1000000),
             ]
             out.req_metrics = RequestMetrics(
                 token_timestamp=time.time(), engine_events=events
@@ -891,9 +923,11 @@ class TurboMindInstance:
             fs.append(_get_logprobs(outputs, gen_config.logprobs))
         if self.tm_model.engine_config.enable_metrics:
             spec_cfg = getattr(self.tm_model.engine_config, "speculative_config", None)
-            eagle_metrics_debug = bool(
-                getattr(spec_cfg, "eagle_metrics_debug", False)
-            ) if spec_cfg is not None else False
+            eagle_metrics_debug = (
+                bool(getattr(spec_cfg, "eagle_metrics_debug", False))
+                if spec_cfg is not None
+                else False
+            )
             fs.append(_get_metrics(metrics, eagle_metrics_debug))
         return fs
 

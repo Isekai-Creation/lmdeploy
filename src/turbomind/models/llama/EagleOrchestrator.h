@@ -90,12 +90,6 @@ public:
 
     void updateSlotMapping(const int* d_batch_slots, int batch_size, cudaStream_t stream);
 
-    // Accessors for compaction support
-    const int* pathIndices() const { return d_path_indices_; }
-    const int* successorOffsets() const { return d_successor_offsets_; }
-    const int* successorCounts() const { return d_successor_counts_; }
-    int totalSuccessors() const { return total_successors_; }
-
 private:
     int max_batch_size_;
     int max_decoding_tokens_;

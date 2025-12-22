@@ -73,6 +73,12 @@ add_library(apply_token_bitmask_inplace_cuda STATIC apply_token_bitmask_inplace_
 set_property(TARGET apply_token_bitmask_inplace_cuda PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET apply_token_bitmask_inplace_cuda PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)
 
+# MXFP4 dequantization kernels for DeepSeek_V32 MLA weight loading
+add_library(mxfp4_dequant_kernels STATIC mxfp4_dequant.cu)
+set_property(TARGET mxfp4_dequant_kernels PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET mxfp4_dequant_kernels PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+
 # EAGLE speculative decoding kernels
 set(EAGLE_KERNEL_DIR ${PROJECT_SOURCE_DIR}/lmdeploy/turbomind/kernels/speculative_decoding)
 add_library(eagle_kernels STATIC 

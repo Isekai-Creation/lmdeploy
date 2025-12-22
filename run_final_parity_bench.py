@@ -10,8 +10,8 @@ MODEL_PATH = "/workspace/aimo/models/gpt-oss-120b"
 LOG_DIR = Path("/workspace/aimo/logs/eagle3_final_bench")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Test configs - Use TurboMind-converted EAGLE model with proper weight files
-EAGLE3_MODEL = "/workspace/aimo/models/gpt-oss-120b-eagle3-turbomind-auto"
+# Test configs
+EAGLE3_MODEL = "/workspace/aimo/models/gpt-oss-120b-eagle3"
 THROUGHPUT_MODEL = "/workspace/aimo/models/gpt-oss-120b-Eagle3-throughput"
 
 # SPEC_SWEEP = [3, 4, 5, 6, 7]

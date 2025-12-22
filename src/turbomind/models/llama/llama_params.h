@@ -20,6 +20,14 @@ struct MLAParam {
     int v_head_dim;
 };
 
+// DeepSeek-V32 Dynamic Sparse Attention (DSA) indexer parameters
+struct DSAParam {
+    int index_topk;      // Number of tokens to select via sparse attention
+    int index_head_dim;  // Dimension of indexer heads
+    int index_n_heads;   // Number of indexer heads
+};
+
+
 struct ModelParam {
     size_t   head_num;
     size_t   head_dim;
@@ -38,6 +46,7 @@ struct ModelParam {
     DataType expert_weight_type;
     int      group_size;
     MLAParam mla;
+    DSAParam dsa;  // DeepSeek-V32 sparse attention indexer params
     bool     qk_norm;
     int      tune_layer_num;
 
@@ -46,6 +55,7 @@ struct ModelParam {
     std::vector<int> window_size;
     std::vector<int> inter_size;
 };
+
 
 /// TODO: rename all `gate` in the context of MoE router to `router`
 struct MoeParam {

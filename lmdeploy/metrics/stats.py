@@ -31,19 +31,23 @@ class SchedulerStats:
     prefix_cache_hit_rate: float = 0.0
 
     def __repr__(self):
-        return ('SchedulerStats(\n'
-                f'  num_total_reqs={self.num_total_reqs},\n'
-                f'  num_finished_reqs={self.num_finished_reqs},\n'
-                f'  num_running_reqs={self.num_running_reqs},\n'
-                f'  num_waiting_reqs={self.num_waiting_reqs},\n'
-                f'  gpu_cache_usage={self.gpu_cache_usage:.6f},\n'
-                f'  prefix_cache_hit_rate={self.prefix_cache_hit_rate:.6f},\n'
-                ')')
+        return (
+            "SchedulerStats(\n"
+            f"  num_total_reqs={self.num_total_reqs},\n"
+            f"  num_finished_reqs={self.num_finished_reqs},\n"
+            f"  num_running_reqs={self.num_running_reqs},\n"
+            f"  num_waiting_reqs={self.num_waiting_reqs},\n"
+            f"  gpu_cache_usage={self.gpu_cache_usage:.6f},\n"
+            f"  prefix_cache_hit_rate={self.prefix_cache_hit_rate:.6f},\n"
+            ")"
+        )
 
     def update_from_schedule_metrics(self, scheduled_metrics: ScheduleMetrics):
         self.num_running_reqs = scheduled_metrics.active_seqs
         self.num_waiting_reqs = scheduled_metrics.waiting_seqs
-        self.gpu_cache_usage = 1.0 - (scheduled_metrics.free_blocks / scheduled_metrics.total_blocks)
+        self.gpu_cache_usage = 1.0 - (
+            scheduled_metrics.free_blocks / scheduled_metrics.total_blocks
+        )
         self.prefix_cache_hit_rate = scheduled_metrics.prefix_cache_hit_rate
 
 
@@ -85,15 +89,17 @@ class RequestStats:
         self.finish_reason: ResponseType = None
 
     def __repr__(self):
-        return ('RequestStats(\n'
-                f'  arrival_time={self.arrival_time:.6f},\n'
-                f'  prompt_tokens={self.prompt_tokens},\n'
-                f'  generation_tokens={self.generation_tokens},\n'
-                f'  queued_time={self.queued_time:.6f},\n'
-                f'  scheduled_time={self.scheduled_time:.6f},\n'
-                f'  first_token_time={self.first_token_time:.6f},\n'
-                f'  latest_token_time={self.lastest_token_time:.6f},\n'
-                ')')
+        return (
+            "RequestStats(\n"
+            f"  arrival_time={self.arrival_time:.6f},\n"
+            f"  prompt_tokens={self.prompt_tokens},\n"
+            f"  generation_tokens={self.generation_tokens},\n"
+            f"  queued_time={self.queued_time:.6f},\n"
+            f"  scheduled_time={self.scheduled_time:.6f},\n"
+            f"  first_token_time={self.first_token_time:.6f},\n"
+            f"  latest_token_time={self.lastest_token_time:.6f},\n"
+            ")"
+        )
 
     def update_from_events(self, engine_events: List[EngineEvent]):
         # avoid circular dependency
@@ -166,14 +172,16 @@ class IterationStats:
         self.itl: Optional[float] = None
 
     def __repr__(self):
-        return ('IterationStats(\n'
-                f'  iteration_timestamp={self.iteration_timestamp:.6f},\n'
-                f'  new_generation_tokens={self.new_generation_tokens},\n'
-                f'  prompt_tokens={self.prompt_tokens},\n'
-                f'  ttft={self.ttft},\n'
-                f'  tpot={self.tpot},\n'
-                f'  itl={self.itl},\n'
-                ')')
+        return (
+            "IterationStats(\n"
+            f"  iteration_timestamp={self.iteration_timestamp:.6f},\n"
+            f"  new_generation_tokens={self.new_generation_tokens},\n"
+            f"  prompt_tokens={self.prompt_tokens},\n"
+            f"  ttft={self.ttft},\n"
+            f"  tpot={self.tpot},\n"
+            f"  itl={self.itl},\n"
+            ")"
+        )
 
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""
@@ -203,7 +211,10 @@ class IterationStats:
             self.ttft = self._time_since(req_stats.arrival_time)
         else:
             self.itl = self._time_since(req_stats.lastest_token_time)
-            self.tpot = self._time_since(req_stats.lastest_token_time) / self.new_generation_tokens
+            self.tpot = (
+                self._time_since(req_stats.lastest_token_time)
+                / self.new_generation_tokens
+            )
 
         req_stats.lastest_token_time = outputs.req_metrics.token_timestamp
         req_stats.generation_tokens += new_generation_tokens
@@ -223,6 +234,19 @@ class SpeculativeDecodingStats:
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: np.ndarray = None
+    # Optional EAGLE3 target-tree metrics, populated when the backend
+    # reports a nested ``tree_decode`` block in ``spec_info``.
+    tree_num_draft_tokens: int = 0
+    tree_num_target_tokens: int = 0
+    tree_num_accepted_tokens: int = 0
+    # Extended EAGLE3 metrics aggregated over drafts/steps.
+    total_steps: int = 0
+    total_tokens_per_seq: int = 0
+    max_tokens_per_seq: int = 0
+    total_accepted_len: int = 0
+    max_accepted_len: int = 0
+    steps_with_accept_ge2: int = 0
+    total_committed_extras: int = 0
 
     def __post_init__(self):
         assert self.num_spec_tokens > 0
@@ -230,12 +254,44 @@ class SpeculativeDecodingStats:
 
     def update_from_output(self, outputs: EngineOutput):
         """Update from engine output."""
-        spec_info = getattr(outputs.req_metrics, 'spec_info', None)
+        spec_info = getattr(outputs.req_metrics, "spec_info", None)
         if spec_info:
             self.num_drafts += 1
-            self.num_draft_tokens += spec_info['num_draft_tokens']
-            self.num_accepted_tokens += spec_info['num_accepted_tokens']
-            self.num_accepted_tokens_per_pos[:spec_info['num_accepted_tokens']] += 1
+            self.num_draft_tokens += spec_info["num_draft_tokens"]
+            self.num_accepted_tokens += spec_info["num_accepted_tokens"]
+            self.num_accepted_tokens_per_pos[: spec_info["num_accepted_tokens"]] += 1
+
+            # Per-step EAGLE3 step-level metrics, when present.
+            tokens_per_seq = int(spec_info.get("tokens_per_seq", 0))
+            accepted_len_step = int(spec_info.get("accepted_len", 0))
+            max_accepted_len_step = int(spec_info.get("max_accepted_len", 0))
+            committed_extras_step = int(spec_info.get("committed_extras", 0))
+
+            self.total_steps += 1
+            self.total_tokens_per_seq += tokens_per_seq
+            self.max_tokens_per_seq = max(self.max_tokens_per_seq, tokens_per_seq)
+
+            self.total_accepted_len += accepted_len_step
+            self.max_accepted_len = max(self.max_accepted_len, max_accepted_len_step)
+            if max_accepted_len_step >= 2:
+                self.steps_with_accept_ge2 += 1
+
+            self.total_committed_extras += committed_extras_step
+
+            # Optional tree-aware metrics.
+            tree_info = (
+                spec_info.get("tree_decode") if isinstance(spec_info, dict) else None
+            )
+            if tree_info:
+                self.tree_num_draft_tokens += int(
+                    tree_info.get("num_tree_draft_tokens", 0)
+                )
+                self.tree_num_target_tokens += int(
+                    tree_info.get("num_tree_target_tokens", 0)
+                )
+                self.tree_num_accepted_tokens += int(
+                    tree_info.get("num_tree_accepted_tokens", 0)
+                )
 
     def update_per_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
         """Update with per draft stats."""
@@ -246,26 +302,36 @@ class SpeculativeDecodingStats:
             self.num_accepted_tokens_per_pos[:num_accepted_tokens] += 1
 
     def __repr__(self):
-        draft_acceptance_rate = (self.num_accepted_tokens / self.num_draft_tokens *
-                                 100 if self.num_draft_tokens > 0 else float('nan'))
+        draft_acceptance_rate = (
+            self.num_accepted_tokens / self.num_draft_tokens * 100
+            if self.num_draft_tokens > 0
+            else float("nan")
+        )
 
         # conventionally, mean acceptance length includes the bonus token
-        mean_acceptance_length = 1 + (self.num_accepted_tokens /
-                                      self.num_drafts) if self.num_drafts > 0 else float('nan')
+        mean_acceptance_length = (
+            1 + (self.num_accepted_tokens / self.num_drafts)
+            if self.num_drafts > 0
+            else float("nan")
+        )
 
-        acceptance_rates = self.num_accepted_tokens_per_pos / self.num_drafts if self.num_drafts > 0 else [
-            float('nan')
-        ] * self.num_accepted_tokens
-        rates_str = ', '.join(f'{p:.3f}' for p in acceptance_rates)
+        acceptance_rates = (
+            self.num_accepted_tokens_per_pos / self.num_drafts
+            if self.num_drafts > 0
+            else [float("nan")] * self.num_accepted_tokens
+        )
+        rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
 
-        return ('SpeculativeDecodingStats('
-                f'num_spec_tokens={self.num_spec_tokens}, '
-                f'num_drafts={self.num_drafts}, '
-                f'num_draft_tokens={self.num_draft_tokens}, '
-                f'num_accepted_tokens={self.num_accepted_tokens}, '
-                f'draft_acceptance_rate={draft_acceptance_rate:.2f}%, '
-                f'mean_acceptance_length={mean_acceptance_length:.2f}, '
-                f'per_position_acceptance_rate={rates_str})')
+        return (
+            "SpeculativeDecodingStats("
+            f"num_spec_tokens={self.num_spec_tokens}, "
+            f"num_drafts={self.num_drafts}, "
+            f"num_draft_tokens={self.num_draft_tokens}, "
+            f"num_accepted_tokens={self.num_accepted_tokens}, "
+            f"draft_acceptance_rate={draft_acceptance_rate:.2f}%, "
+            f"mean_acceptance_length={mean_acceptance_length:.2f}, "
+            f"per_position_acceptance_rate={rates_str})"
+        )
 
 
 @dataclass
@@ -310,12 +376,38 @@ class EagleMetricsSummary:
         else:
             mean_acceptance_length = float("nan")
 
+        # Extended fields: averaged over speculative steps.
+        if stats.total_steps > 0:
+            mean_tokens_per_seq = stats.total_tokens_per_seq / stats.total_steps
+            max_tokens_per_seq = stats.max_tokens_per_seq
+            max_acceptance_length = stats.max_accepted_len
+            fraction_steps_accept_ge2 = stats.steps_with_accept_ge2 / stats.total_steps
+            mean_committed_extras = stats.total_committed_extras / stats.total_steps
+        else:
+            mean_tokens_per_seq = float("nan")
+            max_tokens_per_seq = 0
+            max_acceptance_length = 0
+            fraction_steps_accept_ge2 = float("nan")
+            mean_committed_extras = float("nan")
+
+        tree_num_draft_tokens = stats.tree_num_draft_tokens or 0
+        tree_num_target_tokens = stats.tree_num_target_tokens or 0
+        tree_num_accepted_tokens = stats.tree_num_accepted_tokens or 0
+
         return cls(
             num_drafts=num_drafts,
             num_draft_tokens=num_draft_tokens,
             num_accepted_tokens=num_accepted_tokens,
             draft_acceptance_rate=draft_acceptance_rate,
             mean_acceptance_length=mean_acceptance_length,
+            mean_tokens_per_seq=mean_tokens_per_seq,
+            max_tokens_per_seq=max_tokens_per_seq,
+            max_acceptance_length=max_acceptance_length,
+            fraction_steps_accept_ge2=fraction_steps_accept_ge2,
+            mean_committed_extras=mean_committed_extras,
+            tree_num_draft_tokens=tree_num_draft_tokens or None,
+            tree_num_target_tokens=tree_num_target_tokens or None,
+            tree_num_accepted_tokens=tree_num_accepted_tokens or None,
         )
 
     def to_dict(self) -> dict:
@@ -327,4 +419,27 @@ class EagleMetricsSummary:
             "mean_acceptance_rate": float(self.draft_acceptance_rate),
             "mean_acceptance_length": float(self.mean_acceptance_length),
         }
+        # Extended fields are optional; include them when present.
+        if self.mean_tokens_per_seq is not None:
+            out["mean_tokens_per_seq"] = float(self.mean_tokens_per_seq)
+        if self.max_tokens_per_seq is not None:
+            out["max_tokens_per_seq"] = int(self.max_tokens_per_seq)
+        if self.max_acceptance_length is not None:
+            out["max_acceptance_length"] = int(self.max_acceptance_length)
+        if self.fraction_steps_accept_ge2 is not None:
+            out["fraction_steps_accept_ge2"] = float(self.fraction_steps_accept_ge2)
+        if self.mean_committed_extras is not None:
+            out["mean_committed_extras"] = float(self.mean_committed_extras)
+        # Preserve the original schema and, when tree-aware metrics are
+        # available, attach them under a nested ``tree_decode`` block.
+        if (
+            self.tree_num_draft_tokens is not None
+            or self.tree_num_target_tokens is not None
+            or self.tree_num_accepted_tokens is not None
+        ):
+            out["tree_decode"] = {
+                "total_tree_draft_tokens": int(self.tree_num_draft_tokens or 0),
+                "total_tree_target_tokens": int(self.tree_num_target_tokens or 0),
+                "total_tree_accepted_tokens": int(self.tree_num_accepted_tokens or 0),
+            }
         return out

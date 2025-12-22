@@ -322,8 +322,13 @@ LlamaTritonModel::LlamaTritonModel(std::string                            model_
     model_param_.mla.kv_lora_rank   = model_reader["kv_lora_rank"].as<int>();
     model_param_.mla.qk_rope_dim    = model_reader["qk_rope_dim"].as<int>();
     model_param_.mla.v_head_dim     = model_reader["v_head_dim"].as<int>();
+    // DSA (Dynamic Sparse Attention) indexer params for DeepSeek-V32
+    model_param_.dsa.index_topk     = model_reader["index_topk"].as<int>(0);
+    model_param_.dsa.index_head_dim = model_reader["index_head_dim"].as<int>(128);
+    model_param_.dsa.index_n_heads  = model_reader["index_n_heads"].as<int>(64);
     attn_param_.cache_block_seq_len = attention_reader["cache_block_seq_len"].as<int>(0);
     model_param_.quant_policy       = engine_reader["quant_policy"].as<int>(0);
+
 
     auto inter_size = model_reader["inter_size"];
     for (auto it = inter_size.begin(); it != inter_size.end(); ++it) {

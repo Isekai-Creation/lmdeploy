@@ -90,13 +90,72 @@ class SpeculativeDecodingManager:
         """Initialize EAGLE / EAGLE3 speculative decoding.
 
         Native C++ implementation handles draft model loading and generation.
-        This method is kept for compatibility and logging.
+        If the draft model path contains HuggingFace format files, we
+        auto-convert to TurboMind format first.
         """
         if not self.config.model:
             raise ValueError("EAGLE method requires 'model' to be specified")
 
+        import os
+
+        draft_path = self.config.model
+
+        # Check if this is a HuggingFace format model (has config.json or *.safetensors)
+        is_hf_format = (
+            os.path.exists(os.path.join(draft_path, "config.json"))
+            or os.path.exists(os.path.join(draft_path, "model.safetensors"))
+            or len([f for f in os.listdir(draft_path) if f.endswith(".safetensors")])
+            > 0
+        )
+
+        # Check if TurboMind format already exists (has TM-format weights like norm.weight file)
+        is_tm_format = os.path.exists(os.path.join(draft_path, "norm.weight"))
+
+        if is_hf_format and not is_tm_format:
+            logger.info(
+                f"EAGLE model at {draft_path} is HuggingFace format, converting to TurboMind..."
+            )
+            try:
+                from lmdeploy.turbomind.eagle_draft_converter import (
+                    prepare_eagle_draft_from_hf,
+                )
+
+                # Convert in-place or to a subdirectory
+                tm_dir = os.path.join(draft_path, "turbomind_eagle")
+                os.makedirs(tm_dir, exist_ok=True)
+
+                # Find base model path if available (from parent dir or config)
+                base_model_dir = None
+                # Try to find base model in parent dir (common layout: base_model/eagle3/)
+                parent = os.path.dirname(draft_path)
+                if os.path.exists(os.path.join(parent, "config.json")):
+                    base_model_dir = parent
+
+                # Run the conversion
+                converted_path = prepare_eagle_draft_from_hf(
+                    hf_model_dir=draft_path,
+                    out_dir=tm_dir,
+                    base_model_dir=base_model_dir,
+                    logger=logger,
+                )
+
+                logger.info(
+                    f"EAGLE model converted to TurboMind format at: {converted_path}"
+                )
+                # Update config to use converted path
+                self.config.model = converted_path
+                draft_path = converted_path
+            except Exception as e:
+                logger.error(f"EAGLE HF->TM conversion failed: {e}")
+                import traceback
+
+                logger.error(traceback.format_exc())
+                logger.warning(
+                    "Continuing with original path; C++ may fail to load weights"
+                )
+
         logger.info("Initializing native EAGLE speculative decoding")
-        logger.info("EAGLE draft model (managed natively by TurboMind): %s", self.config.model)
+        logger.info("EAGLE draft model (managed natively by TurboMind): %s", draft_path)
         logger.info(
             "EAGLE config: max_path_len=%s, max_decoding_tokens=%s, num_speculative_tokens=%s",
             getattr(self.config, "max_path_len", None),
@@ -187,7 +246,9 @@ class SpeculativeDecodingManager:
             logger.error(traceback.format_exc())
             return []
 
-    def generate_draft_tokens_sync(self, input_ids, num_tokens=None, hidden_states=None):
+    def generate_draft_tokens_sync(
+        self, input_ids, num_tokens=None, hidden_states=None
+    ):
         """Synchronous draft token generation.
 
         This helper mirrors the interface used in the high‑level design doc
@@ -204,36 +265,35 @@ class SpeculativeDecodingManager:
 
         # Convert to tensor
         input_tensor = torch.tensor([input_ids], dtype=torch.long, device="cuda")
-        
+
         draft_tokens = []
-        
+
         with torch.no_grad():
             # Use KV cache for efficiency
             past_key_values = None
-            
+
             for _ in range(num_tokens):
                 # Run draft model
                 outputs = self.draft_model(
                     input_tensor if past_key_values is None else input_tensor[:, -1:],
                     past_key_values=past_key_values,
-                    use_cache=True
+                    use_cache=True,
                 )
-                
+
                 # Get next token
                 next_token_logits = outputs.logits[0, -1, :]
                 next_token = torch.argmax(next_token_logits).item()
-                
+
                 draft_tokens.append(next_token)
-                
+
                 # Update for next iteration
-                input_tensor = torch.cat([
-                    input_tensor,
-                    torch.tensor([[next_token]], device="cuda")
-                ], dim=1)
-                
+                input_tensor = torch.cat(
+                    [input_tensor, torch.tensor([[next_token]], device="cuda")], dim=1
+                )
+
                 # Update KV cache
                 past_key_values = outputs.past_key_values
-        
+
         return draft_tokens
 
     def verify_draft_tokens(self, draft_tokens, target_logits):

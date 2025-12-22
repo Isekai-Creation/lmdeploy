@@ -3,7 +3,6 @@
 #pragma once
 
 #include <curand_kernel.h>
-#include <mutex>
 
 #include "src/turbomind/core/core.h"
 
@@ -212,7 +211,6 @@ private:
 
     void DestroyCommunicators();
 
-
     void UpdateMetrics();
 
     // Multi-token EAGLE gating helpers. These centralize the conditions under
@@ -325,6 +323,7 @@ private:
     int           kv_max_blocks_per_seq_{};  // max blocks per sequence
     Buffer_<int>  eagle_kv_rewind_lengths_;  // [max_batch_size_]
     Buffer_<int>  eagle_kv_batch_slots_;     // [max_batch_size_]
+    Buffer_<int>  eagle_kv_block_tables_;    // [max_batch_size_, kv_max_blocks_per_seq_]
     Buffer_<int>  eagle_kv_block_tables_;    // [max_batch_size_, kv_max_blocks_per_seq_]
     void**        eagle_kv_cache_blocks_{nullptr};  // [num_layers, kv_max_blocks_per_seq_]
     std::vector<int> free_eagle_slots_;      // Pool of available stable slot IDs
