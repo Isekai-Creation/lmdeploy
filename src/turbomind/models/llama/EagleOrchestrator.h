@@ -90,6 +90,10 @@ public:
 
     void updateSlotMapping(const int* d_batch_slots, int batch_size, cudaStream_t stream);
 
+    // Accessors for tree topology pointers (used by LlamaV2 for KV cache compaction)
+    const int* pathIndices() const { return d_path_indices_; }
+    int maxPathLen() const { return max_path_len_; }
+
 private:
     int max_batch_size_;
     int max_decoding_tokens_;
