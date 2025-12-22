@@ -26,6 +26,9 @@ add_library(Llama STATIC
         mla_utils.cu
         EagleModule.cc
         EagleBuffers.cc
+        EagleOrchestrator.cc
+        EagleSlotManager.cc
+        eagle_orchestration_kernels.cu
         LlamaV2_eagle.cc
         ${CMAKE_SOURCE_DIR}/lmdeploy/turbomind/eagle_tree.cpp
 )

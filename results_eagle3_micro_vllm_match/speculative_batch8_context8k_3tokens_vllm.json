@@ -1,0 +1,39 @@
+{
+  "latency_ms_per_token": {
+    "mean": 6.467558835023313,
+    "min": 6.467558835023313,
+    "max": 6.467558835023313,
+    "values": [
+      6.467558835023313
+    ]
+  },
+  "throughput_tokens_per_sec": {
+    "mean": 154.61784353391124,
+    "min": 154.61784353391124,
+    "max": 154.61784353391124,
+    "values": [
+      154.61784353391124
+    ]
+  },
+  "memory_gb": {
+    "mean": 0.0,
+    "max": 0.0,
+    "utilization_pct": 0.0
+  },
+  "total_runs": 1,
+  "scenario": {
+    "name": "Speculative_Batch8_Context8K_3tokens_VLLM",
+    "batch_size": 8,
+    "context_length": 8192,
+    "max_new_tokens": 24576,
+    "use_speculation": true,
+    "num_spec_tokens": 3,
+    "session_len": 32768
+  },
+  "system": {
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_memory_total_gb": 101.958877184,
+    "timestamp": "2025-12-21T12:39:53.678226",
+    "turbomind_build_id": "unknown"
+  }
+}

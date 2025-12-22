@@ -104,6 +104,23 @@ def _load_tensor_from_shards(
     raise RuntimeError(f"Tensor {key!r} not found in any safetensors shard")
 
 
+def _load_first_available(
+    shards: Iterable[str],
+    keys: Iterable[str],
+    *,
+    optional: bool = False,
+) -> Optional[torch.Tensor]:
+    """Load the first matching tensor key from the shard list."""
+    for key in keys:
+        tensor = _load_tensor_from_shards(shards, key, optional=True)
+        if tensor is not None:
+            return tensor
+    if optional:
+        return None
+    key_list = ", ".join(repr(k) for k in keys)
+    raise RuntimeError(f"Tensor not found in any safetensors shard: {key_list}")
+
+
 def _detect_layout(keys: Iterable[str]) -> str:
     """Heuristic to detect draft checkpoint layout."""
     ks = set(keys)
@@ -112,6 +129,57 @@ def _detect_layout(keys: Iterable[str]) -> str:
     if "lm_head.weight" in ks or any(k.startswith("model.layers.") for k in ks):
         return "llama_like"
     return "unknown"
+
+
+def _looks_like_eagle3_llama(
+    shards: Iterable[str],
+    hidden_size: int,
+    logger=None,
+) -> bool:
+    """Detect Eagle3-style Llama checkpoints with 2x hidden QKV input."""
+    log = logger
+    q_w = _load_first_available(
+        shards,
+        (
+            "layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        ),
+        optional=True,
+    )
+    k_w = _load_first_available(
+        shards,
+        (
+            "layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+        ),
+        optional=True,
+    )
+    v_w = _load_first_available(
+        shards,
+        (
+            "layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ),
+        optional=True,
+    )
+    if q_w is None or k_w is None or v_w is None:
+        return False
+    q_out, q_in = q_w.shape
+    if hidden_size <= 0:
+        return False
+    if q_in != 2 * hidden_size:
+        return False
+    if k_w.shape[1] != q_in or v_w.shape[1] != q_in:
+        if log:
+            log.warning(
+                "Eagle3 Llama-like check failed: q_in=%d, k_in=%d, v_in=%d",
+                q_in,
+                k_w.shape[1],
+                v_w.shape[1],
+            )
+        return False
+    # q_out > hidden_size is typical for GPT-OSS Eagle3 drafts.
+    return True
 
 
 def _collect_all_keys(shards: Iterable[str]) -> Dict[str, None]:
@@ -137,14 +205,32 @@ def _infer_eagle3_geometry(
     log = logger
     meta: Dict[str, int] = {}
 
-    q_w = _load_tensor_from_shards(
-        shards, "midlayer.self_attn.q_proj.weight", optional=True
+    q_w = _load_first_available(
+        shards,
+        (
+            "midlayer.self_attn.q_proj.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        ),
+        optional=True,
     )
-    k_w = _load_tensor_from_shards(
-        shards, "midlayer.self_attn.k_proj.weight", optional=True
+    k_w = _load_first_available(
+        shards,
+        (
+            "midlayer.self_attn.k_proj.weight",
+            "layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+        ),
+        optional=True,
     )
-    v_w = _load_tensor_from_shards(
-        shards, "midlayer.self_attn.v_proj.weight", optional=True
+    v_w = _load_first_available(
+        shards,
+        (
+            "midlayer.self_attn.v_proj.weight",
+            "layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ),
+        optional=True,
     )
     fc_w = _load_tensor_from_shards(shards, "fc.weight", optional=True)
 
@@ -214,6 +300,9 @@ def _infer_eagle3_geometry(
             meta.setdefault(
                 "eagle_fc_in_factor", int(meta["eagle_fc_in_dim"] // draft_hidden)
             )
+        if "eagle_fc_in_dim" not in meta:
+            meta["eagle_fc_in_dim"] = int(3 * draft_hidden)
+            meta["eagle_fc_in_factor"] = 3
 
     return meta
 
@@ -301,12 +390,19 @@ def _convert_llama_like(
     w_dtype = torch.float16
 
     # Token embeddings (optional).
-    emb = _load_tensor_from_shards(shards, "model.embed_tokens.weight", optional=True)
+    emb = _load_first_available(
+        shards,
+        ("model.embed_tokens.weight", "embed_tokens.weight"),
+        optional=True,
+    )
     if emb is not None:
         _write_tensor(emb, os.path.join(out_dir, "tok_embeddings.weight"), w_dtype)
 
     # Output norm and LM head (required).
-    norm = _load_tensor_from_shards(shards, "model.norm.weight")
+    norm = _load_first_available(
+        shards,
+        ("model.norm.weight", "norm.weight"),
+    )
     _write_tensor(norm, os.path.join(out_dir, "norm.weight"), w_dtype)
 
     lm_head = _load_tensor_from_shards(shards, "lm_head.weight")
@@ -318,8 +414,13 @@ def _convert_llama_like(
     _write_tensor(lm_head_t, os.path.join(out_dir, "output.weight"), w_dtype)
 
     # Layer‑0 norms.
-    attn_norm = _load_tensor_from_shards(
-        shards, "model.layers.0.input_layernorm.weight", optional=True
+    attn_norm = _load_first_available(
+        shards,
+        (
+            "model.layers.0.input_layernorm.weight",
+            "layers.0.input_layernorm.weight",
+        ),
+        optional=True,
     )
     if attn_norm is not None:
         _write_tensor(
@@ -328,8 +429,13 @@ def _convert_llama_like(
             w_dtype,
         )
 
-    ffn_norm = _load_tensor_from_shards(
-        shards, "model.layers.0.post_attention_layernorm.weight", optional=True
+    ffn_norm = _load_first_available(
+        shards,
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+        ),
+        optional=True,
     )
     if ffn_norm is not None:
         _write_tensor(
@@ -344,17 +450,37 @@ def _convert_llama_like(
         )
 
     # Attention / MLP when present – optional, purely best‑effort.
-    q_w = _load_tensor_from_shards(
-        shards, "model.layers.0.self_attn.q_proj.weight", optional=True
+    q_w = _load_first_available(
+        shards,
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            "layers.0.self_attn.q_proj.weight",
+        ),
+        optional=True,
     )
-    k_w = _load_tensor_from_shards(
-        shards, "model.layers.0.self_attn.k_proj.weight", optional=True
+    k_w = _load_first_available(
+        shards,
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            "layers.0.self_attn.k_proj.weight",
+        ),
+        optional=True,
     )
-    v_w = _load_tensor_from_shards(
-        shards, "model.layers.0.self_attn.v_proj.weight", optional=True
+    v_w = _load_first_available(
+        shards,
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            "layers.0.self_attn.v_proj.weight",
+        ),
+        optional=True,
     )
-    o_w = _load_tensor_from_shards(
-        shards, "model.layers.0.self_attn.o_proj.weight", optional=True
+    o_w = _load_first_available(
+        shards,
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            "layers.0.self_attn.o_proj.weight",
+        ),
+        optional=True,
     )
     if q_w is not None and k_w is not None and v_w is not None:
         qkv = torch.cat([q_w, k_w, v_w], dim=0)
@@ -368,14 +494,29 @@ def _convert_llama_like(
             o_w, os.path.join(out_dir, "layers.0.attention.wo.weight"), w_dtype
         )
 
-    gate_w = _load_tensor_from_shards(
-        shards, "model.layers.0.mlp.gate_proj.weight", optional=True
+    gate_w = _load_first_available(
+        shards,
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.gate_proj.weight",
+        ),
+        optional=True,
     )
-    up_w = _load_tensor_from_shards(
-        shards, "model.layers.0.mlp.up_proj.weight", optional=True
+    up_w = _load_first_available(
+        shards,
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            "layers.0.mlp.up_proj.weight",
+        ),
+        optional=True,
     )
-    down_w = _load_tensor_from_shards(
-        shards, "model.layers.0.mlp.down_proj.weight", optional=True
+    down_w = _load_first_available(
+        shards,
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            "layers.0.mlp.down_proj.weight",
+        ),
+        optional=True,
     )
     if gate_w is not None:
         _write_tensor(
@@ -421,6 +562,17 @@ def _convert_eagle3_midlayer(
     def get(name: str, *, optional: bool = False) -> Optional[torch.Tensor]:
         return _load_tensor_from_shards(shards, name, optional=optional)
 
+    def get_midlayer_fallback(name: str, *, optional: bool = False) -> Optional[torch.Tensor]:
+        """Load midlayer weights, falling back to layer-0 if needed."""
+        if name.startswith("midlayer."):
+            candidates = [
+                name,
+                name.replace("midlayer.", "layers.0."),
+                name.replace("midlayer.", "model.layers.0."),
+            ]
+            return _load_first_available(shards, candidates, optional=optional)
+        return get(name, optional=optional)
+
     geo = _infer_eagle3_geometry(shards, hidden_size, logger=log)
     draft_hidden = int(geo.get("eagle_draft_hidden", 0))
     if draft_hidden <= 0:
@@ -431,7 +583,7 @@ def _convert_eagle3_midlayer(
     w_dtype = torch.bfloat16
 
     # Output norm from draft.
-    norm = get("norm.weight")
+    norm = get_midlayer_fallback("norm.weight")
     if norm is None:
         raise RuntimeError("norm.weight not found in Eagle3 draft checkpoint")
     _write_tensor(norm, os.path.join(out_dir, "norm.weight"), w_dtype)
@@ -488,7 +640,7 @@ def _convert_eagle3_midlayer(
         _write_tensor(tok_emb, tok_emb_path, w_dtype)
 
     # Midlayer norms.
-    attn_norm = get("midlayer.input_layernorm.weight", optional=True)
+    attn_norm = get_midlayer_fallback("midlayer.input_layernorm.weight", optional=True)
     if attn_norm is not None:
         _write_tensor(
             attn_norm,
@@ -496,7 +648,7 @@ def _convert_eagle3_midlayer(
             w_dtype,
         )
 
-    hidden_norm = get("midlayer.hidden_norm.weight", optional=True)
+    hidden_norm = get_midlayer_fallback("midlayer.hidden_norm.weight", optional=True)
     if hidden_norm is not None:
         _write_tensor(
             hidden_norm,
@@ -504,7 +656,7 @@ def _convert_eagle3_midlayer(
             w_dtype,
         )
 
-    ffn_norm = get("midlayer.post_attention_layernorm.weight", optional=True)
+    ffn_norm = get_midlayer_fallback("midlayer.post_attention_layernorm.weight", optional=True)
     if ffn_norm is not None:
         _write_tensor(
             ffn_norm,
@@ -513,9 +665,9 @@ def _convert_eagle3_midlayer(
         )
 
     # Midlayer MLP gate/up/down.
-    gate_w = get("midlayer.mlp.gate_proj.weight", optional=True)
-    up_w = get("midlayer.mlp.up_proj.weight", optional=True)
-    down_w = get("midlayer.mlp.down_proj.weight", optional=True)
+    gate_w = get_midlayer_fallback("midlayer.mlp.gate_proj.weight", optional=True)
+    up_w = get_midlayer_fallback("midlayer.mlp.up_proj.weight", optional=True)
+    down_w = get_midlayer_fallback("midlayer.mlp.down_proj.weight", optional=True)
 
     if gate_w is not None:
         _write_tensor(
@@ -552,7 +704,12 @@ def _convert_eagle3_midlayer(
     # Pre-FC over concatenated hidden states (Eagle3-specific FC).
     fc_w = get("fc.weight", optional=True)
     if fc_w is None:
-        raise RuntimeError("Eagle3 draft checkpoint is missing fc.weight")
+        if log:
+            log.warning(
+                "fc.weight missing in draft checkpoint; "
+                "initializing zero Eagle3 FC weights."
+            )
+        fc_w = torch.zeros((hidden_size, hidden_size * 3), dtype=w_dtype)
     if fc_w.shape != (hidden_size, hidden_size * 3):
         raise RuntimeError(
             f"Eagle3 fc.weight shape {tuple(fc_w.shape)} != "
@@ -562,19 +719,11 @@ def _convert_eagle3_midlayer(
     # Legacy EagleNet-style FC (last 2 * hidden features).
     fc_slice = fc_w[:, hidden_size : 3 * hidden_size]  # [hidden, 2*hidden]
     fc_eaglenet = fc_slice.transpose(0, 1)  # [2*hidden, hidden]
-    _write_tensor(
-        fc_eaglenet,
-        os.path.join(out_dir, "fc.weight"),
-        w_dtype,
-    )
+    _write_tensor(fc_eaglenet, os.path.join(out_dir, "fc.weight"), w_dtype)
 
     # Full Eagle3 FC over all 3 * hidden concatenated features.
     fc_full = fc_w.to(w_dtype).transpose(0, 1)  # [3*hidden, hidden]
-    _write_tensor(
-        fc_full,
-        os.path.join(out_dir, "eagle_fc.weight"),
-        w_dtype,
-    )
+    _write_tensor(fc_full, os.path.join(out_dir, "eagle_fc.weight"), w_dtype)
 
     # ------------------------------------------------------------------
     # Native Eagle3 midlayer attention projections.
@@ -590,10 +739,10 @@ def _convert_eagle3_midlayer(
     # Eagle3AttentionWeight / Eagle3AttentionLayer without trying to
     # squeeze them into a standard LLaMA attention layout.
     # ------------------------------------------------------------------
-    q_mid = get("midlayer.self_attn.q_proj.weight", optional=True)
-    k_mid = get("midlayer.self_attn.k_proj.weight", optional=True)
-    v_mid = get("midlayer.self_attn.v_proj.weight", optional=True)
-    o_mid = get("midlayer.self_attn.o_proj.weight", optional=True)
+    q_mid = get_midlayer_fallback("midlayer.self_attn.q_proj.weight", optional=True)
+    k_mid = get_midlayer_fallback("midlayer.self_attn.k_proj.weight", optional=True)
+    v_mid = get_midlayer_fallback("midlayer.self_attn.v_proj.weight", optional=True)
+    o_mid = get_midlayer_fallback("midlayer.self_attn.o_proj.weight", optional=True)
 
     if q_mid is not None and k_mid is not None and v_mid is not None and o_mid is not None:
         # Derive expected Eagle-3 geometry and enforce it strictly so we
@@ -650,21 +799,36 @@ def _convert_eagle3_midlayer(
             "Eagle3 midlayer attention weights incomplete; cannot build fused QKV/WO tensors."
         )
 
-    if base_model_dir is None:
-        raise RuntimeError(
-            "Eagle3 fused QKV construction requires base_model_dir "
-            "to provide model.layers.0.self_attn.o_proj.weight"
-        )
+    base_o: Optional[torch.Tensor] = None
+    if o_mid is not None:
+        # Prefer draft o_proj when it already matches Eagle3 geometry.
+        if o_mid.shape == (draft_hidden, eagle_q_size):
+            base_o = o_mid.transpose(0, 1)
+        elif log:
+            log.warning(
+                "Draft o_proj shape %s does not match expected (%d, %d); "
+                "falling back to base model o_proj.",
+                tuple(o_mid.shape),
+                draft_hidden,
+                eagle_q_size,
+            )
 
-    base_shards = _find_safetensor_shards(base_model_dir)
-    if not base_shards:
-        raise RuntimeError(
-            f"No *.safetensors files found under base_model_dir={base_model_dir!r}"
-        )
+    if base_o is None:
+        if base_model_dir is None:
+            raise RuntimeError(
+                "Eagle3 fused QKV construction requires base_model_dir "
+                "or a compatible draft o_proj weight."
+            )
 
-    base_o = _load_tensor_from_shards(
-        base_shards, "model.layers.0.self_attn.o_proj.weight", optional=False
-    )
+        base_shards = _find_safetensor_shards(base_model_dir)
+        if not base_shards:
+            raise RuntimeError(
+                f"No *.safetensors files found under base_model_dir={base_model_dir!r}"
+            )
+
+        base_o = _load_tensor_from_shards(
+            base_shards, "model.layers.0.self_attn.o_proj.weight", optional=False
+        )
 
     eagle_q_size = int(geo.get("eagle_q_size", 0))
     eagle_kv_size = int(geo.get("eagle_kv_size", 0))
@@ -778,6 +942,13 @@ def prepare_eagle_draft_from_hf(
         raise RuntimeError(f"No *.safetensors files found under {hf_model_dir!r}")
     keys = _collect_all_keys(shards).keys()
     layout = _detect_layout(keys)
+    if layout == "llama_like" and _looks_like_eagle3_llama(shards, hidden_size, logger=log):
+        layout = "eagle3_midlayer"
+        if log:
+            log.info(
+                "Detected Eagle3 Llama-like layout for %s (promoting to Eagle3 midlayer conversion)",
+                hf_model_dir,
+            )
 
     # Decide draft weight dtype and record it in config.yaml so
     # EagleModule::load can allocate tensors with the correct dtype.

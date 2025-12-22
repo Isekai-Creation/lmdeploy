@@ -262,8 +262,8 @@ class ArgumentHelper:
         return parser.add_argument('--quant-policy',
                                    type=int,
                                    default=0,
-                                   choices=[0, 4, 8],
-                                   help='Quantize kv or not. 0: no quant; 4: 4bit kv; 8: 8bit kv')
+                                   choices=[0, 4, 8, 16],
+                                   help='Quantize kv or not. 0: no quant; 4: 4bit kv; 8: 8bit kv; 16: fp4 kv')
 
     @staticmethod
     def rope_scaling_factor(parser):

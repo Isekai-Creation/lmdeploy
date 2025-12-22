@@ -56,6 +56,8 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMalloc(&inputs.prev_paths, batch_size_ * max_decoding_tokens_ * max_path_len_ * sizeof(SizeType));
     cudaMalloc(&inputs.best_path_ids, batch_size_ * sizeof(SizeType));
     
+    cudaMalloc(&inputs.cu_block_nums, (static_cast<size_t>(batch_size_) + 1) * sizeof(SizeType));
+
     // Allocate output buffers
     cudaMalloc(&outputs.next_draft_tokens, batch_size_ * max_decoding_tokens_ * sizeof(TokenIdType));
     cudaMalloc(&outputs.next_draft_lens, batch_size_ * sizeof(SizeType));
@@ -75,6 +77,25 @@ void EagleBuffers::allocate(SizeType batch_size, const EagleModule* module, cuda
     cudaMemsetAsync(inputs.draft_paths, -1, batch_size_ * max_decoding_tokens_ * max_path_len_ * sizeof(SizeType), stream);
     cudaMemsetAsync(outputs.accepted_lens, 0, batch_size_ * sizeof(SizeType), stream);
     
+    cudaMemsetAsync(outputs.accepted_lens, 0, batch_size_ * sizeof(SizeType), stream);
+    
+    // Allocate persistent KV scratch 
+    // Size estimate: batch_size * max_decoding_tokens * elem_size_per_token
+    // Elem size depends on model config which we don't have here directly.
+    // However, LlamaV2 usually allocates this. 
+    // Let's assume a safe upper bound or require external sizing?
+    // For now, let's allocate a large enough buffer assuming max hidden size etc.
+    // Better: LlamaV2 should resize it or we pass config.
+    // Given the constraints, we might let LlamaV2 manage the specific size 
+    // but store the pointer here? 
+    // Or we allocate a fixed 256MB scratch per request?
+    // Let's try to infer from module or just allocate a detailed size if possible.
+    // For now, initializing to null and letting LlamaV2 allocate/assign it might be safer 
+    // if we don't have model params.
+    // BUT the goal was "Pre-allocate all EAGLE workspace buffers".
+    // Let's postpone allocation to LlamaV2 which has the params, but use this pointer.
+    inputs.kv_scratch = nullptr; 
+
     check_cuda_error(cudaStreamSynchronize(stream));
     
     allocated_ = true;
@@ -109,8 +130,11 @@ void EagleBuffers::free() {
     cudaFree(inputs.prev_accepted_lens);
     cudaFree(inputs.prev_draft_lens);
     cudaFree(inputs.prev_paths);
+    cudaFree(inputs.prev_paths);
     cudaFree(inputs.best_path_ids);
     
+    cudaFree(inputs.cu_block_nums);
+
     // Free output buffers
     cudaFree(outputs.next_draft_tokens);
     cudaFree(outputs.next_draft_lens);

@@ -34,7 +34,11 @@ def _weight_dtype_map(weight_type: str, default=None):
 
 
 def _pad_inter_size(inter_size: int, group_size: int, tp: int):
-    group_size = max(1, group_size)
+    # Some configs may leave inter_size or tp undefined; treat None as 0/1 to avoid crashes.
+    if inter_size is None:
+        inter_size = 0
+    group_size = max(1, group_size or 1)
+    tp = tp or 1
     group_num = (inter_size + group_size - 1) // group_size
     groups_per_rank = (group_num + tp - 1) // tp
     inter_size_padded = groups_per_rank * group_size * tp
@@ -50,9 +54,9 @@ class BaseOutputModel(ABC):
         self.model_config = cfg.model_config
         self.attention_config = cfg.attention_config
         self.lora_config = cfg.lora_config
-        self.attn_tp_size = self.model_config.attn_tp_size
-        self.attn_cp_size = self.model_config.attn_cp_size
-        self.mlp_tp_size = self.model_config.mlp_tp_size
+        self.attn_tp_size = self.model_config.attn_tp_size or 1
+        self.attn_cp_size = self.model_config.attn_cp_size or 1
+        self.mlp_tp_size = self.model_config.mlp_tp_size or 1
         self.out_dir = out_dir
         self.to_file = True if out_dir else False
         self.tm_params = dict()
@@ -218,6 +222,14 @@ class BaseOutputModel(ABC):
         for i, reader in self.input_model.readers():
             self.model(i, reader)
             yield i
+
+    def save(self, out_dir: str = None):
+        """Export weights and config to the specified directory."""
+        if out_dir:
+            self.out_dir = out_dir
+            self.to_file = True
+            self.tm_params = dict()
+        self.export()
 
     @property
     def tm_config(self):

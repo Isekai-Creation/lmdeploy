@@ -288,8 +288,37 @@ class HuggingFaceTokenizer:
         """
         tokenizer = self.model
         ids_offset, prev_tokens, prefix_offset, read_offset = state.as_tuple()
+        vocab_size = self.vocab_size_with_added
+        strict_env = os.getenv('LMDEPLOY_TOKEN_ID_STRICT', '1').strip().lower()
+        strict_ids = strict_env not in ('0', 'false', 'no', 'off')
+        unk_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 0
+
+        def _sanitize_ids(token_ids: Sequence[int], label: str) -> List[int]:
+            if not token_ids:
+                return []
+            invalid = []
+            for idx, tid in enumerate(token_ids):
+                if tid < 0 or tid >= vocab_size:
+                    invalid.append((idx, tid))
+                    if len(invalid) >= 5:
+                        break
+            if invalid:
+                if strict_ids:
+                    raise ValueError(
+                        f'Invalid token ids in {label}: {invalid} (vocab_size={vocab_size})'
+                    )
+                self.logger.warning(
+                    'Invalid token ids in %s (showing up to 5): %s; replacing with unk_id=%d',
+                    label,
+                    invalid,
+                    unk_id,
+                )
+                return [unk_id if (tid < 0 or tid >= vocab_size) else tid for tid in token_ids]
+            return list(token_ids)
+
         # This is the first iteration for this sequence
-        new_tokens = tokenizer.convert_ids_to_tokens(all_input_ids[ids_offset:],
+        new_ids = _sanitize_ids(all_input_ids[ids_offset:], 'new_ids')
+        new_tokens = tokenizer.convert_ids_to_tokens(new_ids,
                                                      skip_special_tokens=skip_special_tokens)
         # `convert_ids_to_tokens` returns None for out-of-range token_id
         new_tokens = new_tokens or []
@@ -298,7 +327,8 @@ class HuggingFaceTokenizer:
             # Please notice that in VLLM, indexes are detokenized one by one
             # while in LMDeploy, every turn, the detokenized indexes length
             # can be different.
-            prev_tokens = tokenizer.convert_ids_to_tokens(all_input_ids[:ids_offset],
+            prev_ids = _sanitize_ids(all_input_ids[:ids_offset], 'prev_ids')
+            prev_tokens = tokenizer.convert_ids_to_tokens(prev_ids,
                                                           skip_special_tokens=skip_special_tokens)
             # `convert_ids_to_tokens` returns None for out-of-range token_id
             prev_tokens = prev_tokens or []

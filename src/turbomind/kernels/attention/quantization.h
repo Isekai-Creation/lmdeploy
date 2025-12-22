@@ -783,6 +783,153 @@ struct ConvertKvCache<fp4_e2m1_t, T> {
         }
         return vo;
     }
+
+    T scale_;
+    T zero_;
+
+    __device__ ConvertKvCache(T scale, T zero) : scale_(scale), zero_(zero) {}
+
+    template<int N>
+    __device__ auto operator()(const Array<fp4_e2m1_t, N>& vi) const
+    {
+        auto vo = convert(vi);
+        PRAGMA_UNROLL
+        for (int i = 0; i < N; ++i) {
+            vo[i] = vo[i] * scale_ + zero_;
+        }
+        return vo;
+    }
+};
+
+
+inline __device__ uint32_t cvt_float_to_e2m1(float x)
+{
+    // E2M1: 1 sign, 2 exp, 1 mantissa. Bias 1.
+    // Values: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+    // Thresholds: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
+    
+    uint32_t sign = x < 0.0f ? 0x8 : 0x0;
+    float abs_x = fabsf(x);
+    
+    uint32_t val = 0;
+    if (abs_x < 0.25f) val = 0;         // 0.0
+    else if (abs_x < 0.75f) val = 1;    // 0.5
+    else if (abs_x < 1.25f) val = 2;    // 1.0
+    else if (abs_x < 1.75f) val = 3;    // 1.5
+    else if (abs_x < 2.5f) val = 4;     // 2.0
+    else if (abs_x < 3.5f) val = 5;     // 3.0
+    else if (abs_x < 5.0f) val = 6;     // 4.0
+    else val = 7;                       // 6.0 (Saturate)
+
+    return sign | val;
+}
+
+template<class T>
+struct ConvertKvCache<T, fp4_e2m1_t> {
+    T          inv_scale_;
+    T          zero_;
+    __device__ ConvertKvCache(T scale, T zero): zero_{zero}
+    {
+        inv_scale_ = (T)fdividef(1.f, (float)scale);
+    }
+
+    template<int N>
+    __device__ static auto convert_sw(const Array<T, N>& vi, T inv_scale, T zero)
+    {
+        Array<fp4_e2m1_t, N> vo;
+        // Assume packing 8 fp4 elements into 1 uint32_t (32 bits)
+        // Since Array<fp4_e2m1_t, 8> is likely 4 bytes.
+        static_assert(N % 8 == 0);
+        uint32_t* vo_ptr = reinterpret_cast<uint32_t*>(&vo);
+        
+        PRAGMA_UNROLL
+        for (int i = 0; i < N; i += 8) {
+            uint32_t packed = 0;
+            PRAGMA_UNROLL
+            for (int j = 0; j < 8; ++j) {
+                float val = (float)(vi[i + j]);
+                // Apply scale (no zero point for FP4 usually, but handled if passed)
+                val = (val - (float)zero) * (float)inv_scale;
+                uint32_t fp4 = cvt_float_to_e2m1(val);
+                // Little endian packing? 
+                // cvt_bf16x8_e2m1 expects:
+                // vo[0] = (x << 12 & S) | (x << 6 & EM); ...
+                // This implies complex layout in current read kernel.
+                // However, standard intuitive packing is usually [7][6]...[0] or [0][1]...[7]
+                // Let's assume standard intuitive packing: element 0 in bits 0-3.
+                // TRT-LLM packing for 8 elts:
+                // e2m1Vec |= val << (j * 4);
+                
+                // Let's check cvt_f16x8_e2m1 again.
+                // vo[3] = (x << 0 & S) | (x >> 6 & EM);
+                // vo[0] (first element) uses x << 12 & S. S=0x80008000.
+                // This is super swizzled.
+                
+                // RE-ANALYSIS of READ KERNEL to match packing:
+                // vo[0] (elts 0,1) -> S mask 0x80008000.
+                // x has 8 elements.
+                // element 0 maps to vo[0].x.
+                // element 1 maps to vo[0].y.
+                // vo[0] = (x << 12 & S) ...
+                // x bits responsible for vo[0].x sign (bit 31): bit 31-12=19?
+                // This bitwise logic in read kernel is vectorized and interleaved.
+                // Writing 1-by-1 might break if I don't match it.
+                
+                // SIMPLIFICATION:
+                // If I cannot match the vectorized bit-magic easily, I should use a simple packing 
+                // and enable a "simple read" kernel if possible, OR I must match it.
+                // Let's look at `uint32_t const& x = (const uint32_t&)vi`.
+                // Implicitly, element order is 0..7.
+                
+                // Let's assume standard integer packing: elt 0 at 0-3, elt 1 at 4-7.
+                // Does `cvt_f16x8_e2m1` support that?
+                // vo[3] corresponds to elts 6,7 ?
+                // array ops usually [0] is first.
+                // cvt_f16x8_e2m1 returns Array<uint32_t, 4> vo. -> 8 halfs.
+                // vo[0] -> halft 0, 1.
+                // vo[0] constructed from `x`.
+                // S=0x80008000. mask for sign bits of half 0 and 1.
+                // x << 12 & S.
+                // Means bits 19 and 3 of x are signs??
+                // 3 + 12 = 15. Bit 3 of x moves to 15 (Sign of half 0).
+                // 19 + 12 = 31. Bit 19 of x moves to 31 (Sign of half 1).
+                // So Elt 0 is at bits 0-3 (Sign at 3).
+                // Elt 1 is at bits 16-19 (Sign at 19).
+                // This is INTERLEAVED packing!
+                // Element 0: 0-3.
+                // Element 1: 16-19.
+                // Element 2: 4-7.
+                // Element 3: 20-23.
+                // Element 4: 8-11.
+                // Element 5: 24-27.
+                // Element 6: 12-15.
+                // Element 7: 28-31.
+                // Checks out?
+                // 0,2,4,6 are in low halves of 32-bit words (if x is viewed as 8x4b).
+                // No, x is one 32-bit word.
+                // The Read Kernel expects this layout.
+                
+                // I will implement this interleaved packing.
+                
+                uint32_t shift;
+                if (j % 2 == 0) {
+                    shift = (j / 2) * 4;
+                } else {
+                    shift = 16 + (j / 2) * 4;
+                }
+                
+                packed |= (fp4 << shift);
+            }
+            vo_ptr[i / 8] = packed;
+        }
+        return vo;
+    }
+
+    template<int N>
+    __device__ auto operator()(const Array<T, N>& vi) const
+    {
+        return convert_sw(vi, inv_scale_, zero_);
+    }
 };
 
 __device__ inline Array<bfloat16_t, 4> cvt_bf16x4_e4m3(const Array<fp8_e4m3_t, 4>& vi)

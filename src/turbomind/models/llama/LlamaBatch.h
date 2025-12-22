@@ -3,6 +3,7 @@
 #pragma once
 
 #include <curand_kernel.h>
+#include <mutex>
 
 #include "src/turbomind/core/core.h"
 
@@ -44,6 +45,7 @@ struct BatchState {
 
     std::vector<const Sequence*>          sequences;
     std::vector<std::shared_ptr<Request>> requests;
+    std::vector<int>                      eagle_slots; // Stable slot ID for Eagle resource management
 
     std::vector<int> errors;
 
@@ -210,6 +212,7 @@ private:
 
     void DestroyCommunicators();
 
+
     void UpdateMetrics();
 
     // Multi-token EAGLE gating helpers. These centralize the conditions under
@@ -246,6 +249,10 @@ private:
                           const std::vector<int>& kv_accepted_lengths,
                           int                     batch_size,
                           const GenerationState&  g);
+
+    void runEagleKVCacheCompaction(const std::vector<int>& kv_accepted_lengths,
+                                   int                     batch_size,
+                                   const GenerationState&  g);
 
     // Disable multi-token speculative decoding for a given slot and latch the
     // corresponding request into single-token mode for the remainder of its
@@ -320,6 +327,7 @@ private:
     Buffer_<int>  eagle_kv_batch_slots_;     // [max_batch_size_]
     Buffer_<int>  eagle_kv_block_tables_;    // [max_batch_size_, kv_max_blocks_per_seq_]
     void**        eagle_kv_cache_blocks_{nullptr};  // [num_layers, kv_max_blocks_per_seq_]
+    std::vector<int> free_eagle_slots_;      // Pool of available stable slot IDs
 
     ////////////////////////////////////////////////////////////////////
     // context decoding temp buffers

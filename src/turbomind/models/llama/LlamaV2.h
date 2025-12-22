@@ -33,6 +33,7 @@
 #include "src/turbomind/models/llama/unified_decoder.h"
 #include "src/turbomind/models/llama/EagleModule.h"
 #include "src/turbomind/models/llama/EagleBuffers.h"
+#include "src/turbomind/models/llama/EagleOrchestrator.h"
 #include "src/turbomind/models/llama/specpv_kv_cache.h"
 #include "lmdeploy/turbomind/speculative_decoding_mode.h"
 
@@ -55,6 +56,7 @@ public:
         EagleBuffers*       eagle_buffers{nullptr};
         bool                enable_eagle{false};
         bool                enable_eagle_target_tree{false};
+        const int*          d_batch_slots{nullptr};
     };
 
     LlamaV2(DataType                     dtype,
@@ -92,6 +94,16 @@ public:
     // partial KV cache wiring will be added in a later iteration.
     bool isSpecPVEnabled() const noexcept;
     bool shouldUseSpecPV(int seq_len) const noexcept;
+
+    void compactKVCache(int           batch_size,
+                        const int*    dst_block_tables,      // [batch, max_blocks]
+                        void**        dst_block_base_ptrs,   // [total_blocks] or [phys_id -> ptr]
+                        int           max_blocks_per_seq,
+                        int           block_size,
+                        cudaStream_t  stream);
+
+    UnifiedAttentionLayer* getAttentionLayer();
+        const Buffer& getKvBlockPtrsBuffer() const;
 
 private:
     void updateEmbedding(char*            decoder_input,
@@ -324,6 +336,7 @@ private:
     SpeculativeDecodingMode spec_mode_{SpeculativeDecodingMode::None()};
     std::unique_ptr<EagleModule>  eagle_module_;
     std::unique_ptr<EagleBuffers> eagle_buffers_;
+    std::unique_ptr<EagleOrchestrator> eagle_orchestrator_;
     // Non-owning pointer into EagleModule::eagle3_draft_layer_ when present.
     const Eagle3DraftLayerWeight* eagle3_draft_weight_{nullptr};
     // Dedicated hidden-state and logits buffers for target-tree decode.
@@ -363,6 +376,10 @@ private:
     std::vector<int> eagle_step_accepted_tokens_;
     int              eagle_step_tokens_per_seq_{0};
     int              eagle_step_max_extra_{0};
+
+    // Persistent scratch buffer for EAGLE tree KV to facilitate compaction
+    Buffer scratch_kv_buffer_;
+    Buffer kv_block_ptrs_;
 };
 
 }  // namespace turbomind

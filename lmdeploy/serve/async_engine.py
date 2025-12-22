@@ -999,7 +999,17 @@ class AsyncEngine(LogitsMixin):
         try:
             yield generator
         except (Exception, asyncio.CancelledError, GeneratorExit) as e:  # noqa
-            logger.error(f"[safe_run] exception caught: {type(e).__name__} {e}")
+            if isinstance(e, OverflowError):
+                gen_cfg = kwargs.get("gen_config")
+                logger.error(
+                    "[safe_run] OverflowError: session_id=%s step=%s input_len=%s max_new_tokens=%s gen_config=%s",
+                    session_id,
+                    kwargs.get("step"),
+                    len(kwargs.get("input_ids", []) or []),
+                    getattr(gen_cfg, "max_new_tokens", None),
+                    gen_cfg,
+                )
+            logger.exception("[safe_run] exception caught")
             # TODO: remove session_id from async cancel
             await inst.async_cancel(session_id)
             raise e
@@ -1243,8 +1253,15 @@ class AsyncEngine(LogitsMixin):
                             else outputs.logits
                         )
 
-                    # Parse harmony format for GPT-OSS models
-                    if self.harmony_parser and parse_harmony and token_ids:
+                    # Parse harmony format for GPT-OSS models.
+                    # Only attempt parsing for chat-style inputs to avoid
+                    # spurious warnings on plain text prompts.
+                    if (
+                        self.harmony_parser
+                        and parse_harmony
+                        and token_ids
+                        and isinstance(messages, list)
+                    ):
                         try:
                             parsed = self.harmony_parser.parse_streaming(token_ids)
                             # Update output with parsed harmony content

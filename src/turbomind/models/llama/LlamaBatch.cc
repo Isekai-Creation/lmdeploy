@@ -47,6 +47,7 @@
 #include "src/turbomind/models/llama/llama_utils.h"
 
 #include "src/turbomind/utils/anomaly_handler.h"
+#include "src/turbomind/utils/metrics.h"
 #include "src/turbomind/utils/constant.h"
 #include "src/turbomind/utils/cuda_utils.h"
 #include "src/turbomind/utils/debug_utils.h"
@@ -530,6 +531,18 @@ void LlamaBatch::Initialize(GenerationState& g)
     auto process = [&](BatchState* state) {
         for (int i = 0; i < state->size; ++i) {
             if (auto& r = state->requests[i]) {
+                if (state == incoming_) {
+                    // Alloc stable slot for new request
+                    if (free_eagle_slots_.empty()) {
+                        TM_LOG_ERROR("[LlamaBatch] No free Eagle slots available. Dropping request.");
+                        // Handle error? LlamaBatch doesn't easily support drop here.
+                        // Assuming max_batch_size matches pool size.
+                        state->eagle_slots[i] = -1; // Invalid
+                    } else {
+                        state->eagle_slots[i] = free_eagle_slots_.back();
+                        free_eagle_slots_.pop_back();
+                    }
+                }
                 sequences.push_back(state->sequences[i]);
                 status.push_back(state->sequences[i]->status);
                 priorities.push_back(r->unique_id);
@@ -584,6 +597,21 @@ void LlamaBatch::Initialize(GenerationState& g)
             std::stable_sort(swapin_beg, partial_beg, [&](int i, int j) {
                 return sequences[i]->input_length < sequences[j]->input_length;
             });
+        }
+
+        // Free slots for inactive/dropped sequences
+        for (size_t i = 0; i < sequences.size(); ++i) {
+            if (sequences[i]->status != Sequence::kActive) {
+                auto [src_state, src_idx] = coords[i];
+                // Check if we allocated a slot (might be -1 if failed or not init?)
+                if (static_cast<size_t>(src_idx) < src_state->eagle_slots.size()) {
+                    int slot = src_state->eagle_slots[src_idx];
+                    if (slot >= 0) {
+                        free_eagle_slots_.push_back(slot);
+                        src_state->eagle_slots[src_idx] = -1;
+                    }
+                }
+            }
         }
 
         // Copy sequence states to back buffer
@@ -724,6 +752,8 @@ void LlamaBatch::CopyState(const std::vector<std::tuple<BatchState*, BatchState*
         for (int i = beg; i < end; ++i) {
             s_idx.push_back(std::get<2>(desc[idxs[i]]));
             d_idx.push_back(std::get<3>(desc[idxs[i]]));
+            // Copy eagle_slots
+            d->eagle_slots[d_idx.back()] = s->eagle_slots[s_idx.back()];
         }
 
         IndexedCopy(s_idx,
@@ -828,7 +858,9 @@ void LlamaBatch::AllocateBuffer(ssize_t batch_size, ssize_t session_len, int cac
         s.h_prompt_length  = {batch_size, kCPUpinned};
         s.h_context_length = {batch_size, kCPUpinned};
         s.h_finished       = {batch_size * 2, kCPUpinned};
+        s.h_finished       = {batch_size * 2, kCPUpinned};
         s.h_rope_theta     = {batch_size, kCPUpinned};
+        s.eagle_slots.resize(batch_size);
     }
 
     h_seq_limit_len_ = {batch_size, kCPUpinned};
@@ -964,6 +996,11 @@ LlamaBatch::LlamaBatch(DataType                 data_type,
     symm_alloc_ = core::SimpleAllocator::Create([this](ssize_t size) { return SymmAlloc(size, true); },
                                                 [this](void* p, ssize_t size) { return SymmFree(p, size, true); },
                                                 kDEVICE);
+
+    // Init free slot pool
+    for (int i = 0; i < max_batch_size_; ++i) {
+        free_eagle_slots_.push_back(max_batch_size_ - 1 - i);
+    }
 
     InitializeBufferAndKVCache();
 
@@ -1270,6 +1307,64 @@ void LlamaBatch::runEagleMultiTokenAdvance(const std::vector<int>&  h_token_ids,
                                       eagle_accepted_lens,
                                       eagle_accepted_tokens,
                                       g);
+
+    runEagleKVCacheCompaction(eagle_accepted_lens, batch_size, g);
+}
+
+void LlamaBatch::runEagleKVCacheCompaction(const std::vector<int>& kv_accepted_lengths,
+                                           int                     batch_size,
+                                           const GenerationState&  g)
+{
+    if (!isEagleMultiTokenStepEnabled(g)) {
+        return;
+    }
+
+    bool any_compaction = false;
+    for (int i = 0; i < batch_size && i < static_cast<int>(kv_accepted_lengths.size()); ++i) {
+        if (kv_accepted_lengths[i] > 0) {
+            any_compaction = true;
+            break;
+        }
+    }
+    if (!any_compaction) {
+        return;
+    }
+
+    // Prepare Block Tables (Physical IDs from SequenceManager)
+    const int max_batch_size = max_batch_size_;
+    static std::vector<int> h_block_tables_storage;
+    const int total_block_entries = max_batch_size * kv_max_blocks_per_seq_;
+    if (h_block_tables_storage.size() < static_cast<size_t>(total_block_entries)) {
+        h_block_tables_storage.resize(total_block_entries);
+    }
+    std::fill_n(h_block_tables_storage.data(), total_block_entries, -1);
+    
+    for (int slot = 0; slot < state_->active_size; ++slot) {
+        const auto* seq = state_->sequences[slot];
+        if (!seq) continue;
+        const int count = std::min<int>(seq->blocks.size(), kv_max_blocks_per_seq_);
+        for (int j = 0; j < count; ++j) {
+            h_block_tables_storage[slot * kv_max_blocks_per_seq_ + j] = seq->blocks[j];
+        }
+    }
+
+    if (!eagle_kv_block_tables_) {
+        return;
+    }
+
+    // Copy block tables to device
+    core::Copy(h_block_tables_storage.data(), h_block_tables_storage.size(), eagle_kv_block_tables_.data());
+
+    // Get destination block pointers from model's buffer
+    void** dst_block_base_ptrs = (void**)model_->getKvBlockPtrsBuffer().raw_data();
+    
+    // Call Model Compaction (currently stubbed)
+    model_->compactKVCache(batch_size,
+                           eagle_kv_block_tables_.data(),
+                           dst_block_base_ptrs,
+                           kv_max_blocks_per_seq_,
+                           kv_block_size_,
+                           stream_);
 }
 
 void LlamaBatch::runEagleKVRewind(const std::vector<int>& kv_draft_lengths,
@@ -2398,7 +2493,19 @@ bool LlamaBatch::Forward(GenerationState& g)
 
         // stop-words & bad-words require the matched tokens to be contiguous, so item size > 1 is not supported
         if (eagle_enabled && model_->isEagleEnabled()) {
+            // Populate d_batch_slots for EagleOrchestrator
+            // Copy current active slots to device buffer
+            std::vector<int> current_slots;
+            current_slots.reserve(batch_size);
+            for (int i = 0; i < batch_size; ++i) {
+                current_slots.push_back(state_->eagle_slots[i]);
+            }
+            if (!current_slots.empty()) {
+                core::Copy(current_slots.data(), current_slots.size(), eagle_kv_batch_slots_.data());
+            }
+
             LlamaV2::SpecContext spec_ctx{};
+            spec_ctx.d_batch_slots = eagle_kv_batch_slots_.data();
             spec_ctx.max_decoding_tokens_step = param_.spec_max_decoding_tokens;
             spec_ctx.sequences                = state_->sequences.data();
             spec_ctx.d_sequence_lengths       = sequence_lengths_.data();
@@ -3224,6 +3331,7 @@ void LlamaBatch::DestroyCommunicators()
 void LlamaBatch::UpdateMetrics()
 {
     if (tp_rank_ == 0 && param_.enable_metrics) {
+        /*
         // update schedule metrics
         int total_seqs, active_seqs, cached_seqs;
         std::tie(total_seqs, active_seqs, cached_seqs) = sequence_manager_->seq_stats();
@@ -3249,9 +3357,11 @@ void LlamaBatch::UpdateMetrics()
             if (!metrics || metrics->scheduled_time != 0) {
                 continue;
             }
-            metrics->scheduled_time = RequestMetrics::timestamp();
+            metrics->scheduled_time = turbomind::RequestMetrics::timestamp();
         }
+        */
     }
 }
+
 
 }  // namespace turbomind

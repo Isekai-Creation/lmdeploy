@@ -53,6 +53,9 @@ from .tokenizer_info import TokenizerInfo  # noqa: E402
 logger = get_logger("lmdeploy")
 
 MAX_LOGPROBS = 1024
+_INT32_MIN = -(2**31)
+_INT32_MAX = 2**31 - 1
+_UINT64_MAX = 2**64 - 1
 
 
 def _construct_stop_or_bad_words(words: List[int] = None):
@@ -61,6 +64,33 @@ def _construct_stop_or_bad_words(words: List[int] = None):
     offsets = list(range(1, len(words) + 1))
     combined = [words, offsets]
     return combined
+
+
+def _require_int_range(name: str, value: Any, min_val: int, max_val: int) -> int | None:
+    if value is None:
+        return None
+    try:
+        int_val = int(value)
+    except Exception as exc:
+        raise ValueError(
+            f"{name} must be an int in [{min_val}, {max_val}], got {value!r} ({type(value).__name__})"
+        ) from exc
+    if int_val < min_val or int_val > max_val:
+        raise ValueError(
+            f"{name} out of range: {int_val} not in [{min_val}, {max_val}]"
+        )
+    return int_val
+
+
+def _require_int_list(name: str, values: Any, min_val: int, max_val: int) -> list[int] | None:
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        values = list(values)
+    out: list[int] = []
+    for idx, value in enumerate(values):
+        out.append(_require_int_range(f"{name}[{idx}]", value, min_val, max_val))
+    return out
 
 
 def _np_dict_to_tm_dict(np_dict: dict):
@@ -974,6 +1004,8 @@ class TurboMindInstance:
             kwargs (dict): kwargs for backward compatibility
         """
         logger.info(f"[async_stream_infer] session {session_id} start")
+        _require_int_range("session_id", session_id, 0, _UINT64_MAX)
+        _require_int_range("step", step, 0, _INT32_MAX)
         gen_cfg = self._get_generation_config(gen_config)
 
         inputs, input_len = self.prepare_inputs(
@@ -1112,20 +1144,33 @@ class TurboMindInstance:
 
     def _get_generation_config(self, cfg: GenerationConfig):
         c = _tm.GenerationConfig()
-        c.max_new_tokens = cfg.max_new_tokens
-        c.top_k = cfg.top_k
+        max_new_tokens = _require_int_range(
+            "max_new_tokens", cfg.max_new_tokens, 0, _INT32_MAX
+        )
+        if max_new_tokens is None:
+            raise ValueError("max_new_tokens must be set for TurboMind generation")
+        c.max_new_tokens = max_new_tokens
+        c.top_k = _require_int_range("top_k", cfg.top_k, 0, _INT32_MAX)
         c.top_p = cfg.top_p
         c.min_p = cfg.min_p
         c.temperature = cfg.temperature
-        if cfg.stop_token_ids:
-            c.eos_ids = cfg.stop_token_ids
-        if cfg.bad_token_ids:
-            c.bad_ids = _construct_stop_or_bad_words(cfg.bad_token_ids)
-        if not cfg.ignore_eos and cfg.stop_token_ids:
-            c.stop_ids = _construct_stop_or_bad_words(cfg.stop_token_ids)
+        stop_token_ids = _require_int_list(
+            "stop_token_ids", cfg.stop_token_ids, 0, _INT32_MAX
+        )
+        bad_token_ids = _require_int_list(
+            "bad_token_ids", cfg.bad_token_ids, 0, _INT32_MAX
+        )
+        if stop_token_ids:
+            c.eos_ids = stop_token_ids
+        if bad_token_ids:
+            c.bad_ids = _construct_stop_or_bad_words(bad_token_ids)
+        if not cfg.ignore_eos and stop_token_ids:
+            c.stop_ids = _construct_stop_or_bad_words(stop_token_ids)
         c.repetition_penalty = cfg.repetition_penalty
         if cfg.min_new_tokens:
-            c.min_new_tokens = cfg.min_new_tokens
+            c.min_new_tokens = _require_int_range(
+                "min_new_tokens", cfg.min_new_tokens, 0, _INT32_MAX
+            )
         output_type = dict(all=1, generation=2)
         if cfg.output_last_hidden_state:
             c.output_last_hidden_state = output_type[cfg.output_last_hidden_state]
@@ -1138,8 +1183,12 @@ class TurboMindInstance:
                     f"logprobs shoudd be in range [1, {MAX_LOGPROBS}]"
                     f"update logprobs={cfg.logprobs}"
                 )
-            c.output_logprobs = cfg.logprobs
+            c.output_logprobs = _require_int_range(
+                "logprobs", cfg.logprobs, 0, _INT32_MAX
+            )
         if cfg.random_seed is not None:
-            c.random_seed = cfg.random_seed
+            c.random_seed = _require_int_range(
+                "random_seed", cfg.random_seed, 0, _UINT64_MAX
+            )
         # print (c)
         return c

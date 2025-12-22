@@ -1,0 +1,40 @@
+{
+  "latency_ms_per_token": {
+    "mean": 1.9967843740086992,
+    "min": 1.9967843740086992,
+    "max": 1.9967843740086992,
+    "values": [
+      1.9967843740086992
+    ]
+  },
+  "throughput_tokens_per_sec": {
+    "mean": 500.80520111063504,
+    "min": 500.80520111063504,
+    "max": 500.80520111063504,
+    "values": [
+      500.80520111063504
+    ]
+  },
+  "memory_gb": {
+    "mean": 0.0,
+    "max": 0.0,
+    "utilization_pct": 0.0
+  },
+  "total_runs": 1,
+  "scenario": {
+    "name": "Speculative_Batch8_Context8K_1tokens_EAGLE3_Throughput",
+    "batch_size": 8,
+    "context_length": 8192,
+    "max_new_tokens": 24576,
+    "use_speculation": true,
+    "num_spec_tokens": 1,
+    "session_len": 32768,
+    "spec_model_path": "/workspace/aimo/models/gpt-oss-120b-Eagle3-throughput"
+  },
+  "system": {
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_memory_total_gb": 101.958877184,
+    "timestamp": "2025-12-21T12:48:40.687134",
+    "turbomind_build_id": "unknown"
+  }
+}

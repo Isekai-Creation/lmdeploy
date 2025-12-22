@@ -277,7 +277,7 @@ class TurbomindEngineConfig:
         assert self.dtype in ["auto", "float16", "bfloat16"]
         assert self.tp >= 1, "tp must be a positive integer"
         assert self.cache_max_entry_count > 0, "invalid cache_max_entry_count"
-        assert self.quant_policy in (0, 4, 8), "invalid quant_policy"
+        assert self.quant_policy in (0, 4, 8, 16), "invalid quant_policy"
         assert self.rope_scaling_factor >= 0, "invalid rope_scaling_factor"
         assert self.max_prefill_token_num >= 0, "invalid max_prefill_token_num"
         assert self.num_tokens_per_iter >= 0, "invalid num_tokens_per_iter"
@@ -416,7 +416,7 @@ class PytorchEngineConfig:
         assert self.num_cpu_blocks >= 0, "invalid num_cpu_blocks"
         assert self.max_prefill_token_num >= 0, "invalid max_prefill_token_num"
         assert self.num_gpu_blocks >= 0, "invalid num_gpu_blocks"
-        assert self.quant_policy in (0, 4, 8), "invalid quant_policy"
+        assert self.quant_policy in (0, 4, 8, 16), "invalid quant_policy"
         assert self.device_type in [
             "cuda",
             "ascend",

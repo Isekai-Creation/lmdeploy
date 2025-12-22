@@ -266,6 +266,9 @@ void invokeProcessKV_v2(char**                 blocks,
     else if (quant_policy & QuantPolicy::kCacheKVInt4) {
         dispatch(uint4_t{});
     }
+    else if (quant_policy & QuantPolicy::kCacheKVFP4) {
+        dispatch(fp4_e2m1_t{});
+    }
     else {
         dispatch(T{});
     }
@@ -492,6 +495,9 @@ void invokeFlattenKV_v2(T*                     k,
     else if (quant_policy & QuantPolicy::kCacheKVInt4) {
         dispatch(uint4_t{});
     }
+    else if (quant_policy & QuantPolicy::kCacheKVFP4) {
+        dispatch(fp4_e2m1_t{});
+    }
     else {
         dispatch(T{});
     }
@@ -550,6 +556,7 @@ size_t get_cache_block_size(DataType dtype,
             case kUint8:
                 return 8;
             case kUint4:
+            case kFloat4_e2m1:
                 return 4;
             case kUint2:
                 return 2;

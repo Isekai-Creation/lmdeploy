@@ -73,6 +73,11 @@ public:
         return d_cu_q_len_;
     }
 
+    void** getKvBlockPtrs()
+    {
+        return (void**)kv_block_ptrs_.raw_data();
+    }
+
 private:
     Tensor forward_mla(const Tensor& hidden_state, const WeightType& weights);
 

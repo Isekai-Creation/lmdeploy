@@ -57,6 +57,10 @@ struct EagleBuffers {
         SizeType* prev_paths;                // [batch_size, max_decoding_tokens, max_path_len]
         SizeType* best_path_ids;             // [batch_size]
         
+        // KV Cache Compaction
+        void* kv_scratch;                    // [max_persistent_scratch_bytes]
+        SizeType* cu_block_nums;             // [batch_size + 1]
+
         Inputs() { zero(); }
         
         void zero() {
@@ -81,6 +85,8 @@ struct EagleBuffers {
             prev_draft_lens = nullptr;
             prev_paths = nullptr;
             best_path_ids = nullptr;
+            kv_scratch = nullptr;
+            cu_block_nums = nullptr;
         }
     };
     
