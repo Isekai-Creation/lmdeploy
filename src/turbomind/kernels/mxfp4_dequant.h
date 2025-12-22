@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -99,12 +100,5 @@ void dequant_mxfp4(
     dequant_mxfp4_kernel<T><<<grid, block, 0, stream>>>(
         out, blocks, scales, rows, cols, group_size);
 }
-
-// Explicit instantiations
-template void dequant_mxfp4<__nv_bfloat16>(
-    __nv_bfloat16*, const uint8_t*, const uint8_t*, int, int, int, cudaStream_t);
-
-template void dequant_mxfp4<__half>(
-    __half*, const uint8_t*, const uint8_t*, int, int, int, cudaStream_t);
 
 }  // namespace turbomind
