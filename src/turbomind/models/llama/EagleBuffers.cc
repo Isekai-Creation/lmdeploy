@@ -109,44 +109,46 @@ void EagleBuffers::free() {
     
     TM_LOG_INFO("Freeing EagleBuffers");
     
-    // Free input buffers
-    cudaFree(inputs.draft_tokens);
-    cudaFree(inputs.draft_lens);
-    cudaFree(inputs.target_tokens);
-    cudaFree(inputs.draft_paths);
-    cudaFree(inputs.packed_masks);
-    cudaFree(inputs.leaf_mask);
-    cudaFree(inputs.eagle_net_ctx_lens);
-    cudaFree(inputs.eagle_net_gen_lens);
-    cudaFree(inputs.eagle_net_seq_lens);
-    cudaFree(inputs.draft_offsets);
-    cudaFree(inputs.target_offsets);
-    cudaFree(inputs.successor_offsets);
-    cudaFree(inputs.successor_counts);
-    cudaFree(inputs.eagle_net_input_ids);
-    cudaFree(inputs.eagle_net_position_ids);
-    cudaFree(inputs.eagle_net_hidden_indices);
-    cudaFree(inputs.prev_accepted_tokens);
-    cudaFree(inputs.prev_accepted_lens);
-    cudaFree(inputs.prev_draft_lens);
-    cudaFree(inputs.prev_paths);
-    cudaFree(inputs.best_path_ids);
+    // Helper macro for safe free - checks null, frees, then sets to nullptr
+    #define SAFE_CUDA_FREE(ptr) do { if (ptr) { cudaFree(ptr); ptr = nullptr; } } while(0)
     
-    cudaFree(inputs.cu_block_nums);
+    // Free input buffers
+    SAFE_CUDA_FREE(inputs.draft_tokens);
+    SAFE_CUDA_FREE(inputs.draft_lens);
+    SAFE_CUDA_FREE(inputs.target_tokens);
+    SAFE_CUDA_FREE(inputs.draft_paths);
+    SAFE_CUDA_FREE(inputs.packed_masks);
+    SAFE_CUDA_FREE(inputs.leaf_mask);
+    SAFE_CUDA_FREE(inputs.eagle_net_ctx_lens);
+    SAFE_CUDA_FREE(inputs.eagle_net_gen_lens);
+    SAFE_CUDA_FREE(inputs.eagle_net_seq_lens);
+    SAFE_CUDA_FREE(inputs.draft_offsets);
+    SAFE_CUDA_FREE(inputs.target_offsets);
+    SAFE_CUDA_FREE(inputs.successor_offsets);
+    SAFE_CUDA_FREE(inputs.successor_counts);
+    SAFE_CUDA_FREE(inputs.eagle_net_input_ids);
+    SAFE_CUDA_FREE(inputs.eagle_net_position_ids);
+    SAFE_CUDA_FREE(inputs.eagle_net_hidden_indices);
+    SAFE_CUDA_FREE(inputs.prev_accepted_tokens);
+    SAFE_CUDA_FREE(inputs.prev_accepted_lens);
+    SAFE_CUDA_FREE(inputs.prev_draft_lens);
+    SAFE_CUDA_FREE(inputs.prev_paths);
+    SAFE_CUDA_FREE(inputs.best_path_ids);
+    
+    SAFE_CUDA_FREE(inputs.cu_block_nums);
 
     // Free output buffers
-    cudaFree(outputs.next_draft_tokens);
-    cudaFree(outputs.next_draft_lens);
-    cudaFree(outputs.next_draft_paths);
-    cudaFree(outputs.accepted_tokens);
-    cudaFree(outputs.accepted_lens);
-    cudaFree(outputs.best_path_ids);
-    cudaFree(outputs.accepted_lengths_cumsum);
-    cudaFree(outputs.accepted_path_offsets);
-    cudaFree(outputs.acceptance_rate);
+    SAFE_CUDA_FREE(outputs.next_draft_tokens);
+    SAFE_CUDA_FREE(outputs.next_draft_lens);
+    SAFE_CUDA_FREE(outputs.next_draft_paths);
+    SAFE_CUDA_FREE(outputs.accepted_tokens);
+    SAFE_CUDA_FREE(outputs.accepted_lens);
+    SAFE_CUDA_FREE(outputs.best_path_ids);
+    SAFE_CUDA_FREE(outputs.accepted_lengths_cumsum);
+    SAFE_CUDA_FREE(outputs.accepted_path_offsets);
+    SAFE_CUDA_FREE(outputs.acceptance_rate);
     
-    inputs.zero();
-    outputs.zero();
+    #undef SAFE_CUDA_FREE
     
     allocated_ = false;
     TM_LOG_INFO("EagleBuffers freed");
