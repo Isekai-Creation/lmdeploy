@@ -39,6 +39,19 @@ void EagleOrchestrator::free()
         cudaFree(workspace_);
         workspace_ = nullptr;
     }
+    // Free buffers allocated in setChoices()
+    if (d_path_indices_) {
+        cudaFree(d_path_indices_);
+        d_path_indices_ = nullptr;
+    }
+    if (d_successor_offsets_) {
+        cudaFree(d_successor_offsets_);
+        d_successor_offsets_ = nullptr;
+    }
+    if (d_successor_counts_) {
+        cudaFree(d_successor_counts_);
+        d_successor_counts_ = nullptr;
+    }
     allocated_ = false;
 }
 
@@ -103,12 +116,10 @@ void EagleOrchestrator::setChoices(const std::vector<std::vector<int>>& choices)
     
     total_successors_ = static_cast<int>(h_succ_counts.size());
     
-    if (allocated_) { // Re-alloc or just copy if size fits
-         // Simplified: free and alloc for now to be safe on size change
-         if (d_path_indices_) cudaFree(d_path_indices_);
-         if (d_successor_offsets_) cudaFree(d_successor_offsets_);
-         if (d_successor_counts_) cudaFree(d_successor_counts_);
-    }
+    // Free existing buffers if they were previously allocated
+    if (d_path_indices_) cudaFree(d_path_indices_);
+    if (d_successor_offsets_) cudaFree(d_successor_offsets_);
+    if (d_successor_counts_) cudaFree(d_successor_counts_);
 
     cudaMalloc(&d_path_indices_, h_path_indices.size() * sizeof(int));
     cudaMemcpy(d_path_indices_, h_path_indices.data(), h_path_indices.size() * sizeof(int), cudaMemcpyHostToDevice);
