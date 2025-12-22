@@ -2,8 +2,8 @@
 """
 FP4 vs INT8 KV Cache Memory Benchmark
 
-Compares memory pressure during decoding at:
-- 8192 tokens
+Compares memory pressure during decode at:
+- 8192 tokens (8K)
 - 32768 tokens (32K)
 - 65536 tokens (64K)
 
@@ -38,14 +38,10 @@ def reset_gpu():
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
-def run_decode_benchmark(model_path, quant_policy, session_len, num_prompts=4):
+def run_decode_benchmark(model_path, quant_policy, session_len, max_new_tokens=2048):
     """
     Run decode benchmark with specified session length.
-    
-    We simulate heavy decode by:
-    1. Loading engine with given session_len
-    2. Running multiple concurrent requests
-    3. Measuring peak memory during decode
+    Focus on memory pressure during decoding.
     """
     from lmdeploy import TurbomindEngineConfig, pipeline
     
@@ -58,31 +54,30 @@ def run_decode_benchmark(model_path, quant_policy, session_len, num_prompts=4):
             session_len=session_len,
         )
         
-        print(f"    Loading engine (session_len={session_len})...")
+        print(f"      Loading engine (session_len={session_len})...")
         start = time.time()
         pipe = pipeline(model_path, backend_config=config)
         load_time = time.time() - start
         
         _, mem_after_load = get_gpu_memory()
         
-        # Generate prompts that will trigger long decode sequences
-        prompts = [
-            f"Write a very long detailed story about adventure {i}. Continue until you reach the maximum length." 
-            for i in range(num_prompts)
-        ]
+        # Single long prompt to maximize decode memory pressure
+        prompt = "Write an extremely detailed technical documentation about CUDA kernel optimization, " \
+                 "covering memory coalescing, warp divergence, shared memory banking, occupancy optimization, " \
+                 "and register pressure. Provide extensive code examples for each technique."
         
-        print(f"    Running {num_prompts} concurrent decodes...")
+        print(f"      Running decode (max_tokens={max_new_tokens})...")
         start = time.time()
         
         # Run generation - this will allocate KV cache
-        responses = pipe(prompts, max_new_tokens=min(2048, session_len // 4))
+        response = pipe(prompt, max_new_tokens=max_new_tokens)
         
         decode_time = time.time() - start
         
         torch.cuda.synchronize()
         peak_mem = torch.cuda.max_memory_allocated() / 1e9
         
-        total_tokens = sum(len(r.text.split()) for r in responses)
+        output_tokens = len(response.text.split())
         
         del pipe
         reset_gpu()
@@ -93,10 +88,13 @@ def run_decode_benchmark(model_path, quant_policy, session_len, num_prompts=4):
             'decode_time': decode_time,
             'peak_memory_gb': peak_mem,
             'mem_after_load_gb': mem_after_load,
-            'total_tokens': total_tokens,
+            'output_tokens': output_tokens,
+            'tokens_per_sec': output_tokens / decode_time if decode_time > 0 else 0,
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         reset_gpu()
         return {
             'success': False,
@@ -111,29 +109,21 @@ def main():
     print(f"Timestamp: {datetime.now().isoformat()}")
     print("=" * 70)
     
-    # Model path - use available model
-    model_candidates = [
-        "/workspace/aimo/models/gpt-oss-20b",
-        "/workspace/aimo/models/Qwen2.5-7B-Instruct",
-        "/workspace/aimo/models/Meta-Llama-3.1-8B-Instruct",
-    ]
+    # Use turbomind-converted model
+    model_path = "/workspace/aimo/models/gpt-oss-120b-turbomind"
     
-    model_path = None
-    for candidate in model_candidates:
-        if os.path.exists(candidate):
-            model_path = candidate
-            break
-    
-    if not model_path:
-        print("ERROR: No model found!")
+    if not os.path.exists(model_path):
+        print(f"ERROR: Model not found at {model_path}")
         return 1
     
     print(f"Model: {model_path}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    # Benchmark configurations
+    # Benchmark configurations - focus on decode pressure
     session_lengths = [8192, 32768, 65536]  # 8K, 32K, 64K
+    max_tokens_per_session = {8192: 4096, 32768: 8192, 65536: 16384}  # Decode heavy
+    
     quant_policies = {
         8: "INT8 KV",
         16: "FP4 KV",
@@ -142,8 +132,10 @@ def main():
     results = {}
     
     for session_len in session_lengths:
+        max_tokens = max_tokens_per_session[session_len]
         print(f"\n{'='*70}")
         print(f"Session Length: {session_len} tokens ({session_len//1024}K)")
+        print(f"Max Decode Tokens: {max_tokens}")
         print("=" * 70)
         
         for qp, qp_name in quant_policies.items():
@@ -153,23 +145,24 @@ def main():
                 model_path=model_path,
                 quant_policy=qp,
                 session_len=session_len,
-                num_prompts=4
+                max_new_tokens=max_tokens
             )
             
             key = f"{session_len}_{qp}"
             results[key] = result
             
             if result['success']:
-                print(f"    Peak Memory: {result['peak_memory_gb']:.2f} GB")
-                print(f"    Decode Time: {result['decode_time']:.1f}s")
+                print(f"      Peak Memory: {result['peak_memory_gb']:.2f} GB")
+                print(f"      Decode Time: {result['decode_time']:.1f}s")
+                print(f"      Tokens/sec: {result['tokens_per_sec']:.1f}")
             else:
-                print(f"    FAILED: {result['error']}")
+                print(f"      FAILED: {result['error']}")
     
     # Summary table
     print("\n" + "=" * 70)
     print("SUMMARY: Peak Memory Usage (GB)")
     print("=" * 70)
-    print(f"{'Session Len':<15} {'INT8 KV':<15} {'FP4 KV':<15} {'Savings':<15}")
+    print(f"{'Session':<12} {'INT8 KV':<18} {'FP4 KV':<18} {'Savings':<12}")
     print("-" * 70)
     
     for session_len in session_lengths:
@@ -188,7 +181,7 @@ def main():
         int8_str = f"{int8_mem:.2f} GB" if int8_mem > 0 else "FAILED"
         fp4_str = f"{fp4_mem:.2f} GB" if fp4_mem > 0 else "FAILED"
         
-        print(f"{session_len//1024}K tokens{'':<7} {int8_str:<15} {fp4_str:<15} {savings_str:<15}")
+        print(f"{session_len//1024}K{'':<8} {int8_str:<18} {fp4_str:<18} {savings_str:<12}")
     
     print("=" * 70)
     print("[DONE] Benchmark completed!")
