@@ -955,7 +955,9 @@ LlamaBatch::~LlamaBatch()
 {
     TM_LOG_DEBUG("~LlamaBatch()");
 
-    internal_thread_.join();
+    if (internal_thread_.joinable()) {
+        internal_thread_.join();
+    }
 
     // The dtor maybe called from unknown thread, set device id before CUDA calls
     cudaSetDevice(device_id_);
