@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
+import re
 
 from ..config import RopeParam
 from .base import INPUT_MODELS
@@ -7,6 +8,15 @@ from .llama import LlamaModel, LlamaReader
 
 
 class DeepSeek2Reader(LlamaReader):
+
+    # Mapping for MXFP4 experts (same as GptOssReader)
+    mappings = [
+        lambda s: re.sub(
+            r"(experts.*proj)_blocks$",
+            r"\1.blocks",
+            re.sub(r"(experts.*proj)_scales$", r"\1.scales", s),
+        )
+    ]
 
     def moe_ffn_gate(self, i, kind):
         return self.params.get(f"model.layers.{i}.mlp.gate.{kind}")
@@ -23,20 +33,42 @@ class DeepSeek2Reader(LlamaReader):
         return (*result,)
 
     def _ffn(self, i: int, kind: str):
-        """Get ffn kind for layer i."""
+        """Get ffn kind for layer i.
+
+        For DeepSeek models WITH shared_experts:
+          - Layer 0: Regular MLP (gate/down/up_proj)
+          - Layer 1+: shared_experts.{gate/down/up}_proj
+
+        For DeepSeek-V32 models WITHOUT shared_experts (pure MoE):
+          - Return None, as FFN is handled entirely by MoE experts
+        """
         if not kind:
             return self.filter(r"mlp" if i == 0 else r"shared_expert\.")
+
         result = []
         for key in ["gate", "down", "up"]:
+            # Try shared_experts first (DeepSeek V2/V3)
             name = f"model.layers.{i}.mlp.shared_experts.{key}_proj.{kind}"
             if i == 0:
+                # Layer 0 uses regular MLP without 'shared_experts' prefix
                 name = name.replace("shared_experts.", "")
+
             tensor = self.params.get(name)
-            tensor = self.transform(tensor, kind)
+
+            # For pure MoE models (no shared_experts), tensor will be None
+            # and that's expected - the MoE experts handle everything
+            tensor = self.transform(tensor, kind) if tensor is not None else None
             result.append(tensor)
+
+        # If all tensors are None, this layer has no dense FFN (pure MoE)
         return (*result,)
 
     def mla(self, i: int, kind: str):
+        # Check for MXFP4 quantization (Attn should be dequantized to BF16)
+        quant_config = self.model_cfg.get("quantization_config", {})
+        if quant_config.get("quant_method") == "mxfp4" and kind == "weight":
+            return self.mla_mxfp4(i)
+
         if not kind:
             return self.filter(r"self_attn.*proj")
         result = []
@@ -66,6 +98,8 @@ class DeepSeek2Reader(LlamaReader):
         """
         from ..mxfp4_utils import dequant_mxfp4_weight
 
+        import torch
+
         result = []
         for key in [
             "q_a_proj",
@@ -83,8 +117,6 @@ class DeepSeek2Reader(LlamaReader):
 
             if blocks is not None and scales is not None:
                 # Dequantize MXFP4 to BF16
-                import torch
-
                 tensor = dequant_mxfp4_weight(blocks, scales, torch.bfloat16)
             else:
                 # Fall back to regular weight loading
@@ -195,6 +227,11 @@ class DeepSeek2Model(LlamaModel):
                 index_head_dim=cfg.get("index_head_dim", 128),
                 index_n_heads=cfg.get("index_n_heads", 64),
             )
+
+        # Force BF16 weight type for MXFP4 models since we dequantize on load
+        quant_config = cfg.get("quantization_config", {})
+        if quant_config.get("quant_method") == "mxfp4":
+            info["weight_type"] = "bfloat16"
 
         rope_param: RopeParam = info["rope_param"]
         rope_param.dim = qk_rope_dim

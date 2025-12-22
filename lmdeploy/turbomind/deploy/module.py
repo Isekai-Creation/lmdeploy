@@ -11,7 +11,7 @@ from .target_model.base import BaseOutputModel
 
 def permute_v2(x: torch.Tensor, size_per_head: int = 128):
     """
-        Contract: x.size(-1) is output dims
+    Contract: x.size(-1) is output dims
     """
 
     assert x.size(-1) > 1
@@ -24,7 +24,7 @@ def permute_v2(x: torch.Tensor, size_per_head: int = 128):
 
 def merge_qkv_v2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tp: int):
     """
-        Contract: x.size(-1) is output dims
+    Contract: x.size(-1) is output dims
     """
 
     def reshape(x):
@@ -46,7 +46,7 @@ def transpose(x):
 def pad_out_dims(x: torch.Tensor, dims: int):
     pad = dims - x.size(-1)
     assert pad >= 0
-    return torch.nn.functional.pad(x, (0, pad), 'constant', 0)
+    return torch.nn.functional.pad(x, (0, pad), "constant", 0)
 
 
 def pad_in_dims(x: torch.Tensor, dims: int):
@@ -55,13 +55,13 @@ def pad_in_dims(x: torch.Tensor, dims: int):
     pad = dims - x.size(0)
     assert x.dim() == 2
     assert pad >= 0
-    return torch.nn.functional.pad(x, (0, 0, 0, pad), 'constant', 0)
+    return torch.nn.functional.pad(x, (0, 0, 0, pad), "constant", 0)
 
 
 # split out dims -> copy A, split-out-dims B (qkv, w1, w3)
 # split  in dims -> split-in-dims A,  copy B (  o, w2)
 def get_lora_flags(kind: str):
-    return ('lora_a' in kind, 'lora_b' in kind)
+    return ("lora_a" in kind, "lora_b" in kind)
 
 
 class Module(ABC):
@@ -82,8 +82,8 @@ class LayerNorm(Module):
     def apply(self, i: int, r: BaseReader):
         attn_norm = r.attn_norm(i)
         ffn_norm = r.ffn_norm(i)
-        self.model.save_split(attn_norm, f'layers.{i}.attention_norm.weight')
-        self.model.save_split(ffn_norm, f'layers.{i}.ffn_norm.weight')
+        self.model.save_split(attn_norm, f"layers.{i}.attention_norm.weight")
+        self.model.save_split(ffn_norm, f"layers.{i}.ffn_norm.weight")
 
 
 class Ffn(Module):
@@ -92,7 +92,7 @@ class Ffn(Module):
         r.ffn(i, kind)
     """
 
-    _ffn = 'layers.{0}.feed_forward.{1}.{2}'
+    _ffn = "layers.{0}.feed_forward.{1}.{2}"
 
     def __init__(self, model: BaseOutputModel):
         self.model = model
@@ -102,29 +102,65 @@ class Ffn(Module):
         self.inter_size = model.model_config.inter_size
         self.group_size = max(1, model.model_config.group_size)
 
-    def _export(self, inter_size: int, fmt: str, idx: int, w123, kind: str, pack_fn, apply_gs=[], **kwargs):
+    def _export(
+        self,
+        inter_size: int,
+        fmt: str,
+        idx: int,
+        w123,
+        kind: str,
+        pack_fn,
+        apply_gs=[],
+        **kwargs,
+    ):
         is_lora_a, is_lora_b = get_lora_flags(kind)
         w1, w2, w3 = map(transpose, w123)
 
-        gs1 = self.group_size if 'w1' in apply_gs else 1
+        # Skip if all weights are None (pure MoE layer without shared_experts)
+        if w1 is None and w2 is None and w3 is None:
+            return
+
+        gs1 = self.group_size if "w1" in apply_gs else 1
         w1 = pad_out_dims(w1, inter_size // gs1)
 
-        gs3 = self.group_size if 'w3' in apply_gs else 1
+        gs3 = self.group_size if "w3" in apply_gs else 1
         w3 = pad_out_dims(w3, inter_size // gs3)
 
-        gs2 = self.group_size if 'w2' in apply_gs else 1
+        gs2 = self.group_size if "w2" in apply_gs else 1
         w2 = pad_in_dims(w2, inter_size // gs2)
 
         w1, w2, w3 = map(pack_fn, (w1, w2, w3))
-        self.model.save_split(w1, fmt.format(idx, 'w1', kind), split_dim=-1, split_num=self.tp, copy=is_lora_a)
-        self.model.save_split(w3, fmt.format(idx, 'w3', kind), split_dim=-1, split_num=self.tp, copy=is_lora_a)
-        self.model.save_split(w2, fmt.format(idx, 'w2', kind), split_dim=0, split_num=self.tp, copy=is_lora_b)
+        self.model.save_split(
+            w1,
+            fmt.format(idx, "w1", kind),
+            split_dim=-1,
+            split_num=self.tp,
+            copy=is_lora_a,
+        )
+        self.model.save_split(
+            w3,
+            fmt.format(idx, "w3", kind),
+            split_dim=-1,
+            split_num=self.tp,
+            copy=is_lora_a,
+        )
+        self.model.save_split(
+            w2,
+            fmt.format(idx, "w2", kind),
+            split_dim=0,
+            split_num=self.tp,
+            copy=is_lora_b,
+        )
 
     def apply(self, i: int, r: BaseReader):
         if not self.inter_size[i]:
             return
         for e in get_params(r.ffn(i, None)):
-            e(partial(self._export, self.inter_size[i], self._ffn), partial(r.ffn, i), i)
+            e(
+                partial(self._export, self.inter_size[i], self._ffn),
+                partial(r.ffn, i),
+                i,
+            )
 
 
 class MoeFfn(Ffn):
@@ -135,9 +171,9 @@ class MoeFfn(Ffn):
         r.moe_ffn_shared_gate(i)
     """
 
-    _moe_ffn_expert = 'layers.{0}.moe_ffn.experts.E.{1}.{2}'
-    _moe_ffn_gate = 'layers.{0}.moe_ffn.gate.{1}'
-    _moe_ffn_shared_gate = 'layers.{0}.moe_ffn.shared_gate.weight'
+    _moe_ffn_expert = "layers.{0}.moe_ffn.experts.E.{1}.{2}"
+    _moe_ffn_gate = "layers.{0}.moe_ffn.gate.{1}"
+    _moe_ffn_shared_gate = "layers.{0}.moe_ffn.shared_gate.weight"
 
     def __init__(self, model: BaseOutputModel):
         super().__init__(model)
@@ -150,15 +186,19 @@ class MoeFfn(Ffn):
             return
         for p in get_params(r.moe_ffn_expert(), 1):
             for e in range(self.expert_num[i]):
-                fmt = self._moe_ffn_expert.replace('E', str(e))
-                p(partial(self._export, self.inter_size, fmt), partial(r.moe_ffn_expert, e, i), i)
+                fmt = self._moe_ffn_expert.replace("E", str(e))
+                p(
+                    partial(self._export, self.inter_size, fmt),
+                    partial(r.moe_ffn_expert, e, i),
+                    i,
+                )
 
         # router
-        gate = transpose(r.moe_ffn_gate(i, 'weight'))
-        self.model.save_split(gate, self._moe_ffn_gate.format(i, 'weight'))
-        bias = r.moe_ffn_gate(i, 'bias')
+        gate = transpose(r.moe_ffn_gate(i, "weight"))
+        self.model.save_split(gate, self._moe_ffn_gate.format(i, "weight"))
+        bias = r.moe_ffn_gate(i, "bias")
         if bias is not None:
-            self.model.save_split(bias, self._moe_ffn_gate.format(i, 'bias'))
+            self.model.save_split(bias, self._moe_ffn_gate.format(i, "bias"))
 
         if self.shared_gate:
             shared_gate = transpose(r.moe_ffn_shared_gate(i))
@@ -171,7 +211,7 @@ class Attn(Module):
         r.attn(i, kind)
     """
 
-    _attn = 'layers.{0}.attention.{1}.{2}'
+    _attn = "layers.{0}.attention.{1}.{2}"
 
     def __init__(self, model: BaseOutputModel):
         self.model = model
@@ -215,7 +255,7 @@ class Attn(Module):
 
         k, v = map(_repeat, (k, v))
 
-        if kind == 'bias':
+        if kind == "bias":
             if o is None:
                 o = torch.zeros(hidden_dim, dtype=q.dtype, device=q.device)
             q, k, v, o = map(torch.squeeze, (q, k, v, o))
@@ -230,23 +270,27 @@ class Attn(Module):
 
         qkvo = tuple(map(transpose, qkvo))
 
-        gs = self.group_size if ('w1' in apply_gs) else 1
+        gs = self.group_size if ("w1" in apply_gs) else 1
 
         if self.model.repeat_kv:
             qkvo = self._repeat_kv(qkvo, gs, kind)
 
         qkv, o = self._reorder_and_merge(qkvo, gs)
 
-        self.model.save_split(pack_fn(qkv),
-                              self._attn.format(idx, 'w_qkv', kind),
-                              split_dim=-1,
-                              split_num=self.tp,
-                              copy=is_lora_a)
-        self.model.save_split(pack_fn(o),
-                              self._attn.format(idx, 'wo', kind),
-                              split_dim=0,
-                              split_num=self.tp,
-                              copy=is_lora_b)
+        self.model.save_split(
+            pack_fn(qkv),
+            self._attn.format(idx, "w_qkv", kind),
+            split_dim=-1,
+            split_num=self.tp,
+            copy=is_lora_a,
+        )
+        self.model.save_split(
+            pack_fn(o),
+            self._attn.format(idx, "wo", kind),
+            split_dim=0,
+            split_num=self.tp,
+            copy=is_lora_b,
+        )
 
     def apply(self, i: int, r: BaseReader):
         for e in get_params(r.attn(i, None), bias=self.attn_bias):
@@ -256,11 +300,16 @@ class Attn(Module):
             if self.model.permute_qk:
                 q = permute_v2(q, self.head_dim)
                 k = permute_v2(k, self.head_dim)
-            self.model.save_split(q, self._attn.format(i, 'q_norm', '')[:-1])
-            self.model.save_split(k, self._attn.format(i, 'k_norm', '')[:-1])
+            self.model.save_split(q, self._attn.format(i, "q_norm", "")[:-1])
+            self.model.save_split(k, self._attn.format(i, "k_norm", "")[:-1])
         if self.attn_sink:
             sinks = r.attn_sinks(i)
-            self.model.save_split(sinks, self._attn.format(i, 'sinks', '')[:-1], split_dim=-1, split_num=self.tp)
+            self.model.save_split(
+                sinks,
+                self._attn.format(i, "sinks", "")[:-1],
+                split_dim=-1,
+                split_num=self.tp,
+            )
 
 
 class MLA(Module):
@@ -270,7 +319,7 @@ class MLA(Module):
         r.mla_norm(i)
     """
 
-    _mla = 'layers.{0}.attention.{1}.{2}'
+    _mla = "layers.{0}.attention.{1}.{2}"
 
     def __init__(self, model: BaseOutputModel):
         self.model = model
@@ -286,20 +335,34 @@ class MLA(Module):
         cfg = self.model.model_config
 
         o = o.reshape(cfg.head_num, cfg.v_head_dim, -1)
-        o = torch.nn.functional.pad(o, (0, 0, 0, cfg.size_per_head - cfg.v_head_dim, 0, 0))
+        o = torch.nn.functional.pad(
+            o, (0, 0, 0, cfg.size_per_head - cfg.v_head_dim, 0, 0)
+        )
         o = o.view(cfg.head_num * cfg.size_per_head, cfg.hidden_units)
 
         tp = self.model.attn_tp_size
 
         if q_a is not None:
-            self.model.save_split(pack_fn(q_a), self._mla.format(idx, 'q_a_proj', kind))
-        q_b_name = 'q_proj' if q_a is None else 'q_b_proj'
-        self.model.save_split(pack_fn(q_b), self._mla.format(idx, q_b_name, kind), split_dim=-1, split_num=tp)
-        self.model.save_split(pack_fn(kv_a), self._mla.format(idx, 'kv_a_proj', kind))
-        self.model.save_split(pack_fn(kv_b), self._mla.format(idx, 'kv_b_proj', kind), split_dim=-1, split_num=tp)
-        self.model.save_split(pack_fn(o), self._mla.format(idx, 'wo', kind), split_dim=0, split_num=tp)
+            self.model.save_split(pack_fn(q_a), self._mla.format(idx, "q_a_proj", kind))
+        q_b_name = "q_proj" if q_a is None else "q_b_proj"
+        self.model.save_split(
+            pack_fn(q_b),
+            self._mla.format(idx, q_b_name, kind),
+            split_dim=-1,
+            split_num=tp,
+        )
+        self.model.save_split(pack_fn(kv_a), self._mla.format(idx, "kv_a_proj", kind))
+        self.model.save_split(
+            pack_fn(kv_b),
+            self._mla.format(idx, "kv_b_proj", kind),
+            split_dim=-1,
+            split_num=tp,
+        )
+        self.model.save_split(
+            pack_fn(o), self._mla.format(idx, "wo", kind), split_dim=0, split_num=tp
+        )
 
-    _layernorm = 'layers.{0}.attention.{1}_a_layernorm'
+    _layernorm = "layers.{0}.attention.{1}_a_layernorm"
 
     def apply(self, i: int, r: BaseReader):
 
@@ -308,8 +371,8 @@ class MLA(Module):
 
         q, k = r.mla_norm(i)
         if q is not None:
-            self.model.save_split(q, self._layernorm.format(i, 'q'))
-        self.model.save_split(k, self._layernorm.format(i, 'kv'))
+            self.model.save_split(q, self._layernorm.format(i, "q"))
+        self.model.save_split(k, self._layernorm.format(i, "kv"))
 
 
 class Misc(Module):
@@ -333,18 +396,22 @@ class Misc(Module):
                 pad_size = (vocab_size + tp - 1) // tp * tp - vocab_size
             if pad_size is None:
                 return tensor
-            return torch.nn.functional.pad(tensor, (0, 0, 0, pad_size), 'constant', 0)
+            return torch.nn.functional.pad(tensor, (0, 0, 0, pad_size), "constant", 0)
 
         tp = self.model.attn_tp_size * self.model.attn_cp_size
         if emb is not None:
             emb = pad_weight(emb, tp=tp)
-            self.model.save_split(emb, 'tok_embeddings.weight', split_dim=1, split_num=tp)
+            self.model.save_split(
+                emb, "tok_embeddings.weight", split_dim=1, split_num=tp
+            )
         if norm_weight is not None:
-            self.model.export_weight(norm_weight, 'norm.weight')
+            self.model.export_weight(norm_weight, "norm.weight")
         if output_weight is not None:
             output_weight = pad_weight(output_weight, tp=tp)
             # transpose
-            self.model.save_split(output_weight.t(), 'output.weight', split_dim=1, split_num=tp)
+            self.model.save_split(
+                output_weight.t(), "output.weight", split_dim=1, split_num=tp
+            )
 
 
 class Transformer:

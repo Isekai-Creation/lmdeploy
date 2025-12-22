@@ -24,6 +24,7 @@ add_library(Llama STATIC
         llama_kernels.cu
         llama_utils.cu
         mla_utils.cu
+        dsa_indexer.cu
         EagleModule.cc
         EagleBuffers.cc
         EagleOrchestrator.cc
