@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import dataclasses
+import os
 import random
 from contextlib import asynccontextmanager, closing
 from copy import deepcopy
@@ -101,9 +102,13 @@ class GenOut:
 
     routed_experts: Any = None
 
+    # Optional per-request metrics (e.g. EAGLE spec_info) propagated
+    # from the backend EngineOutput.
+    req_metrics: Any = None
+
 
 def _gen_out_to_response(out: GenOut, index) -> Response:
-    return Response(text=out.response,
+    resp = Response(text=out.response,
                     generate_token_len=out.generate_token_len,
                     input_token_len=out.input_token_len,
                     finish_reason=out.finish_reason,
@@ -113,6 +118,12 @@ def _gen_out_to_response(out: GenOut, index) -> Response:
                     logits=out.logits,
                     routed_experts=out.routed_experts,
                     index=index)
+    # Preserve req_metrics when present so downstream consumers
+    # (e.g. benchmarks) can access EAGLE spec_info from offline
+    # pipelines just like they do in the serve path.
+    if getattr(out, "req_metrics", None) is not None:
+        setattr(resp, "req_metrics", out.req_metrics)
+    return resp
 
 
 def _append_response(dst: Response, src: Response):
@@ -130,6 +141,11 @@ def _append_response(dst: Response, src: Response):
         dst.logprobs = dst.logprobs or []
         dst.logprobs += src.logprobs
     dst.routed_experts = src.routed_experts
+    # Propagate req_metrics when present so the final
+    # aggregated Response exposes per-request metrics
+    # (including EAGLE spec_info) to callers.
+    if getattr(src, "req_metrics", None) is not None:
+        setattr(dst, "req_metrics", src.req_metrics)
     return dst
 
 
