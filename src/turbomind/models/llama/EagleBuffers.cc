@@ -130,7 +130,6 @@ void EagleBuffers::free() {
     cudaFree(inputs.prev_accepted_lens);
     cudaFree(inputs.prev_draft_lens);
     cudaFree(inputs.prev_paths);
-    cudaFree(inputs.prev_paths);
     cudaFree(inputs.best_path_ids);
     
     cudaFree(inputs.cu_block_nums);
