@@ -2923,7 +2923,15 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
             }
             const int len_i =
                 (i < static_cast<int>(eagle_accepted_lens.size())) ? eagle_accepted_lens[i] : 0;
-            const int* seq_tokens = eagle_accepted_tokens.data() + i * max_path_len;
+            // BOUNDS CHECK: Prevent buffer overflow when accessing eagle_accepted_tokens
+            const int token_offset = i * max_path_len;
+            if (token_offset + len_i > static_cast<int>(eagle_accepted_tokens.size())) {
+                TM_LOG_WARNING(
+                    "[LlamaBatch][EAGLE] step=%d, seq=%d, token_offset=%d + len=%d > tokens.size()=%zu; skipping debug",
+                    g.step, i, token_offset, len_i, eagle_accepted_tokens.size());
+                continue;
+            }
+            const int* seq_tokens = eagle_accepted_tokens.data() + token_offset;
             std::ostringstream accepted_ss;
             for (int e = 0; e < len_i; ++e) {
                 if (e) {
@@ -2952,6 +2960,16 @@ void LlamaBatch::advanceSequencesByEagleAcceptance(const std::vector<int>&  dyna
         }
 
         const int token_offset = i * max_path_len;
+        // BOUNDS CHECK: Prevent buffer overflow - critical for heap safety
+        // The access pattern is seq_tokens[1 + e] where e goes from 0 to extra-1
+        // So we need token_offset + 1 + (extra - 1) = token_offset + extra to be valid
+        if (token_offset + extra > static_cast<int>(eagle_accepted_tokens.size())) {
+            TM_LOG_WARNING(
+                "[LlamaBatch][EAGLE] step=%d, seq=%d, token_offset=%d + extra=%d > tokens.size()=%zu; "
+                "SKIPPING to prevent heap corruption",
+                g.step, i, token_offset, extra, eagle_accepted_tokens.size());
+            continue;
+        }
         const int* seq_tokens  = eagle_accepted_tokens.data() + token_offset;
 
         for (int e = 0; e < extra; ++e) {
