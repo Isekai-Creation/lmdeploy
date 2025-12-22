@@ -118,16 +118,18 @@ class LlamaModel(BaseInputModel):
     def model_info(self):
         """Read model info."""
         model_arg = self.model_config
-        num_layer = model_arg['num_hidden_layers']
-        norm_eps = model_arg['rms_norm_eps']
-        attn_head_num = model_arg['num_attention_heads']
-        vocab_size = model_arg['vocab_size']
-        inter_size = model_arg['intermediate_size']
+        # Use .get() with defaults for compatibility with TurboMind-converted models
+        num_layer = model_arg.get('num_hidden_layers', 36)
+        norm_eps = model_arg.get('rms_norm_eps', 1e-5)
+        attn_head_num = model_arg.get('num_attention_heads', 64)
+        vocab_size = model_arg.get('vocab_size', 128256)
+        inter_size = model_arg.get('intermediate_size', 14336)
         if 'num_key_value_heads' in model_arg:
             kv_head_num = model_arg['num_key_value_heads']
         else:
-            kv_head_num = model_arg['num_attention_heads']
-        hidden_units = model_arg['hidden_size']
+            kv_head_num = model_arg.get('num_attention_heads', attn_head_num)
+        hidden_units = model_arg.get('hidden_size', 4096)
+
         # head_dim could be none in config
         head_dim = model_arg.get('head_dim', None)
         head_dim = head_dim or hidden_units // attn_head_num

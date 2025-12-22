@@ -1353,6 +1353,9 @@ void LlamaV2::runEagleTargetTreeDecode(int batch_size,
     else if (param_.quant_policy & QuantPolicy::kCacheKVInt4) {
         kv_dtype = kUint4;
     }
+    else if (param_.quant_policy & QuantPolicy::kCacheKVFP4) {
+        kv_dtype = kFloat4_e2m1;
+    }
 
     // SpecPV integration currently supports only unquantized fp16/bf16
     // KV for the tree decode path. On any other KV dtype we fall back to

@@ -251,18 +251,54 @@ class TurboMind:
             model_path = get_model(
                 model_path, _engine_config.download_dir, _engine_config.revision
             )
+        
+        # Auto-convert HuggingFace EAGLE model BEFORE _from_hf builds config_dict
+        # This ensures the converted model path is included in the YAML passed to C++
+        if _engine_config.speculative_config is not None:
+            spec_cfg = _engine_config.speculative_config
+            eagle_model_path = getattr(spec_cfg, 'model', None)
+            
+            # Auto-convert HuggingFace EAGLE model to TurboMind format if needed
+            if eagle_model_path and osp.exists(eagle_model_path):
+                has_yaml = osp.exists(osp.join(eagle_model_path, 'config.yaml'))
+                has_json = osp.exists(osp.join(eagle_model_path, 'config.json'))
+                has_safetensors = osp.exists(osp.join(eagle_model_path, 'model.safetensors'))
+                
+                # HuggingFace format: config.json exists but config.yaml doesn't
+                if not has_yaml and has_json and has_safetensors:
+                    logger.info(f"Detected HuggingFace EAGLE model at {eagle_model_path}, auto-converting to TurboMind format...")
+                    try:
+                        from lmdeploy.turbomind.eagle_draft_converter import prepare_eagle_draft_from_hf
+                        # Create output directory in same location with -turbomind suffix
+                        out_dir = eagle_model_path.rstrip('/') + '-turbomind-auto'
+                        if not osp.exists(out_dir) or not osp.exists(osp.join(out_dir, 'config.yaml')):
+                            prepare_eagle_draft_from_hf(
+                                hf_model_dir=eagle_model_path,
+                                out_dir=out_dir,
+                                base_model_dir=model_path,  # Use the main model as base
+                                logger=logger
+                            )
+                            logger.info(f"EAGLE model converted to: {out_dir}")
+                        else:
+                            logger.info(f"Using previously converted EAGLE model: {out_dir}")
+                        # Update speculative config to point to converted model
+                        spec_cfg.model = out_dir
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-convert HuggingFace EAGLE model: {e}. "
+                                       "Please manually convert using prepare_eagle_draft_from_hf().")
+            
+            logger.info(
+                "Speculative decoding is handled natively by C++ engine. "
+                "Python-side speculative decoding manager is deprecated."
+            )
+
         self.model_comm = self._from_hf(
             model_path=model_path, engine_config=_engine_config
         )
         self.tokenizer = Tokenizer(model_path)
 
-        # Initialize speculative decoding if configured
+        # Speculative manager init (deprecated, kept for compatibility)
         self.speculative_manager = None
-        if _engine_config.speculative_config is not None:
-            logger.info(
-                "Speculative decoding is handled natively by C++ engine. "
-                "Python-side speculative decoding manager is deprecated."
-            )
 
         if not _engine_config.empty_init:
             self._load_weights()

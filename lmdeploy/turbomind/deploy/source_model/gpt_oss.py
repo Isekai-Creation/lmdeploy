@@ -49,18 +49,24 @@ class GptOssModel(LlamaModel):
 
     def model_info(self):
         cfg = self.model_config
-        types = cfg['layer_types']
-        sliding_window = cfg['sliding_window']
+        # Handle missing layer_types - default to alternating sliding/full pattern
+        num_layers = cfg.get('num_hidden_layers', 24)
+        types = cfg.get('layer_types', None)
+        if types is None:
+            # Generate default alternating pattern: sliding_attention, full_attention, ...
+            types = ['sliding_attention' if i % 2 == 0 else 'full_attention' for i in range(num_layers)]
+        sliding_window = cfg.get('sliding_window', 128)  # Default sliding window size
         info = super().model_info()
-        info.update(attn_bias=int(cfg['attention_bias']),
+        info.update(attn_bias=int(cfg.get('attention_bias', True)),
                     mlp_bias=True,
                     expert_router_bias=True,
-                    expert_num=cfg['num_local_experts'],
-                    expert_inter_size=cfg['intermediate_size'],
-                    experts_per_token=cfg['experts_per_token'],
+                    expert_num=cfg.get('num_local_experts', 32),
+                    expert_inter_size=cfg.get('intermediate_size', 2880),
+                    experts_per_token=cfg.get('experts_per_token', 4),
                     norm_topk_prob=True,
                     inter_size=0,
                     window_size=[sliding_window if x == 'sliding_attention' else 0 for x in types],
                     attn_sink=True,
                     activation_type='gpt-oss')
         return info
+

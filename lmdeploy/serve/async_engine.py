@@ -346,8 +346,10 @@ class AsyncEngine(LogitsMixin):
         self.session_len = (_get_and_verify_max_len(self.hf_cfg, None)
                             if backend_config.session_len is None else backend_config.session_len)
         backend_config.session_len = self.session_len
-        if speculative_config is not None and backend == 'turbomind':
-            logger.warning('speculative decoding is not supported by turbomind ')
+        # TurboMind DOES support speculative decoding via TurbomindEngineConfig.speculative_config
+        # Attach speculative_config to the engine config for both backends
+        if speculative_config is not None:
+            backend_config.speculative_config = speculative_config
         # build backend engine
         if backend == 'turbomind':
             self.engine = self._build_turbomind(model_path=model_path, backend_config=backend_config, **kwargs)

@@ -102,50 +102,91 @@ void EagleModule::load(const std::string& model_dir, int /*device_id*/, cudaStre
 {
     enabled_ = false;
     bool success = true;
+    bool is_hf_format = false;
 
-    logEagleProgress(5, "Begin EagleModule::load (parsing config.yaml)");
+    logEagleProgress(5, "Begin EagleModule::load (parsing config)");
 
-    const std::string config_path = model_dir + "/config.yaml";
+    const std::string yaml_path = model_dir + "/config.yaml";
+    const std::string json_path = model_dir + "/config.json";
     YAML::Node        config;
+    
+    // Try config.yaml first (TurboMind deployed format)
     try {
-        config = YAML::LoadFile(config_path);
+        config = YAML::LoadFile(yaml_path);
     }
     catch (const std::exception& e) {
-        logEagleError("Failed to load config.yaml from " + model_dir + ": " + e.what());
-        return;
+        // Fallback to config.json (HuggingFace format) - YAML can parse JSON
+        try {
+            config = YAML::LoadFile(json_path);
+            is_hf_format = true;
+            TM_LOG_INFO("[EAGLE] Loaded HuggingFace config.json from %s", model_dir.c_str());
+        }
+        catch (const std::exception& e2) {
+            logEagleError("Failed to load config.yaml or config.json from " + model_dir + ": " + e2.what());
+            return;
+        }
     }
 
-    if (!config["model_config"]) {
-        logEagleError("config.yaml missing 'model_config' node");
-        return;
+    // Handle both TurboMind config.yaml format and HuggingFace config.json format
+    YAML::Node model_config;
+    if (is_hf_format) {
+        // HuggingFace format: fields are at root level, not under model_config
+        model_config = config;
+    } else {
+        if (!config["model_config"]) {
+            logEagleError("config.yaml missing 'model_config' node");
+            return;
+        }
+        model_config = config["model_config"];
     }
 
-    YAML::Node model_config = config["model_config"];
-
-    if (!model_config["hidden_units"] || !model_config["vocab_size"] || !model_config["head_num"]
-        || !model_config["size_per_head"] || !model_config["inter_size"]) {
-        logEagleError("config.yaml missing required fields in model_config");
-        return;
+    // Map field names: HF uses different names than TurboMind
+    // HF: hidden_size, vocab_size, num_attention_heads, head_dim, intermediate_size
+    // TM: hidden_units, vocab_size, head_num, size_per_head, inter_size
+    int hidden_units = 0, vocab_size = 0, head_num = 0, head_dim = 0;
+    
+    if (is_hf_format) {
+        if (!model_config["hidden_size"] || !model_config["vocab_size"] || 
+            !model_config["num_attention_heads"] || !model_config["head_dim"]) {
+            logEagleError("config.json missing required fields (hidden_size, vocab_size, num_attention_heads, head_dim)");
+            return;
+        }
+        hidden_units = model_config["hidden_size"].as<int>();
+        vocab_size = model_config["vocab_size"].as<int>();
+        head_num = model_config["num_attention_heads"].as<int>();
+        head_dim = model_config["head_dim"].as<int>();
+    } else {
+        if (!model_config["hidden_units"] || !model_config["vocab_size"] || !model_config["head_num"]
+            || !model_config["size_per_head"] || !model_config["inter_size"]) {
+            logEagleError("config.yaml missing required fields in model_config");
+            return;
+        }
+        hidden_units = model_config["hidden_units"].as<int>();
+        vocab_size = model_config["vocab_size"].as<int>();
+        head_num = model_config["head_num"].as<int>();
+        head_dim = model_config["size_per_head"].as<int>();
     }
-
-    int hidden_units = model_config["hidden_units"].as<int>();
-    int vocab_size   = model_config["vocab_size"].as<int>();
-    int head_num     = model_config["head_num"].as<int>();
-    int head_dim     = model_config["size_per_head"].as<int>();
+    
     const int attn_hidden_units = head_num * head_dim; // 4096 for GPT-OSS-120B
 
     if (hidden_units <= 0 || vocab_size <= 0 || head_num <= 0 || head_dim <= 0) {
-        logEagleError("Invalid model_config values in config.yaml (non-positive)");
+        logEagleError("Invalid model_config values in config (non-positive)");
         return;
     }
 
     int        intermediate_size = 0;
-    YAML::Node inter_node        = model_config["inter_size"];
-    if (inter_node.IsSequence()) {
-        intermediate_size = inter_node[0].as<int>();
-    }
-    else {
-        intermediate_size = inter_node.as<int>();
+    if (is_hf_format) {
+        if (model_config["intermediate_size"]) {
+            intermediate_size = model_config["intermediate_size"].as<int>();
+        }
+    } else {
+        YAML::Node inter_node = model_config["inter_size"];
+        if (inter_node.IsSequence()) {
+            intermediate_size = inter_node[0].as<int>();
+        }
+        else {
+            intermediate_size = inter_node.as<int>();
+        }
     }
     if (intermediate_size <= 0) {
         logEagleError("Invalid inter_size in config.yaml");

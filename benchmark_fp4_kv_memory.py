@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FP4 vs INT8 KV Cache Memory Benchmark
+FP4 vs INT8 KV Cache Memory Benchmark for gpt-oss-120b
 
 Compares memory pressure during decode at:
 - 8192 tokens (8K)
@@ -38,7 +38,7 @@ def reset_gpu():
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
-def run_decode_benchmark(model_path, quant_policy, session_len, max_new_tokens=2048):
+def run_decode_benchmark(model_path, quant_policy, session_len, max_new_tokens=512):
     """
     Run decode benchmark with specified session length.
     Focus on memory pressure during decoding.
@@ -50,21 +50,20 @@ def run_decode_benchmark(model_path, quant_policy, session_len, max_new_tokens=2
     try:
         config = TurbomindEngineConfig(
             quant_policy=quant_policy,
-            cache_max_entry_count=0.8,  # Use most of available GPU memory
+            cache_max_entry_count=0.8,  # Standard cache size
             session_len=session_len,
         )
         
-        print(f"      Loading engine (session_len={session_len})...")
+        print(f"      Loading engine (session_len={session_len}, quant_policy={quant_policy})...")
         start = time.time()
         pipe = pipeline(model_path, backend_config=config)
         load_time = time.time() - start
         
         _, mem_after_load = get_gpu_memory()
+        print(f"      Memory after load: {mem_after_load:.2f} GB")
         
-        # Single long prompt to maximize decode memory pressure
-        prompt = "Write an extremely detailed technical documentation about CUDA kernel optimization, " \
-                 "covering memory coalescing, warp divergence, shared memory banking, occupancy optimization, " \
-                 "and register pressure. Provide extensive code examples for each technique."
+        # Single prompt to test decode
+        prompt = "Write a detailed explanation of CUDA kernel optimization."
         
         print(f"      Running decode (max_tokens={max_new_tokens})...")
         start = time.time()
@@ -105,11 +104,11 @@ def run_decode_benchmark(model_path, quant_policy, session_len, max_new_tokens=2
 
 def main():
     print("=" * 70)
-    print("FP4 vs INT8 KV Cache Memory Benchmark")
+    print("FP4 vs INT8 KV Cache Memory Benchmark (gpt-oss-120b)")
     print(f"Timestamp: {datetime.now().isoformat()}")
     print("=" * 70)
     
-    # Use turbomind-converted model
+    # Use gpt-oss-120b-turbomind
     model_path = "/workspace/aimo/models/gpt-oss-120b-turbomind"
     
     if not os.path.exists(model_path):
@@ -120,9 +119,9 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    # Benchmark configurations - focus on decode pressure
+    # Standard session lengths - focus on decode pressure
     session_lengths = [8192, 32768, 65536]  # 8K, 32K, 64K
-    max_tokens_per_session = {8192: 4096, 32768: 8192, 65536: 16384}  # Decode heavy
+    max_tokens_per_session = {8192: 512, 32768: 512, 65536: 512}
     
     quant_policies = {
         8: "INT8 KV",

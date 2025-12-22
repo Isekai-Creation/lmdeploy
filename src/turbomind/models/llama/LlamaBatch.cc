@@ -3169,7 +3169,15 @@ void LlamaBatch::InitializeBufferAndKVCache()
     const int dbits = byte_size(data_type_, 8);
 
     const auto quant_policy = model_->param_.quant_policy;
-    const int  elem_bits    = quant_policy ? quant_policy : dbits;
+    // Map quant_policy to actual KV element bit width
+    int elem_bits = dbits;  // default: unquantized
+    if (quant_policy & QuantPolicy::kCacheKVInt8) {
+        elem_bits = 8;
+    } else if (quant_policy & QuantPolicy::kCacheKVInt4) {
+        elem_bits = 4;
+    } else if (quant_policy & QuantPolicy::kCacheKVFP4) {
+        elem_bits = 4;  // FP4 is 4 bits per element
+    }
 
     SequenceManager::BlockConfig block_config{
         (int)model_->size_per_head_,
