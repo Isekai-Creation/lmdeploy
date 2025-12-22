@@ -2,6 +2,7 @@ model_path: /mnt/vc-intern-delivery/qa-llm-cicd/qa_test_models
 resource_path: /mnt/vc-intern-delivery/qa-llm-cicd/resource
 log_path: /mnt/vc-intern-delivery/qa-llm-cicd/log
 eval_log_path: /mnt/vc-intern-delivery/qa-llm-cicd/evaluation_report
+mllm_eval_log_path: /mnt/vc-intern-delivery/qa-llm-cicd/mllm_evaluation_report
 benchmark_path: /mnt/vc-intern-delivery/qa-llm-cicd/benchmark-reports
 dataset_path: /mnt/vc-intern-delivery/qa-llm-cicd/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
 prefix_dataset_path: /mnt/vc-intern-delivery/qa-llm-cicd/datasets/prefix_cache_test.json
@@ -19,23 +20,26 @@ tp_config:
     Qwen2.5-32B-Instruct: 4
 
 pytorch_chat_model:
-    - Qwen/Qwen3-30B-A3B
-    - Qwen/Qwen3-235B-A22B
-    - Qwen/Qwen3-32B
-    - Qwen/Qwen3-8B
-    - Qwen/Qwen3-0.6B
+    tp:
+        - Qwen/Qwen3-30B-A3B
+        - Qwen/Qwen3-235B-A22B
+        - Qwen/Qwen3-32B
+        - Qwen/Qwen3-8B
+        - Qwen/Qwen3-0.6B
 
 pytorch_vl_model:
-    - internlm/Intern-S1
-    - internlm/Intern-S1-mini
-    - OpenGVLab/InternVL3_5-2B
-    - OpenGVLab/InternVL3_5-8B
-    - OpenGVLab/InternVL3_5-38B
+    tp:
+        - internlm/Intern-S1
+        - internlm/Intern-S1-mini
+        - OpenGVLab/InternVL3_5-2B
+        - OpenGVLab/InternVL3_5-8B
+        - OpenGVLab/InternVL3_5-38B
 
 pytorch_base_model:
-    - Qwen/Qwen3-0.6B
+    tp:
+        - Qwen/Qwen3-0.6B
 
-pytorch_quatization:
+pytorch_quantization:
     awq:
         - Empty
     w8a8:

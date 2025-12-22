@@ -1,6 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
-import base64
 import contextlib
 import json
 import os
@@ -287,12 +286,12 @@ class RayExecutor(ExecutorBase):
             self.remote_outs: asyncio.Queue = None
 
             logger.info('Init distributed environment by device.')
+            self.rank_offset = dist_config.dp_rank * attn_tp
             self._init_distributed_environment_by_device(device_type)
 
             logger.info('Init distributed process group.')
-            rank_offset = dist_config.dp_rank * attn_tp
             ray.get([
-                worker.init_process_group.remote(rank + rank_offset, self.master_addr, self.master_port)
+                worker.init_process_group.remote(rank + self.rank_offset, self.master_addr, self.master_port)
                 for rank, worker in enumerate(self.workers)
             ])
 
@@ -353,13 +352,6 @@ class RayExecutor(ExecutorBase):
         if tags is None or 'kv_cache' in tags:
             self.update_configs()
         self.collective_rpc('wakeup', (tags, ))
-
-    def serialize(self, obj) -> str:
-        """Serialize obj."""
-        ref = ray.put(obj)
-        data = ray.cloudpickle.dumps(ref)
-        data = base64.b64encode(data).decode('utf-8')
-        return data
 
     def get_input_processor(self):
         """Build cache engine."""
@@ -561,13 +553,14 @@ class RayExecutor(ExecutorBase):
     def _init_distributed_environment_by_device(self, device_str: str):
         """Init distributed environment."""
         driver_ip = _get_master_addr()
-        if device_str in ['cuda', 'maca']:
+        if device_str == 'cuda':
             self.workers = self._sort_workers(driver_ip, self.workers)
 
         elif device_str == 'ascend':
             self._init_ascend_distributed_environment(driver_ip)
-        elif device_str == 'camb':
-            self._init_camb_distributed_environment(driver_ip)
+        elif device_str in ['camb', 'maca']:
+            self.workers = self._sort_workers(driver_ip, self.workers)
+            ray.get([worker.set_device.remote(idx) for idx, worker in enumerate(self.workers)])
         else:
             raise ValueError(f'Unsupported device type: {device_str}')
 
@@ -586,13 +579,9 @@ class RayExecutor(ExecutorBase):
             # if rank table file is not set, treat as single node
             # simply set device by index, this is for single node, multiple devices
             self.workers = self._sort_workers(driver_ip, self.workers)
-            ray.get([worker.set_device.remote(idx) for idx, worker in enumerate(self.workers)])
+            ray.get([worker.set_device.remote(idx + self.rank_offset) for idx, worker in enumerate(self.workers)])
         else:
             self.workers = self._sort_workers(driver_ip, self.workers)
-
-    def _init_camb_distributed_environment(self, driver_ip):
-        self.workers = self._sort_workers(driver_ip, self.workers)
-        ray.get([worker.set_device.remote(idx) for idx, worker in enumerate(self.workers)])
 
     """ PD Disaggregation API Begin """
 

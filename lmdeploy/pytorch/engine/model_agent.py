@@ -28,7 +28,7 @@ from ..models.patch import BuildModelContext, add_adapters, build_patched_model,
 from ..spec_decode import build_spec_agent
 from ..strategies import build_strategy_factory
 from ..strategies.base.model_agent import ExtraInputs, ExtraOutputs, StoppingCriteria
-from ..utils import get_gpu_memory
+from ..utils import get_gpu_memory, monkey_patch_hf_modules_cache
 from ..weight_loader.model_weight_loader import ModelWeightLoader, load_model_weights
 from .cache_engine import CacheEngine, StateCacheEngine
 from .guided_process import GuidedDecodingManager
@@ -124,10 +124,7 @@ class AgentProfiler:
         self.dp = dist_ctx.dist_config.dp
         self.stream = stream
         self.profiler = None
-        if self.dp == 1:
-            self.name = f'rank[{self.rank}]'
-        else:
-            self.name = f'dp_rank[{self.dp_rank}]'
+        self.name = f'rank[{self.rank}]'
 
         self.delay = envs.torch_profile_delay
         self.duration = envs.torch_profile_duration
@@ -166,7 +163,7 @@ class AgentProfiler:
 
         try:
             self.profiler.stop()
-            rank = self.rank if self.dp == 1 else self.dp_rank
+            rank = self.rank
             dump_path = f'{self.prefix}{rank}.json'
             self.profiler.export_chrome_trace(dump_path)
             logger.warning(f'Profiler {self.name} dump to {dump_path}.')
@@ -235,6 +232,7 @@ def model_forward(
         context = ctx_mgr.build_context(
             inputs=inputs,
             model_config=cache_engine.model_config,
+            cache_config=cache_engine.cache_config,
             kv_caches=cache_engine.gpu_cache,
             state_caches=state_cache_engine.state_caches,
             kv_quant_policy=cache_engine.cache_config.quant_policy,
@@ -325,6 +323,7 @@ class BaseModelAgent:
         self.model_config = model_config
         self.cache_config = cache_config
         # use raw tokenizer
+        monkey_patch_hf_modules_cache()
         self.tokenizer = Tokenizer(model_path).model.model
 
         self._pre_in_que = None
@@ -440,6 +439,9 @@ class BaseModelAgent:
             # warmup decoding(with cuda graph)
             capture_batch_sizes = self.patched_model.get_capture_batch_sizes()
             capture_batch_sizes = sorted(capture_batch_sizes, reverse=True)
+            if self.cache_config.role == EngineRole.Prefill:
+                # do not warmup decoding for prefill engine
+                capture_batch_sizes = []
             for num_tokens in capture_batch_sizes:
                 inputs = self.inputs_strategy.make_dummy(num_tokens,
                                                          is_decoding=True,
@@ -870,16 +872,17 @@ class BaseModelAgent:
         keys = ['inputs', 'sampling_inputs', 'stopping_criteria', 'extra_inputs']
         while True:
             forward_inputs = await self._pre_in_que.get()
-
+            forward_inputs_cuda = {}
+            forward_inputs_cuda.update(forward_inputs)
             logger.debug('preprocessing forward inputs.')
             with torch.cuda.stream(self.out_stream), torch.inference_mode(), record_function('inputs_H2D'):
                 for k in keys:
-                    if k not in forward_inputs:
+                    if k not in forward_inputs_cuda:
                         continue
-                    forward_inputs[k] = _try_to_cuda(forward_inputs[k], non_blocking=non_blocking)
+                    forward_inputs_cuda[k] = _try_to_cuda(forward_inputs_cuda[k], non_blocking=non_blocking)
                 self.out_stream.synchronize()
             logger.debug('preprocessing forward inputs done.')
-            self._in_que.put_nowait(forward_inputs)
+            self._in_que.put_nowait(forward_inputs_cuda)
             if forward_event is not None:
                 forward_event.clear()
 
@@ -1222,6 +1225,13 @@ class DPForwardInputsMaker:
         self._ready_event = torch.cuda.Event()
         self._attn_tp_cpu_group = self.dist_ctx.attn_tp_group.cpu_group
 
+        # timeout to wait for inputs
+        # if any rank has no inputs, all ranks would wait for this timeout
+        # so it is very important to balance the inputs between ranks
+        from lmdeploy.pytorch import envs
+        self.base_timeout = envs.dp_input_timeout
+        self.timeout = self.base_timeout
+
     def _make_dummy_forward_inputs(self):
         """Make dummy forward inputs."""
         is_decoding = self._is_decoding
@@ -1248,7 +1258,16 @@ class DPForwardInputsMaker:
         if self.cache_config.role != EngineRole.Prefill:
             self._is_decoding = not self._is_decoding
 
-    async def _broadcast_has_inputs(self, has_inputs: bool = False):
+        if self.cache_config.role == EngineRole.Decode:
+            # set timeout for next inputs
+            # next inputs is ~self._is_decoding
+            # and prefill is rarely happened in decoding engine
+            if self._is_decoding:
+                self.timeout = max(0.02, self.base_timeout / 2)
+            else:
+                self.timeout = self.base_timeout
+
+    async def _gather_has_inputs(self, has_inputs: bool = False):
         """Broadcast has inputs."""
         attn_tp_group = self.dist_ctx.attn_tp_group
         attn_tp = self.dist_ctx.dist_config.attn_tp
@@ -1256,52 +1275,40 @@ class DPForwardInputsMaker:
             return has_inputs
 
         group = attn_tp_group.cpu_group
-        rank = dist.get_global_rank(group, 0)
-        has_inputs = torch.tensor((has_inputs, ))
-        handle = dist.broadcast(has_inputs, src=rank, group=group, async_op=True)
+        has_inputs = torch.tensor((int(has_inputs), ))
+        handle = dist.all_reduce(has_inputs, op=dist.ReduceOp.SUM, group=group, async_op=True)
         future = handle.get_future()
         while not future.done():
             await asyncio.sleep(0)
-        return has_inputs.item()
+        future.wait()
+        return (has_inputs > 0).item()
 
-    async def _get_inputs_rank0(self):
-        """Try get inputs rank0."""
-        try:
-            forward_inputs = await asyncio.wait_for(self._in_que.get(), timeout=0.02)
-        except asyncio.TimeoutError:
-            forward_inputs = None
-
-        has_inputs = forward_inputs is not None
-        await self._broadcast_has_inputs(has_inputs)
-        return forward_inputs
-
-    async def _get_inputs_rankn(self):
-        """Try get inputs rankn."""
-        # broadcast
-        has_inputs = await self._broadcast_has_inputs()
-
-        # try get inputs
-        if has_inputs:
+    async def _get_inputs(self):
+        if self.model_agent._pre_in_que.qsize() > 0:
             forward_inputs = await self._in_que.get()
         else:
-            forward_inputs = None
+            try:
+                forward_inputs = await asyncio.wait_for(self._in_que.get(), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                forward_inputs = None
+
+        has_inputs = await self._gather_has_inputs(forward_inputs is not None)
+
+        # try get inputs
+        if has_inputs and forward_inputs is None:
+            forward_inputs = await self._in_que.get()
+
         return forward_inputs
 
     async def _try_get_inputs(self):
         """Try get inputs."""
-
-        attn_tp_group = self.dist_ctx.attn_tp_group
-        tp_rank = attn_tp_group.rank
 
         # initialize output
         forward_inputs = None
         need_dummy = True
 
         # get inputs from in_que. Rank 1 will not gather if rank 0 does not read inputs.
-        if tp_rank == 0:
-            forward_inputs = await self._get_inputs_rank0()
-        else:
-            forward_inputs = await self._get_inputs_rankn()
+        forward_inputs = await self._get_inputs()
 
         if forward_inputs is not None:
             model_inputs = forward_inputs['inputs']
